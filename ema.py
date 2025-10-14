@@ -82,7 +82,7 @@ def main():
                 bot.send_message(chat_id=CHAT_ID, text=msg)
             time.sleep(SLEEP_BETWEEN)
         print("⏳ 30 dk bekleniyor...")
-        time.sleep(1800)  # 30 dakika
+        time.sleep(600)  # 30 dakika
 
 if __name__ == "__main__":
     main()
