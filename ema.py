@@ -1,4 +1,3 @@
-
 import requests
 import time
 from datetime import datetime
@@ -10,6 +9,10 @@ LIMIT = 300
 INTERVALS = ["1h", "4h", "1d"]
 SLEEP_BETWEEN = 0.5  # rate-limit dostu
 SCAN_INTERVAL = 600   # 10 dakika
+
+# Slope eşikleri (güçlü trend için)
+SLOPE_UP_THRESHOLD = 0.2
+SLOPE_DOWN_THRESHOLD = -0.2
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -96,7 +99,8 @@ def process_symbol(sym):
         ema25 = ema(closes, EMA_25)
         cross_dir, bars_ago = last_cross_info(ema7, ema25)
         if cross_dir and bars_ago == 0:
-            alerts.append((interval, cross_dir))
+            slope = ema7[-1] - ema7[-3]  # son 3 bar farkı
+            alerts.append((interval, cross_dir, slope))
         time.sleep(SLEEP_BETWEEN)
     return alerts
 
@@ -108,7 +112,6 @@ def main():
     else:
         log(f"{len(symbols)} coin taranıyor...")
 
-    # Sinyalleri ve yönlerini saklamak için dict
     last_alerts = {}  # örn: {"BTCUSDT_1h": "UP"}
 
     while True:
@@ -118,13 +121,17 @@ def main():
 
         for sym in symbols:
             alerts = process_symbol(sym)
-            for interval, direction in alerts:
+            for interval, direction, slope in alerts:
                 alert_id = f"{sym}_{interval}"
-                # Eğer aynı yön zaten kayıtlıysa mesaj gönderme
-                if last_alerts.get(alert_id) != direction:
-                    msg = f"⚡ {sym} ({interval}) EMA7-EMA25 kesişimi: {direction}"
-                    send_telegram(msg)
-                    last_alerts[alert_id] = direction
+                # Sadece güçlü trendler
+                if (direction == "UP" and slope >= SLOPE_UP_THRESHOLD) or \
+                   (direction == "DOWN" and slope <= SLOPE_DOWN_THRESHOLD):
+                    # Eğer aynı yön zaten kayıtlıysa mesaj gönderme
+                    if last_alerts.get(alert_id) != direction:
+                        msg = f"⚡ {sym} ({interval}) EMA7-EMA25 kesişimi: {direction}, slope={slope:.4f}"
+                        send_telegram(msg)
+                        last_alerts[alert_id] = direction
+
         log(f"⏳ {SCAN_INTERVAL/60:.0f} dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
 
