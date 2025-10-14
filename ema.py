@@ -1,3 +1,4 @@
+
 import requests
 import time
 from datetime import datetime
@@ -7,8 +8,8 @@ import os
 EMA_7, EMA_25, EMA_99 = 7, 25, 99
 LIMIT = 300
 INTERVALS = ["1h", "4h", "1d"]
-SLEEP_BETWEEN = 0.15
-SCAN_INTERVAL = 600  # 10 dakika
+SLEEP_BETWEEN = 0.5  # rate-limit dostu
+SCAN_INTERVAL = 600   # 10 dakika
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -56,6 +57,13 @@ def get_klines(symbol, interval):
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.HTTPError as e:
+        if r.status_code == 418:
+            log(f"{symbol} {interval}: 418 I’m a teapot, atlanıyor.")
+            return []
+        else:
+            log(f"get_klines HTTPError {symbol} {interval}: {e}")
+            return []
     except Exception as e:
         log(f"get_klines hatası {symbol} {interval}: {e}")
         return []
@@ -100,7 +108,8 @@ def main():
     else:
         log(f"{len(symbols)} coin taranıyor...")
 
-    last_alerts = set()
+    # Sinyalleri ve yönlerini saklamak için dict
+    last_alerts = {}  # örn: {"BTCUSDT_1h": "UP"}
 
     while True:
         if not symbols:
@@ -110,11 +119,12 @@ def main():
         for sym in symbols:
             alerts = process_symbol(sym)
             for interval, direction in alerts:
-                alert_id = f"{sym}_{interval}_{direction}"
-                if alert_id not in last_alerts:
-                    msg = f"⚡ {sym} ({interval}) yeni EMA7-EMA25 kesişimi: {direction}"
+                alert_id = f"{sym}_{interval}"
+                # Eğer aynı yön zaten kayıtlıysa mesaj gönderme
+                if last_alerts.get(alert_id) != direction:
+                    msg = f"⚡ {sym} ({interval}) EMA7-EMA25 kesişimi: {direction}"
                     send_telegram(msg)
-                    last_alerts.add(alert_id)
+                    last_alerts[alert_id] = direction
         log(f"⏳ {SCAN_INTERVAL/60:.0f} dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
 
