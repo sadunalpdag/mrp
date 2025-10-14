@@ -37,15 +37,28 @@ def ema(values, length):
 
 def get_futures_symbols():
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    r = requests.get(url)
-    data = r.json()
-    return [s["symbol"] for s in data["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if "symbols" not in data:
+            log(f"Binance API hatası: {data}")
+            return []
+        return [s["symbol"] for s in data["symbols"]
+                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"]
+    except Exception as e:
+        log(f"get_futures_symbols hatası: {e}")
+        return []
 
 def get_klines(symbol, interval):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={LIMIT}"
-    r = requests.get(url)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log(f"get_klines hatası {symbol} {interval}: {e}")
+        return []
 
 def last_cross_info(ema_fast, ema_slow):
     last_cross = None
@@ -67,28 +80,33 @@ def last_cross_info(ema_fast, ema_slow):
 def process_symbol(sym):
     alerts = []
     for interval in INTERVALS:
-        try:
-            klines = get_klines(sym, interval)
-            closes = [float(k[4]) for k in klines]
-            if len(closes) < EMA_99:
-                continue
-            ema7 = ema(closes, EMA_7)
-            ema25 = ema(closes, EMA_25)
-            cross_dir, bars_ago = last_cross_info(ema7, ema25)
-            if cross_dir and bars_ago == 0:
-                alerts.append((interval, cross_dir))
-        except Exception as e:
-            log(f"Hata {sym} {interval}: {e}")
-            time.sleep(0.2)
+        klines = get_klines(sym, interval)
+        if not klines or len(klines) < EMA_99:
+            continue
+        closes = [float(k[4]) for k in klines]
+        ema7 = ema(closes, EMA_7)
+        ema25 = ema(closes, EMA_25)
+        cross_dir, bars_ago = last_cross_info(ema7, ema25)
+        if cross_dir and bars_ago == 0:
+            alerts.append((interval, cross_dir))
+        time.sleep(SLEEP_BETWEEN)
     return alerts
 
 def main():
     log("🚀 EMA bot başlatıldı")
     symbols = get_futures_symbols()
-    log(f"{len(symbols)} coin taranıyor...")
+    if not symbols:
+        log("❌ Binance Futures coin listesi boş, tekrar denenecek 10 dk sonra.")
+    else:
+        log(f"{len(symbols)} coin taranıyor...")
+
     last_alerts = set()
 
     while True:
+        if not symbols:
+            symbols = get_futures_symbols()
+            time.sleep(10)
+
         for sym in symbols:
             alerts = process_symbol(sym)
             for interval, direction in alerts:
@@ -97,7 +115,6 @@ def main():
                     msg = f"⚡ {sym} ({interval}) yeni EMA7-EMA25 kesişimi: {direction}"
                     send_telegram(msg)
                     last_alerts.add(alert_id)
-            time.sleep(SLEEP_BETWEEN)
         log(f"⏳ {SCAN_INTERVAL/60:.0f} dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
 
