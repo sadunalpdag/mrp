@@ -10,10 +10,6 @@ INTERVALS = ["1h", "4h", "1d"]
 SLEEP_BETWEEN = 0.5  # rate-limit dostu
 SCAN_INTERVAL = 600   # 10 dakika
 
-# Slope eşikleri (güçlü trend için)
-SLOPE_UP_THRESHOLD = 0.2
-SLOPE_DOWN_THRESHOLD = -0.2
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 LOG_FILE = "log.txt"
@@ -72,10 +68,6 @@ def get_klines(symbol, interval):
         return []
 
 def last_cross_info(ema_fast, ema_slow):
-    """
-    EMA7/EMA25 kesişimini bulur ve kaç bar önce olduğunu döndürür.
-    Son 1 bar için kullanacağız.
-    """
     last_cross = None
     direction = None
     for i in range(1, len(ema_fast)):
@@ -116,7 +108,7 @@ def main():
     else:
         log(f"{len(symbols)} coin taranıyor...")
 
-    last_alerts = {}  # {"BTCUSDT_1h": "UP"} -> tekrar göndermeyi engeller
+    last_alerts = {}  # {"BTCUSDT_1h_UP": True} -> tekrar göndermeyi engeller
 
     while True:
         if not symbols:
@@ -126,14 +118,12 @@ def main():
         for sym in symbols:
             alerts = process_symbol(sym)
             for interval, direction, slope in alerts:
-                alert_id = f"{sym}_{interval}"
-                # Sadece güçlü trendler
-                if (direction == "UP" and slope >= 0.2) or \
-                   (direction == "DOWN" and slope <= -0.2):
-                    if last_alerts.get(alert_id) != direction:
-                        msg = f"⚡ {sym} ({interval}) EMA7-EMA25 kesişimi: {direction}, slope={slope:.4f}"
-                        send_telegram(msg)
-                        last_alerts[alert_id] = direction
+                alert_id = f"{sym}_{interval}_{direction}"
+                # Aynı sinyal tekrar gönderilmeyecek
+                if not last_alerts.get(alert_id):
+                    msg = f"⚡ {sym} ({interval}) EMA7-EMA25 kesişimi: {direction}, slope={slope:.4f}"
+                    send_telegram(msg)
+                    last_alerts[alert_id] = True
 
         log(f"⏳ {SCAN_INTERVAL/60:.0f} dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
