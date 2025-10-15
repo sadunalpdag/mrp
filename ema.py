@@ -5,38 +5,41 @@ from datetime import datetime, timezone
 LIMIT = 300
 INTERVALS = ["1h", "4h", "1d"]
 
-# Her interval için EMA setleri: (fast, slow, long)
+# EMA setleri (fast, slow, long)
 EMA_SETS = {
     "1h": (7, 25, 99),
     "4h": (9, 26, 200),
     "1d": (20, 50, 200),
 }
 
-# ATR ayarları
+# ATR
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-
-# Interval bazlı ATR minimum yüzde eşikleri (premium için)
-# ENV override: ATR_MIN_PCT_1H / _4H / _1D  (örn: 0.003 = %0.3)
 ATR_MIN_PCT_DEFAULTS = {
     "1h": float(os.getenv("ATR_MIN_PCT_1H", "0.0035")),  # %0.35
     "4h": float(os.getenv("ATR_MIN_PCT_4H", "0.0025")),  # %0.25
     "1d": float(os.getenv("ATR_MIN_PCT_1D", "0.0015")),  # %0.15
 }
-
-# Premium için ekstra güç doğrulaması:
-# |EMA_fast slope(3)| >= ATR_SLOPE_MULT * ATR  (ENV override: ATR_SLOPE_MULT_1H/_4H/_1D)
 ATR_SLOPE_MULT_DEFAULTS = {
     "1h": float(os.getenv("ATR_SLOPE_MULT_1H", "0.6")),
     "4h": float(os.getenv("ATR_SLOPE_MULT_4H", "0.5")),
     "1d": float(os.getenv("ATR_SLOPE_MULT_1D", "0.4")),
 }
 
+# SL/TP öneri katsayıları (ENV override)
+SL_MULT   = float(os.getenv("SL_MULT", "1.5"))
+TP1_MULT  = float(os.getenv("TP1_MULT", "1.0"))
+TP2_MULT  = float(os.getenv("TP2_MULT", "2.0"))
+TP3_MULT  = float(os.getenv("TP3_MULT", "3.0"))
+
 SLEEP_BETWEEN = 0.25
 SCAN_INTERVAL = 600
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+
 STATE_FILE = os.getenv("ALERTS_FILE", "alerts.json")
 LOG_FILE = os.getenv("LOG_FILE", "log.txt")
+PREMIUM_LOG_FILE = os.getenv("PREMIUM_LOG_FILE", "premium.log")
 # ===========================
 
 def nowiso():
@@ -46,6 +49,13 @@ def log(msg):
     print(msg, flush=True)
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now()} - {msg}\n")
+    except Exception:
+        pass
+
+def log_premium(msg):
+    try:
+        with open(PREMIUM_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now()} - {msg}\n")
     except Exception:
         pass
@@ -110,11 +120,11 @@ def atr_series(highs, lows, closes, period):
     for i in range(period, len(trs)):
         atr[i] = (atr[i-1] * (period - 1) + trs[i]) / period
     for i in range(period - 1):
-        atr[i] = trs[i]  # baş kısım kaba tahmin
+        atr[i] = trs[i]
     return atr
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-PremiumBot/1.1", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-PremiumBot/1.4", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -167,9 +177,23 @@ def higher_tf_of(interval):
 def thresholds(interval):
     return ATR_MIN_PCT_DEFAULTS.get(interval, 0.003), ATR_SLOPE_MULT_DEFAULTS.get(interval, 0.5)
 
-def process_symbol(sym, state):
-    alerts = []  # (sym, interval, dir, price, premium_flag, details..., bar_close_ms)
+def long_short_label(dirn: str) -> str:
+    return "LONG" if dirn == "UP" else "SHORT"
 
+def sl_tp_from_atr(entry, atr, dirn):
+    """ATR tabanlı SL/TP seviyeleri ve R:R değerleri"""
+    sl = entry - SL_MULT * atr if dirn == "UP" else entry + SL_MULT * atr
+    tp1 = entry + TP1_MULT * atr if dirn == "UP" else entry - TP1_MULT * atr
+    tp2 = entry + TP2_MULT * atr if dirn == "UP" else entry - TP2_MULT * atr
+    tp3 = entry + TP3_MULT * atr if dirn == "UP" else entry - TP3_MULT * atr
+    # R:R = (TP - Entry) / (Entry - SL)  (mutlak değerlerle)
+    risk = abs(entry - sl)
+    rr1 = abs(tp1 - entry) / risk if risk > 0 else 0.0
+    rr2 = abs(tp2 - entry) / risk if risk > 0 else 0.0
+    rr3 = abs(tp3 - entry) / risk if risk > 0 else 0.0
+    return sl, tp1, tp2, tp3, rr1, rr2, rr3
+
+def process_symbol(sym, state):
     # 1) Verileri önceden çek ve cache'le
     cache = {}
     for interval in INTERVALS:
@@ -183,9 +207,11 @@ def process_symbol(sym, state):
         cache[interval] = {"closes": closes, "highs": highs, "lows": lows, "bar_ms": bar_close_ms}
         time.sleep(SLEEP_BETWEEN)
 
-    # 2) Her interval kendi CROSS sinyalini üretir (sadece SON BAR)
+    # 2) Her interval kendi CROSS sinyalini üretir (sadece SON BAR + erken dedup)
     for interval in INTERVALS:
-        if interval not in cache: continue
+        if interval not in cache:
+            continue
+
         closes = cache[interval]["closes"]
         highs  = cache[interval]["highs"]
         lows   = cache[interval]["lows"]
@@ -196,58 +222,83 @@ def process_symbol(sym, state):
         ema_f = ema(closes, ef)
         ema_s = ema(closes, es)
 
+        key = f"{sym}_{interval}"
+        prev = state.get(key, {})
+
+        # erken dedup — son kapanan bar değişmediyse bu interval için hiçbir şey yapma
+        if prev.get("bar_ms") == bar_ms:
+            continue
+
+        # sadece son bar kesişimi
         dirn = last_bar_cross_direction(ema_f, ema_s)
         if not dirn:
-            continue  # sadece son bar kesişimleri
+            # bar değişti ama cross yok → barı işaretle
+            state[key] = {"bar_ms": bar_ms, "last_dir": prev.get("last_dir"), "time": nowiso()}
+            safe_save_json(STATE_FILE, state)
+            continue
 
-        # --- PREMIUM adayı mı? (üst TF trend uyumu + ATR güçlü)
-        prem = False
-        prem_explain = []
-        # ATR hesapla (kendi TF)
+        # premium adayı mı? (üst TF trend uyumu + ATR güçlü)
         atr = atr_series(highs, lows, closes, ATR_PERIOD)
         atr_now = atr[-1]
         atr_pct = (atr_now / price) if price > 0 else 0.0
         slope_now = slope_value(ema_f, lookback=3)
         min_pct, slope_mult = thresholds(interval)
 
-        atr_ok = atr_pct >= min_pct and abs(slope_now) >= slope_mult * atr_now
-        if atr_ok:
-            prem_explain.append(f"ATR OK ({atr_pct*100:.2f}% ≥ {min_pct*100:.2f}%, |slope|≥{slope_mult:.2f}×ATR)")
-        else:
-            prem_explain.append(f"ATR yetersiz ({atr_pct*100:.2f}%/{min_pct*100:.2f}%, slope-th:{slope_mult:.2f})")
+        atr_ok = (atr_pct >= min_pct) and (abs(slope_now) >= slope_mult * atr_now)
+        atr_tag = "[ATR OK]" if atr_ok else "[ATR LOW]"
 
         htfi = higher_tf_of(interval)
         trend_ok = False
+        trend_line = None
         if htfi and htfi in cache:
             ef_h, es_h, _ = EMA_SETS[htfi]
             ema_f_h = ema(cache[htfi]["closes"], ef_h)
             ema_s_h = ema(cache[htfi]["closes"], es_h)
             trend_h = trend_direction(ema_f_h, ema_s_h)
             trend_ok = (trend_h == dirn)
-            prem_explain.append(f"Trend({htfi}): {trend_h} {'✓' if trend_ok else '✗'}")
+            trend_line = f"Trend({htfi}): {trend_h} {'✓' if trend_ok else '✗'}"
         elif interval == "1d":
-            prem_explain.append("Üst TF yok (1d)")
+            trend_line = "Üst TF yok (1d)"
 
-        # Premium koşulu:
-        if interval == "1d":
-            prem = atr_ok
-        else:
-            prem = atr_ok and trend_ok
+        # premium koşulu:
+        prem = (atr_ok if interval == "1d" else atr_ok and trend_ok)
 
-        # dedup: aynı bar için aynı interval+sym tekrar gönderme
-        key = f"{sym}_{interval}"
-        prev_bar = state.get(key, {}).get("bar_ms")
-        if prev_bar == bar_ms:
-            continue  # aynı bar
+        # SL/TP önerileri (ATR tabanlı)
+        sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
 
-        alerts.append((sym, interval, dirn, price, prem, atr_now, atr_pct, slope_now, min_pct, slope_mult, htfi, prem_explain, bar_ms))
+        # mesaj
+        tag = "⚡🔥 PREMIUM SİNYAL" if prem else "⚡ CROSS"
+        direction_label = "LONG" if dirn == "UP" else "SHORT"
+        lines = [
+            f"{tag}: {sym} ({interval}) {atr_tag}",
+            f"Direction: {dirn} ({direction_label})",
+        ]
+        if trend_line:
+            lines.append(trend_line)
+        lines += [
+            f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
+            f"Slope(fast,3): {slope_now:.6f}",
+            f"Eşikler[{interval}]: ATR%≥{min_pct*100:.2f}%, |slope|≥{slope_mult:.2f}×ATR",
+            f"Entry≈ {price}",
+            f"SL≈ {sl}  |  TP1≈ {tp1} (R:R {rr1:.2f})  TP2≈ {tp2} (R:R {rr2:.2f})  TP3≈ {tp3} (R:R {rr3:.2f})",
+            f"Time: {nowiso()}",
+        ]
+        msg = "\n".join(lines)
+        send_telegram(msg)
 
-    return alerts
+        # premium olanları ayrı loga da yaz
+        if prem:
+            log_premium(msg)
+
+        # bu barı işaretle (aynı bar ikinci kez gelmesin)
+        state[key] = {"bar_ms": bar_ms, "last_dir": dirn, "time": nowiso()}
+        safe_save_json(STATE_FILE, state)
 
 def main():
-    log("🚀 Premium (Cross + Trend + ATR) bot — yalnızca son bar kesişimi ile")
+    log("🚀 Premium (Cross + Trend + ATR) bot — Son bar kesişimi, ATR etiketi, LONG/SHORT ve SL/TP")
     state = safe_load_json(STATE_FILE)
-    if not isinstance(state, dict): state = {}
+    if not isinstance(state, dict):
+        state = {}
 
     symbols = get_futures_symbols()
     if not symbols:
@@ -256,32 +307,7 @@ def main():
 
     while True:
         for sym in symbols:
-            alerts = process_symbol(sym, state)
-            for (s, interval, dirn, price, prem, atr_now, atr_pct, slope_now,
-                 min_pct, slope_mult, htfi, prem_explain, bar_ms) in alerts:
-
-                tag = "⚡🔥 PREMIUM SİNYAL" if prem else "⚡ CROSS"
-                lines = [
-                    f"{tag}: {s} ({interval})",
-                    f"Direction: {dirn}",
-                ]
-                if htfi:
-                    # prem_explain içinde trend detayı var
-                    trend_line = next((pe for pe in prem_explain if pe.startswith("Trend") or "Üst TF" in pe), None)
-                    if trend_line:
-                        lines.append(trend_line)
-                lines += [
-                    f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
-                    f"Slope(fast,3): {slope_now:.6f}",
-                    f"Eşikler[{interval}]: ATR%≥{min_pct*100:.2f}%, |slope|≥{slope_mult:.2f}×ATR",
-                    f"Price: {price}",
-                    f"Time: {nowiso()}",
-                ]
-                send_telegram("\n".join(lines))
-
-                state[f"{s}_{interval}"] = {"bar_ms": bar_ms, "last_dir": dirn, "time": nowiso()}
-                safe_save_json(STATE_FILE, state)
-
+            process_symbol(sym, state)
         log(f"⏳ {SCAN_INTERVAL//60} dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
 
