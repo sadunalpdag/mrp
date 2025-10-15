@@ -114,7 +114,7 @@ def atr_series(highs, lows, closes, period):
     return atr
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-PremiumBot/1.0", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-PremiumBot/1.1", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -142,19 +142,17 @@ def get_futures_symbols():
     except Exception:
         return []
 
-def last_cross_info(ema_fast, ema_slow):
-    last=None;direction=None
-    for i in range(1, len(ema_fast)):
-        prev = ema_fast[i-1] - ema_slow[i-1]
-        curr = ema_fast[i]   - ema_slow[i]
-        if prev < 0 and curr > 0:
-            last = i; direction = "UP"
-        elif prev > 0 and curr < 0:
-            last = i; direction = "DOWN"
-    if last is None:
-        return None, None
-    bars_ago = len(ema_fast) - last - 1
-    return direction, bars_ago
+def last_bar_cross_direction(ema_fast, ema_slow):
+    """Sadece son kapanmış barda kesişim: 'UP' / 'DOWN' / None"""
+    if len(ema_fast) < 2 or len(ema_slow) < 2:
+        return None
+    prev = ema_fast[-2] - ema_slow[-2]
+    curr = ema_fast[-1] - ema_slow[-1]
+    if prev < 0 and curr > 0:
+        return "UP"
+    if prev > 0 and curr < 0:
+        return "DOWN"
+    return None
 
 def trend_direction(ema_fast, ema_slow):
     if ema_fast[-1] > ema_slow[-1]:
@@ -170,7 +168,7 @@ def thresholds(interval):
     return ATR_MIN_PCT_DEFAULTS.get(interval, 0.003), ATR_SLOPE_MULT_DEFAULTS.get(interval, 0.5)
 
 def process_symbol(sym, state):
-    alerts = []  # (sym, interval, dir, price, premium_flag, premium_info, bar_close_ms)
+    alerts = []  # (sym, interval, dir, price, premium_flag, details..., bar_close_ms)
 
     # 1) Verileri önceden çek ve cache'le
     cache = {}
@@ -185,7 +183,7 @@ def process_symbol(sym, state):
         cache[interval] = {"closes": closes, "highs": highs, "lows": lows, "bar_ms": bar_close_ms}
         time.sleep(SLEEP_BETWEEN)
 
-    # 2) Her interval kendi CROSS sinyalini üretir
+    # 2) Her interval kendi CROSS sinyalini üretir (sadece SON BAR)
     for interval in INTERVALS:
         if interval not in cache: continue
         closes = cache[interval]["closes"]
@@ -198,9 +196,9 @@ def process_symbol(sym, state):
         ema_f = ema(closes, ef)
         ema_s = ema(closes, es)
 
-        dirn, bars_ago = last_cross_info(ema_f, ema_s)
-        if not dirn or bars_ago != 0:
-            continue  # sadece son barda cross
+        dirn = last_bar_cross_direction(ema_f, ema_s)
+        if not dirn:
+            continue  # sadece son bar kesişimleri
 
         # --- PREMIUM adayı mı? (üst TF trend uyumu + ATR güçlü)
         prem = False
@@ -221,7 +219,6 @@ def process_symbol(sym, state):
         htfi = higher_tf_of(interval)
         trend_ok = False
         if htfi and htfi in cache:
-            # üst TF trendi
             ef_h, es_h, _ = EMA_SETS[htfi]
             ema_f_h = ema(cache[htfi]["closes"], ef_h)
             ema_s_h = ema(cache[htfi]["closes"], es_h)
@@ -229,7 +226,6 @@ def process_symbol(sym, state):
             trend_ok = (trend_h == dirn)
             prem_explain.append(f"Trend({htfi}): {trend_h} {'✓' if trend_ok else '✗'}")
         elif interval == "1d":
-            # 1d için üst TF yok: sadece ATR güçlü ise premium
             prem_explain.append("Üst TF yok (1d)")
 
         # Premium koşulu:
@@ -249,7 +245,7 @@ def process_symbol(sym, state):
     return alerts
 
 def main():
-    log("🚀 Premium (Cross + Trend + ATR) bot başlatıldı")
+    log("🚀 Premium (Cross + Trend + ATR) bot — yalnızca son bar kesişimi ile")
     state = safe_load_json(STATE_FILE)
     if not isinstance(state, dict): state = {}
 
@@ -271,7 +267,9 @@ def main():
                 ]
                 if htfi:
                     # prem_explain içinde trend detayı var
-                    lines.append([pe for pe in prem_explain if pe.startswith("Trend") or "Üst TF" in pe][0] if prem_explain else f"Trend({htfi}): n/a")
+                    trend_line = next((pe for pe in prem_explain if pe.startswith("Trend") or "Üst TF" in pe), None)
+                    if trend_line:
+                        lines.append(trend_line)
                 lines += [
                     f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
                     f"Slope(fast,3): {slope_now:.6f}",
