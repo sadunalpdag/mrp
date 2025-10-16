@@ -236,11 +236,25 @@ def process_symbol(sym, state):
         div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
         rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
 
-        level = "CROSS"
+        # POWER HESABI
+        power = 40  # EMA Cross sabit
         if atr_ok:
-            level = "PREMIUM"
-        if atr_ok and div_type and ((dirn == "UP" and div_type == "BULLISH") or (dirn == "DOWN" and div_type == "BEARISH")):
+            power += 20
+            if abs(slope_now) >= slope_mult * atr_now * 1.5:
+                power += 10
+        if div_type:
+            power += 10
+            if (dirn=="UP" and div_type=="BULLISH") or (dirn=="DOWN" and div_type=="BEARISH"):
+                power += 15
+        if atr_ok and div_type:
+            power += 5
+        power = min(power, 100)
+
+        level = "CROSS"
+        if power >= 86:
             level = "ULTRA"
+        elif power >= 70:
+            level = "PREMIUM"
 
         sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
 
@@ -253,6 +267,7 @@ def process_symbol(sym, state):
 
         lines = [
             f"{tag}: {sym} ({interval}) {atr_tag}",
+            f"Power: {power}/100",
             f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
             f"Kesişim: EMA{ef} {'↗' if dirn=='UP' else '↘'} EMA{es}",
             f"RSI: {rsi_val:.2f} → {rsi_status}",
@@ -270,12 +285,11 @@ def process_symbol(sym, state):
 
         state[key] = {"last_signal_bar_ms": bar_ms, "last_dir": dirn}
         safe_save_json(STATE_FILE, state)
-
         time.sleep(SLEEP_BETWEEN)
 
 
 def main():
-    log("🚀 Binance EMA/ATR/RSI — Canlı bar + 5dk tarama + ULTRA PREMIUM + EMA kesişim bilgisi")
+    log("🚀 Binance EMA/ATR/RSI — Canlı bar + Signal Power + 5dk tarama")
     state = safe_load_json(STATE_FILE)
     symbols = get_futures_symbols()
     if not symbols:
