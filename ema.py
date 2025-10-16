@@ -11,7 +11,7 @@ EMA_SETS = {
     "1d": (20, 50, 200),
 }
 
-ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_PERIOD = 14
 ATR_MIN_PCT_DEFAULTS = {"1h": 0.0035, "4h": 0.0025, "1d": 0.0015}
 ATR_SLOPE_MULT_DEFAULTS = {"1h": 0.6, "4h": 0.5, "1d": 0.4}
 
@@ -27,6 +27,8 @@ STATE_FILE = "alerts.json"
 LOG_FILE, PREMIUM_LOG_FILE = "log.txt", "premium.log"
 # ===========================
 
+
+# ---------- Yardımcı Fonksiyonlar ----------
 def nowiso():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -35,14 +37,14 @@ def log(msg):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now()} - {msg}\n")
-    except Exception:
+    except:
         pass
 
 def log_premium(msg):
     try:
         with open(PREMIUM_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now()} - {msg}\n")
-    except Exception:
+    except:
         pass
 
 def send_telegram(text):
@@ -72,7 +74,10 @@ def safe_save_json(path, data):
         os.replace(tmp, path)
     except:
         pass
+# ------------------------------------------
 
+
+# ---------- Hesaplama Fonksiyonları ----------
 def ema(values, length):
     ema_vals = [values[0]]
     k = 2 / (length + 1)
@@ -134,34 +139,15 @@ def detect_rsi_divergence(closes, rsis, lookback=12):
             return "BULLISH", troughs_p[-1][0]
     return None, None
 
-def get_klines(symbol, interval, limit=LIMIT):
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    p = {"symbol": symbol, "interval": interval, "limit": limit}
-    for _ in range(3):
-        try:
-            r = requests.get(url, params=p, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                now = int(datetime.now(timezone.utc).timestamp() * 1000)
-                if data and int(data[-1][6]) > now:
-                    data = data[:-1]
-                return data
-        except:
-            time.sleep(1)
-    return []
-
-def get_futures_symbols():
-    try:
-        r = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
-        return [s["symbol"] for s in r.json()["symbols"] if s["quoteAsset"]=="USDT"]
-    except:
-        return []
-
-def last_bar_cross_direction(ema_fast, ema_slow):
-    if len(ema_fast) < 2: return None
-    prev, curr = ema_fast[-2]-ema_slow[-2], ema_fast[-1]-ema_slow[-1]
-    if prev<0 and curr>0: return "UP"
-    if prev>0 and curr<0: return "DOWN"
+def just_crossed_now(ema_fast, ema_slow):
+    if len(ema_fast) < 3:
+        return None
+    prev2_diff = ema_fast[-3] - ema_slow[-3]
+    prev1_diff = ema_fast[-2] - ema_slow[-2]
+    if prev2_diff < 0 and prev1_diff > 0:
+        return "UP"
+    if prev2_diff > 0 and prev1_diff < 0:
+        return "DOWN"
     return None
 
 def trend_direction(ema_fast, ema_slow):
@@ -183,54 +169,103 @@ def sl_tp_from_atr(entry, atr, dirn):
     risk = abs(entry-sl)
     r = lambda tp: abs(tp-entry)/risk if risk>0 else 0
     return sl,tp1,tp2,tp3,r(tp1),r(tp2),r(tp3)
+# ------------------------------------------
 
-def process_symbol(sym,state):
-    cache={}
+
+# ---------- Binance Veri ----------
+def get_klines(symbol, interval, limit=LIMIT):
+    url = "https://fapi.binance.com/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    for _ in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                now = int(datetime.now(timezone.utc).timestamp() * 1000)
+                if data and int(data[-1][6]) > now:
+                    data = data[:-1]
+                return data
+        except:
+            time.sleep(1)
+    return []
+
+def get_futures_symbols():
+    try:
+        r = requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
+        return [s["symbol"] for s in r.json()["symbols"] if s["quoteAsset"]=="USDT"]
+    except:
+        return []
+# ------------------------------------------
+
+
+# ---------- Ana Mantık ----------
+def process_symbol(sym, state):
+    cache = {}
     for interval in INTERVALS:
-        kl=get_klines(sym,interval)
-        if not kl or len(kl)<220: continue
-        closes=[float(k[4]) for k in kl]
-        highs=[float(k[2]) for k in kl]
-        lows=[float(k[3]) for k in kl]
-        cache[interval]={"closes":closes,"highs":highs,"lows":lows,"bar_ms":int(kl[-1][6])}
+        kl = get_klines(sym, interval)
+        if not kl or len(kl) < 220: continue
+        closes = [float(k[4]) for k in kl]
+        highs  = [float(k[2]) for k in kl]
+        lows   = [float(k[3]) for k in kl]
+        cache[interval] = {"closes": closes, "highs": highs, "lows": lows, "bar_ms": int(kl[-1][6])}
         time.sleep(SLEEP_BETWEEN)
+
     for interval in INTERVALS:
         if interval not in cache: continue
-        closes,highs,lows=cache[interval]["closes"],cache[interval]["highs"],cache[interval]["lows"]
-        bar_ms,price=cache[interval]["bar_ms"],closes[-1]
-        ef,es,_=EMA_SETS[interval]
-        ema_f,ema_s=ema(closes,ef),ema(closes,es)
-        key=f"{sym}_{interval}"; prev=state.get(key,{})
-        if prev.get("bar_ms")==bar_ms: continue
-        dirn=last_bar_cross_direction(ema_f,ema_s)
+        closes = cache[interval]["closes"]
+        highs  = cache[interval]["highs"]
+        lows   = cache[interval]["lows"]
+        bar_ms = cache[interval]["bar_ms"]
+        price  = closes[-1]
+        ef, es, _ = EMA_SETS[interval]
+        ema_f = ema(closes, ef)
+        ema_s = ema(closes, es)
+
+        key = f"{sym}_{interval}"
+        prev = state.get(key, {})
+        if prev.get("bar_ms") == bar_ms:
+            continue
+
+        dirn = just_crossed_now(ema_f, ema_s)
         if not dirn:
-            state[key]={"bar_ms":bar_ms}; safe_save_json(STATE_FILE,state); continue
-        atr=atr_series(highs,lows,closes,ATR_PERIOD)
-        atr_now=atr[-1]; atr_pct=atr_now/price if price>0 else 0
-        slope_now=slope_value(ema_f,3)
-        min_pct,slope_mult=thresholds(interval)
-        atr_ok=(atr_pct>=min_pct and abs(slope_now)>=slope_mult*atr_now)
-        rsis=rsi(closes,RSI_PERIOD)
-        rsi_val=rsis[-1] if rsis[-1] else 50
-        div_type,_=detect_rsi_divergence(closes,rsis,RSI_SWING_LOOKBACK)
+            state[key] = {"bar_ms": bar_ms}
+            safe_save_json(STATE_FILE, state)
+            continue
+
+        atr = atr_series(highs, lows, closes, ATR_PERIOD)
+        atr_now = atr[-1]
+        atr_pct = atr_now / price if price > 0 else 0
+        slope_now = slope_value(ema_f, 3)
+        min_pct, slope_mult = thresholds(interval)
+        atr_ok = (atr_pct >= min_pct and abs(slope_now) >= slope_mult * atr_now)
+
+        rsis = rsi(closes, RSI_PERIOD)
+        rsi_val = rsis[-1] if rsis[-1] else 50
+        div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
         rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
-        htfi=higher_tf_of(interval)
-        trend_ok=False; trend_line=""
+
+        htfi = higher_tf_of(interval)
+        trend_ok = False
+        trend_line = ""
         if htfi and htfi in cache:
-            ef_h,es_h,_=EMA_SETS[htfi]
-            ema_f_h,ema_s_h=ema(cache[htfi]["closes"],ef_h),ema(cache[htfi]["closes"],es_h)
-            trend_h=trend_direction(ema_f_h,ema_s_h)
-            trend_ok=(trend_h==dirn)
-            trend_line=f"Trend({htfi}): {trend_h} {'✓' if trend_ok else '✗'}"
-        elif interval=="1d":
-            trend_line="Üst TF yok (1d)"
-        prem=(atr_ok if interval=="1d" else atr_ok and trend_ok)
-        if div_type and ((dirn=="UP" and div_type=="BULLISH") or (dirn=="DOWN" and div_type=="BEARISH")):
-            prem=True
-        sl,tp1,tp2,tp3,rr1,rr2,rr3=sl_tp_from_atr(price,atr_now,dirn)
-        tag="⚡🔥 PREMIUM SİNYAL" if prem else "⚡ CROSS"
-        atr_tag="[ATR OK]" if atr_ok else "[ATR LOW]"
-        lines=[
+            ef_h, es_h, _ = EMA_SETS[htfi]
+            ema_f_h = ema(cache[htfi]["closes"], ef_h)
+            ema_s_h = ema(cache[htfi]["closes"], es_h)
+            trend_h = trend_direction(ema_f_h, ema_s_h)
+            trend_ok = (trend_h == dirn)
+            trend_line = f"Trend({htfi}): {trend_h} {'✓' if trend_ok else '✗'}"
+        elif interval == "1d":
+            trend_line = "Üst TF yok (1d)"
+
+        prem = (atr_ok if interval == "1d" else atr_ok and trend_ok)
+        if div_type and ((dirn == "UP" and div_type == "BULLISH") or (dirn == "DOWN" and div_type == "BEARISH")):
+            prem = True
+
+        sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
+
+        tag = "⚡🔥 PREMIUM SİNYAL" if prem else "⚡ CROSS"
+        atr_tag = "[ATR OK]" if atr_ok else "[ATR LOW]"
+        lines = [
             f"{tag}: {sym} ({interval}) {atr_tag}",
             f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
             trend_line,
@@ -240,19 +275,27 @@ def process_symbol(sym,state):
             f"Eşik: ATR%≥{min_pct*100:.2f} | slope≥{slope_mult:.2f}×ATR",
             f"Entry≈ {price}",
             f"SL≈ {sl} | TP1≈ {tp1} (R:R {rr1:.2f}) TP2≈ {tp2} (R:R {rr2:.2f}) TP3≈ {tp3} (R:R {rr3:.2f})",
-            f"Time: {nowiso()}"]
-        msg="\n".join([l for l in lines if l])
+            f"Time: {nowiso()}",
+        ]
+        msg = "\n".join([l for l in lines if l])
         send_telegram(msg)
-        if prem: log_premium(msg)
-        state[key]={"bar_ms":bar_ms,"last_dir":dirn}
-        safe_save_json(STATE_FILE,state)
+        if prem:
+            log_premium(msg)
+        state[key] = {"bar_ms": bar_ms, "last_dir": dirn}
+        safe_save_json(STATE_FILE, state)
+# ------------------------------------------
+
 
 def main():
-    log("🚀 Binance EMA+ATR+RSI bot başlatıldı")
-    state=safe_load_json(STATE_FILE)
-    symbols=get_futures_symbols()
+    log("🚀 Binance EMA+ATR+RSI bot (real-time cross) başlatıldı")
+    state = safe_load_json(STATE_FILE)
+    symbols = get_futures_symbols()
     while True:
-        for sym in symbols: process_symbol(sym,state)
-        log(f"⏳ {SCAN_INTERVAL//60} dk bekleniyor..."); time.sleep(SCAN_INTERVAL)
+        for sym in symbols:
+            process_symbol(sym, state)
+        log(f"⏳ {SCAN_INTERVAL//60} dk bekleniyor...\n")
+        time.sleep(SCAN_INTERVAL)
 
-if __name__=="__main__": main()
+
+if __name__ == "__main__":
+    main()
