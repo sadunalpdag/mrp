@@ -213,6 +213,7 @@ def process_symbol(sym,state):
         rsis=rsi(closes,RSI_PERIOD)
         rsi_val=rsis[-1] if rsis[-1] else 50
         div_type,_=detect_rsi_divergence(closes,rsis,RSI_SWING_LOOKBACK)
+        rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
         htfi=higher_tf_of(interval)
         trend_ok=False; trend_line=""
         if htfi and htfi in cache:
@@ -233,7 +234,7 @@ def process_symbol(sym,state):
             f"{tag}: {sym} ({interval}) {atr_tag}",
             f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
             trend_line,
-            f"RSI: {rsi_val:.2f} {'→ '+div_type+' DIVERGENCE' if div_type else ''}",
+            f"RSI: {rsi_val:.2f} → {rsi_status}",
             f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
             f"Slope: {slope_now:.6f}",
             f"Eşik: ATR%≥{min_pct*100:.2f} | slope≥{slope_mult:.2f}×ATR",
