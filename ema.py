@@ -5,29 +5,42 @@ from datetime import datetime, timezone
 LIMIT = 300
 INTERVALS = ["1h", "4h", "1d"]
 
+# EMA setleri (fast, slow, long)
 EMA_SETS = {
     "1h": (7, 25, 99),
     "4h": (9, 26, 200),
     "1d": (20, 50, 200),
 }
 
+# ATR & eşikler
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_MIN_PCT_DEFAULTS = {"1h": 0.0035, "4h": 0.0025, "1d": 0.0015}
 ATR_SLOPE_MULT_DEFAULTS = {"1h": 0.6, "4h": 0.5, "1d": 0.4}
 
+# SL/TP (TP'ler 4 ondalık)
 SL_MULT   = float(os.getenv("SL_MULT", "1.5"))
 TP1_MULT  = float(os.getenv("TP1_MULT", "1.0"))
 TP2_MULT  = float(os.getenv("TP2_MULT", "2.0"))
 TP3_MULT  = float(os.getenv("TP3_MULT", "3.0"))
 
+# RSI & Divergence
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_SWING_LOOKBACK = int(os.getenv("RSI_SWING_LOOKBACK", "12"))
 
+# Destek/Direnç lookback
 SR_LOOKBACK = int(os.getenv("SR_LOOKBACK", "100"))
+
+# Erken onay: bar kapanışına ≤30dk kala canlı barda yön korunuyorsa sinyal ver
 EARLY_CONFIRM_MS = int(os.getenv("EARLY_CONFIRM_MS", str(30*60*1000)))  # 30dk
 
+# SCALP ayarları (EMA7 slope reversal)
+SCALP_TF_CONFIRM = os.getenv("SCALP_TF_CONFIRM", "4h")  # 1h için üst TF onayı ("4h" önerilir)
+SCALP_TP_MULT = float(os.getenv("SCALP_TP_MULT", "0.5"))   # ATR * 0.5
+SCALP_SL_MULT = float(os.getenv("SCALP_SL_MULT", "0.25"))  # ATR * 0.25
+SCALP_MIN_ATR_FACTOR = float(os.getenv("SCALP_MIN_ATR_FACTOR", "1.0"))  # atr_pct ≥ min_pct * factor
+
 SLEEP_BETWEEN = 0.2
-SCAN_INTERVAL = 300  # 5 dk
+SCAN_INTERVAL = 300  # 5 dakika
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
@@ -152,9 +165,11 @@ def detect_rsi_divergence(closes, rsis, lookback=12):
     rsis   = rsis[-lookback:]
     peaks_p, troughs_p = _local_extrema(closes)
     peaks_r, troughs_r = _local_extrema([r for r in rsis if r is not None])
+    # Bearish: Price HH & RSI LH
     if len(peaks_p) >= 2 and len(peaks_r) >= 2:
         if peaks_p[-1][1] > peaks_p[-2][1] and peaks_r[-1][1] < peaks_r[-2][1]:
             return "BEARISH", peaks_p[-1][0]
+    # Bullish: Price LL & RSI HL
     if len(troughs_p) >= 2 and len(troughs_r) >= 2:
         if troughs_p[-1][1] < troughs_p[-2][1] and troughs_r[-1][1] > troughs_r[-2][1]:
             return "BULLISH", troughs_p[-1][0]
@@ -191,6 +206,7 @@ def stabilized_or_early(ema_f_closed, ema_s_closed, ema_f_full, ema_s_full, bar_
 
     return None, None
 
+# Destek / Direnç (son tepe/diplerden, yatay seviye)
 def trend_lines_from_extrema(closes, lookback=100):
     clip = closes[-min(lookback, len(closes)):]
     peaks, troughs = _local_extrema(clip)
@@ -204,22 +220,10 @@ def trend_lines_from_extrema(closes, lookback=100):
         support = min(clip) if clip else None
     return support, resistance
 
-# ---------- EŞİKLER ----------
-def thresholds(interval):
-    return ATR_MIN_PCT_DEFAULTS.get(interval, 0.003), ATR_SLOPE_MULT_DEFAULTS.get(interval, 0.5)
 
-def sl_tp_from_atr(entry, atr, dirn):
-    sl  = entry - SL_MULT * atr if dirn=="UP" else entry + SL_MULT * atr
-    tp1 = entry + TP1_MULT * atr if dirn=="UP" else entry - TP1_MULT * atr
-    tp2 = entry + TP2_MULT * atr if dirn=="UP" else entry - TP2_MULT * atr
-    tp3 = entry + TP3_MULT * atr if dirn=="UP" else entry - TP3_MULT * atr
-    risk = abs(entry - sl)
-    def rr(tp): return (abs(tp - entry) / risk) if risk > 0 else 0.0
-    return sl, tp1, tp2, tp3, rr(tp1), rr(tp2), rr(tp3)
-
-# ---------- Binance ----------
+# ---------- Binance Kaynak ----------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.4", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.8", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -230,7 +234,7 @@ def get_klines(symbol, interval, limit=LIMIT):
             if r.status_code == 200:
                 return r.json()
         except:
-            time.sleep(0.5)
+            time.sleep(0.4)
     return []
 
 def get_futures_symbols():
@@ -241,7 +245,8 @@ def get_futures_symbols():
     except:
         return []
 
-# ---------- ÜST TF (1h için 4h & 1d) ----------
+
+# ---------- ÜST TF YÖN HESABI (1h için 4h & 1d) ----------
 def ema_trend_direction_from_closes(closes, fast_len, slow_len):
     ef = ema(closes, fast_len)
     es = ema(closes, slow_len)
@@ -273,6 +278,58 @@ def alignment_score(dirn, higher_dirs):
 
 def arrow_for(d): return "↑" if d == "UP" else "↓" if d == "DOWN" else "-"
 
+
+# ---------- EŞİKLER ----------
+def thresholds(interval):
+    return ATR_MIN_PCT_DEFAULTS.get(interval, 0.003), ATR_SLOPE_MULT_DEFAULTS.get(interval, 0.5)
+
+def sl_tp_from_atr(entry, atr, dirn):
+    sl  = entry - SL_MULT * atr if dirn=="UP" else entry + SL_MULT * atr
+    tp1 = entry + TP1_MULT * atr if dirn=="UP" else entry - TP1_MULT * atr
+    tp2 = entry + TP2_MULT * atr if dirn=="UP" else entry - TP2_MULT * atr
+    tp3 = entry + TP3_MULT * atr if dirn=="UP" else entry - TP3_MULT * atr
+    risk = abs(entry - sl)
+    def rr(tp): return (abs(tp - entry) / risk) if risk > 0 else 0.0
+    return sl, tp1, tp2, tp3, rr(tp1), rr(tp2), rr(tp3)
+
+
+# ---------- Smart Scalp Trigger ----------
+def detect_slope_reversal(ema_series):
+    """
+    EMA7 eğiminin yön değiştirdiği anı yakalar.
+    slope_prev = EMA[-2] - EMA[-5]
+    slope_now  = EMA[-1] - EMA[-4]
+    """
+    if len(ema_series) < 6:
+        return None, (0.0, 0.0)
+    slope_now  = ema_series[-1] - ema_series[-4]
+    slope_prev = ema_series[-2] - ema_series[-5]
+    if slope_prev < 0 and slope_now > 0:
+        return "UP", (slope_prev, slope_now)
+    if slope_prev > 0 and slope_now < 0:
+        return "DOWN", (slope_prev, slope_now)
+    return None, (slope_prev, slope_now)
+
+
+# ---------- Trend Retest Confirm ----------
+def detect_trend_retest(closes, support, resistance, tol=0.003):
+    """
+    Kırılım + retest algısı:
+    - Direnç üzeri kapanış sonrası fiyatın direnci ~tol içinde test etmesi → 'UP'
+    - Destek altı kapanış sonrası fiyatın desteği ~tol içinde test etmesi → 'DOWN'
+    """
+    if support is None or resistance is None or len(closes) < 3:
+        return None
+    prev, curr = closes[-2], closes[-1]
+    broke_res = prev < resistance and curr > resistance
+    broke_sup = prev > support and curr < support
+    retest_res = broke_res and abs(curr - resistance) / max(resistance, 1e-9) < tol
+    retest_sup = broke_sup and abs(curr - support)    / max(support,    1e-9) < tol
+    if retest_res: return "UP"
+    if retest_sup: return "DOWN"
+    return None
+
+
 # ---------- ANA İŞ AKIŞI ----------
 def process_symbol(sym, state):
     for interval in INTERVALS:
@@ -299,117 +356,179 @@ def process_symbol(sym, state):
         ema_f_full   = ema(closes, ef)
         ema_s_full   = ema(closes, es)
 
-        # Stabilizasyon + Erken onay kontrolü
+        # Stabilizasyon + Erken onay kontrolü (Sadece CROSS için)
         dirn, confirm_mode = stabilized_or_early(
             ema_f_closed, ema_s_closed,
             ema_f_full,   ema_s_full,
             bar_close_ms, now_ms,
             EARLY_CONFIRM_MS
         )
-        if not dirn:
-            continue
 
         key  = f"{sym}_{interval}"
         prev = state.get(key, {})
-        # Aynı PREV bar için tekrar etme (erken/kapalı fark etmeksizin prev_bar_ms'ye pinliyoruz)
-        if prev.get("last_signal_bar_ms") == prev_bar_ms and prev.get("last_dir") == dirn:
-            continue
 
-        # ATR / RSI
-        atr = atr_series(highs, lows, closes, ATR_PERIOD)
-        atr_now = atr[-1]
-        atr_pct = (atr_now / price) if price > 0 else 0.0
-        slope_now = slope_value(ema_f_closed, 3)  # kapalı seriden eğim (daha sağlam)
+        # ==== 1) ANA CROSS / POWER SİNYALİ ====
+        if dirn:
+            # Aynı PREV bar için tekrar etme (erken/kapalı fark etmeksizin prev_bar_ms'ye pinliyoruz)
+            if prev.get("last_signal_bar_ms") != prev_bar_ms or prev.get("last_dir") != dirn:
+                # ATR / RSI
+                atr = atr_series(highs, lows, closes, ATR_PERIOD)
+                atr_now = atr[-1]
+                atr_pct = (atr_now / price) if price > 0 else 0.0
+                slope_now = slope_value(ema_f_closed, 3)  # kapalı seriden eğim
+                min_pct, slope_mult = thresholds(interval)
+                rsis = rsi(closes, RSI_PERIOD)
+                rsi_val = rsis[-1] if rsis[-1] is not None else 50.0
+                div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
+                rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
+                # S/R
+                support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
 
-        min_pct, slope_mult = thresholds(interval)
-        atr_ok = (atr_pct >= min_pct) and (abs(slope_now) >= slope_mult * atr_now)
+                # ---- Dynamic Momentum Power (slope/ATR)
+                atr_ok = (atr_pct >= min_pct) and (atr_now > 0)
+                slope_factor = (abs(slope_now) / (atr_now * slope_mult)) if (atr_now > 0 and slope_mult > 0) else 0.0
+                atr_factor = (atr_pct / min_pct) if (min_pct > 0) else 1.0
+                momentum_boost = min(25.0, (slope_factor * 10.0) + (atr_factor * 8.0))
+                if slope_factor >= 2.0: momentum_tag = "🔥 Aşırı Güçlü"
+                elif slope_factor >= 1.0: momentum_tag = "💪 Sağlam"
+                elif slope_factor >= 0.5: momentum_tag = "⚠️ Zayıf"
+                else: momentum_tag = "🧊 Çok Zayıf"
 
-        rsis = rsi(closes, RSI_PERIOD)
-        rsi_val = rsis[-1] if rsis[-1] is not None else 50.0
-        div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
-        rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
+                power = 40.0 + momentum_boost
+                if div_type:
+                    power += 10
+                    if (dirn == "UP" and div_type == "BULLISH") or (dirn == "DOWN" and div_type == "BEARISH"):
+                        power += 15
+                if not atr_ok:
+                    power -= 3
 
-        # S/R
-        support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
+                trend_line = None
+                if interval == "1h":
+                    higher_dirs = get_higher_tf_dirs(sym)
+                    add = alignment_score(dirn, higher_dirs)
+                    power += add
+                    indicator = "✅" if add > 0 else "❌" if add < 0 else "➖"
+                    trend_line = f"Trend Uyumu: {indicator} 4h{arrow_for(higher_dirs.get('4h','-'))} | 1d{arrow_for(higher_dirs.get('1d','-'))}"
 
-        # ---- Signal Power
-        power = 40  # onaylı cross
-        if confirm_mode == "EARLY":
-            power -= 3  # hafif temkin (erken onay 30dk)
-        if atr_ok:
-            power += 20
-            if abs(slope_now) >= slope_mult * atr_now * 1.5:
-                power += 10
-        if div_type:
-            power += 10
-            if (dirn=="UP" and div_type=="BULLISH") or (dirn=="DOWN" and div_type=="BEARISH"):
-                power += 15
-        if atr_ok and div_type:
-            power += 5
+                power = max(0.0, min(power, 100.0))
 
-        trend_line = None
+                # Power etiketi
+                if power >= 86:
+                    power_tag = "🟦 Ultra Power"; level = "ULTRA"
+                elif power >= 70:
+                    power_tag = "🟩 Strong";      level = "PREMIUM"
+                elif power >= 50:
+                    power_tag = "🟨 Moderate";    level = "CROSS"
+                else:
+                    power_tag = "🟥 Weak";        level = "CROSS"
+
+                # SL/TP
+                sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
+                rr = lambda x: f"{x:.2f}"
+                atr_tag = "[ATR OK]" if atr_ok else "[ATR LOW]"
+                early_tag = " ⏳ Early Confirm (30dk)" if confirm_mode == "EARLY" else ""
+                tag = "⚡ CROSS"
+                if level == "PREMIUM": tag = "⚡🔥 PREMIUM SİNYAL"
+                elif level == "ULTRA": tag = "⚡🚀 ULTRA PREMIUM SİNYAL"
+
+                lines = [
+                    f"{tag}: {sym} ({interval}) {atr_tag}{early_tag}",
+                    f"Power: {power_tag} ({power:.0f}/100)",
+                    f"Momentum: {momentum_tag} (Slope/ATR={slope_factor:.2f}, ATR%={atr_pct*100:.2f}%)",
+                    f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
+                    f"Kesişim: EMA{ef} {'↗' if dirn=='UP' else '↘'} EMA{es}",
+                    trend_line,
+                    f"RSI: {rsi_val:.2f} → {rsi_status}",
+                    f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
+                    f"Slope(fast,3): {slope_now:.6f}",
+                    f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support is not None and resistance is not None) else None,
+                    f"Eşik[{interval}]: ATR%≥{min_pct*100:.2f} | slope_mult={slope_mult:.2f}",
+                    f"Entry≈ {price}",
+                    f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr(rr1)})  TP2≈ {tp2:.4f} (R:R {rr(rr2)})  TP3≈ {tp3:.4f} (R:R {rr(rr3)})",
+                    f"Time: {nowiso()}",
+                ]
+                msg = "\n".join([l for l in lines if l])
+                send_telegram(msg)
+                if level in ("PREMIUM", "ULTRA"):
+                    log_premium(msg)
+
+                # Sinyali stabilizasyon barına pin'le → kapanışta tekrar etmez
+                state[key] = {**prev, "last_signal_bar_ms": prev_bar_ms, "last_dir": dirn}
+                safe_save_json(STATE_FILE, state)
+                time.sleep(SLEEP_BETWEEN)
+
+        # ==== 2) SMART SCALP TRIGGER (Power'dan bağımsız) ====
         if interval == "1h":
-            higher_dirs = get_higher_tf_dirs(sym)
-            add = alignment_score(dirn, higher_dirs)
-            power += add
-            indicator = "✅" if add > 0 else "❌" if add < 0 else "➖"
-            trend_line = f"Trend Uyumu: {indicator} 4h{arrow_for(higher_dirs.get('4h','-'))} | 1d{arrow_for(higher_dirs.get('1d','-'))}"
+            slope_flip, (s_prev, s_now) = detect_slope_reversal(ema_f_closed)
+            if slope_flip:
+                # Anti-spam: aynı bar & yön için tekrar yollama
+                if prev.get("last_scalp_bar_ms") != prev_bar_ms or prev.get("last_scalp_dir") != slope_flip:
+                    # Üst TF onayı
+                    higher_dirs = get_higher_tf_dirs(sym)
+                    tf_dir = higher_dirs.get(SCALP_TF_CONFIRM, "FLAT")
 
-        power = max(0, min(power, 100))
+                    # ATR yeterliliği
+                    atr = atr_series(highs, lows, closes, ATR_PERIOD)
+                    atr_now = atr[-1]
+                    atr_pct = (atr_now / price) if price > 0 else 0.0
+                    min_pct_1h = ATR_MIN_PCT_DEFAULTS["1h"]
+                    atr_ok_for_scalp = atr_pct >= (min_pct_1h * SCALP_MIN_ATR_FACTOR)
 
-        if power >= 86:
-            power_tag = "🟦 Ultra Power"; level = "ULTRA"
-        elif power >= 70:
-            power_tag = "🟩 Strong";      level = "PREMIUM"
-        elif power >= 50:
-            power_tag = "🟨 Moderate";    level = "CROSS"
-        else:
-            power_tag = "🟥 Weak";        level = "CROSS"
+                    if slope_flip == tf_dir and atr_ok_for_scalp:
+                        # Mini TP/SL
+                        tp = price + (SCALP_TP_MULT * atr_now if slope_flip == "UP" else -SCALP_TP_MULT * atr_now)
+                        sl = price - (SCALP_SL_MULT * atr_now if slope_flip == "UP" else -SCALP_SL_MULT * atr_now)
 
-        sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
-        rr = lambda x: f"{x:.2f}"
+                        # Scalp momentum skoru (görsel)
+                        denom = (atr_now * ATR_SLOPE_MULT_DEFAULTS["1h"]) if atr_now > 0 else 1.0
+                        scalp_power = max(0.0, min(100.0, 60.0 + (abs(s_now - s_prev) / denom) * 20.0))
 
-        tag = "⚡ CROSS"
-        if level == "PREMIUM": tag = "⚡🔥 PREMIUM SİNYAL"
-        elif level == "ULTRA": tag = "⚡🚀 ULTRA PREMIUM SİNYAL"
-        atr_tag = "[ATR OK]" if atr_ok else "[ATR LOW]"
-        early_tag = " ⏳ Early Confirm (30dk)" if confirm_mode == "EARLY" else ""
+                        scalp_text = (
+                            f"💥 SCALP {('LONG' if slope_flip=='UP' else 'SHORT')} TRIGGER: {sym} (1h)\n"
+                            f"{SCALP_TF_CONFIRM.upper()} Trend Onayı: {tf_dir} ✅\n"
+                            f"Slope Change: {s_prev:+.6f} → {s_now:+.6f}\n"
+                            f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)\n"
+                            f"TP≈ {tp:.4f} | SL≈ {sl:.4f}  (TP {SCALP_TP_MULT}×ATR, SL {SCALP_SL_MULT}×ATR)\n"
+                            f"Power: ⚡ Momentum {scalp_power:.0f}\n"
+                            f"Time: {nowiso()}"
+                        )
+                        send_telegram(scalp_text)
 
-        lines = [
-            f"{tag}: {sym} ({interval}) {atr_tag}{early_tag}",
-            f"Power: {power_tag} ({power}/100)",
-            f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
-            f"Kesişim: EMA{ef} {'↗' if dirn=='UP' else '↘'} EMA{es}",
-            trend_line,
-            f"RSI: {rsi_val:.2f} → {rsi_status}",
-            f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
-            f"Slope(fast,3): {slope_now:.6f}",
-            f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support is not None and resistance is not None) else None,
-            f"Eşik[{interval}]: ATR%≥{min_pct*100:.2f} | |slope|≥{slope_mult:.2f}×ATR",
-            f"Entry≈ {price}",
-            f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr(rr1)})  TP2≈ {tp2:.4f} (R:R {rr(rr2)})  TP3≈ {tp3:.4f} (R:R {rr(rr3)})",
-            f"Time: {nowiso()}",
-        ]
-        msg = "\n".join([l for l in lines if l])
-        send_telegram(msg)
-        if level in ("PREMIUM", "ULTRA"):
-            log_premium(msg)
+                        # scalp spam engeli
+                        state[key] = {**state.get(key, {}), "last_scalp_bar_ms": prev_bar_ms, "last_scalp_dir": slope_flip}
+                        safe_save_json(STATE_FILE, state)
+                        time.sleep(SLEEP_BETWEEN)
 
-        # Sinyali stabilizasyon barına pin'le → kapanışta tekrar etmez
-        state[key] = {"last_signal_bar_ms": prev_bar_ms, "last_dir": dirn}
-        safe_save_json(STATE_FILE, state)
-        time.sleep(SLEEP_BETWEEN)
+        # ==== 3) TREND RETEST CONFIRM (Power'dan bağımsız) ====
+        # S/R'yi tekrar hesaplamaya gerek yok; CROSS kısmında yoksa burada hesaplayalım:
+        support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
+        retest_dir = detect_trend_retest(closes, support, resistance)
+        if retest_dir:
+            # EMA7 eğimi ile aynı yönde onay
+            slope_confirm = slope_value(ema_f_closed, 3)
+            if (retest_dir == "UP" and slope_confirm > 0) or (retest_dir == "DOWN" and slope_confirm < 0):
+                msg = (
+                    f"✅ Trend Retest Confirm: {sym} ({interval})\n"
+                    f"{'Direnç kırıldı → destek testi' if retest_dir=='UP' else 'Destek kırıldı → direnç testi'}\n"
+                    f"Slope: {slope_confirm:+.6f}\n"
+                    f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}\n"
+                    f"Time: {nowiso()}"
+                )
+                send_telegram(msg)
+                time.sleep(SLEEP_BETWEEN)
 
 
 def main():
-    log("🚀 Binance EMA/ATR/RSI — Stabilizasyon + 30dk Early Confirm + Power + S/R + 1h→(4h&1d)")
+    log("🚀 v7 | Binance only | EMA/ATR/RSI — Stabilizasyon + 30dk Early Confirm + Dynamic Momentum Power + 1h→(4h&1d) + SCALP + RETEST (Power bağımsız)")
     state = safe_load_json(STATE_FILE)
-    symbols = get_futures_symbols()
-    if not symbols:
-        log("❌ Sembol listesi boş; Binance erişimini kontrol edin.")
+
+    binance_symbols = get_futures_symbols()
+    if not binance_symbols:
+        log("❌ Binance sembol listesi boş.")
         return
+
     while True:
-        for sym in symbols:
+        for sym in binance_symbols:
             process_symbol(sym, state)
         log("⏳ 5 dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
