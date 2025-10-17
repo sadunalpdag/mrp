@@ -27,7 +27,7 @@ TP3_MULT  = float(os.getenv("TP3_MULT", "3.0"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_SWING_LOOKBACK = int(os.getenv("RSI_SWING_LOOKBACK", "12"))
 
-# Destek/Direnç lookback
+# Destek/Direnç lookback (Power ekranında bilgi amaçlı)
 SR_LOOKBACK = int(os.getenv("SR_LOOKBACK", "100"))
 
 # Erken onay: bar kapanışına ≤30dk kala canlı barda yön korunuyorsa sinyal ver
@@ -206,7 +206,7 @@ def stabilized_or_early(ema_f_closed, ema_s_closed, ema_f_full, ema_s_full, bar_
 
     return None, None
 
-# Destek / Direnç (son tepe/diplerden, yatay seviye)
+# Destek / Direnç (bilgi amaçlı — Power mesajında gösterim)
 def trend_lines_from_extrema(closes, lookback=100):
     clip = closes[-min(lookback, len(closes)):]
     peaks, troughs = _local_extrema(clip)
@@ -223,7 +223,7 @@ def trend_lines_from_extrema(closes, lookback=100):
 
 # ---------- Binance Kaynak ----------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.8", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.9", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -311,25 +311,6 @@ def detect_slope_reversal(ema_series):
     return None, (slope_prev, slope_now)
 
 
-# ---------- Trend Retest Confirm ----------
-def detect_trend_retest(closes, support, resistance, tol=0.003):
-    """
-    Kırılım + retest algısı:
-    - Direnç üzeri kapanış sonrası fiyatın direnci ~tol içinde test etmesi → 'UP'
-    - Destek altı kapanış sonrası fiyatın desteği ~tol içinde test etmesi → 'DOWN'
-    """
-    if support is None or resistance is None or len(closes) < 3:
-        return None
-    prev, curr = closes[-2], closes[-1]
-    broke_res = prev < resistance and curr > resistance
-    broke_sup = prev > support and curr < support
-    retest_res = broke_res and abs(curr - resistance) / max(resistance, 1e-9) < tol
-    retest_sup = broke_sup and abs(curr - support)    / max(support,    1e-9) < tol
-    if retest_res: return "UP"
-    if retest_sup: return "DOWN"
-    return None
-
-
 # ---------- ANA İŞ AKIŞI ----------
 def process_symbol(sym, state):
     for interval in INTERVALS:
@@ -381,7 +362,7 @@ def process_symbol(sym, state):
                 rsi_val = rsis[-1] if rsis[-1] is not None else 50.0
                 div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
                 rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
-                # S/R
+                # S/R (info)
                 support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
 
                 # ---- Dynamic Momentum Power (slope/ATR)
@@ -499,27 +480,9 @@ def process_symbol(sym, state):
                         safe_save_json(STATE_FILE, state)
                         time.sleep(SLEEP_BETWEEN)
 
-        # ==== 3) TREND RETEST CONFIRM (Power'dan bağımsız) ====
-        # S/R'yi tekrar hesaplamaya gerek yok; CROSS kısmında yoksa burada hesaplayalım:
-        support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
-        retest_dir = detect_trend_retest(closes, support, resistance)
-        if retest_dir:
-            # EMA7 eğimi ile aynı yönde onay
-            slope_confirm = slope_value(ema_f_closed, 3)
-            if (retest_dir == "UP" and slope_confirm > 0) or (retest_dir == "DOWN" and slope_confirm < 0):
-                msg = (
-                    f"✅ Trend Retest Confirm: {sym} ({interval})\n"
-                    f"{'Direnç kırıldı → destek testi' if retest_dir=='UP' else 'Destek kırıldı → direnç testi'}\n"
-                    f"Slope: {slope_confirm:+.6f}\n"
-                    f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}\n"
-                    f"Time: {nowiso()}"
-                )
-                send_telegram(msg)
-                time.sleep(SLEEP_BETWEEN)
-
 
 def main():
-    log("🚀 v7 | Binance only | EMA/ATR/RSI — Stabilizasyon + 30dk Early Confirm + Dynamic Momentum Power + 1h→(4h&1d) + SCALP + RETEST (Power bağımsız)")
+    log("🚀 v8 | Binance only | EMA/ATR/RSI — Stabilizasyon + 30dk Early Confirm + Dynamic Momentum Power + 1h→(4h&1d) + Smart Scalp Trigger (Retest yok)")
     state = safe_load_json(STATE_FILE)
 
     binance_symbols = get_futures_symbols()
