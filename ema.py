@@ -1,4 +1,4 @@
-import os, time, json, requests
+import os, time, json, requests, io
 from datetime import datetime, timezone
 
 # ========= AYARLAR =========
@@ -17,7 +17,7 @@ ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 ATR_MIN_PCT_DEFAULTS = {"1h": 0.0035, "4h": 0.0025, "1d": 0.0015}
 ATR_SLOPE_MULT_DEFAULTS = {"1h": 0.6, "4h": 0.5, "1d": 0.4}
 
-# SL/TP (TP'ler 4 ondalık)
+# SL/TP (TP'ler ve raporda 4 ondalık gösterim)
 SL_MULT   = float(os.getenv("SL_MULT", "1.5"))
 TP1_MULT  = float(os.getenv("TP1_MULT", "1.0"))
 TP2_MULT  = float(os.getenv("TP2_MULT", "2.0"))
@@ -27,17 +27,26 @@ TP3_MULT  = float(os.getenv("TP3_MULT", "3.0"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 RSI_SWING_LOOKBACK = int(os.getenv("RSI_SWING_LOOKBACK", "12"))
 
-# Destek/Direnç lookback (Power ekranında bilgi amaçlı)
+# Destek/Direnç lookback (bilgi amaçlı)
 SR_LOOKBACK = int(os.getenv("SR_LOOKBACK", "100"))
 
 # Erken onay: bar kapanışına ≤30dk kala canlı barda yön korunuyorsa sinyal ver
 EARLY_CONFIRM_MS = int(os.getenv("EARLY_CONFIRM_MS", str(30*60*1000)))  # 30dk
 
 # SCALP ayarları (EMA7 slope reversal)
-SCALP_TF_CONFIRM = os.getenv("SCALP_TF_CONFIRM", "4h")  # 1h için üst TF onayı ("4h" önerilir)
-SCALP_TP_MULT = float(os.getenv("SCALP_TP_MULT", "0.5"))   # ATR * 0.5
-SCALP_SL_MULT = float(os.getenv("SCALP_SL_MULT", "0.25"))  # ATR * 0.25
-SCALP_MIN_ATR_FACTOR = float(os.getenv("SCALP_MIN_ATR_FACTOR", "1.0"))  # atr_pct ≥ min_pct * factor
+SCALP_TF_CONFIRM = os.getenv("SCALP_TF_CONFIRM", "4h")  # 1h için üst TF onayı
+SCALP_TP_MULT = float(os.getenv("SCALP_TP_MULT", "0.5"))
+SCALP_SL_MULT = float(os.getenv("SCALP_SL_MULT", "0.25"))
+SCALP_MIN_ATR_FACTOR = float(os.getenv("SCALP_MIN_ATR_FACTOR", "1.0"))
+
+# ==== SİMÜLASYON ====
+SIM_ENABLE = os.getenv("SIM_ENABLE", "1") == "1"
+SIM_MIN_POWER = int(os.getenv("SIM_MIN_POWER", "60"))   # POWER ≥ 60 ise simülasyon al
+SIM_TP_PCT = float(os.getenv("SIM_TP_PCT", "0.01"))     # +%1 TP
+# SL yüzde: 0.03 / 0.04 / 0.05 (kullanıcı isteğine göre)
+SIM_SL_PCT = float(os.getenv("SIM_SL_PCT", "0.03"))
+# Rapor aralığı (dakika): varsayılan 60 = saatlik rapor
+REPORT_INTERVAL_MIN = int(os.getenv("REPORT_INTERVAL_MIN", "60"))
 
 SLEEP_BETWEEN = 0.2
 SCAN_INTERVAL = 300  # 5 dakika
@@ -78,9 +87,23 @@ def send_telegram(text):
         return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=12)
     except Exception as e:
         log(f"Telegram hatası: {e}")
+
+
+def send_telegram_document(file_bytes: bytes, filename: str, caption: str = ""):
+    """Excel/CSV dosyasını Telegram'a yükler."""
+    if not BOT_TOKEN or not CHAT_ID:
+        log("Telegram env eksik (BOT_TOKEN/CHAT_ID). Belge gönderilmedi.")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+        files = {'document': (filename, file_bytes)}
+        data = {'chat_id': CHAT_ID, 'caption': caption}
+        requests.post(url, files=files, data=data, timeout=20)
+    except Exception as e:
+        log(f"Telegram sendDocument hatası: {e}")
 
 
 def safe_load_json(path):
@@ -165,11 +188,9 @@ def detect_rsi_divergence(closes, rsis, lookback=12):
     rsis   = rsis[-lookback:]
     peaks_p, troughs_p = _local_extrema(closes)
     peaks_r, troughs_r = _local_extrema([r for r in rsis if r is not None])
-    # Bearish: Price HH & RSI LH
     if len(peaks_p) >= 2 and len(peaks_r) >= 2:
         if peaks_p[-1][1] > peaks_p[-2][1] and peaks_r[-1][1] < peaks_r[-2][1]:
             return "BEARISH", peaks_p[-1][0]
-    # Bullish: Price LL & RSI HL
     if len(troughs_p) >= 2 and len(troughs_r) >= 2:
         if troughs_p[-1][1] < troughs_p[-2][1] and troughs_r[-1][1] > troughs_r[-2][1]:
             return "BULLISH", troughs_p[-1][0]
@@ -177,36 +198,23 @@ def detect_rsi_divergence(closes, rsis, lookback=12):
 
 # --- Stabilizasyon (kapalı bar) + Erken onay (canlı bar) ---
 def stabilized_or_early(ema_f_closed, ema_s_closed, ema_f_full, ema_s_full, bar_close_ms, now_ms, early_ms):
-    """
-    1) Kapanmış barlarla onay:
-       prev_diff(−3), cross_diff(−2), after_closed(−1) aynı yönde → 'UP'/'DOWN', 'CLOSED'
-    2) Erken onay:
-       bar kapanışına <= early_ms kaldıysa ve (prev, cross, curr_live) aynı yönde → 'UP'/'DOWN', 'EARLY'
-    """
     if len(ema_f_closed) < 3:
         return None, None
-
     prev_diff   = ema_f_closed[-3] - ema_s_closed[-3]
     cross_diff  = ema_f_closed[-2] - ema_s_closed[-2]
     after_diff  = ema_f_closed[-1] - ema_s_closed[-1]
-
-    # Kapalı barla stabilizasyon
     if prev_diff < 0 and cross_diff > 0 and after_diff > 0:
         return "UP", "CLOSED"
     if prev_diff > 0 and cross_diff < 0 and after_diff < 0:
         return "DOWN", "CLOSED"
-
-    # Erken onay (canlı bar yönüyle)
     if (bar_close_ms - now_ms) <= early_ms and len(ema_f_full) >= 2 and len(ema_s_full) >= 2:
         curr_live = ema_f_full[-1] - ema_s_full[-1]
         if prev_diff < 0 and cross_diff > 0 and curr_live > 0:
             return "UP", "EARLY"
         if prev_diff > 0 and cross_diff < 0 and curr_live < 0:
             return "DOWN", "EARLY"
-
     return None, None
 
-# Destek / Direnç (bilgi amaçlı — Power mesajında gösterim)
 def trend_lines_from_extrema(closes, lookback=100):
     clip = closes[-min(lookback, len(closes)):]
     peaks, troughs = _local_extrema(clip)
@@ -223,7 +231,7 @@ def trend_lines_from_extrema(closes, lookback=100):
 
 # ---------- Binance Kaynak ----------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.9", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/2.0", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -259,8 +267,7 @@ def get_higher_tf_dirs(sym):
     for tf in ["4h", "1d"]:
         kl = get_klines(sym, tf, limit=150)
         if not kl:
-            higher_dirs[tf] = "FLAT"
-            continue
+            higher_dirs[tf] = "FLAT"; continue
         closes = [float(k[4]) for k in kl]
         ef, es, _ = EMA_SETS[tf]
         higher_dirs[tf] = ema_trend_direction_from_closes(closes, ef, es)
@@ -295,11 +302,6 @@ def sl_tp_from_atr(entry, atr, dirn):
 
 # ---------- Smart Scalp Trigger ----------
 def detect_slope_reversal(ema_series):
-    """
-    EMA7 eğiminin yön değiştirdiği anı yakalar.
-    slope_prev = EMA[-2] - EMA[-5]
-    slope_now  = EMA[-1] - EMA[-4]
-    """
     if len(ema_series) < 6:
         return None, (0.0, 0.0)
     slope_now  = ema_series[-1] - ema_series[-4]
@@ -311,8 +313,164 @@ def detect_slope_reversal(ema_series):
     return None, (slope_prev, slope_now)
 
 
+# ========== SİMÜLASYON DURUMU ==========
+def ensure_sim_state(state):
+    if "positions" not in state: state["positions"] = {}   # open positions by symbol
+    if "history"   not in state: state["history"]   = []   # closed trades list
+    if "last_report_ts" not in state: state["last_report_ts"] = 0
+    return state
+
+def open_position(state, symbol, side, price, source, power=None, slope_factor=None, atr_pct=None, sl_pct=SIM_SL_PCT, tp_pct=SIM_TP_PCT):
+    if not SIM_ENABLE: return
+    pos = state["positions"].get(symbol)
+    if pos and pos.get("is_open"):  # aynı sembolde tek pozisyon
+        return
+    state["positions"][symbol] = {
+        "is_open": True,
+        "symbol": symbol,
+        "side": side,  # LONG/SHORT
+        "entry": price,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
+        "opened_at": nowiso(),
+        "opened_ts": int(datetime.now(timezone.utc).timestamp()),
+        "bars_held": 0,
+        "source": source,            # POWER / SCALP
+        "power": power,
+        "slope_factor": slope_factor,
+        "atr_pct": atr_pct,
+    }
+
+def update_positions_and_close_if_hit(state, symbol, last_price):
+    """TP/SL kontrolü, kapananları history'ye yazar."""
+    pos = state["positions"].get(symbol)
+    if not pos or not pos.get("is_open"): return
+    side = pos["side"]
+    entry = pos["entry"]
+    tp_pct = pos["tp_pct"]
+    sl_pct = pos["sl_pct"]
+    # hedefler
+    if side == "LONG":
+        tp_price = entry * (1 + tp_pct)
+        sl_price = entry * (1 - sl_pct)
+        hit_tp = last_price >= tp_price
+        hit_sl = last_price <= sl_price
+    else:
+        tp_price = entry * (1 - tp_pct)
+        sl_price = entry * (1 + sl_pct)
+        hit_tp = last_price <= tp_price
+        hit_sl = last_price >= sl_price
+
+    if hit_tp or hit_sl:
+        outcome = "TP" if hit_tp else "SL"
+        pnl_pct = tp_pct if hit_tp else -sl_pct
+        closed = {
+            "symbol": symbol,
+            "side": side,
+            "entry": round(entry, 6),
+            "exit": round(last_price, 6),
+            "pnl_pct": round(pnl_pct*100, 2),
+            "outcome": outcome,
+            "opened_at": pos["opened_at"],
+            "closed_at": nowiso(),
+            "bars_held": pos.get("bars_held", 0),
+            "source": pos.get("source"),
+            "power": pos.get("power"),
+            "slope_factor": pos.get("slope_factor"),
+            "atr_pct": pos.get("atr_pct"),
+        }
+        state["history"].append(closed)
+        # pozisyonu kapat
+        state["positions"][symbol] = {"is_open": False}
+        # Telegram mini bildirim
+        send_telegram(
+            f"📘 SIM | {outcome} | {symbol} {side}\n"
+            f"Entry: {entry:.6f}  Exit: {last_price:.6f}\n"
+            f"PnL: {pnl_pct*100:.2f}%  Bars: {closed['bars_held']}\n"
+            f"From: {pos.get('source')} (Power={pos.get('power')})"
+        )
+
+def tick_positions_bars_held(state, symbol):
+    pos = state["positions"].get(symbol)
+    if pos and pos.get("is_open"):
+        pos["bars_held"] = pos.get("bars_held", 0) + 1
+
+
+def make_excel_report_bytes(history, best_candidate):
+    """
+    .xlsx üretmeye çalışır; olmazsa CSV döner.
+    Telegram'a bytes göndeririz.
+    """
+    # Önce CSV string hazırla (Excel açabilir)
+    headers = [
+        "symbol","side","entry","exit","pnl_pct","outcome",
+        "opened_at","closed_at","bars_held","source","power","slope_factor","atr_pct"
+    ]
+    import csv
+    csv_buf = io.StringIO()
+    writer = csv.DictWriter(csv_buf, fieldnames=headers)
+    writer.writeheader()
+    for row in history:
+        writer.writerow(row)
+    csv_bytes = csv_buf.getvalue().encode("utf-8")
+
+    # openpyxl varsa xlsx üret
+    try:
+        from openpyxl import Workbook
+        from openpyxl.utils import get_column_letter
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Trades"
+        ws.append(headers)
+        for row in history:
+            ws.append([row.get(h) for h in headers])
+        # ikinci sayfa: Best Candidate
+        ws2 = wb.create_sheet("BestCandidate")
+        ws2.append(["symbol","interval","slope_factor","atr_pct","note"])
+        if best_candidate:
+            ws2.append([
+                best_candidate.get("symbol"),
+                best_candidate.get("interval"),
+                round(best_candidate.get("slope_factor",0.0), 3),
+                f"{best_candidate.get('atr_pct',0.0)*100:.2f}%",
+                "Highest Slope/ATR among valid ATR%"
+            ])
+        # sütun genişlikleri
+        for i in range(1, 14):
+            ws.column_dimensions[get_column_letter(i)].width = 14
+        bio = io.BytesIO()
+        wb.save(bio)
+        return bio.getvalue(), "report.xlsx"
+    except Exception as e:
+        log(f"openpyxl yok veya xlsx hata: {e}; CSV'ye düşüldü.")
+        return csv_bytes, "report.csv"
+
+
+def maybe_send_periodic_report(state):
+    """Belirli aralıklarla kapanan işlemler raporunu gönder."""
+    if not state.get("history"):
+        return
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    last = state.get("last_report_ts", 0)
+    if now_ts - last < REPORT_INTERVAL_MIN * 60:
+        return
+
+    # Best candidate notunu ekleyelim (son taramadan)
+    best = state.get("best_candidate")
+
+    file_bytes, fname = make_excel_report_bytes(state["history"], best)
+    caption = f"📊 SIM Raporu | İşlem sayısı: {len(state['history'])}\nTP={int(SIM_TP_PCT*100)}% | SL={int(SIM_SL_PCT*100)}% | POWER≥{SIM_MIN_POWER}"
+    send_telegram_document(file_bytes, fname, caption)
+
+    state["last_report_ts"] = now_ts
+    # İstersen history'yi sıfırlayabilirsin; şimdilik biriktirelim
+    safe_save_json(STATE_FILE, state)
+
+
 # ---------- ANA İŞ AKIŞI ----------
 def process_symbol(sym, state):
+    ensure_sim_state(state)
+
     for interval in INTERVALS:
         kl = get_klines(sym, interval)
         if not kl or len(kl) < 220:
@@ -350,22 +508,21 @@ def process_symbol(sym, state):
 
         # ==== 1) ANA CROSS / POWER SİNYALİ ====
         if dirn:
-            # Aynı PREV bar için tekrar etme (erken/kapalı fark etmeksizin prev_bar_ms'ye pinliyoruz)
+            # Aynı PREV bar için tekrar etme
             if prev.get("last_signal_bar_ms") != prev_bar_ms or prev.get("last_dir") != dirn:
                 # ATR / RSI
                 atr = atr_series(highs, lows, closes, ATR_PERIOD)
                 atr_now = atr[-1]
                 atr_pct = (atr_now / price) if price > 0 else 0.0
-                slope_now = slope_value(ema_f_closed, 3)  # kapalı seriden eğim
+                slope_now = slope_value(ema_f_closed, 3)
                 min_pct, slope_mult = thresholds(interval)
                 rsis = rsi(closes, RSI_PERIOD)
                 rsi_val = rsis[-1] if rsis[-1] is not None else 50.0
                 div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
                 rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
-                # S/R (info)
                 support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
 
-                # ---- Dynamic Momentum Power (slope/ATR)
+                # ---- Dynamic Momentum Power
                 atr_ok = (atr_pct >= min_pct) and (atr_now > 0)
                 slope_factor = (abs(slope_now) / (atr_now * slope_mult)) if (atr_now > 0 and slope_mult > 0) else 0.0
                 atr_factor = (atr_pct / min_pct) if (min_pct > 0) else 1.0
@@ -403,7 +560,7 @@ def process_symbol(sym, state):
                 else:
                     power_tag = "🟥 Weak";        level = "CROSS"
 
-                # SL/TP
+                # SL/TP (bilgi)
                 sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
                 rr = lambda x: f"{x:.2f}"
                 atr_tag = "[ATR OK]" if atr_ok else "[ATR LOW]"
@@ -412,6 +569,7 @@ def process_symbol(sym, state):
                 if level == "PREMIUM": tag = "⚡🔥 PREMIUM SİNYAL"
                 elif level == "ULTRA": tag = "⚡🚀 ULTRA PREMIUM SİNYAL"
 
+                # ---- Telegram
                 lines = [
                     f"{tag}: {sym} ({interval}) {atr_tag}{early_tag}",
                     f"Power: {power_tag} ({power:.0f}/100)",
@@ -424,8 +582,8 @@ def process_symbol(sym, state):
                     f"Slope(fast,3): {slope_now:.6f}",
                     f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support is not None and resistance is not None) else None,
                     f"Eşik[{interval}]: ATR%≥{min_pct*100:.2f} | slope_mult={slope_mult:.2f}",
-                    f"Entry≈ {price}",
-                    f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr(rr1)})  TP2≈ {tp2:.4f} (R:R {rr(rr2)})  TP3≈ {tp3:.4f} (R:R {rr(rr3)})",
+                    f"Entry≈ {price:.6f}",
+                    f"SL≈ {sl:.6f} | TP1≈ {tp1:.4f} (R:R {rr(rr1)})  TP2≈ {tp2:.4f} (R:R {rr(rr2)})  TP3≈ {tp3:.4f} (R:R {rr(rr3)})",
                     f"Time: {nowiso()}",
                 ]
                 msg = "\n".join([l for l in lines if l])
@@ -433,22 +591,30 @@ def process_symbol(sym, state):
                 if level in ("PREMIUM", "ULTRA"):
                     log_premium(msg)
 
+                # ==== SIMÜLASYON GİRİŞ (POWER ≥ SIM_MIN_POWER) ====
+                if SIM_ENABLE and power >= SIM_MIN_POWER and interval == "1h":
+                    side = "LONG" if dirn == "UP" else "SHORT"
+                    open_position(
+                        state, sym, side, price, source="POWER",
+                        power=round(power, 0),
+                        slope_factor=round(slope_factor, 3),
+                        atr_pct=atr_pct,
+                        sl_pct=SIM_SL_PCT, tp_pct=SIM_TP_PCT
+                    )
+
                 # Sinyali stabilizasyon barına pin'le → kapanışta tekrar etmez
                 state[key] = {**prev, "last_signal_bar_ms": prev_bar_ms, "last_dir": dirn}
                 safe_save_json(STATE_FILE, state)
                 time.sleep(SLEEP_BETWEEN)
 
-        # ==== 2) SMART SCALP TRIGGER (Power'dan bağımsız) ====
+        # ==== 2) SMART SCALP TRIGGER (bağımsız ve her zaman SIM alır) ====
         if interval == "1h":
             slope_flip, (s_prev, s_now) = detect_slope_reversal(ema_f_closed)
             if slope_flip:
-                # Anti-spam: aynı bar & yön için tekrar yollama
                 if prev.get("last_scalp_bar_ms") != prev_bar_ms or prev.get("last_scalp_dir") != slope_flip:
-                    # Üst TF onayı
                     higher_dirs = get_higher_tf_dirs(sym)
                     tf_dir = higher_dirs.get(SCALP_TF_CONFIRM, "FLAT")
 
-                    # ATR yeterliliği
                     atr = atr_series(highs, lows, closes, ATR_PERIOD)
                     atr_now = atr[-1]
                     atr_pct = (atr_now / price) if price > 0 else 0.0
@@ -456,11 +622,9 @@ def process_symbol(sym, state):
                     atr_ok_for_scalp = atr_pct >= (min_pct_1h * SCALP_MIN_ATR_FACTOR)
 
                     if slope_flip == tf_dir and atr_ok_for_scalp:
-                        # Mini TP/SL
                         tp = price + (SCALP_TP_MULT * atr_now if slope_flip == "UP" else -SCALP_TP_MULT * atr_now)
                         sl = price - (SCALP_SL_MULT * atr_now if slope_flip == "UP" else -SCALP_SL_MULT * atr_now)
 
-                        # Scalp momentum skoru (görsel)
                         denom = (atr_now * ATR_SLOPE_MULT_DEFAULTS["1h"]) if atr_now > 0 else 1.0
                         scalp_power = max(0.0, min(100.0, 60.0 + (abs(s_now - s_prev) / denom) * 20.0))
 
@@ -475,15 +639,54 @@ def process_symbol(sym, state):
                         )
                         send_telegram(scalp_text)
 
-                        # scalp spam engeli
+                        # ==== SIMÜLASYON GİRİŞ (SCALP) ====
+                        side = "LONG" if slope_flip == "UP" else "SHORT"
+                        if SIM_ENABLE:
+                            open_position(
+                                state, sym, side, price, source="SCALP",
+                                power=round(scalp_power, 0),
+                                slope_factor=None, atr_pct=atr_pct,
+                                sl_pct=SIM_SL_PCT, tp_pct=SIM_TP_PCT
+                            )
+
                         state[key] = {**state.get(key, {}), "last_scalp_bar_ms": prev_bar_ms, "last_scalp_dir": slope_flip}
                         safe_save_json(STATE_FILE, state)
                         time.sleep(SLEEP_BETWEEN)
 
+        # ==== 3) SİMÜLASYON POZİSYON GÜNCELLEME ====
+        # her sembol için bar kapanışında bar sayacı 1 artar ve TP/SL kontrol edilir
+        tick_positions_bars_held(state, sym)
+        update_positions_and_close_if_hit(state, sym, price)
+
+        # ==== 4) “En Uygun Slope/ATR Dönüş” Adayı (bilgi & rapor için state'e yaz) ====
+        if interval == "1h":
+            # anlık momentum adayı: ATR yeterli ve slope_factor en yüksek
+            atr = atr_series(highs, lows, closes, ATR_PERIOD)
+            atr_now = atr[-1]
+            atr_pct = (atr_now / price) if price > 0 else 0.0
+            min_pct, slope_mult = thresholds("1h")
+            if atr_now > 0 and atr_pct >= min_pct:
+                ef1, es1, _ = EMA_SETS["1h"]
+                emaf = ema(closes, ef1)[:-1]  # kapalı barda momentum
+                slope_now = slope_value(emaf, 3)
+                slope_factor = abs(slope_now) / (atr_now * slope_mult) if slope_mult > 0 else 0.0
+                cur_best = state.get("best_candidate")
+                if (not cur_best) or slope_factor > cur_best.get("slope_factor", 0.0):
+                    state["best_candidate"] = {
+                        "symbol": sym,
+                        "interval": "1h",
+                        "slope_factor": slope_factor,
+                        "atr_pct": atr_pct,
+                        "price": price,
+                        "time": nowiso(),
+                    }
+                    safe_save_json(STATE_FILE, state)
+
 
 def main():
-    log("🚀 v8 | Binance only | EMA/ATR/RSI — Stabilizasyon + 30dk Early Confirm + Dynamic Momentum Power + 1h→(4h&1d) + Smart Scalp Trigger (Retest yok)")
+    log("🚀 v9 | Binance only | EMA/ATR/RSI — Power + Smart Scalp + SIM(+1% TP, −3/4/5% SL) + Excel Rapor")
     state = safe_load_json(STATE_FILE)
+    ensure_sim_state(state)
 
     binance_symbols = get_futures_symbols()
     if not binance_symbols:
@@ -493,6 +696,9 @@ def main():
     while True:
         for sym in binance_symbols:
             process_symbol(sym, state)
+        # periyodik rapor
+        maybe_send_periodic_report(state)
+
         log("⏳ 5 dk bekleniyor...\n")
         time.sleep(SCAN_INTERVAL)
 
