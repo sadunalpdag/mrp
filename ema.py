@@ -5,26 +5,48 @@ from datetime import datetime, timezone
 LIMIT = 300
 INTERVALS = ["1h", "4h", "1d"]
 
+# EMA setleri (fast, slow, long)
 EMA_SETS = {
     "1h": (7, 25, 99),
     "4h": (9, 26, 200),
     "1d": (20, 50, 200),
 }
 
-ATR_PERIOD = 14
-ATR_MIN_PCT_DEFAULTS = {"1h": 0.0035, "4h": 0.0025, "1d": 0.0015}
-ATR_SLOPE_MULT_DEFAULTS = {"1h": 0.6, "4h": 0.5, "1d": 0.4}
+# ATR ve eşiği
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
+ATR_MIN_PCT_DEFAULTS = {
+    "1h": float(os.getenv("ATR_MIN_PCT_1H", "0.0035")),  # 0.35%
+    "4h": float(os.getenv("ATR_MIN_PCT_4H", "0.0025")),  # 0.25%
+    "1d": float(os.getenv("ATR_MIN_PCT_1D", "0.0015")),  # 0.15%
+}
+ATR_SLOPE_MULT_DEFAULTS = {
+    "1h": float(os.getenv("ATR_SLOPE_MULT_1H", "0.6")),
+    "4h": float(os.getenv("ATR_SLOPE_MULT_4H", "0.5")),
+    "1d": float(os.getenv("ATR_SLOPE_MULT_1D", "0.4")),
+}
 
-SL_MULT, TP1_MULT, TP2_MULT, TP3_MULT = 1.5, 1.0, 2.0, 3.0
-RSI_PERIOD = 14
-RSI_SWING_LOOKBACK = 12
-SLEEP_BETWEEN, SCAN_INTERVAL = 0.25, 300  # 5 dakika
+# SL/TP (TP’ler 4 ondalık yazdırılır)
+SL_MULT   = float(os.getenv("SL_MULT", "1.5"))
+TP1_MULT  = float(os.getenv("TP1_MULT", "1.0"))
+TP2_MULT  = float(os.getenv("TP2_MULT", "2.0"))
+TP3_MULT  = float(os.getenv("TP3_MULT", "3.0"))
+
+# RSI & Divergence
+RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
+RSI_SWING_LOOKBACK = int(os.getenv("RSI_SWING_LOOKBACK", "12"))
+
+# Destek/Direnç lookback
+SR_LOOKBACK = int(os.getenv("SR_LOOKBACK", "100"))
+
+SLEEP_BETWEEN = 0.2
+SCAN_INTERVAL = 300  # 5 dakika
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID   = os.getenv("CHAT_ID")
 
-STATE_FILE = "alerts.json"
-LOG_FILE, PREMIUM_LOG_FILE = "log.txt", "premium.log"
+STATE_FILE = os.getenv("STATE_FILE", "alerts.json")
+LOG_FILE   = os.getenv("LOG_FILE",   "log.txt")
+PREMIUM_LOG_FILE = os.getenv("PREMIUM_LOG_FILE", "premium.log")
 # ===========================
 
 
@@ -142,24 +164,43 @@ def detect_rsi_divergence(closes, rsis, lookback=12):
     rsis   = rsis[-lookback:]
     peaks_p, troughs_p = _local_extrema(closes)
     peaks_r, troughs_r = _local_extrema([r for r in rsis if r is not None])
+    # Bearish: Price HH & RSI LH
     if len(peaks_p) >= 2 and len(peaks_r) >= 2:
         if peaks_p[-1][1] > peaks_p[-2][1] and peaks_r[-1][1] < peaks_r[-2][1]:
             return "BEARISH", peaks_p[-1][0]
+    # Bullish: Price LL & RSI HL
     if len(troughs_p) >= 2 and len(troughs_r) >= 2:
         if troughs_p[-1][1] < troughs_p[-2][1] and troughs_r[-1][1] > troughs_r[-2][1]:
             return "BULLISH", troughs_p[-1][0]
     return None, None
 
+# Canlı bar kesişim (anlık): prev_diff ve curr_diff farklı işaret
 def just_crossed_now(ema_fast, ema_slow):
     if len(ema_fast) < 2 or len(ema_slow) < 2:
         return None
-    prev_diff = ema_fast[-2] - ema_slow[-2]
-    curr_diff = ema_fast[-1] - ema_slow[-1]
+    prev_diff = ema_fast[-2] - ema_slow[-2]  # bir önceki bar
+    curr_diff = ema_fast[-1] - ema_slow[-1]  # canlı bar
     if prev_diff < 0 and curr_diff > 0:
         return "UP"
     if prev_diff > 0 and curr_diff < 0:
         return "DOWN"
     return None
+
+# Destek / Direnç (son tepe/diplerden, yatay seviye)
+def trend_lines_from_extrema(closes, lookback=100):
+    clip = closes[-min(lookback, len(closes)):]
+    peaks, troughs = _local_extrema(clip)
+    # Direnç: son 2 tepenin ortalaması; yoksa local max
+    if len(peaks) >= 2:
+        resistance = (peaks[-1][1] + peaks[-2][1]) / 2.0
+    else:
+        resistance = max(clip) if clip else None
+    # Destek: son 2 dibin ortalaması; yoksa local min
+    if len(troughs) >= 2:
+        support = (troughs[-1][1] + troughs[-2][1]) / 2.0
+    else:
+        support = min(clip) if clip else None
+    return support, resistance
 
 # ---------- EŞİKLER ----------
 def thresholds(interval):
@@ -176,7 +217,7 @@ def sl_tp_from_atr(entry, atr, dirn):
 
 # ---------- Binance ----------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.0", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.1", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -185,7 +226,7 @@ def get_klines(symbol, interval, limit=LIMIT):
         try:
             r = SESSION.get(url, params=params, timeout=10)
             if r.status_code == 200:
-                return r.json()
+                return r.json()  # canlı bar DAHİL
         except:
             time.sleep(0.5)
     return []
@@ -218,12 +259,15 @@ def process_symbol(sym, state):
         key  = f"{sym}_{interval}"
         prev = state.get(key, {})
 
+        # — anlık kesişim kontrolü
         dirn = just_crossed_now(ema_f, ema_s)
         if not dirn:
             continue
+        # — aynı bar ve aynı yönde tekrar etme
         if prev.get("last_signal_bar_ms") == bar_ms and prev.get("last_dir") == dirn:
             continue
 
+        # ATR / RSI
         atr = atr_series(highs, lows, closes, ATR_PERIOD)
         atr_now = atr[-1]
         atr_pct = (atr_now / price) if price > 0 else 0.0
@@ -236,7 +280,10 @@ def process_symbol(sym, state):
         div_type, _ = detect_rsi_divergence(closes, rsis, RSI_SWING_LOOKBACK)
         rsi_status = f"{div_type} DIVERGENCE" if div_type else "NÖTR"
 
-        # POWER HESABI
+        # Destek / Direnç (lookback=100)
+        support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
+
+        # Signal Power (0–100) + renk etiketi
         power = 40  # EMA Cross sabit
         if atr_ok:
             power += 20
@@ -250,11 +297,18 @@ def process_symbol(sym, state):
             power += 5
         power = min(power, 100)
 
-        level = "CROSS"
         if power >= 86:
+            power_tag = "🟦 Ultra Power"
             level = "ULTRA"
         elif power >= 70:
+            power_tag = "🟩 Strong"
             level = "PREMIUM"
+        elif power >= 50:
+            power_tag = "🟨 Moderate"
+            level = "CROSS"
+        else:
+            power_tag = "🟥 Weak"
+            level = "CROSS"
 
         sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
 
@@ -267,18 +321,19 @@ def process_symbol(sym, state):
 
         lines = [
             f"{tag}: {sym} ({interval}) {atr_tag}",
-            f"Power: {power}/100",
+            f"Power: {power_tag} ({power}/100)",
             f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
             f"Kesişim: EMA{ef} {'↗' if dirn=='UP' else '↘'} EMA{es}",
             f"RSI: {rsi_val:.2f} → {rsi_status}",
             f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
             f"Slope(fast,3): {slope_now:.6f}",
+            f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support and resistance) else None,
             f"Eşik[{interval}]: ATR%≥{min_pct*100:.2f} | |slope|≥{slope_mult:.2f}×ATR",
             f"Entry≈ {price}",
             f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr1:.2f})  TP2≈ {tp2:.4f} (R:R {rr2:.2f})  TP3≈ {tp3:.4f} (R:R {rr3:.2f})",
             f"Time: {nowiso()}",
         ]
-        msg = "\n".join(lines)
+        msg = "\n".join([l for l in lines if l is not None])
         send_telegram(msg)
         if level in ("PREMIUM", "ULTRA"):
             log_premium(msg)
@@ -289,7 +344,7 @@ def process_symbol(sym, state):
 
 
 def main():
-    log("🚀 Binance EMA/ATR/RSI — Canlı bar + Signal Power + 5dk tarama")
+    log("🚀 Binance EMA/ATR/RSI — Canlı bar + 5dk tarama + Signal Power + S/R(100)")
     state = safe_load_json(STATE_FILE)
     symbols = get_futures_symbols()
     if not symbols:
