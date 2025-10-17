@@ -166,15 +166,21 @@ def detect_rsi_divergence(closes, rsis, lookback=12):
             return "BULLISH", troughs_p[-1][0]
     return None, None
 
-# Canlı bar kesişim (anlık): prev_diff ve curr_diff farklı işaret
-def just_crossed_now(ema_fast, ema_slow):
-    if len(ema_fast) < 2 or len(ema_slow) < 2:
+# --- Stabilizasyonlu kesişim: (kapanmış barlarla) cross + 1 bar yön koruma
+def stabilized_cross_closed(ema_fast_closed, ema_slow_closed):
+    """
+    ema_*_closed: SON CANLI BAR HARİÇ KAPANMIŞ barlardan hesaplanmış EMA serileri.
+    Şart: -2. bar (cross) ve -1. bar (stabilizasyon) aynı yönde olmalı.
+    """
+    if len(ema_fast_closed) < 3:
         return None
-    prev_diff = ema_fast[-2] - ema_slow[-2]  # bir önceki bar
-    curr_diff = ema_fast[-1] - ema_slow[-1]  # canlı bar
-    if prev_diff < 0 and curr_diff > 0:
+    prev_diff   = ema_fast_closed[-3] - ema_slow_closed[-3]  # cross'tan bir önceki kapanmış bar
+    cross_diff  = ema_fast_closed[-2] - ema_slow_closed[-2]  # cross gerçekleşen kapanmış bar
+    after_diff  = ema_fast_closed[-1] - ema_slow_closed[-1]  # cross sonrası kapanmış bar (stabilizasyon)
+
+    if prev_diff < 0 and cross_diff > 0 and after_diff > 0:
         return "UP"
-    if prev_diff > 0 and curr_diff < 0:
+    if prev_diff > 0 and cross_diff < 0 and after_diff < 0:
         return "DOWN"
     return None
 
@@ -182,12 +188,10 @@ def just_crossed_now(ema_fast, ema_slow):
 def trend_lines_from_extrema(closes, lookback=100):
     clip = closes[-min(lookback, len(closes)):]
     peaks, troughs = _local_extrema(clip)
-    # Direnç: son 2 tepenin ortalaması; yoksa local max
     if len(peaks) >= 2:
         resistance = (peaks[-1][1] + peaks[-2][1]) / 2.0
     else:
         resistance = max(clip) if clip else None
-    # Destek: son 2 dibin ortalaması; yoksa local min
     if len(troughs) >= 2:
         support = (troughs[-1][1] + troughs[-2][1]) / 2.0
     else:
@@ -209,7 +213,7 @@ def sl_tp_from_atr(entry, atr, dirn):
 
 # ---------- Binance ----------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.2", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.3", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -254,18 +258,14 @@ def get_higher_tf_dirs(sym):
 
 def alignment_score(dirn, higher_dirs):
     score = 0
-    matches = sum(1 for tf, d in higher_dirs.items() if d == dirn)
-    opposes = sum(1 for tf, d in higher_dirs.items() if d != dirn and d != "FLAT")
-    if matches == 2:
-        score += 10
-    elif matches == 1:
-        score += 5
-    if opposes == 2:
-        score -= 10
+    matches = sum(1 for d in higher_dirs.values() if d == dirn)
+    opposes = sum(1 for d in higher_dirs.values() if (d != dirn and d != "FLAT"))
+    if matches == 2: score += 10
+    elif matches == 1: score += 5
+    if opposes == 2: score -= 10
     return score
 
-def arrow_for(d):
-    return "↑" if d == "UP" else "↓" if d == "DOWN" else "-"
+def arrow_for(d): return "↑" if d == "UP" else "↓" if d == "DOWN" else "-"
 
 # ---------- ANA İŞ AKIŞI ----------
 def process_symbol(sym, state):
@@ -274,32 +274,41 @@ def process_symbol(sym, state):
         if not kl or len(kl) < 220:
             continue
 
-        closes = [float(k[4]) for k in kl]
+        closes = [float(k[4]) for k in kl]  # canlı dahil
         highs  = [float(k[2]) for k in kl]
         lows   = [float(k[3]) for k in kl]
-        bar_ms = int(kl[-1][6])
-        price  = closes[-1]
+
+        # --- Stabilizasyon kontrollü kesişim için: yalnızca KAPANMIŞ barlarla EMA hesapla
+        closes_closed = closes[:-1]   # son (canlı) bar hariç
+        if len(closes_closed) < 3:
+            continue
 
         ef, es, _ = EMA_SETS[interval]
-        ema_f = ema(closes, ef)
-        ema_s = ema(closes, es)
+        ema_f_closed = ema(closes_closed, ef)
+        ema_s_closed = ema(closes_closed, es)
 
-        key  = f"{sym}_{interval}"
-        prev = state.get(key, {})
-
-        # — anlık kesişim?
-        dirn = just_crossed_now(ema_f, ema_s)
+        # cross + 1 bar stabilizasyon onayı
+        dirn = stabilized_cross_closed(ema_f_closed, ema_s_closed)
         if not dirn:
             continue
-        # — aynı bar ve aynı yönde tekrar etme
-        if prev.get("last_signal_bar_ms") == bar_ms and prev.get("last_dir") == dirn:
-            continue
 
-        # ATR / RSI
+        # Sinyal eşsizliği: sinyali -1 kapanmış bar zamanına bağla (stabilizasyon barı)
+        bar_close_ms = int(kl[-1][6])        # canlı bar kapanış zamanı (gelecek)
+        prev_bar_ms  = int(kl[-2][6])        # SON KAPANMIŞ barın kapanış zamanı  ← stabilizasyon barı
+        key  = f"{sym}_{interval}"
+        prev = state.get(key, {})
+        if prev.get("last_signal_bar_ms") == prev_bar_ms and prev.get("last_dir") == dirn:
+            continue  # aynı kapanmış bar için tekrar etme
+
+        # Fiyat/ATR/RSI hesaplarını tam seri (canlı dahil) üstünden yapıyoruz (daha güncel entry)
+        price  = closes[-1]
         atr = atr_series(highs, lows, closes, ATR_PERIOD)
         atr_now = atr[-1]
         atr_pct = (atr_now / price) if price > 0 else 0.0
-        slope_now = slope_value(ema_f, 3)
+
+        # Slope (hızlı EMA'nın eğimi) – kapanmış seriden almak daha sağlam:
+        slope_now = slope_value(ema_f_closed, 3)
+
         min_pct, slope_mult = thresholds(interval)
         atr_ok = (atr_pct >= min_pct) and (abs(slope_now) >= slope_mult * atr_now)
 
@@ -312,7 +321,7 @@ def process_symbol(sym, state):
         support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
 
         # ---- Signal Power (0–100) hesapla
-        power = 40  # EMA Cross sabit
+        power = 40  # EMA Cross sabit (onaylı)
         if atr_ok:
             power += 20
             if abs(slope_now) >= slope_mult * atr_now * 1.5:
@@ -324,7 +333,7 @@ def process_symbol(sym, state):
         if atr_ok and div_type:
             power += 5
 
-        # 1h sinyali için 4h & 1d trend uyumu ekle
+        # 1h sinyali için 4h & 1d trend uyumu puanı + gösterimi
         trend_line = None
         if interval == "1h":
             higher_dirs = get_higher_tf_dirs(sym)
@@ -335,7 +344,7 @@ def process_symbol(sym, state):
 
         power = max(0, min(power, 100))
 
-        # Power renk etiketi
+        # Power renk etiketi + seviye
         if power >= 86:
             power_tag = "🟦 Ultra Power"
             level = "ULTRA"
@@ -350,6 +359,7 @@ def process_symbol(sym, state):
             level = "CROSS"
 
         # SL/TP
+        def rr_fmt(x): return f"{x:.2f}"
         sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
 
         tag = "⚡ CROSS"
@@ -364,14 +374,14 @@ def process_symbol(sym, state):
             f"Power: {power_tag} ({power}/100)",
             f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
             f"Kesişim: EMA{ef} {'↗' if dirn=='UP' else '↘'} EMA{es}",
-            trend_line,  # sadece 1h'te dolu olur, diğerlerinde None
+            trend_line,  # sadece 1h'te dolu
             f"RSI: {rsi_val:.2f} → {rsi_status}",
             f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
             f"Slope(fast,3): {slope_now:.6f}",
             f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support is not None and resistance is not None) else None,
             f"Eşik[{interval}]: ATR%≥{min_pct*100:.2f} | |slope|≥{slope_mult:.2f}×ATR",
             f"Entry≈ {price}",
-            f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr1:.2f})  TP2≈ {tp2:.4f} (R:R {rr2:.2f})  TP3≈ {tp3:.4f} (R:R {rr3:.2f})",
+            f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr_fmt(rr1)})  TP2≈ {tp2:.4f} (R:R {rr_fmt(rr2)})  TP3≈ {tp3:.4f} (R:R {rr_fmt(rr3)})",
             f"Time: {nowiso()}",
         ]
         msg = "\n".join([l for l in lines if l])
@@ -379,13 +389,14 @@ def process_symbol(sym, state):
         if level in ("PREMIUM", "ULTRA"):
             log_premium(msg)
 
-        state[key] = {"last_signal_bar_ms": bar_ms, "last_dir": dirn}
+        # Stabilizasyon barına pin'le
+        state[key] = {"last_signal_bar_ms": prev_bar_ms, "last_dir": dirn}
         safe_save_json(STATE_FILE, state)
         time.sleep(SLEEP_BETWEEN)
 
 
 def main():
-    log("🚀 Binance EMA/ATR/RSI — Canlı bar + 5dk + Signal Power + S/R(100) + 1h→(4h&1d) trend uyumu")
+    log("🚀 Binance EMA/ATR/RSI — 1-Bar Stabilizasyon + 5dk + Power + S/R(100) + 1h→(4h&1d) uyum")
     state = safe_load_json(STATE_FILE)
     symbols = get_futures_symbols()
     if not symbols:
@@ -400,3 +411,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
