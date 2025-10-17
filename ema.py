@@ -12,20 +12,12 @@ EMA_SETS = {
     "1d": (20, 50, 200),
 }
 
-# ATR ve eşiği
+# ATR & eşikler
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
-ATR_MIN_PCT_DEFAULTS = {
-    "1h": float(os.getenv("ATR_MIN_PCT_1H", "0.0035")),  # 0.35%
-    "4h": float(os.getenv("ATR_MIN_PCT_4H", "0.0025")),  # 0.25%
-    "1d": float(os.getenv("ATR_MIN_PCT_1D", "0.0015")),  # 0.15%
-}
-ATR_SLOPE_MULT_DEFAULTS = {
-    "1h": float(os.getenv("ATR_SLOPE_MULT_1H", "0.6")),
-    "4h": float(os.getenv("ATR_SLOPE_MULT_4H", "0.5")),
-    "1d": float(os.getenv("ATR_SLOPE_MULT_1D", "0.4")),
-}
+ATR_MIN_PCT_DEFAULTS = {"1h": 0.0035, "4h": 0.0025, "1d": 0.0015}
+ATR_SLOPE_MULT_DEFAULTS = {"1h": 0.6, "4h": 0.5, "1d": 0.4}
 
-# SL/TP (TP’ler 4 ondalık yazdırılır)
+# SL/TP (TP'ler 4 ondalık)
 SL_MULT   = float(os.getenv("SL_MULT", "1.5"))
 TP1_MULT  = float(os.getenv("TP1_MULT", "1.0"))
 TP2_MULT  = float(os.getenv("TP2_MULT", "2.0"))
@@ -217,7 +209,7 @@ def sl_tp_from_atr(entry, atr, dirn):
 
 # ---------- Binance ----------
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.1", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/1.2", "Accept": "application/json"})
 
 def get_klines(symbol, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
@@ -239,6 +231,42 @@ def get_futures_symbols():
     except:
         return []
 
+# ---------- ÜST TF YÖN HESABI (1h için 4h & 1d) ----------
+def ema_trend_direction_from_closes(closes, fast_len, slow_len):
+    ef = ema(closes, fast_len)
+    es = ema(closes, slow_len)
+    if ef[-1] > es[-1]: return "UP"
+    if ef[-1] < es[-1]: return "DOWN"
+    return "FLAT"
+
+def get_higher_tf_dirs(sym):
+    higher_dirs = {}
+    for tf in ["4h", "1d"]:
+        kl = get_klines(sym, tf, limit=150)
+        if not kl:
+            higher_dirs[tf] = "FLAT"
+            continue
+        closes = [float(k[4]) for k in kl]
+        ef, es, _ = EMA_SETS[tf]
+        higher_dirs[tf] = ema_trend_direction_from_closes(closes, ef, es)
+        time.sleep(0.05)
+    return higher_dirs
+
+def alignment_score(dirn, higher_dirs):
+    score = 0
+    matches = sum(1 for tf, d in higher_dirs.items() if d == dirn)
+    opposes = sum(1 for tf, d in higher_dirs.items() if d != dirn and d != "FLAT")
+    if matches == 2:
+        score += 10
+    elif matches == 1:
+        score += 5
+    if opposes == 2:
+        score -= 10
+    return score
+
+def arrow_for(d):
+    return "↑" if d == "UP" else "↓" if d == "DOWN" else "-"
+
 # ---------- ANA İŞ AKIŞI ----------
 def process_symbol(sym, state):
     for interval in INTERVALS:
@@ -259,7 +287,7 @@ def process_symbol(sym, state):
         key  = f"{sym}_{interval}"
         prev = state.get(key, {})
 
-        # — anlık kesişim kontrolü
+        # — anlık kesişim?
         dirn = just_crossed_now(ema_f, ema_s)
         if not dirn:
             continue
@@ -283,7 +311,7 @@ def process_symbol(sym, state):
         # Destek / Direnç (lookback=100)
         support, resistance = trend_lines_from_extrema(closes, lookback=SR_LOOKBACK)
 
-        # Signal Power (0–100) + renk etiketi
+        # ---- Signal Power (0–100) hesapla
         power = 40  # EMA Cross sabit
         if atr_ok:
             power += 20
@@ -295,8 +323,19 @@ def process_symbol(sym, state):
                 power += 15
         if atr_ok and div_type:
             power += 5
-        power = min(power, 100)
 
+        # 1h sinyali için 4h & 1d trend uyumu ekle
+        trend_line = None
+        if interval == "1h":
+            higher_dirs = get_higher_tf_dirs(sym)
+            add = alignment_score(dirn, higher_dirs)
+            power += add
+            indicator = "✅" if add > 0 else "❌" if add < 0 else "➖"
+            trend_line = f"Trend Uyumu: {indicator} 4h{arrow_for(higher_dirs.get('4h','-'))} | 1d{arrow_for(higher_dirs.get('1d','-'))}"
+
+        power = max(0, min(power, 100))
+
+        # Power renk etiketi
         if power >= 86:
             power_tag = "🟦 Ultra Power"
             level = "ULTRA"
@@ -310,6 +349,7 @@ def process_symbol(sym, state):
             power_tag = "🟥 Weak"
             level = "CROSS"
 
+        # SL/TP
         sl, tp1, tp2, tp3, rr1, rr2, rr3 = sl_tp_from_atr(price, atr_now, dirn)
 
         tag = "⚡ CROSS"
@@ -324,16 +364,17 @@ def process_symbol(sym, state):
             f"Power: {power_tag} ({power}/100)",
             f"Direction: {dirn} ({'LONG' if dirn=='UP' else 'SHORT'})",
             f"Kesişim: EMA{ef} {'↗' if dirn=='UP' else '↘'} EMA{es}",
+            trend_line,  # sadece 1h'te dolu olur, diğerlerinde None
             f"RSI: {rsi_val:.2f} → {rsi_status}",
             f"ATR({ATR_PERIOD}): {atr_now:.6f} ({atr_pct*100:.2f}%)",
             f"Slope(fast,3): {slope_now:.6f}",
-            f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support and resistance) else None,
+            f"Support≈ {support:.4f} | Resistance≈ {resistance:.4f}" if (support is not None and resistance is not None) else None,
             f"Eşik[{interval}]: ATR%≥{min_pct*100:.2f} | |slope|≥{slope_mult:.2f}×ATR",
             f"Entry≈ {price}",
             f"SL≈ {sl} | TP1≈ {tp1:.4f} (R:R {rr1:.2f})  TP2≈ {tp2:.4f} (R:R {rr2:.2f})  TP3≈ {tp3:.4f} (R:R {rr3:.2f})",
             f"Time: {nowiso()}",
         ]
-        msg = "\n".join([l for l in lines if l is not None])
+        msg = "\n".join([l for l in lines if l])
         send_telegram(msg)
         if level in ("PREMIUM", "ULTRA"):
             log_premium(msg)
@@ -344,7 +385,7 @@ def process_symbol(sym, state):
 
 
 def main():
-    log("🚀 Binance EMA/ATR/RSI — Canlı bar + 5dk tarama + Signal Power + S/R(100)")
+    log("🚀 Binance EMA/ATR/RSI — Canlı bar + 5dk + Signal Power + S/R(100) + 1h→(4h&1d) trend uyumu")
     state = safe_load_json(STATE_FILE)
     symbols = get_futures_symbols()
     if not symbols:
