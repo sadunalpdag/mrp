@@ -1,9 +1,12 @@
-# === EMA ULTRA FINAL v9.7 ===
-# Hybrid: EMA Cross Engine (v9.2 tarzı, Power ≥ 60) + Scalp Slope Engine (4H trend uyumlu, Power ≥ 68, TP/SL)
-# RSI Divergence + ATR Boost (+5 @ ATR% ≥ 0.4) | Günlük Özet (23:59 UTC+3) | Telegram | CSV Kayıtları
+# === EMA ULTRA FINAL v11 ===
+# Cross (v9.2 tarzı, Power ≥ 60) + Scalp Slope (4H trend uyumlu, Power ≥ 68, TP/SL)
+# RSI Divergence + ATR Boost | Günlük Özet + Auto-Optimize (v10)
+# 30 Günlük Öğrenme (Saatlik & Coin Analitiği) + Aylık Rapor (v11)
+# Zaman: UTC+3 (Istanbul)
 
 import os, json, csv, time, requests
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
 # ========= SABİTLER / AYARLAR =========
 INTERVAL_1H = "1h"
@@ -18,7 +21,7 @@ RSI_PERIOD = 14
 POWER_NORMAL_MIN  = 60.0   # Cross için min power
 POWER_PREMIUM_MIN = 68.0   # Scalp için min power
 
-# ATR Boost (volatilite)
+# ATR Boost
 ATR_BOOST_PCT = 0.004      # ATR/Fiyat ≥ %0.4 -> +5 power
 ATR_BOOST_ADD = 5.0
 
@@ -34,25 +37,48 @@ SLEEP_BETWEEN = 0.12
 DAILY_SUMMARY_ENABLED = True
 DAILY_SUMMARY_TIME = "23:59"  # HH:MM (UTC+3)
 
-# Dosyalar
+# Otomatik Optimizasyon (v10)
+OPTIMIZE_APPLY_ON_START = True
+OPTIMIZE_MIN_WINRATE = 60.0
+OPTIMIZE_MIN_TRADES = 5
+NEXT_PARAMS_FILE = "next_day_params.json"
+
+# Rapor dosyaları
 STATE_FILE = "alerts.json"
 OPEN_CSV   = "open_positions.csv"
 CLOSED_CSV = "closed_trades.csv"
 LOG_FILE   = "log.txt"
+REPORTS_DIR = "reports"
+MONTHLY_TRADES = os.path.join(REPORTS_DIR, "monthly_trades.csv")
+LEARNED_HOURS  = os.path.join(REPORTS_DIR, "learned_hours.json")
+BEST_COINS_JSON= os.path.join(REPORTS_DIR, "best_coins_monthly.json")
 
 # Telegram
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
 # ========= ZAMAN / LOG =========
+def now_ist_dt():
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
+
 def now_ist():
-    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0).isoformat()
+    return now_ist_dt().isoformat()
 
 def today_ist_date():
-    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%Y-%m-%d")
+    return now_ist_dt().strftime("%Y-%m-%d")
 
 def now_ist_hhmm():
-    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
+    return now_ist_dt().strftime("%H:%M")
+
+def month_key_ist(dt=None):
+    d = now_ist_dt() if dt is None else dt
+    return d.strftime("%Y-%m")  # "2025-10"
+
+def is_month_end():
+    # İstanbul'a göre ay sonu: yarın ay değişiyorsa bugün son gün
+    today = now_ist_dt().date()
+    tomorrow = today + timedelta(days=1)
+    return today.month != tomorrow.month
 
 def log(msg):
     print(msg, flush=True)
@@ -87,6 +113,12 @@ def send_doc(bytes_data, filename, caption=""):
         log(f"send_doc hatası: {e}")
 
 # ========= DOSYA / STATE =========
+def ensure_dir(p):
+    try:
+        os.makedirs(p, exist_ok=True)
+    except:
+        pass
+
 def safe_load_json(path):
     try:
         if os.path.exists(path):
@@ -103,13 +135,29 @@ def safe_save_json(path, data):
     except:
         pass
 
+def load_json(path, default=None):
+    try:
+        if os.path.exists(path):
+            return json.load(open(path, "r", encoding="utf-8"))
+    except:
+        pass
+    return {} if default is None else default
+
+def save_json(path, data):
+    ensure_dir(os.path.dirname(path) or ".")
+    tmp = path + ".tmp"
+    json.dump(data, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
 def ensure_csv(path, headers):
+    ensure_dir(os.path.dirname(path) or ".")
     if not os.path.exists(path):
         with open(path, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(headers)
 
 ensure_csv(OPEN_CSV,   ["symbol","direction","entry","tp","sl","power","rsi","divergence","time_open"])
 ensure_csv(CLOSED_CSV, ["symbol","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
+ensure_csv(MONTHLY_TRADES, ["symbol","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close","month_key"])
 
 def ensure_state(st):
     st.setdefault("last_slope_dir", {})       # scalp duplicate engel
@@ -124,61 +172,6 @@ def roll_daily_counters_if_needed(state):
     t = today_ist_date()
     if state.get("daily_counters", {}).get("date") != t:
         state["daily_counters"] = {"date": t, "cross": 0, "scalp": 0}
-
-def build_daily_summary_for(date_str, state):
-    total = wins = loses = 0
-    pnl_sum = 0.0
-    try:
-        with open(CLOSED_CSV, "r", encoding="utf-8") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                tc = row.get("time_close", "")
-                if not tc.startswith(date_str):
-                    continue
-                total += 1
-                res = row.get("result", "")
-                pnl = float(row.get("pnl", "0") or 0)
-                pnl_sum += pnl
-                if res == "TP":
-                    wins += 1
-                elif res == "SL":
-                    loses += 1
-    except FileNotFoundError:
-        pass
-
-    winrate = (wins / total * 100.0) if total else 0.0
-    avg_pnl = (pnl_sum / total) if total else 0.0
-    open_cnt = len(state.get("open_positions", []))
-    counters = state.get("daily_counters", {"cross": 0, "scalp": 0})
-    return {
-        "date": date_str,
-        "trades": total,
-        "wins": wins,
-        "loses": loses,
-        "winrate": winrate,
-        "avg_pnl": avg_pnl,
-        "open_positions": open_cnt,
-        "cross_signals": counters.get("cross", 0),
-        "scalp_signals": counters.get("scalp", 0),
-    }
-
-def maybe_send_daily_summary(state):
-    if not DAILY_SUMMARY_ENABLED:
-        return
-    hhmm = now_ist_hhmm()
-    today = today_ist_date()
-    if hhmm >= DAILY_SUMMARY_TIME and state.get("last_daily_summary_date") != today:
-        s = build_daily_summary_for(today, state)
-        msg = (
-            "📊 GÜNLÜK RAPOR (İstanbul)\n"
-            f"📅 {s['date']}\n"
-            f"Signals → CROSS: {s['cross_signals']} | SCALP: {s['scalp_signals']}\n"
-            f"Trades  → Total: {s['trades']} | TP: {s['wins']} | SL: {s['loses']}\n"
-            f"Winrate → {s['winrate']:.1f}%  | AvgPnL: {s['avg_pnl']:.2f}%\n"
-            f"Açık Pozisyon: {s['open_positions']}"
-        )
-        send_tg(msg)
-        state["last_daily_summary_date"] = today
 
 # ========= İNDİKATÖRLER =========
 def ema(vals, length):
@@ -240,7 +233,7 @@ def atr_boost(atr_now, price):
 
 # ========= BINANCE =========
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA-v9.7", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA-v11", "Accept": "application/json"})
 
 def get_futures_symbols():
     try:
@@ -273,7 +266,7 @@ def run_cross_engine(sym, kl1):
     closes = [float(k[4]) for k in kl1]
     ema7   = ema(closes, 7)
     ema25  = ema(closes, 25)
-    ema99  = ema(closes, 99)  # bilgilendirme için
+    ema99  = ema(closes, 99)  # bilgi amaçlı
 
     # Sadece son barda kesişim
     prev_diff = ema7[-2] - ema25[-2]
@@ -284,7 +277,6 @@ def run_cross_engine(sym, kl1):
     if not cross_dir: 
         return None
 
-    # Güç, divergence, ATR
     highs = [float(k[2]) for k in kl1]
     lows  = [float(k[3]) for k in kl1]
     atr_now = atr_series(highs, lows, closes, ATR_PERIOD)[-1]
@@ -321,7 +313,6 @@ def run_scalp_engine(sym, kl1, kl4):
     if len(ema7_1) < 6: 
         return None
 
-    # Slope reversal
     s_now  = ema7_1[-1] - ema7_1[-4]
     s_prev = ema7_1[-2] - ema7_1[-5]
     slope_flip = None
@@ -330,13 +321,12 @@ def run_scalp_engine(sym, kl1, kl4):
     if not slope_flip:
         return None
 
-    # 4H trend
     closes4 = [float(k[4]) for k in kl4]
     ema7_4  = ema(closes4, 7)
     ema25_4 = ema(closes4, 25)
     trend_4h = "UP" if ema7_4[-1] > ema25_4[-1] else "DOWN"
     if slope_flip != trend_4h:
-        return None  # trend uyumsuz ise scalp gösterme
+        return None  # trend uyumsuzsa gösterme
 
     price   = closes1[-1]
     atr_now = atr_series(highs1, lows1, closes1, ATR_PERIOD)[-1]
@@ -345,7 +335,6 @@ def run_scalp_engine(sym, kl1, kl4):
     boost, atr_pct = atr_boost(atr_now, price)
     pwr += boost
 
-    # Divergence bilgi
     rsi_prev = rsi(closes1, RSI_PERIOD)[-2]
     div = rsi_divergence(closes1[-1], closes1[-2], rsi_now, rsi_prev)
 
@@ -368,10 +357,321 @@ def run_scalp_engine(sym, kl1, kl4):
         "atr_pct": atr_pct,
     }
 
-# ========= ANA DÖNGÜ =========
+# ========= GÜNLÜK ÖZET / OPTİMİZASYON / ANALİTİK =========
+def build_daily_summary_for(date_str, state):
+    total = wins = loses = 0
+    pnl_sum = 0.0
+    try:
+        with open(CLOSED_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                tc = row.get("time_close", "")
+                if not tc.startswith(date_str):
+                    continue
+                total += 1
+                res = row.get("result", "")
+                pnl = float(row.get("pnl", "0") or 0)
+                pnl_sum += pnl
+                if res == "TP":
+                    wins += 1
+                elif res == "SL":
+                    loses += 1
+    except FileNotFoundError:
+        pass
+
+    winrate = (wins / total * 100.0) if total else 0.0
+    avg_pnl = (pnl_sum / total) if total else 0.0
+    open_cnt = len(state.get("open_positions", []))
+    counters = state.get("daily_counters", {"cross": 0, "scalp": 0})
+    return {
+        "date": date_str,
+        "trades": total,
+        "wins": wins,
+        "loses": loses,
+        "winrate": winrate,
+        "avg_pnl": avg_pnl,
+        "open_positions": open_cnt,
+        "cross_signals": counters.get("cross", 0),
+        "scalp_signals": counters.get("scalp", 0),
+    }
+
+def read_closed_trades_for(date_str):
+    rows = []
+    try:
+        with open(CLOSED_CSV, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                if row.get("time_close","").startswith(date_str):
+                    rows.append(row)
+    except FileNotFoundError:
+        pass
+    return rows
+
+def compute_day_stats(rows):
+    out = {"total":0,"wins":0,"loses":0,"avg_pnl":0.0,"winrate":0.0,
+           "tp_bars_avg":None,"sl_bars_avg":None,"hourly":{},"fastest_tp_bars":None}
+    if not rows: return out
+    pnl_sum = 0.0
+    tp_b, sl_b = [], []
+    for row in rows:
+        out["total"] += 1
+        res = row.get("result")
+        pnl = float(row.get("pnl","0") or 0.0)
+        bars = int(row.get("bars","0") or 0)
+        pnl_sum += pnl
+        if res == "TP":
+            out["wins"] += 1
+            tp_b.append(bars)
+            if out["fastest_tp_bars"] is None or bars < out["fastest_tp_bars"]:
+                out["fastest_tp_bars"] = bars
+        elif res == "SL":
+            out["loses"] += 1
+            sl_b.append(bars)
+        hh = (row.get("time_open","")[11:13] or "??")
+        d = out["hourly"].setdefault(hh, {"trades":0,"wins":0,"loses":0})
+        d["trades"] += 1
+        if res == "TP": d["wins"] += 1
+        elif res == "SL": d["loses"] += 1
+    out["avg_pnl"] = pnl_sum / out["total"]
+    out["winrate"] = (out["wins"] / out["total"] * 100.0) if out["total"] else 0.0
+    if tp_b: out["tp_bars_avg"] = sum(tp_b)/len(tp_b)
+    if sl_b: out["sl_bars_avg"] = sum(sl_b)/len(sl_b)
+    return out
+
+def recommend_params(rows, min_winrate=OPTIMIZE_MIN_WINRATE, min_trades=OPTIMIZE_MIN_TRADES):
+    total = len(rows)
+    if total < min_trades:
+        return {}
+    stats = compute_day_stats(rows)
+    best_hour, best_hour_win = None, -1
+    for hh, d in stats["hourly"].items():
+        if d["trades"] >= 3:
+            wr = (d["wins"]/d["trades"]*100.0) if d["trades"] else 0.0
+            if wr > best_hour_win:
+                best_hour_win, best_hour = wr, hh
+    tp_opts   = [0.004, 0.006, 0.008]
+    boost_opts= [0.003, 0.004, 0.005]
+    pow_opts  = [66, 68, 70]
+    def score(winrate, avg_tp_bars, tp_pct, pow_min, boost_pct):
+        if winrate < min_winrate or avg_tp_bars is None: return -1e9
+        return (winrate*2.0) + (100.0/max(1.0, avg_tp_bars)) - (tp_pct*1000*0.3) + (max(0,(70-pow_min))*0.5) - (boost_pct*1000*0.2)
+    best = None
+    for tpv in tp_opts:
+        for bv in boost_opts:
+            for pv in pow_opts:
+                sc = score(stats["winrate"], stats["tp_bars_avg"], tpv, pv, bv)
+                cand = {"SCALP_TP_PCT": tpv, "ATR_BOOST_PCT": bv, "POWER_PREMIUM_MIN": pv, "score": sc}
+                if best is None or sc > best["score"]:
+                    best = cand
+    rec = {
+        "SCALP_TP_PCT": best["SCALP_TP_PCT"] if best else 0.006,
+        "SCALP_SL_PCT": SCALP_SL_PCT,
+        "POWER_PREMIUM_MIN": best["POWER_PREMIUM_MIN"] if best else POWER_PREMIUM_MIN,
+        "POWER_NORMAL_MIN": POWER_NORMAL_MIN,
+        "ATR_BOOST_PCT": best["ATR_BOOST_PCT"] if best else ATR_BOOST_PCT,
+        "best_hour": f"{best_hour}:00-{(int(best_hour)+1)%24:02d}:00" if best_hour is not None else None,
+        "winrate": stats["winrate"],
+        "avg_tp_bars": stats["tp_bars_avg"],
+    }
+    return rec
+
+def make_and_send_strategy_report(date_str, rows):
+    ensure_dir(REPORTS_DIR)
+    csv_path = os.path.join(REPORTS_DIR, f"strategy_stats_{date_str}.csv")
+    if rows:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        try:
+            with open(csv_path, "rb") as f:
+                send_doc(f.read(), os.path.basename(csv_path), f"📎 Günlük strateji verisi ({date_str})")
+        except:
+            send_tg(f"📎 Günlük strateji verisi hazır: {csv_path}")
+
+def append_monthly_trade(row):
+    # row: dict (closed_trades ile aynı alanlar + month_key)
+    ensure_csv(MONTHLY_TRADES, ["symbol","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close","month_key"])
+    with open(MONTHLY_TRADES, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            row["symbol"], row["direction"], row["entry"], row["exit"], row["result"], row["pnl"],
+            row["bars"], row["power"], row["rsi"], row["divergence"], row["time_open"], row["time_close"],
+            month_key_ist()
+        ])
+
+def load_last_30_days_rows():
+    cutoff = now_ist_dt() - timedelta(days=30)
+    rows = []
+    try:
+        with open(MONTHLY_TRADES, "r", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                # time_close ISO+03:00
+                tc = row.get("time_close","")
+                if not tc:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(tc)
+                except:
+                    continue
+                # dt is naive? assume already +03:00 iso; best-effort
+                if dt >= cutoff:
+                    rows.append(row)
+    except FileNotFoundError:
+        pass
+    return rows
+
+def compute_hourly_learning(last30_rows):
+    # saat → trades, wins, loses, avg_pnl, avg_tp_bars
+    hourly = {}
+    for row in last30_rows:
+        hh = (row.get("time_open","")[11:13] or "??")
+        d = hourly.setdefault(hh, {"trades":0,"wins":0,"loses":0,"pnl_sum":0.0,"tp_bars_sum":0,"tp_bars_cnt":0})
+        d["trades"] += 1
+        res = row.get("result")
+        pnl = float(row.get("pnl","0") or 0.0)
+        bars = int(row.get("bars","0") or 0)
+        d["pnl_sum"] += pnl
+        if res == "TP":
+            d["wins"] += 1
+            d["tp_bars_sum"] += bars
+            d["tp_bars_cnt"] += 1
+        elif res == "SL":
+            d["loses"] += 1
+    # finalize
+    out = {}
+    for hh, d in hourly.items():
+        avg_pnl = d["pnl_sum"]/d["trades"] if d["trades"] else 0.0
+        winrate = (d["wins"]/d["trades"]*100.0) if d["trades"] else 0.0
+        tp_bars_avg = (d["tp_bars_sum"]/d["tp_bars_cnt"]) if d["tp_bars_cnt"] else None
+        out[hh] = {"trades":d["trades"], "winrate":round(winrate,1), "avg_pnl":round(avg_pnl,3),
+                   "tp_bars_avg": (round(tp_bars_avg,2) if tp_bars_avg is not None else None)}
+    # en iyi/zayıf saatleri seç
+    best_hours = []
+    weak_hours = []
+    for hh, d in out.items():
+        if d["trades"] >= 5 and d["winrate"] >= 70 and (d["tp_bars_avg"] is None or d["tp_bars_avg"] <= 5):
+            best_hours.append(f"{hh}:00-{(int(hh)+1)%24:02d}:00")
+        if d["trades"] >= 5 and d["winrate"] <= 55:
+            weak_hours.append(f"{hh}:00-{(int(hh)+1)%24:02d}:00")
+    payload = {"updated_at": now_ist(), "hours": out, "best_hours": best_hours, "weak_hours": weak_hours}
+    save_json(LEARNED_HOURS, payload)
+    return payload
+
+def compute_best_coins(last30_rows):
+    # coin → stats
+    coins = {}
+    for row in last30_rows:
+        sym = row.get("symbol","?")
+        d = coins.setdefault(sym, {"trades":0,"wins":0,"loses":0,"pnl_sum":0.0})
+        d["trades"] += 1
+        if row.get("result") == "TP": d["wins"] += 1
+        elif row.get("result") == "SL": d["loses"] += 1
+        d["pnl_sum"] += float(row.get("pnl","0") or 0.0)
+    ranked = []
+    for sym, d in coins.items():
+        wr = (d["wins"]/d["trades"]*100.0) if d["trades"] else 0.0
+        avg = d["pnl_sum"]/d["trades"] if d["trades"] else 0.0
+        ranked.append((sym, d["trades"], wr, avg))
+    ranked.sort(key=lambda x: (x[2], x[3], x[1]), reverse=True)
+    best = [sym for sym, n, wr, avg in ranked if n>=10 and wr>=70 and avg>=0.4][:10]  # kriter
+    payload = {"updated_at": now_ist(), "best_coins": best, "ranking": [
+        {"symbol":sym,"trades":n,"winrate":round(wr,1),"avg_pnl":round(avg,3)} for sym,n,wr,avg in ranked
+    ]}
+    save_json(BEST_COINS_JSON, payload)
+    return payload
+
+def maybe_send_daily_summary(state):
+    if not DAILY_SUMMARY_ENABLED:
+        return
+    hhmm = now_ist_hhmm()
+    today = today_ist_date()
+    if hhmm >= DAILY_SUMMARY_TIME and state.get("last_daily_summary_date") != today:
+        s = build_daily_summary_for(today, state)
+        msg = (
+            "📊 GÜNLÜK RAPOR (İstanbul)\n"
+            f"📅 {s['date']}\n"
+            f"Signals → CROSS: {s['cross_signals']} | SCALP: {s['scalp_signals']}\n"
+            f"Trades  → Total: {s['trades']} | TP: {s['wins']} | SL: {s['loses']}\n"
+            f"Winrate → {s['winrate']:.1f}%  | AvgPnL: {s['avg_pnl']:.2f}%\n"
+            f"Açık Pozisyon: {s['open_positions']}"
+        )
+        send_tg(msg)
+
+        # Günlük raw veriyi TG'ye belge olarak da gönder
+        rows = read_closed_trades_for(today)
+        make_and_send_strategy_report(today, rows)
+
+        # Optimize öneri üret ve kaydet
+        rec = recommend_params(rows, OPTIMIZE_MIN_WINRATE, OPTIMIZE_MIN_TRADES)
+        if rec:
+            payload = {
+                "date": today,
+                "recommended": {
+                    "SCALP_TP_PCT": rec["SCALP_TP_PCT"],
+                    "SCALP_SL_PCT": rec["SCALP_SL_PCT"],
+                    "POWER_PREMIUM_MIN": rec["POWER_PREMIUM_MIN"],
+                    "POWER_NORMAL_MIN": rec["POWER_NORMAL_MIN"],
+                    "ATR_BOOST_PCT": rec["ATR_BOOST_PCT"]
+                },
+                "insights": {
+                    "winrate": rec["winrate"],
+                    "avg_tp_bars": rec["avg_tp_bars"],
+                    "best_hour_window": rec["best_hour"]
+                }
+            }
+            save_json(NEXT_PARAMS_FILE, payload["recommended"])
+            pretty = "\n".join([
+                f"• SCALP_TP_PCT = {rec['SCALP_TP_PCT']}",
+                f"• SCALP_SL_PCT = {rec['SCALP_SL_PCT']}",
+                f"• POWER_PREMIUM_MIN = {rec['POWER_PREMIUM_MIN']}",
+                f"• POWER_NORMAL_MIN = {rec['POWER_NORMAL_MIN']}",
+                f"• ATR_BOOST_PCT = {rec['ATR_BOOST_PCT']}",
+                f"• Best Hour = {rec['best_hour'] or '-'}",
+                f"• Winrate = {rec['winrate']:.1f}% | Avg TP Bars = {rec['avg_tp_bars'] or '-'}",
+            ])
+            send_tg("🧪 Optimize Öneri (yarın için):\n" + pretty)
+        else:
+            send_tg("ℹ️ Optimize öneri için bugün yeterli veri yok.")
+
+        # v11: 30 günlük öğrenme & aylık rapor
+        last30 = load_last_30_days_rows()
+        hrs = compute_hourly_learning(last30)
+        coins = compute_best_coins(last30)
+        send_tg(
+            "🧠 30 Günlük Öğrenme Güncellendi\n"
+            f"En iyi saatler: {', '.join(hrs.get('best_hours', [])) or '-'}\n"
+            f"En iyi coinler: {', '.join(coins.get('best_coins', [])) or '-'}"
+        )
+        if is_month_end():
+            # Aylık özet
+            mk = month_key_ist()
+            total = len([r for r in last30 if r.get('time_close','').startswith(mk)])
+            send_tg(f"📅 Aylık Özet ({mk}) hazırlandı.\nToplam kapanan işlem: {total}")
+
+        state["last_daily_summary_date"] = today
+
+# ========= ANA DÖNGÜ (CROSS + SCALP + TP/SL) =========
 def main():
-    log("🚀 v9.7 Başladı (Cross≥60 + Scalp≥68 | RSI Divergence + ATR Boost | Günlük Rapor)")
+    log("🚀 v11 Başladı (Cross≥60 + Scalp≥68 | Optimize + 30g Öğrenme)")
     state = ensure_state(safe_load_json(STATE_FILE))
+
+    # v10: açılışta optimize parametreleri uygula
+    if OPTIMIZE_APPLY_ON_START:
+        params = load_json(NEXT_PARAMS_FILE, {})
+        applied = []
+        def setf(name, val):
+            globals()[name] = float(val)
+            applied.append(f"{name}={val}")
+        if "SCALP_TP_PCT" in params: setf("SCALP_TP_PCT", params["SCALP_TP_PCT"])
+        if "SCALP_SL_PCT" in params: setf("SCALP_SL_PCT", params["SCALP_SL_PCT"])
+        if "POWER_PREMIUM_MIN" in params: setf("POWER_PREMIUM_MIN", params["POWER_PREMIUM_MIN"])
+        if "POWER_NORMAL_MIN" in params: setf("POWER_NORMAL_MIN", params["POWER_NORMAL_MIN"])
+        if "ATR_BOOST_PCT" in params: setf("ATR_BOOST_PCT", params["ATR_BOOST_PCT"])
+        if applied:
+            send_tg("🧠 Optimize parametreler yüklendi:\n" + "\n".join("• " + x for x in applied))
+            log("[OPT] applied at start: " + ", ".join(applied))
 
     symbols = get_futures_symbols()
     if not symbols:
@@ -402,7 +702,6 @@ def main():
                             f"Power: {cross['power']:.1f}\n"
                             f"Time: {now_ist()}"
                         )
-                        # günlük sayaç ↑
                         state["daily_counters"]["cross"] = state["daily_counters"].get("cross", 0) + 1
                     state["last_cross"][sym] = {"dir": cross["dir"], "bar_close_ms": cross["bar_close_ms"]}
 
@@ -418,7 +717,6 @@ def main():
                         f"TP≈{scalp['tp']:.6f} | SL≈{scalp['sl']:.6f}\n"
                         f"Time: {now_ist()}"
                     )
-                    # Açık pozisyona ekle (CSV + state)
                     with open(OPEN_CSV, "a", newline="", encoding="utf-8") as f:
                         csv.writer(f).writerow([sym, scalp["dir"], scalp["price"], scalp["tp"], scalp["sl"],
                                                 scalp["power"], scalp["rsi"], scalp["div"], now_ist()])
@@ -428,12 +726,11 @@ def main():
                         "rsi": scalp["rsi"], "div": scalp["div"], "open": now_ist(), "bar": bar
                     })
                     state["last_slope_dir"][sym] = scalp["dir"]
-                    # günlük sayaç ↑
                     state["daily_counters"]["scalp"] = state["daily_counters"].get("scalp", 0) + 1
 
             time.sleep(SLEEP_BETWEEN)
 
-        # === Açık scalp pozisyonlarını TP/SL için takip et ===
+        # === Açık scalp pozisyonlarını TP/SL için takip et & kapananları kaydet ===
         still_open = []
         for t in state["open_positions"]:
             lp = get_last_price(t["symbol"])
@@ -454,15 +751,20 @@ def main():
                 f"PnL: {pnl:.2f}%  Bars: {bars_open}\n"
                 f"From: SCALP"
             )
+            row = [t["symbol"], t["dir"], t["entry"], lp, res, pnl, bars_open,
+                   t["power"], t["rsi"], t["div"], t["open"], now_ist()]
             with open(CLOSED_CSV, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([
-                    t["symbol"], t["dir"], t["entry"], lp, res, pnl, bars_open,
-                    t["power"], t["rsi"], t["div"], t["open"], now_ist()
-                ])
+                csv.writer(f).writerow(row)
+            # monthly dataset'e de pushla
+            append_monthly_trade({
+                "symbol": t["symbol"], "direction": t["dir"], "entry": t["entry"], "exit": lp,
+                "result": res, "pnl": pnl, "bars": bars_open, "power": t["power"], "rsi": t["rsi"],
+                "divergence": t["div"], "time_open": t["open"], "time_close": now_ist()
+            })
 
         state["open_positions"] = still_open
 
-        # Günlük sayaç/rapor yönetimi
+        # Günlük sayaç/rapor yönetimi + öğrenme
         roll_daily_counters_if_needed(state)
         maybe_send_daily_summary(state)
 
