@@ -1,7 +1,8 @@
-# === EMA ULTRA FINAL v11.3 ===
+# === EMA ULTRA FINAL v11.4 ===
 # Confirmed Cross (1-bar) + Multi-Tier Premium Colors 🟨🟦🟩
 # 4h + 1D Trend Alignment (Cross & Scalp), RSI Divergence, ATR Boost
-# Telegram sinyalleri, Günlük rapor, (opsiyonel) Auto-Optimize + 30g öğrenme altyapısı
+# Telegram sinyalleri, Günlük rapor
+# 🔒 v11.4: Clean Signal Engine → CROSS & SCALP duplicate prevention
 
 import os, json, csv, time, requests
 from datetime import datetime, timedelta, timezone
@@ -37,9 +38,8 @@ SLEEP_BETWEEN = 0.12
 DAILY_SUMMARY_ENABLED = True
 DAILY_SUMMARY_TIME = "23:59"
 
-# (Opsiyonel) Auto-Optimize başlangıçta uygula
-OPTIMIZE_APPLY_ON_START = True
-NEXT_PARAMS_FILE = "next_day_params.json"
+# Duplicate önleme (v11.4)
+SCALP_COOLDOWN_BARS = 3  # aynı yön için bu kadar bar içinde SCALP tekrar etmesin
 
 # Dosyalar
 STATE_FILE   = "alerts.json"
@@ -112,7 +112,8 @@ ensure_csv(OPEN_CSV,   ["symbol","direction","entry","tp","sl","power","rsi","di
 ensure_csv(CLOSED_CSV, ["symbol","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
 
 def ensure_state(st):
-    st.setdefault("last_cross", {})            # {sym: {dir, bar_close_ms}}
+    # v11.3 alanları
+    st.setdefault("last_cross", {})            # eski uyumluluk (kullanılmaya devam etmiyoruz)
     st.setdefault("last_slope_dir", {})        # {sym: "UP"/"DOWN"}
     st.setdefault("open_positions", [])
     st.setdefault("last_daily_summary_date", "")
@@ -123,6 +124,9 @@ def ensure_state(st):
         "scalp_premium": 0, "scalp_ultra": 0,
         "cross_align_total": 0, "cross_align_match": 0
     })
+    # v11.4 duplicate önleme
+    st.setdefault("last_cross_seen", {})   # { "BTCUSDT_UP":  bar_close_ms_confirmed }
+    st.setdefault("last_scalp_seen", {})   # { "BTCUSDT_DOWN": last_bar_index }
     return st
 
 def roll_daily_counters_if_needed(state):
@@ -197,7 +201,7 @@ def tier_color(power):
 
 # ========= BINANCE =========
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA-v11.3", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA-v11.4", "Accept": "application/json"})
 
 def get_futures_symbols():
     try:
@@ -372,29 +376,13 @@ def maybe_send_daily_summary(state):
 
 # ========= ANA DÖNGÜ =========
 def main():
-    log("🚀 v11.3 başladı (Confirmed Cross + Tiers + Trend Alignment)")
+    log("🚀 v11.4 başladı (Confirmed Cross + Tiers + Trend Alignment + No-Repeat)")
     state = ensure_state(safe_load_json(STATE_FILE))
 
-    # açılışta optimize parametreleri uygula (varsa)
-    if OPTIMIZE_APPLY_ON_START:
-        try:
-            prm = json.load(open(NEXT_PARAMS_FILE, "r", encoding="utf-8"))
-            applied=[]
-            def setf(n,v): globals()[n]=float(v); applied.append(f"{n}={v}")
-            for k in ["SCALP_TP_PCT","SCALP_SL_PCT","POWER_PREMIUM_MIN","POWER_NORMAL_MIN","ATR_BOOST_PCT"]:
-                if k in prm: setf(k, prm[k])
-            if applied:
-                send_tg("🧠 Optimize parametreler yüklendi:\n" + "\n".join("• "+x for x in applied))
-        except FileNotFoundError:
-            pass
-
     # semboller
-    try:
-        symbols = get_futures_symbols()
-        if not symbols:
-            log("❌ Sembol yok"); return
-    except Exception as e:
-        log(f"symbol err: {e}"); return
+    symbols = get_futures_symbols()
+    if not symbols:
+        log("❌ Sembol yok"); return
 
     bar = 0
     while True:
@@ -409,8 +397,13 @@ def main():
             # === CROSS (Confirmed) ===
             cross = run_cross_engine_confirmed(sym, kl1, kl4, kl1d)
             if cross:
-                prev = state["last_cross"].get(sym, {})
-                if not (prev.get("dir")==cross["dir"] and prev.get("bar_close_ms")==cross["bar_close_ms"]):
+                # v11.4 duplicate guard (symbol+dir per confirmed bar)
+                cross_key = f"{sym}_{cross['dir']}"
+                last_seen_bar = state["last_cross_seen"].get(cross_key)
+                if last_seen_bar == cross["bar_close_ms"]:
+                    # aynı confirmed bar için tekrar etme
+                    pass
+                else:
                     tier, color = tier_color(cross["power"])
                     if tier != "NONE":
                         # alignment sayacı
@@ -440,12 +433,18 @@ def main():
                             f"ATR({ATR_PERIOD}): {cross['atr']:.6f} ({cross['atr_pct']*100:.2f}%)\n"
                             f"Time: {now_ist()}"
                         )
-                    state["last_cross"][sym] = {"dir": cross["dir"], "bar_close_ms": cross["bar_close_ms"]}
+                    # işaretle
+                    state["last_cross_seen"][cross_key] = cross["bar_close_ms"]
 
             # === SCALP (4h trend uyumlu) ===
             scalp = run_scalp_engine(sym, kl1, kl4, kl1d)
             if scalp:
-                if state["last_slope_dir"].get(sym) != scalp["dir"]:
+                scalp_key = f"{sym}_{scalp['dir']}"
+                last_idx = state["last_scalp_seen"].get(scalp_key)
+                if last_idx is not None and (bar - last_idx) <= SCALP_COOLDOWN_BARS:
+                    # cooldown içinde tekrar etme
+                    pass
+                else:
                     tier, color = tier_color(scalp["power"])  # ≥68 buraya zaten girdi
                     align_tag = "✅ 4h/1D Trend Match" if scalp["aligned"] else f"ℹ️ 4h OK, 1D {scalp['trend1d']}"
                     boost_tag = " ⚡ ATR Boost" if scalp["atr_pct"] >= ATR_BOOST_PCT else ""
@@ -459,53 +458,24 @@ def main():
                         f"TP≈{scalp['tp']:.6f} | SL≈{scalp['sl']:.6f}\n"
                         f"Time: {now_ist()}"
                     )
-                    # sayaç
+                    # sayaçlar
                     if tier=="ULTRA": state["daily_counters"]["scalp_ultra"] += 1
                     else:             state["daily_counters"]["scalp_premium"] += 1
-
-                    # açık pozisyon listesi
+                    # işaretle
+                    state["last_scalp_seen"][scalp_key] = bar
+                    # açık pozisyon kaydı (opsiyonel simüle takip)
                     with open(OPEN_CSV, "a", newline="", encoding="utf-8") as f:
                         csv.writer(f).writerow([sym, scalp["dir"], scalp["price"], scalp["tp"], scalp["sl"],
                                                 scalp["power"], scalp["rsi"], scalp["div"], now_ist()])
-                    state["open_positions"].append({
-                        "symbol": sym, "dir": scalp["dir"], "entry": scalp["price"],
-                        "tp": scalp["tp"], "sl": scalp["sl"], "power": scalp["power"],
-                        "rsi": scalp["rsi"], "div": scalp["div"], "open": now_ist(), "bar": bar
-                    })
-                    state["last_slope_dir"][sym] = scalp["dir"]
 
             time.sleep(SLEEP_BETWEEN)
-
-        # === Açık SCALP pozisyonlarını TP/SL ile yönet ===
-        still_open=[]
-        for t in state["open_positions"]:
-            lp = get_last_price(t["symbol"])
-            if lp is None: still_open.append(t); continue
-            pnl = (lp - t["entry"])/t["entry"]*100 if t["dir"]=="UP" else (t["entry"] - lp)/t["entry"]*100
-            bars_open = bar - t["bar"]
-            hit_tp = (lp >= t["tp"]) if t["dir"]=="UP" else (lp <= t["tp"])
-            hit_sl = (lp <= t["sl"]) if t["dir"]=="UP" else (lp >= t["sl"])
-            if not (hit_tp or hit_sl): still_open.append(t); continue
-
-            res = "TP" if hit_tp else "SL"
-            send_tg(
-                f"📘 {res} | {t['symbol']} {t['dir']}\n"
-                f"Entry: {t['entry']:.6f}  Exit: {lp:.6f}\n"
-                f"PnL: {pnl:.2f}%  Bars: {bars_open}\n"
-                f"From: SCALP"
-            )
-            with open(CLOSED_CSV, "a", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow([t["symbol"], t["dir"], t["entry"], lp, res, pnl, bars_open,
-                                        t["power"], t["rsi"], t["div"], t["open"], now_ist()])
-
-        state["open_positions"] = still_open
 
         # günlük idare
         roll_daily_counters_if_needed(state)
         maybe_send_daily_summary(state)
 
         safe_save_json(STATE_FILE, state)
-        log(f"Scan done | Open scalp: {len(still_open)}")
+        log(f"Scan done | Bar: {bar}")
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
