@@ -44,7 +44,7 @@ SIM_ENABLE = os.getenv("SIM_ENABLE", "1") == "1"
 SIM_MIN_POWER = int(os.getenv("SIM_MIN_POWER", "60"))   # POWER ≥ 60 ise simülasyon al
 SIM_TP_PCT = float(os.getenv("SIM_TP_PCT", "0.01"))     # +%1 TP
 # SL yüzde: 0.03 / 0.04 / 0.05 (kullanıcı isteğine göre)
-SIM_SL_PCT = float(os.getenv("SIM_SL_PCT", "0.03"))
+SIM_SL_PCT = float(os.getenv("SIM_SL_PCT", "0.1"))
 # Rapor aralığı (dakika): varsayılan 60 = saatlik rapor
 REPORT_INTERVAL_MIN = int(os.getenv("REPORT_INTERVAL_MIN", "60"))
 
