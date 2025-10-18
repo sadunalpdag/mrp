@@ -1,273 +1,244 @@
-# === EMA ULTRA FINAL v9.2 ===
-# Binance only | Smart Scalp (Power≥68, TP 0.6%) | Anti-Duplicate | Bars since last reversal
+# === EMA ULTRA FINAL v9.4 ===
+# Dual Signal Engine (Normal + Premium Scalp)
+# Binance Futures | EMA + ATR + RSI + Trend Filter | TP/SL + CSV Logging | Istanbul Time
 
-import os, time, json, io, requests, csv
-from datetime import datetime, timezone
+import os, json, csv, time, requests
+from datetime import datetime, timedelta, timezone
 
 # ========= AYARLAR =========
 LIMIT = 300
-INTERVALS = ["1h", "4h", "1d"]
 ATR_PERIOD = 14
-SCAN_INTERVAL = 300      # 5 dk
-SLEEP_BETWEEN = 0.2
-
-# --- SIMULASYON ---
-SIM_ENABLE = True
-SCALP_MIN_POWER = 68
-SCALP_TP_PCT = 0.006     # %0.6
-SIM_SL_PCT = 0.10        # %10
-REPORT_INTERVAL_MIN = 60
+RSI_PERIOD = 14
+SCAN_INTERVAL = 300        # 5 dakika
+SLEEP_BETWEEN = 0.15
+SCALP_TP_PCT = 0.006
+SCALP_SL_PCT = 0.10
+POWER_NORMAL_MIN = 60
+POWER_PREMIUM_MIN = 68
+STATE_FILE = "alerts.json"
+OPEN_CSV = "open_positions.csv"
+CLOSED_CSV = "closed_trades.csv"
+LOG_FILE = "log.txt"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-STATE_FILE = "alerts.json"
-LOG_FILE = "log.txt"
 
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/2.1"})
-
-
-# ========= UTILS =========
-def nowiso():
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
+# ========= YARDIMCI =========
+def now_ist():
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0).isoformat()
 
 def log(msg):
     print(msg, flush=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now()} - {msg}\n")
-
+        f.write(f"{now_ist()} - {msg}\n")
 
 def send_tg(text):
     if not BOT_TOKEN or not CHAT_ID:
+        log("[!] Telegram bilgileri eksik")
         return
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=10)
-    except:
-        pass
+        log(f"[TG] {text}")
+    except Exception as e:
+        log(f"Telegram hatası: {e}")
 
-
-def send_doc(b, fname, cap=""):
-    if not BOT_TOKEN or not CHAT_ID:
-        return
+def safe_load_json(path):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-        requests.post(url, files={'document': (fname, b)}, data={'chat_id': CHAT_ID, 'caption': cap}, timeout=20)
-    except:
-        pass
-
-
-def safe_load(p):
-    try:
-        if os.path.exists(p):
-            return json.load(open(p, "r", encoding="utf-8"))
+        if os.path.exists(path):
+            return json.load(open(path, "r", encoding="utf-8"))
     except:
         pass
     return {}
 
+def safe_save_json(path, data):
+    tmp = path + ".tmp"
+    json.dump(data, open(tmp, "w", encoding="utf-8"), indent=2)
+    os.replace(tmp, path)
 
-def safe_save(p, d):
-    tmp = p + ".tmp"
-    json.dump(d, open(tmp, "w", encoding="utf-8"), indent=2)
-    os.replace(tmp, p)
+def ensure_csv(path, headers):
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
 
-
-# ========= INDIKATORLER =========
-def ema(v, l):
-    k = 2 / (l + 1)
-    e = [v[0]]
-    for i in range(1, len(v)):
-        e.append(v[i] * k + e[-1] * (1 - k))
+# ========= INDIKATOR =========
+def ema(vals, length):
+    k = 2 / (length + 1)
+    e = [vals[0]]
+    for i in range(1, len(vals)):
+        e.append(vals[i] * k + e[-1] * (1 - k))
     return e
 
-
-def atr_series(h, lw, c, p=14):
+def atr_series(h, l, c, p=14):
     trs = []
     for i in range(len(h)):
         if i == 0:
-            trs.append(h[i] - lw[i])
+            trs.append(h[i] - l[i])
         else:
-            pc = c[i - 1]
-            trs.append(max(h[i] - lw[i], abs(h[i] - pc), abs(lw[i] - pc)))
+            prev_c = c[i - 1]
+            trs.append(max(h[i] - l[i], abs(h[i] - prev_c), abs(l[i] - prev_c)))
     if len(trs) < p:
-        return [0] * len(trs)
+        return [0]*len(trs)
     a = [sum(trs[:p]) / p]
     for i in range(p, len(trs)):
-        a.append((a[-1] * (p - 1) + trs[i]) / p)
-    return [0] * (len(trs) - len(a)) + a
+        a.append((a[-1]*(p-1)+trs[i]) / p)
+    return [0]*(len(trs)-len(a)) + a
 
+def rsi(vals, p=14):
+    if len(vals) < p+1:
+        return [50]*len(vals)
+    deltas = [vals[i]-vals[i-1] for i in range(1, len(vals))]
+    gains = [max(d,0) for d in deltas]
+    losses = [abs(min(d,0)) for d in deltas]
+    avg_gain = sum(gains[:p])/p
+    avg_loss = sum(losses[:p])/p
+    rsis = [50]*p
+    for i in range(p, len(deltas)):
+        avg_gain = (avg_gain*(p-1)+gains[i])/p
+        avg_loss = (avg_loss*(p-1)+losses[i])/p
+        rs = avg_gain/avg_loss if avg_loss != 0 else 0
+        r = 100 - 100/(1+rs)
+        rsis.append(r)
+    return [50]*(len(vals)-len(rsis)) + rsis
 
 # ========= BINANCE =========
-def get_klines(sym, intv, limit=LIMIT):
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "EMA-ULTRA-v9.4"})
+
+def get_klines(sym, interval, limit=LIMIT):
     url = "https://fapi.binance.com/fapi/v1/klines"
     try:
-        r = SESSION.get(url, params={"symbol": sym, "interval": intv, "limit": limit}, timeout=10)
+        r = SESSION.get(url, params={"symbol": sym, "interval": interval, "limit": limit}, timeout=10)
         return r.json() if r.status_code == 200 else []
     except:
         return []
 
-
-def get_syms():
+def get_futures_symbols():
     try:
         r = SESSION.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10)
-        d = r.json()
-        return [s["symbol"] for s in d["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+        data = r.json()
+        return [s["symbol"] for s in data["symbols"] if s["quoteAsset"]=="USDT" and s["status"]=="TRADING"]
     except:
         return []
 
+def get_last_price(sym):
+    try:
+        url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}"
+        r = SESSION.get(url, timeout=5).json()
+        return float(r["price"])
+    except:
+        return None
 
-# ========= STATE / SIM =========
-def ensure_state(st):
-    st.setdefault("positions", {})
-    st.setdefault("history", [])
-    st.setdefault("last_report_ts", 0)
-    st.setdefault("last_slope_dir", {})  # 🔸 yeni ekleme
-    st.setdefault("last_reversal_bar", {})  # 🔸 bar zamanı kaydı
-    return st
+# ========= POWER HESABI =========
+def power_v2(s_prev, s_now, atr_now, price, rsi_now):
+    slope_comp = abs(s_now - s_prev) / (atr_now * 0.6) if atr_now > 0 else 0
+    rsi_comp = (rsi_now - 50) / 50
+    atr_comp = atr_now / price * 100
+    return max(0, min(100, 55 + slope_comp*20 + rsi_comp*15 + atr_comp*2))
 
+# ========= CSV =========
+ensure_csv(OPEN_CSV, ["symbol","direction","entry","tp","sl","power","rsi","time_open"])
+ensure_csv(CLOSED_CSV, ["symbol","direction","entry","exit","result","pnl","bars","power","rsi","time_open","time_close"])
 
-def open_pos(st, sym, side, price, src, power, s_prev, s_now):
-    st["positions"][sym] = {
-        "is_open": True,
-        "side": side,
-        "entry": price,
-        "tp_pct": SCALP_TP_PCT,
-        "sl_pct": SIM_SL_PCT,
-        "source": src,
-        "power": power,
-        "opened_at": nowiso(),
-        "bars": 0,
-        "s_prev": s_prev,
-        "s_now": s_now
-    }
-
-
-def check_close(st, sym, price):
-    p = st["positions"].get(sym)
-    if not p or not p.get("is_open"):
-        return
-
-    side = p["side"]
-    e = p["entry"]
-    tp = e * (1 + (p["tp_pct"] if side == "LONG" else -p["tp_pct"]))
-    sl = e * (1 + (-p["sl_pct"] if side == "LONG" else p["sl_pct"]))
-    hit_tp = (price >= tp if side == "LONG" else price <= tp)
-    hit_sl = (price <= sl if side == "LONG" else price >= sl)
-
-    if hit_tp or hit_sl:
-        res = "TP" if hit_tp else "SL"
-        pnl = p["tp_pct"] if hit_tp else -p["sl_pct"]
-        st["positions"][sym]["is_open"] = False
-        st["history"].append({
-            "symbol": sym,
-            "side": side,
-            "entry": round(e, 6),
-            "exit": round(price, 6),
-            "pnl_pct": round(pnl * 100, 2),
-            "outcome": res,
-            "bars": p["bars"],
-            "source": p["source"],
-            "power": p["power"],
-            "slope_prev": p["s_prev"],
-            "slope_now": p["s_now"],
-            "slope_change": p["s_now"] - p["s_prev"],
-            "closed_at": nowiso()
-        })
-        send_tg(f"📘 SIM | {res} | {sym} {side}\nPnL: {pnl*100:.2f}% Bars: {p['bars']} From: {p['source']} Power={p['power']}")
-        safe_save(STATE_FILE, st)
-
-
-def maybe_report(st):
-    if not st["history"]:
-        return
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    if now_ts - st["last_report_ts"] < REPORT_INTERVAL_MIN * 60:
-        return
-    buf = io.StringIO()
-    w = csv.DictWriter(buf, fieldnames=list(st["history"][0].keys()))
-    w.writeheader()
-    w.writerows(st["history"])
-    send_doc(buf.getvalue().encode(), "scalp_report.csv", f"📊 SIM Raporu ({len(st['history'])} işlem)")
-    st["last_report_ts"] = now_ts
-    safe_save(STATE_FILE, st)
-
-
-# ========= SCALP DETECT =========
-def detect_slope_rev(ema7):
-    if len(ema7) < 6:
-        return None, (0, 0)
-    s_now = ema7[-1] - ema7[-4]
-    s_prev = ema7[-2] - ema7[-5]
-    if s_prev < 0 and s_now > 0:
-        return "UP", (s_prev, s_now)
-    if s_prev > 0 and s_now < 0:
-        return "DOWN", (s_prev, s_now)
-    return None, (s_prev, s_now)
-
-
-# ========= MAIN =========
-def process(sym, st, bar_idx):
-    for intv in INTERVALS:
-        kl = get_klines(sym, intv)
-        if not kl or len(kl) < 100:
-            continue
-        closes = [float(k[4]) for k in kl]
-        highs = [float(k[2]) for k in kl]
-        lows = [float(k[3]) for k in kl]
-
-        ema7 = ema(closes, 7)
-        slope_flip, (s_prev, s_now) = detect_slope_rev(ema7)
-        price = closes[-1]
-
-        if intv == "1h" and slope_flip:
-            # 🔸 anti-duplicate
-            if st["last_slope_dir"].get(sym) == slope_flip:
-                continue
-
-            atr = atr_series(highs, lows, closes, ATR_PERIOD)
-            atr_now = atr[-1]
-            scalp_power = max(0, min(100, 60 + abs(s_now - s_prev) / (atr_now * 0.6) * 20))
-            if scalp_power < SCALP_MIN_POWER:
-                continue
-
-            # 🔸 kaç bar sonra geldi?
-            last_rev_bar = st["last_reversal_bar"].get(sym, bar_idx)
-            bars_since = bar_idx - last_rev_bar if bar_idx > last_rev_bar else 0
-            st["last_reversal_bar"][sym] = bar_idx
-
-            # sinyal
-            tp = price * (1 + 0.006 if slope_flip == "UP" else 1 - 0.006)
-            sl = price * (1 - 0.10 if slope_flip == "UP" else 1 + 0.10)
-            send_tg(
-                f"💥 SCALP {('LONG' if slope_flip == 'UP' else 'SHORT')} TRIGGER: {sym}\n"
-                f"Slope: {s_prev:+.6f} → {s_now:+.6f}\n"
-                f"Bars since last reversal: {bars_since}\n"
-                f"TP≈{tp:.6f} | SL≈{sl:.6f}\n"
-                f"Power={scalp_power:.1f}\nTime: {nowiso()}"
-            )
-            open_pos(st, sym, "LONG" if slope_flip == "UP" else "SHORT", price, "SCALP", scalp_power, s_prev, s_now)
-            st["last_slope_dir"][sym] = slope_flip
-            safe_save(STATE_FILE, st)
-
-        check_close(st, sym, price)
-        if sym in st["positions"] and st["positions"][sym].get("is_open"):
-            st["positions"][sym]["bars"] += 1
-
-
+# ========= ANA =========
 def main():
-    log("🚀 v9.2 başlatıldı (Smart Scalp Anti-Duplicate + Bars since reversal)")
-    st = ensure_state(safe_load(STATE_FILE))
-    syms = get_syms()
-    bar_idx = 0
+    log("🚀 v9.4 Başlatıldı (Dual Signal + TP/SL CSV Takip)")
+    state = safe_load_json(STATE_FILE)
+    state.setdefault("last_slope_dir", {})
+    state.setdefault("open_positions", [])
+    symbols = get_futures_symbols()
+    bar = 0
+
     while True:
-        bar_idx += 1
-        for s in syms:
-            process(s, st, bar_idx)
-        maybe_report(st)
-        log(f"⏳ 5dk bekleniyor... (bar {bar_idx})")
+        bar += 1
+        for sym in symbols:
+            kl1 = get_klines(sym, "1h")
+            kl4 = get_klines(sym, "4h")
+            if not kl1 or not kl4: continue
+
+            closes = [float(k[4]) for k in kl1]
+            highs = [float(k[2]) for k in kl1]
+            lows = [float(k[3]) for k in kl1]
+            price = closes[-1]
+
+            ema7, ema25 = ema(closes,7), ema(closes,25)
+            s_now = ema7[-1]-ema7[-4]
+            s_prev = ema7[-2]-ema7[-5]
+            atr_now = atr_series(highs,lows,closes,ATR_PERIOD)[-1]
+            rsi_now = rsi(closes,RSI_PERIOD)[-1]
+            pwr = power_v2(s_prev,s_now,atr_now,price,rsi_now)
+
+            # 4H trend
+            ema7_4h = ema([float(k[4]) for k in kl4],7)
+            ema25_4h = ema([float(k[4]) for k in kl4],25)
+            trend_4h = "UP" if ema7_4h[-1]>ema25_4h[-1] else "DOWN"
+
+            # slope reversal check
+            slope_flip = None
+            if s_prev < 0 and s_now > 0: slope_flip="UP"
+            if s_prev > 0 and s_now < 0: slope_flip="DOWN"
+            if not slope_flip: continue
+            if state["last_slope_dir"].get(sym)==slope_flip: continue
+            state["last_slope_dir"][sym]=slope_flip
+
+            # TP/SL seviyeleri
+            tp = price*(1+SCALP_TP_PCT if slope_flip=="UP" else 1-SCALP_TP_PCT)
+            sl = price*(1-SCALP_SL_PCT if slope_flip=="UP" else 1+SCALP_SL_PCT)
+
+            # === NORMAL SINYAL ===
+            if pwr >= POWER_NORMAL_MIN:
+                send_tg(
+                    f"⚡ NORMAL SIGNAL: {sym}\n"
+                    f"Direction: {slope_flip}\n"
+                    f"RSI(14): {rsi_now:.1f}\n"
+                    f"Power: {pwr:.1f}\n"
+                    f"Slope: {s_prev:+.6f}→{s_now:+.6f}\n"
+                    f"ATR: {atr_now:.6f}\n"
+                    f"Time: {now_ist()}"
+                )
+
+            # === PREMIUM SCALP ===
+            if pwr >= POWER_PREMIUM_MIN and slope_flip==trend_4h:
+                send_tg(
+                    f"🔥 PREMIUM SCALP {('LONG' if slope_flip=='UP' else 'SHORT')}: {sym}\n"
+                    f"Trend(4H): {trend_4h} ✅\n"
+                    f"Power(v2): {pwr:.1f}\n"
+                    f"RSI(14): {rsi_now:.1f}\n"
+                    f"TP≈{tp:.6f} | SL≈{sl:.6f}\n"
+                    f"Time: {now_ist()}"
+                )
+                with open(OPEN_CSV,"a",newline="",encoding="utf-8") as f:
+                    csv.writer(f).writerow([sym,slope_flip,price,tp,sl,pwr,rsi_now,now_ist()])
+                state["open_positions"].append({
+                    "symbol":sym,"dir":slope_flip,"entry":price,
+                    "tp":tp,"sl":sl,"power":pwr,"rsi":rsi_now,"open":now_ist(),"bars":bar
+                })
+
+            time.sleep(SLEEP_BETWEEN)
+
+        # === AÇIK İŞLEMLERİ KONTROL ET ===
+        new_open=[]
+        for t in state["open_positions"]:
+            lp = get_last_price(t["symbol"])
+            if not lp: continue
+            pnl=(lp-t["entry"])/t["entry"]*100 if t["dir"]=="UP" else (t["entry"]-lp)/t["entry"]*100
+            bars_open=bar-t["bars"]
+            if (t["dir"]=="UP" and lp>=t["tp"]) or (t["dir"]=="DOWN" and lp<=t["tp"]):
+                res="TP"
+            elif (t["dir"]=="UP" and lp<=t["sl"]) or (t["dir"]=="DOWN" and lp>=t["sl"]):
+                res="SL"
+            else:
+                new_open.append(t); continue
+
+            send_tg(f"📘 {res} | {t['symbol']} {t['dir']}\nEntry: {t['entry']:.6f} Exit: {lp:.6f}\nPnL: {pnl:.2f}% | Bars: {bars_open}\nFrom: SCALP (Power={t['power']:.1f})")
+            with open(CLOSED_CSV,"a",newline="",encoding="utf-8") as f:
+                csv.writer(f).writerow([t["symbol"],t["dir"],t["entry"],lp,res,pnl,bars_open,t["power"],t["rsi"],t["open"],now_ist()])
+        state["open_positions"]=new_open
+        safe_save_json(STATE_FILE,state)
+
+        log(f"⏳ Tarama tamamlandı. Açık pozisyon: {len(new_open)} | Bar={bar}")
         time.sleep(SCAN_INTERVAL)
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
