@@ -1,5 +1,5 @@
-# === EMA ULTRA FINAL v9.1 (Fixed Indentation) ===
-# Binance only | Smart Scalp (Power≥68, TP 0.6%) | Power≥60 SIM | ATR/RSI/Divergence | CSV rapor
+# === EMA ULTRA FINAL v9.2 ===
+# Binance only | Smart Scalp (Power≥68, TP 0.6%) | Anti-Duplicate | Bars since last reversal
 
 import os, time, json, io, requests, csv
 from datetime import datetime, timezone
@@ -8,19 +8,15 @@ from datetime import datetime, timezone
 LIMIT = 300
 INTERVALS = ["1h", "4h", "1d"]
 ATR_PERIOD = 14
-EARLY_CONFIRM_MS = 30 * 60 * 1000  # 30 dk erken onay
+SCAN_INTERVAL = 300      # 5 dk
+SLEEP_BETWEEN = 0.2
 
 # --- SIMULASYON ---
 SIM_ENABLE = True
-SIM_MIN_POWER = 60
-SIM_TP_PCT = 0.01        # %1
-SIM_SL_PCT = 0.10        # %10
 SCALP_MIN_POWER = 68
 SCALP_TP_PCT = 0.006     # %0.6
-
+SIM_SL_PCT = 0.10        # %10
 REPORT_INTERVAL_MIN = 60
-SLEEP_BETWEEN = 0.2
-SCAN_INTERVAL = 300      # 5 dk
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -28,7 +24,7 @@ STATE_FILE = "alerts.json"
 LOG_FILE = "log.txt"
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA/2.0"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA/2.1"})
 
 
 # ========= UTILS =========
@@ -86,10 +82,6 @@ def ema(v, l):
     return e
 
 
-def slope_value(s, l=3):
-    return s[-1] - s[-l] if len(s) > l else 0
-
-
 def atr_series(h, lw, c, p=14):
     trs = []
     for i in range(len(h)):
@@ -125,23 +117,22 @@ def get_syms():
         return []
 
 
-# ========= SIM =========
-def ensure_sim(st):
+# ========= STATE / SIM =========
+def ensure_state(st):
     st.setdefault("positions", {})
     st.setdefault("history", [])
     st.setdefault("last_report_ts", 0)
+    st.setdefault("last_slope_dir", {})  # 🔸 yeni ekleme
+    st.setdefault("last_reversal_bar", {})  # 🔸 bar zamanı kaydı
     return st
 
 
-def open_pos(st, sym, side, price, src, power, s_prev=None, s_now=None):
-    if sym in st["positions"] and st["positions"][sym].get("is_open"):
-        return
-    tp_pct = SCALP_TP_PCT if src == "SCALP" else SIM_TP_PCT
+def open_pos(st, sym, side, price, src, power, s_prev, s_now):
     st["positions"][sym] = {
         "is_open": True,
         "side": side,
         "entry": price,
-        "tp_pct": tp_pct,
+        "tp_pct": SCALP_TP_PCT,
         "sl_pct": SIM_SL_PCT,
         "source": src,
         "power": power,
@@ -150,11 +141,6 @@ def open_pos(st, sym, side, price, src, power, s_prev=None, s_now=None):
         "s_prev": s_prev,
         "s_now": s_now
     }
-
-
-def tick(st, sym):
-    if sym in st["positions"] and st["positions"][sym].get("is_open"):
-        st["positions"][sym]["bars"] += 1
 
 
 def check_close(st, sym, price):
@@ -172,7 +158,8 @@ def check_close(st, sym, price):
     if hit_tp or hit_sl:
         res = "TP" if hit_tp else "SL"
         pnl = p["tp_pct"] if hit_tp else -p["sl_pct"]
-        h = {
+        st["positions"][sym]["is_open"] = False
+        st["history"].append({
             "symbol": sym,
             "side": side,
             "entry": round(e, 6),
@@ -182,32 +169,13 @@ def check_close(st, sym, price):
             "bars": p["bars"],
             "source": p["source"],
             "power": p["power"],
-            "slope_prev": p.get("s_prev"),
-            "slope_now": p.get("s_now"),
-            "slope_change": (p.get("s_now") - p.get("s_prev")) if (p.get("s_prev") is not None) else None,
+            "slope_prev": p["s_prev"],
+            "slope_now": p["s_now"],
+            "slope_change": p["s_now"] - p["s_prev"],
             "closed_at": nowiso()
-        }
-        st["history"].append(h)
-        st["positions"][sym] = {"is_open": False}
-        send_tg(
-            f"📘 SIM | {res} | {sym} {side}\nPnL: {pnl*100:.2f}% Bars: {p['bars']} From: {p['source']} Power={p['power']}"
-        )
+        })
+        send_tg(f"📘 SIM | {res} | {sym} {side}\nPnL: {pnl*100:.2f}% Bars: {p['bars']} From: {p['source']} Power={p['power']}")
         safe_save(STATE_FILE, st)
-
-
-def make_report_bytes(hist):
-    buf = io.StringIO()
-    w = csv.DictWriter(
-        buf,
-        fieldnames=[
-            "symbol", "side", "entry", "exit", "pnl_pct", "outcome", "bars",
-            "source", "power", "slope_prev", "slope_now", "slope_change", "closed_at"
-        ]
-    )
-    w.writeheader()
-    for r in hist:
-        w.writerow(r)
-    return buf.getvalue().encode("utf-8")
 
 
 def maybe_report(st):
@@ -216,13 +184,16 @@ def maybe_report(st):
     now_ts = int(datetime.now(timezone.utc).timestamp())
     if now_ts - st["last_report_ts"] < REPORT_INTERVAL_MIN * 60:
         return
-    b = make_report_bytes(st["history"])
-    send_doc(b, "sim_report.csv", f"📊 SIM Raporu | {len(st['history'])} işlem")
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=list(st["history"][0].keys()))
+    w.writeheader()
+    w.writerows(st["history"])
+    send_doc(buf.getvalue().encode(), "scalp_report.csv", f"📊 SIM Raporu ({len(st['history'])} işlem)")
     st["last_report_ts"] = now_ts
     safe_save(STATE_FILE, st)
 
 
-# ========= SCALP =========
+# ========= SCALP DETECT =========
 def detect_slope_rev(ema7):
     if len(ema7) < 6:
         return None, (0, 0)
@@ -235,8 +206,8 @@ def detect_slope_rev(ema7):
     return None, (s_prev, s_now)
 
 
-# ========= ANA =========
-def process(sym, st):
+# ========= MAIN =========
+def process(sym, st, bar_idx):
     for intv in INTERVALS:
         kl = get_klines(sym, intv)
         if not kl or len(kl) < 100:
@@ -250,37 +221,51 @@ def process(sym, st):
         price = closes[-1]
 
         if intv == "1h" and slope_flip:
+            # 🔸 anti-duplicate
+            if st["last_slope_dir"].get(sym) == slope_flip:
+                continue
+
             atr = atr_series(highs, lows, closes, ATR_PERIOD)
             atr_now = atr[-1]
-            atr_pct = atr_now / price if price > 0 else 0
             scalp_power = max(0, min(100, 60 + abs(s_now - s_prev) / (atr_now * 0.6) * 20))
-            if scalp_power >= SCALP_MIN_POWER:
-                tp = price * (1 + 0.006 if slope_flip == "UP" else 1 - 0.006)
-                sl = price * (1 - 0.10 if slope_flip == "UP" else 1 + 0.10)
-                send_tg(
-                    f"💥 SCALP {('LONG' if slope_flip == 'UP' else 'SHORT')} TRIGGER {sym}\n"
-                    f"Slope: {s_prev:+.6f} → {s_now:+.6f}\n"
-                    f"TP≈{tp:.6f} | SL≈{sl:.6f}\n"
-                    f"Power={scalp_power:.1f}\nTime: {nowiso()}"
-                )
-                open_pos(
-                    st, sym, "LONG" if slope_flip == "UP" else "SHORT",
-                    price, "SCALP", round(scalp_power, 1), s_prev, s_now
-                )
+            if scalp_power < SCALP_MIN_POWER:
+                continue
 
-        tick(st, sym)
+            # 🔸 kaç bar sonra geldi?
+            last_rev_bar = st["last_reversal_bar"].get(sym, bar_idx)
+            bars_since = bar_idx - last_rev_bar if bar_idx > last_rev_bar else 0
+            st["last_reversal_bar"][sym] = bar_idx
+
+            # sinyal
+            tp = price * (1 + 0.006 if slope_flip == "UP" else 1 - 0.006)
+            sl = price * (1 - 0.10 if slope_flip == "UP" else 1 + 0.10)
+            send_tg(
+                f"💥 SCALP {('LONG' if slope_flip == 'UP' else 'SHORT')} TRIGGER: {sym}\n"
+                f"Slope: {s_prev:+.6f} → {s_now:+.6f}\n"
+                f"Bars since last reversal: {bars_since}\n"
+                f"TP≈{tp:.6f} | SL≈{sl:.6f}\n"
+                f"Power={scalp_power:.1f}\nTime: {nowiso()}"
+            )
+            open_pos(st, sym, "LONG" if slope_flip == "UP" else "SHORT", price, "SCALP", scalp_power, s_prev, s_now)
+            st["last_slope_dir"][sym] = slope_flip
+            safe_save(STATE_FILE, st)
+
         check_close(st, sym, price)
+        if sym in st["positions"] and st["positions"][sym].get("is_open"):
+            st["positions"][sym]["bars"] += 1
 
 
 def main():
-    log("🚀 v9.1 başlatıldı (Scalp TP 0.6% SL 10% Power≥68)")
-    st = ensure_sim(safe_load(STATE_FILE))
+    log("🚀 v9.2 başlatıldı (Smart Scalp Anti-Duplicate + Bars since reversal)")
+    st = ensure_state(safe_load(STATE_FILE))
     syms = get_syms()
+    bar_idx = 0
     while True:
+        bar_idx += 1
         for s in syms:
-            process(s, st)
+            process(s, st, bar_idx)
         maybe_report(st)
-        log("⏳ 5dk bekleniyor...\n")
+        log(f"⏳ 5dk bekleniyor... (bar {bar_idx})")
         time.sleep(SCAN_INTERVAL)
 
 
