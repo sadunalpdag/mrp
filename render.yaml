@@ -1,0 +1,30 @@
+services:
+  - type: worker
+    name: ema-ultra-ai
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ema.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHAT_ID
+        sync: false
+      - key: DATA_DIR
+        value: /data
+      - key: LEARN_DIR
+        value: /data/data_learning
+      - key: STATE_FILE
+        value: /data/alerts.json
+      - key: OPEN_CSV
+        value: /data/open_positions.csv
+      - key: CLOSED_CSV
+        value: /data/closed_trades.csv
+      - key: LOG_FILE
+        value: /data/log.txt
+    disk:
+      name: ema-ultra-data
+      mountPath: /data
+      sizeGB: 2
