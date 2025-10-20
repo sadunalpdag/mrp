@@ -1,8 +1,9 @@
 # ==============================================================
-#  📘 EMA ULTRA v12.2 — Full System + AI Param Archive (RenderFix)
+#  📘 EMA ULTRA v12.2 — Full System + AI Param Archive (RenderFix+)
 #  Binance Futures EMA+ATR+RSI+ADX + SCALP + AI Learning + Daily CSV
 #  - Render-safe path handling (falls back to ./data if /data not mounted)
 #  - Auto-create folders & CSVs
+#  - 3s mount wait for Render disk
 # ==============================================================
 
 import os, json, csv, io, time, requests
@@ -12,25 +13,52 @@ import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from joblib import dump, load
 
-# ================= RENDER-SAFE YOLLAR =================
+# ================= RENDER GÜVENLİ DİZİN (istenen düzeltme) =================
+# Render güvenli dizin
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))               # fallback: ./data
-LEARN_DIR = os.getenv("LEARN_DIR", os.path.join(DATA_DIR, "data_learning"))
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
+if not DATA_DIR:
+    DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Tüm dosya yolları DATA_DIR ile kurulsun
+LOG_FILE    = os.path.join(DATA_DIR, "log.txt")
+STATE_FILE  = os.path.join(DATA_DIR, "alerts.json")
+OPEN_CSV    = os.path.join(DATA_DIR, "open_positions.csv")
+CLOSED_CSV  = os.path.join(DATA_DIR, "closed_trades.csv")
+
+# Öğrenme/Arşiv klasörleri (DATA_DIR altında)
+LEARN_DIR = os.path.join(DATA_DIR, "data_learning")
 PARAM_HISTORY_DIR = os.path.join(LEARN_DIR, "params_history")
-
-LOG_FILE = os.getenv("LOG_FILE", os.path.join(DATA_DIR, "log.txt"))
-STATE_FILE = os.getenv("STATE_FILE", os.path.join(DATA_DIR, "alerts.json"))
-OPEN_CSV = os.getenv("OPEN_CSV", os.path.join(DATA_DIR, "open_positions.csv"))
-CLOSED_CSV = os.getenv("CLOSED_CSV", os.path.join(DATA_DIR, "closed_trades.csv"))
-
 WEEK_MODEL_FILE    = os.path.join(LEARN_DIR, "week_model.json")
 WEEKEND_MODEL_FILE = os.path.join(LEARN_DIR, "weekend_model.json")
 WEEK_MODEL_PKL     = os.path.join(LEARN_DIR, "week_model.pkl")
 WEEKEND_MODEL_PKL  = os.path.join(LEARN_DIR, "weekend_model.pkl")
 
-# ================= TELEGRAM =================
+# ================= TELEGRAM (ENV'den okunur) =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
+
+# ================= ZAMAN / LOG / FS HELPERS =================
+def now_ist_dt():
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
+
+def now_ist(): return now_ist_dt().isoformat()
+def today_ist_date(): return now_ist_dt().strftime("%Y-%m-%d")
+def now_ist_hhmm(): return now_ist_dt().strftime("%H:%M")
+def is_weekend_ist(): return now_ist_dt().weekday() in (5, 6)
+
+def ensure_dir(path):
+    try: os.makedirs(path, exist_ok=True)
+    except: pass
+
+def log(msg):
+    print(msg, flush=True)
+    try:
+        ensure_dir(os.path.dirname(LOG_FILE) or ".")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{now_ist()} - {msg}\n")
+    except: pass
 
 def send_tg(text):
     if not BOT_TOKEN or not CHAT_ID:
@@ -53,27 +81,6 @@ def send_tg_document(filename, bytes_content):
         log(f"[TG] document sent: {filename}")
     except Exception as e:
         log(f"[TG] doc error: {e}")
-
-# ================= ZAMAN / LOG =================
-def now_ist_dt():
-    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
-
-def now_ist(): return now_ist_dt().isoformat()
-def today_ist_date(): return now_ist_dt().strftime("%Y-%m-%d")
-def now_ist_hhmm(): return now_ist_dt().strftime("%H:%M")
-def is_weekend_ist(): return now_ist_dt().weekday() in (5, 6)
-
-def ensure_dir(path):
-    try: os.makedirs(path, exist_ok=True)
-    except: pass
-
-def log(msg):
-    print(msg, flush=True)
-    try:
-        ensure_dir(os.path.dirname(LOG_FILE) or ".")
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{now_ist()} - {msg}\n")
-    except: pass
 
 def safe_load_json(path, default=None):
     try:
@@ -110,6 +117,9 @@ ensure_dir(PARAM_HISTORY_DIR)
 ensure_csv(OPEN_CSV,   ["symbol","type","direction","entry","tp","sl","power","rsi","divergence","time_open"])
 ensure_csv(CLOSED_CSV, ["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
 log("[INIT] ensured data folders & CSVs")
+# Render disk mount gecikmesi için 3 sn bekle
+time.sleep(3)
+log("[WAIT] Render disk mount için 3sn bekleme eklendi.")
 
 # ================= GENEL AYARLAR =================
 INTERVAL_1H, INTERVAL_4H, INTERVAL_1D = "1h", "4h", "1d"
@@ -670,15 +680,10 @@ def maybe_daily_summary_and_learn(state):
         state["last_daily_summary_date"] = today_ist_date()
 
 # ================= ANA DÖNGÜ =================
-def tier_color(power):
-    if power >= PARAM["POWER_ULTRA_MIN"]:   return "ULTRA", "🟩"
-    if power >= PARAM["POWER_PREMIUM_MIN"]: return "PREMIUM", "🟦"
-    if power >= PARAM["POWER_NORMAL_MIN"]:  return "NORMAL", "🟨"
-    return "NONE", ""
-
 def main():
-    send_tg("🚀 EMA ULTRA v12.2 AI Engine started… (RenderFix)")
-    log("🚀 v12.2 başladı (Full + AI Param Archive + RenderFix)")
+    send_tg("🚀 EMA ULTRA v12.2 AI Engine started… (RenderFix+)")
+    log("🚀 v12.2 başladı (Full + AI Param Archive + RenderFix+)")
+
     state = ensure_state(safe_load_json(STATE_FILE))
 
     symbols = get_futures_symbols()
@@ -699,6 +704,7 @@ def main():
             kl4  = get_klines(sym, INTERVAL_4H, limit=LIMIT_4H)
             kl1d = get_klines(sym, INTERVAL_1D, limit=LIMIT_1D)
             if not kl1 or len(kl1)<120 or not kl4 or len(kl4)<50 or not kl1d or len(kl1d)<50:
+                time.sleep(SLEEP_BETWEEN)
                 continue
 
             # === CROSS (confirmed 1-bar) ===
@@ -756,7 +762,7 @@ def main():
                         align_tag = "✅ 4h/1D Trend Match" if scalp["aligned"] else f"ℹ️ 4h OK, 1D {scalp['trend1d']}"
                         boost_tag = " ⚡ ATR Boost" if scalp["atr_pct"] >= PARAM["ATR_BOOST_PCT"] else ""
                         adx_tag   = f"ADX: {scalp['adx']:.1f}"
-                        vol_tag   = f"VOL Spike x{scalp['vol_mult']:.2f}" if scalp["vol_mult"] >= VOL_SPIKE_MULT else f"VOL x{scalp['vol_mult']:.2f}"
+                        vol_tag   = f"VOL Spike x{scalp['vol_mult']:.2f}" if scalp['vol_mult'] >= VOL_SPIKE_MULT else f"VOL x{scalp['vol_mult']:.2f}"
                         header = f"{color} {'ULTRA' if tier=='ULTRA' else 'PREMIUM'} SCALP: {sym} ({INTERVAL_1H})"
                         send_tg(
                             f"{header}\n"
