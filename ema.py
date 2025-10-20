@@ -1,38 +1,120 @@
 # ==============================================================
-#  📘 EMA ULTRA v12.2 — Full System + AI Param Archive
-#  Binance Futures EMA+ATR+RSI+ADX+AI Learning (Render-ready)
+#  📘 EMA ULTRA v12.2 — Full System + AI Param Archive (RenderFix)
+#  Binance Futures EMA+ATR+RSI+ADX + SCALP + AI Learning + Daily CSV
+#  - Render-safe path handling (falls back to ./data if /data not mounted)
+#  - Auto-create folders & CSVs
 # ==============================================================
 
 import os, json, csv, io, time, requests
 from datetime import datetime, timezone, timedelta
-
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from joblib import dump, load
 
-# ================= ORTAM / DOSYA YOLLARI =================
+# ================= RENDER-SAFE YOLLAR =================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))               # fallback: ./data
+LEARN_DIR = os.getenv("LEARN_DIR", os.path.join(DATA_DIR, "data_learning"))
+PARAM_HISTORY_DIR = os.path.join(LEARN_DIR, "params_history")
+
+LOG_FILE = os.getenv("LOG_FILE", os.path.join(DATA_DIR, "log.txt"))
+STATE_FILE = os.getenv("STATE_FILE", os.path.join(DATA_DIR, "alerts.json"))
+OPEN_CSV = os.getenv("OPEN_CSV", os.path.join(DATA_DIR, "open_positions.csv"))
+CLOSED_CSV = os.getenv("CLOSED_CSV", os.path.join(DATA_DIR, "closed_trades.csv"))
+
+WEEK_MODEL_FILE    = os.path.join(LEARN_DIR, "week_model.json")
+WEEKEND_MODEL_FILE = os.path.join(LEARN_DIR, "weekend_model.json")
+WEEK_MODEL_PKL     = os.path.join(LEARN_DIR, "week_model.pkl")
+WEEKEND_MODEL_PKL  = os.path.join(LEARN_DIR, "weekend_model.pkl")
+
+# ================= TELEGRAM =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
-DATA_DIR   = os.getenv("DATA_DIR", "/data")
-LEARN_DIR  = os.getenv("LEARN_DIR", os.path.join(DATA_DIR, "data_learning"))
-STATE_FILE = os.getenv("STATE_FILE", os.path.join(DATA_DIR, "alerts.json"))
-OPEN_CSV   = os.getenv("OPEN_CSV",   os.path.join(DATA_DIR, "open_positions.csv"))
-CLOSED_CSV = os.getenv("CLOSED_CSV", os.path.join(DATA_DIR, "closed_trades.csv"))
-LOG_FILE   = os.getenv("LOG_FILE",   os.path.join(DATA_DIR, "log.txt"))
+def send_tg(text):
+    if not BOT_TOKEN or not CHAT_ID:
+        log("[TG] env eksik"); return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
+        log(f"[TG] {text.splitlines()[0][:64]} ...")
+    except Exception as e:
+        log(f"[TG] send error: {e}")
 
-PARAM_HISTORY_DIR = os.path.join(LEARN_DIR, "params_history")
-WEEK_MODEL_FILE   = os.path.join(LEARN_DIR, "week_model.json")
-WEEKEND_MODEL_FILE= os.path.join(LEARN_DIR, "weekend_model.json")
-WEEK_MODEL_PKL    = os.path.join(LEARN_DIR, "week_model.pkl")
-WEEKEND_MODEL_PKL = os.path.join(LEARN_DIR, "weekend_model.pkl")
+def send_tg_document(filename, bytes_content):
+    if not BOT_TOKEN or not CHAT_ID:
+        log("[TG] env eksik"); return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    files = {'document': (filename, bytes_content)}
+    data = {'chat_id': CHAT_ID, 'caption': filename}
+    try:
+        requests.post(url, data=data, files=files, timeout=30)
+        log(f"[TG] document sent: {filename}")
+    except Exception as e:
+        log(f"[TG] doc error: {e}")
+
+# ================= ZAMAN / LOG =================
+def now_ist_dt():
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
+
+def now_ist(): return now_ist_dt().isoformat()
+def today_ist_date(): return now_ist_dt().strftime("%Y-%m-%d")
+def now_ist_hhmm(): return now_ist_dt().strftime("%H:%M")
+def is_weekend_ist(): return now_ist_dt().weekday() in (5, 6)
+
+def ensure_dir(path):
+    try: os.makedirs(path, exist_ok=True)
+    except: pass
+
+def log(msg):
+    print(msg, flush=True)
+    try:
+        ensure_dir(os.path.dirname(LOG_FILE) or ".")
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{now_ist()} - {msg}\n")
+    except: pass
+
+def safe_load_json(path, default=None):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except: pass
+    return {} if default is None else default
+
+def safe_save_json(path, data):
+    try:
+        ensure_dir(os.path.dirname(path) or ".")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        log(f"[ERR] save_json {path}: {e}")
+
+def ensure_csv(path, headers):
+    try:
+        ensure_dir(os.path.dirname(path) or ".")
+        if not os.path.exists(path):
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(headers)
+            log(f"[INIT] CSV oluşturuldu: {path}")
+    except Exception as e:
+        log(f"[ERR] CSV oluşturulamadı: {path} → {e}")
+
+# === İlk kurulum (dizin/CSV) ===
+ensure_dir(DATA_DIR)
+ensure_dir(LEARN_DIR)
+ensure_dir(PARAM_HISTORY_DIR)
+ensure_csv(OPEN_CSV,   ["symbol","type","direction","entry","tp","sl","power","rsi","divergence","time_open"])
+ensure_csv(CLOSED_CSV, ["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
+log("[INIT] ensured data folders & CSVs")
 
 # ================= GENEL AYARLAR =================
 INTERVAL_1H, INTERVAL_4H, INTERVAL_1D = "1h", "4h", "1d"
 LIMIT_1H, LIMIT_4H, LIMIT_1D = 500, 300, 250
 
-EMA_1H = (7, 25, 99)    # cross motoru 1h
 ATR_PERIOD = 14
 RSI_PERIOD = 14
 ADX_PERIOD = 14
@@ -44,10 +126,9 @@ SCAN_INTERVAL = 300              # 5 dk
 SLEEP_BETWEEN = 0.12
 DAILY_SUMMARY_ENABLED = True
 DAILY_SUMMARY_TIME = "23:59"     # IST
+LEARN_DAYS = 14
 
-LEARN_DAYS = 14  # 14 gün öğren sonra uygula
-
-# ================= RUNTIME PARAMS (AI ile nazikçe değişir) =================
+# ================= PARAMETRELER (AI ile nazikçe değişir) =================
 PARAM = {
     "POWER_NORMAL_MIN": 60.0,
     "POWER_PREMIUM_MIN": 68.0,
@@ -67,89 +148,6 @@ PARAM = {
 
     "SCALP_COOLDOWN_BARS": 3     # tekrarsızlaşma (aynı yön)
 }
-
-# ================= ZAMAN / LOG / TG =================
-def now_ist_dt():
-    return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
-def now_ist(): return now_ist_dt().isoformat()
-def today_ist_date(): return now_ist_dt().strftime("%Y-%m-%d")
-def now_ist_hhmm(): return now_ist_dt().strftime("%H:%M")
-def is_weekend_ist(): return now_ist_dt().weekday() in (5, 6)
-
-def log(msg):
-    print(msg, flush=True)
-    try:
-        os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{now_ist()} - {msg}\n")
-    except:
-        pass
-
-def send_tg(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        log("[TG] env eksik"); return
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=15)
-        log(f"[TG] {text.splitlines()[0][:60]} ...")
-    except Exception as e:
-        log(f"[TG] send error: {e}")
-
-def send_tg_document(filename, bytes_content):
-    if not BOT_TOKEN or not CHAT_ID:
-        log("[TG] env eksik"); return
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
-    files = {'document': (filename, bytes_content)}
-    data = {'chat_id': CHAT_ID, 'caption': filename}
-    try:
-        requests.post(url, data=data, files=files, timeout=30)
-        log(f"[TG] document sent: {filename}")
-    except Exception as e:
-        log(f"[TG] doc error: {e}")
-
-# ================= DOSYA / STATE / CSV =================
-def safe_load_json(path, default=None):
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except: pass
-    return {} if default is None else default
-
-def safe_save_json(path, data):
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except Exception as e:
-        log(f"[ERR] save_json {path}: {e}")
-
-# === GÜVENLİ DİZİN VE CSV OLUŞTURMA ===
-def ensure_dir(path):
-    try: os.makedirs(path, exist_ok=True)
-    except: pass
-
-def ensure_csv(path, headers):
-    """Dosya yoksa dizini ve CSV dosyasını otomatik oluşturur."""
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        if not os.path.exists(path):
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
-            log(f"[INIT] CSV oluşturuldu: {path}")
-    except Exception as e:
-        log(f"[ERR] CSV oluşturulamadı: {path} → {e}")
-
-# İlk kurulum güvenliği
-ensure_dir(DATA_DIR)
-ensure_dir(LEARN_DIR)
-ensure_dir(PARAM_HISTORY_DIR)
-ensure_csv(OPEN_CSV,   ["symbol","type","direction","entry","tp","sl","power","rsi","divergence","time_open"])
-ensure_csv(CLOSED_CSV, ["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
-log("[INIT] ensured /data folders and CSV files")
 
 # ================= İNDİKATÖRLER =================
 def ema(vals, length):
@@ -275,13 +273,17 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "EMA-ULTRA-v12.2", "Accept": "application/json"})
 BASE = "https://fapi.binance.com"
 
-def get_futures_symbols():
-    try:
-        r = SESSION.get(BASE + "/fapi/v1/exchangeInfo", timeout=15)
-        data = r.json()
-        return [s["symbol"] for s in data["symbols"] if s["quoteAsset"]=="USDT" and s["status"]=="TRADING"]
-    except:
-        return []
+def get_futures_symbols(retries=3, delay=3.0):
+    for i in range(retries):
+        try:
+            r = SESSION.get(BASE + "/fapi/v1/exchangeInfo", timeout=15)
+            data = r.json()
+            syms = [s["symbol"] for s in data["symbols"] if s["quoteAsset"]=="USDT" and s["status"]=="TRADING"]
+            if syms: return syms
+        except Exception as e:
+            log(f"exchangeInfo err try {i+1}/{retries}: {e}")
+        time.sleep(delay)
+    return []
 
 def get_klines(symbol, interval, limit=500):
     url = BASE + "/fapi/v1/klines"
@@ -290,9 +292,11 @@ def get_klines(symbol, interval, limit=500):
         if r.status_code == 200:
             data = r.json()
             now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
-            if int(data[-1][6]) > now_ms: data = data[:-1]
+            # gelecek barı at
+            if data and int(data[-1][6]) > now_ms: data = data[:-1]
             return data
-    except: pass
+    except Exception as e:
+        log(f"klines err {symbol} {interval}: {e}")
     return []
 
 def get_last_price(symbol):
@@ -422,7 +426,8 @@ def run_scalp_engine(sym, kl1, kl4, kl1d):
         "aligned": aligned, "trend4h": d4, "trend1d": d1,
         "adx": adx_now, "vol_mult": vol_mult
     }
-# ================= GÜNLÜK ÖZET / CSV GÖNDER =================
+
+# ================= GÜNLÜK ÖZET & CSV =================
 def build_daily_summary_for(date_str, state):
     rows = []
     try:
@@ -437,7 +442,6 @@ def build_daily_summary_for(date_str, state):
     wins = sum(1 for r in rows if r.get("result")=="TP")
     pnl_sum = sum(float(r.get("pnl","0") or 0) for r in rows)
     bars_sum= sum(int(r.get("bars","0") or 0) for r in rows)
-
     winrate = (wins/total*100.0) if total else 0.0
     avg_pnl = (pnl_sum/total) if total else 0.0
     avg_bars= (bars_sum/total) if total else 0.0
@@ -461,7 +465,7 @@ def daily_csv_bytes(rows, date_str):
                     r.get("divergence"), r.get("time_open"), r.get("time_close")])
     return out.getvalue().encode("utf-8"), f"closed_trades_{date_str}.csv"
 
-# ================= AI LEARNING: DATA & MODEL =================
+# ================= AI LEARNING =================
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def apply_model_to_params(model):
@@ -548,7 +552,7 @@ def train_random_forest(df):
     return model, importances
 
 def save_param_snapshot(model_meta, weekend=False):
-    os.makedirs(PARAM_HISTORY_DIR, exist_ok=True)
+    ensure_dir(PARAM_HISTORY_DIR)
     tag = "weekend" if weekend else "week"
     ts = now_ist_dt().strftime("%Y-%m-%d_%H%M%S")
     fname = os.path.join(PARAM_HISTORY_DIR, f"{ts}_{tag}_params.json")
@@ -557,7 +561,7 @@ def save_param_snapshot(model_meta, weekend=False):
     log(f"[AI] Param snapshot saved → {fname}")
 
 def ai_learning_update_and_apply():
-    os.makedirs(LEARN_DIR, exist_ok=True)
+    ensure_dir(LEARN_DIR)
     weekend = is_weekend_ist()
     json_path = WEEKEND_MODEL_FILE if weekend else WEEK_MODEL_FILE
     pkl_path  = WEEKEND_MODEL_PKL  if weekend else WEEK_MODEL_PKL
@@ -619,7 +623,7 @@ def ai_learning_update_and_apply():
     )
     save_param_snapshot(model_meta, weekend)
 
-# ================= STATE =================
+# ================= STATE & GÜNLÜK =================
 def ensure_state(st):
     st.setdefault("last_slope_dir", {})
     st.setdefault("open_positions", [])
@@ -645,7 +649,6 @@ def roll_daily_counters_if_needed(state):
             "cross_align_total": 0, "cross_align_match": 0
         }
 
-# ================= GÜNLÜK ÖZET & LEARNING TETİK =================
 def maybe_daily_summary_and_learn(state):
     if not DAILY_SUMMARY_ENABLED: return
     if now_ist_hhmm() >= DAILY_SUMMARY_TIME and state.get("last_daily_summary_date") != today_ist_date():
@@ -667,18 +670,24 @@ def maybe_daily_summary_and_learn(state):
         state["last_daily_summary_date"] = today_ist_date()
 
 # ================= ANA DÖNGÜ =================
+def tier_color(power):
+    if power >= PARAM["POWER_ULTRA_MIN"]:   return "ULTRA", "🟩"
+    if power >= PARAM["POWER_PREMIUM_MIN"]: return "PREMIUM", "🟦"
+    if power >= PARAM["POWER_NORMAL_MIN"]:  return "NORMAL", "🟨"
+    return "NONE", ""
+
 def main():
-    send_tg("🚀 EMA ULTRA v12.2 AI Engine started… (Render)")
-    log("🚀 v12.2 başladı (Full + AI Param Archive)")
+    send_tg("🚀 EMA ULTRA v12.2 AI Engine started… (RenderFix)")
+    log("🚀 v12.2 başladı (Full + AI Param Archive + RenderFix)")
     state = ensure_state(safe_load_json(STATE_FILE))
 
     symbols = get_futures_symbols()
     if not symbols:
-        send_tg("❌ Binance sembol listesi boş döndü.")
-        time.sleep(10)
+        send_tg("❌ Binance sembol listesi boş döndü. 3 sn sonra tekrar deniyorum…")
+        time.sleep(3)
         symbols = get_futures_symbols()
         if not symbols:
-            send_tg("⚠️ Tekrar deniyorum; hala boşsa redeploy yapmayı deneyebilirsin.")
+            send_tg("⚠️ Hala boş. Render’da Restart/Manual Redeploy deneyebilirsin.")
             return
     log(f"OK, {len(symbols)} sembol taranacak...")
 
@@ -692,7 +701,7 @@ def main():
             if not kl1 or len(kl1)<120 or not kl4 or len(kl4)<50 or not kl1d or len(kl1d)<50:
                 continue
 
-            # === CROSS (confirmed) ===
+            # === CROSS (confirmed 1-bar) ===
             cross = run_cross_engine_confirmed(sym, kl1, kl4, kl1d)
             if cross:
                 cross_key = f"{sym}_{cross['dir']}"
