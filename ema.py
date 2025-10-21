@@ -1,8 +1,9 @@
-# Generating the EMA ULTRA v12.4 Angle+AIAdaptive integrated Python script and saving it for download
+# Create the final ema.py (RenderFix+, no private trading API) and save for download
 
-code = r'''# ==============================================================
-#  📘 EMA ULTRA v12.4 — Angle+AIAdaptive (Self-Learning Engine, RenderFix)
-#  Binance Futures EMA+ATR+RSI+ADX + SCALP + Angle Momentum + AI Adaptive + Daily CSV + PKL push
+ema_code = r'''# ==============================================================
+#  📘 EMA ULTRA v12.4 — Angle+AIAdaptive (RenderFix+, No-Trade)
+#  Binance Futures PUBLIC data (klines/ticker) only — NO private trading/API keys
+#  EMA+ATR+RSI+ADX + SCALP + Angle Momentum + AI Adaptive + Daily CSV + PKL push
 #  - Render-safe path handling (falls back to ./data if /data not mounted)
 #  - Auto-create folders & CSVs
 #  - 3s mount wait for Render disk
@@ -332,7 +333,7 @@ def power_with_adx_vol(base_power, adx_now, vol_now, vol_ma):
             add += (mult - 1.0) * (PARAM["VOL_MAX_ADD"] / (VOL_SPIKE_MULT - 1.0))
     return max(0.0, min(100.0, base_power + add)), mult
 
-# ================= BINANCE =================
+# ================= BINANCE (PUBLIC ENDPOINTS ONLY) =================
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "EMA-ULTRA-v12.4", "Accept": "application/json"})
 BASE = "https://fapi.binance.com"
@@ -809,7 +810,7 @@ def ai_learning_update_and_apply():
 
     save_param_snapshot(model_meta, weekend)
 
-    # Model pkl dosyasını anlık olarak da Telegram'a gönder (opsiyonel ama faydalı)
+    # Model pkl dosyasını anlık olarak da Telegram'a gönder (opsiyonel)
     try:
         if os.path.exists(pkl_path):
             with open(pkl_path, "rb") as f:
@@ -890,8 +891,8 @@ def maybe_daily_summary_and_learn(state):
 
 # ================= ANA DÖNGÜ =================
 def main():
-    send_tg("🚀 EMA ULTRA v12.4 Angle+AIAdaptive Engine started… (RenderFix)")
-    log("🚀 v12.4 başladı (Angle Momentum + AI Adaptive + RenderFix + Daily Reports)")
+    send_tg("🚀 EMA ULTRA v12.4 Angle+AIAdaptive (RenderFix+, No-Trade) started…")
+    log("🚀 v12.4 başladı (Angle Momentum + AI Adaptive + RenderFix + Daily Reports, No-Trade)")
 
     state = ensure_state(safe_load_json(STATE_FILE))
 
@@ -1050,8 +1051,8 @@ if __name__ == "__main__":
         log(f"FATAL: {e}")
         send_tg(f"❗ Bot hata verdi: {e}")
 '''
-path = "/mnt/data/EMA_ULTRA_v12_4_AngleAIAdaptive.py"
-with open(path, "w", encoding="utf-8") as f:
-    f.write(code)
+file_path = "/mnt/data/ema.py"
+with open(file_path, "w", encoding="utf-8") as f:
+    f.write(ema_code)
 
-path
+file_path
