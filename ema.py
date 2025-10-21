@@ -1051,7 +1051,7 @@ if __name__ == "__main__":
         log(f"FATAL: {e}")
         send_tg(f"❗ Bot hata verdi: {e}")
 '''
-file_path = "/mnt/data/ema.py"
+file_path = os.path.join(DATA_DIR, "ema.py")
 with open(file_path, "w", encoding="utf-8") as f:
     f.write(ema_code)
 
