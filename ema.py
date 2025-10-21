@@ -1,20 +1,23 @@
-# ==============================================================
-#  📘 EMA ULTRA v12.2 — Full System + AI Param Archive (RenderFix+)
-#  Binance Futures EMA+ATR+RSI+ADX + SCALP + AI Learning + Daily CSV
+# Generating the EMA ULTRA v12.4 Angle+AIAdaptive integrated Python script and saving it for download
+
+code = r'''# ==============================================================
+#  📘 EMA ULTRA v12.4 — Angle+AIAdaptive (Self-Learning Engine, RenderFix)
+#  Binance Futures EMA+ATR+RSI+ADX + SCALP + Angle Momentum + AI Adaptive + Daily CSV + PKL push
 #  - Render-safe path handling (falls back to ./data if /data not mounted)
 #  - Auto-create folders & CSVs
 #  - 3s mount wait for Render disk
+#  - Daily end-of-day (IST) summary & AI logs & model .pkl sent to Telegram
+#  - AI signal filter via predicted PnL (+ confidence from tree variance)
 # ==============================================================
 
-import os, json, csv, io, time, requests
+import os, json, csv, io, time, requests, math
 from datetime import datetime, timezone, timedelta
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from joblib import dump, load
 
-# ================= RENDER GÜVENLİ DİZİN (istenen düzeltme) =================
-# Render güvenli dizin
+# ================= RENDER GÜVENLİ DİZİN =================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 if not DATA_DIR:
@@ -34,6 +37,9 @@ WEEK_MODEL_FILE    = os.path.join(LEARN_DIR, "week_model.json")
 WEEKEND_MODEL_FILE = os.path.join(LEARN_DIR, "weekend_model.json")
 WEEK_MODEL_PKL     = os.path.join(LEARN_DIR, "week_model.pkl")
 WEEKEND_MODEL_PKL  = os.path.join(LEARN_DIR, "weekend_model.pkl")
+
+# AI günlük log dosyası
+AI_LOG_FILE = os.path.join(DATA_DIR, "ai_updates.csv")
 
 # ================= TELEGRAM (ENV'den okunur) =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -77,7 +83,7 @@ def send_tg_document(filename, bytes_content):
     files = {'document': (filename, bytes_content)}
     data = {'chat_id': CHAT_ID, 'caption': filename}
     try:
-        requests.post(url, data=data, files=files, timeout=30)
+        requests.post(url, data=data, files=files, timeout=60)
         log(f"[TG] document sent: {filename}")
     except Exception as e:
         log(f"[TG] doc error: {e}")
@@ -114,8 +120,9 @@ def ensure_csv(path, headers):
 ensure_dir(DATA_DIR)
 ensure_dir(LEARN_DIR)
 ensure_dir(PARAM_HISTORY_DIR)
-ensure_csv(OPEN_CSV,   ["symbol","type","direction","entry","tp","sl","power","rsi","divergence","time_open"])
-ensure_csv(CLOSED_CSV, ["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
+ensure_csv(OPEN_CSV,   ["symbol","type","direction","entry","tp","sl","power","rsi","divergence","ang_now","ang_change","time_open"])
+ensure_csv(CLOSED_CSV, ["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","ang_now","ang_change","time_open","time_close"])
+ensure_csv(AI_LOG_FILE, ["date","winrate","avg_pnl","avg_bars","samples","changed_params"])
 log("[INIT] ensured data folders & CSVs")
 # Render disk mount gecikmesi için 3 sn bekle
 time.sleep(3)
@@ -137,6 +144,11 @@ SLEEP_BETWEEN = 0.12
 DAILY_SUMMARY_ENABLED = True
 DAILY_SUMMARY_TIME = "23:59"     # IST
 LEARN_DAYS = 14
+
+# === AI sinyal filtresi ayarları ===
+AI_PREDICT_ENABLE = True     # Model varsa kullan, yoksa bypass
+AI_PNL_THRESHOLD  = 0.30     # %0.30 beklenen PnL altında sinyal açma
+AI_MIN_CONF       = 0.10     # min güven (0-1), tree varianza göre yaklaşık
 
 # ================= PARAMETRELER (AI ile nazikçe değişir) =================
 PARAM = {
@@ -243,6 +255,48 @@ def adx_series(highs, lows, closes, period=14):
     di_minus= di_minus[:len(highs)]
     return adx, di_plus, di_minus
 
+# ================= AÇI / MOMENTUM HELPERS =================
+def slope_per_bar(series, window=3):
+    """EMA (veya kapanış) serisinde son window barlık ortalama eğim (Δ/bars)."""
+    if len(series) < window + 1:
+        return 0.0
+    return (series[-1] - series[-1 - window]) / float(window)
+
+def slope_angle_deg(slope, atr_now, eps=1e-9):
+    """
+    Eğim açı derecesi (ATR ile normalize).
+    s_norm = slope / ATR → angle = arctan(s_norm)
+    """
+    if atr_now <= eps:
+        return 0.0
+    s_norm = slope / atr_now
+    return math.degrees(math.atan(s_norm))
+
+def angle_between_deg(s_prev, s_now, atr_now, eps=1e-9):
+    """
+    İki eğim arasındaki açı (derece).
+    m1 = s_prev/ATR, m2 = s_now/ATR
+    tan(theta) = |(m2 - m1) / (1 + m1*m2)|
+    """
+    if atr_now <= eps:
+        return 0.0
+    m1 = s_prev / atr_now
+    m2 = s_now  / atr_now
+    denom = 1.0 + (m1 * m2)
+    if abs(denom) < eps:
+        return 90.0
+    return math.degrees(math.atan(abs(m2 - m1) / denom))
+
+def power_with_angle(base_power, ang_now, ang_change):
+    """
+    Açının etkisi:
+    - ang_now büyük → trend netliği için +bonus (maks ~+6)
+    - ang_change büyük → keskin yön değişimi için -ceza (maks ~-5)
+    """
+    bonus = min(6.0, max(0.0, (abs(ang_now) / 75.0) * 6.0))   # 75° ⇒ ~+6
+    penalty = min(5.0, (ang_change / 45.0) * 5.0)             # 45° ⇒ ~-5
+    return max(0.0, min(100.0, base_power + bonus - penalty))
+
 # ================= POWER / ETİKETLER =================
 def rsi_divergence(last_close, prev_close, rsi_now, rsi_prev):
     if last_close < prev_close and rsi_now > rsi_prev:  return "Bullish"
@@ -280,7 +334,7 @@ def power_with_adx_vol(base_power, adx_now, vol_now, vol_ma):
 
 # ================= BINANCE =================
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "EMA-ULTRA-v12.2", "Accept": "application/json"})
+SESSION.headers.update({"User-Agent": "EMA-ULTRA-v12.4", "Accept": "application/json"})
 BASE = "https://fapi.binance.com"
 
 def get_futures_symbols(retries=3, delay=3.0):
@@ -327,6 +381,36 @@ def trend_alignment(signal_dir, closes_4h, closes_1d):
     match = (signal_dir == d4) and (signal_dir == d1)
     return match, d4, d1
 
+# ================= AI PREDICT HELPERS =================
+def get_today_model_path():
+    return WEEKEND_MODEL_PKL if is_weekend_ist() else WEEK_MODEL_PKL
+
+def predict_pnl_and_conf(feat_vector, model=None):
+    """
+    feat_vector: [type_is_scalp, dir_is_up, power, rsi, div_bull, div_bear, weekday,
+                  bars, trend_match, atr_pct, adx, vol_mult, ang_now, ang_change]
+    Returns: (pred_pnl, conf)
+    conf ~ 1 - normalized variance of estimators (approx)
+    """
+    try:
+        if model is None:
+            pkl = get_today_model_path()
+            if not os.path.exists(pkl):
+                return None, None
+            model = load(pkl)
+        pred = model.predict([feat_vector])[0]
+        # confidence approx via tree predictions variance
+        if hasattr(model, "estimators_"):
+            preds = np.array([est.predict([feat_vector])[0] for est in model.estimators_])
+            var = float(np.var(preds))
+            conf = 1.0 / (1.0 + var*50.0)  # heuristic scaling
+        else:
+            conf = 0.5
+        return float(pred), float(max(0.0, min(1.0, conf)))
+    except Exception as e:
+        log(f"[AI_PRED_ERR] {e}")
+        return None, None
+
 # ================= ENGINES =================
 def run_cross_engine_confirmed(sym, kl1, kl4, kl1d):
     closes = [float(k[4]) for k in kl1]
@@ -355,9 +439,15 @@ def run_cross_engine_confirmed(sym, kl1, kl4, kl1d):
     atr_now = atr_series(highs, lows, closes, ATR_PERIOD)[-1]
     rsi_all = rsi(closes, RSI_PERIOD)
     rsi_now, rsi_prev = rsi_all[-1], rsi_all[-2]
+
     s_now  = ema7[-1] - ema7[-4]
     s_prev = ema7[-2] - ema7[-5]
     price  = closes[-1]
+
+    # Angles
+    ang_now = slope_angle_deg(s_now, atr_now)
+    ang_prev = slope_angle_deg(s_prev, atr_now)
+    ang_change = angle_between_deg(s_prev, s_now, atr_now)
 
     adx_all, _, _ = adx_series(highs, lows, closes, ADX_PERIOD)
     adx_now = adx_all[-1]
@@ -367,16 +457,36 @@ def run_cross_engine_confirmed(sym, kl1, kl4, kl1d):
     boost, atr_pct = atr_boost(atr_now, price)
     pwr_after_boost = base + boost
     pwr_final, vol_mult = power_with_adx_vol(pwr_after_boost, adx_now, vols[-1], vol_ma)
+    pwr_final = power_with_angle(pwr_final, ang_now, ang_change)
 
     div = rsi_divergence(closes[-1], closes[-2], rsi_now, rsi_prev)
 
     closes4  = [float(k[4]) for k in kl4]
     closes1d = [float(k[4]) for k in kl1d]
     aligned, d4, d1 = trend_alignment(cross_dir, closes4, closes1d)
+    trend_match = 1 if aligned else 0
 
     entry = price
     tp = entry * (1 + PARAM["CROSS_TP_PCT"] if cross_dir == "UP" else 1 - PARAM["CROSS_TP_PCT"])
     sl = entry * (1 - PARAM["CROSS_SL_PCT"] if cross_dir == "UP" else 1 + PARAM["CROSS_SL_PCT"])
+
+    # AI PREDICT FILTER
+    ai_pred, ai_conf = None, None
+    if AI_PREDICT_ENABLE:
+        weekday = now_ist_dt().weekday()
+        type_is_scalp = 0
+        dir_is_up = 1 if cross_dir=="UP" else 0
+        div_bull = 1 if div.lower()=="bullish" else 0
+        div_bear = 1 if div.lower()=="bearish" else 0
+        bars = 0  # open state
+        feat_vector = [type_is_scalp, dir_is_up, pwr_final, rsi_now, div_bull, div_bear,
+                       weekday, bars, trend_match, atr_pct, adx_now, vol_mult, ang_now, ang_change]
+        ai_pred, ai_conf = predict_pnl_and_conf(feat_vector)
+
+        # Yetersiz tahmin veya güven → filtrele
+        if ai_pred is not None and ai_conf is not None:
+            if (ai_pred*100.0) < AI_PNL_THRESHOLD or ai_conf < AI_MIN_CONF:
+                return None
 
     return {
         "symbol": sym, "type": "CROSS", "dir": cross_dir,
@@ -384,7 +494,9 @@ def run_cross_engine_confirmed(sym, kl1, kl4, kl1d):
         "power": pwr_final, "rsi": rsi_now, "div": div,
         "atr": atr_now, "atr_pct": atr_pct, "bar_close_ms": bar_close_ms,
         "aligned": aligned, "trend4h": d4, "trend1d": d1, "confirmed": CROSS_CONFIRM_BARS==1,
-        "adx": adx_now, "vol_mult": vol_mult
+        "adx": adx_now, "vol_mult": vol_mult,
+        "ang_now": ang_now, "ang_prev": ang_prev, "ang_change": ang_change,
+        "ai_pred": ai_pred, "ai_conf": ai_conf
     }
 
 def run_scalp_engine(sym, kl1, kl4, kl1d):
@@ -402,6 +514,7 @@ def run_scalp_engine(sym, kl1, kl4, kl1d):
     if slope_dir != d4: return None
     d1 = ema_trend_dir(closes1d)
     aligned = (slope_dir == d4) and (slope_dir == d1)
+    trend_match = 1 if aligned else 0
 
     highs1 = [float(k[2]) for k in kl1]
     lows1  = [float(k[3]) for k in kl1]
@@ -409,6 +522,11 @@ def run_scalp_engine(sym, kl1, kl4, kl1d):
     atr_now = atr_series(highs1, lows1, closes1, ATR_PERIOD)[-1]
     rsi_now = rsi(closes1, RSI_PERIOD)[-1]
     price   = closes1[-1]
+
+    # Angles
+    ang_now = slope_angle_deg(s_now, atr_now)
+    ang_prev = slope_angle_deg(s_prev, atr_now)
+    ang_change = angle_between_deg(s_prev, s_now, atr_now)
 
     adx_all, _, _ = adx_series(highs1, lows1, closes1, ADX_PERIOD)
     adx_now = adx_all[-1]
@@ -418,6 +536,7 @@ def run_scalp_engine(sym, kl1, kl4, kl1d):
     boost, atr_pct = atr_boost(atr_now, price)
     pwr_after_boost = base + boost
     pwr_final, vol_mult = power_with_adx_vol(pwr_after_boost, adx_now, vols1[-1], vol_ma)
+    pwr_final = power_with_angle(pwr_final, ang_now, ang_change)
 
     rsi_prev = rsi(closes1, RSI_PERIOD)[-2]
     div = rsi_divergence(closes1[-1], closes1[-2], rsi_now, rsi_prev)
@@ -428,13 +547,32 @@ def run_scalp_engine(sym, kl1, kl4, kl1d):
     tp = entry * (1 + PARAM["SCALP_TP_PCT"] if slope_dir == "UP" else 1 - PARAM["SCALP_TP_PCT"])
     sl = entry * (1 - PARAM["SCALP_SL_PCT"] if slope_dir == "UP" else 1 + PARAM["SCALP_SL_PCT"])
 
+    # AI PREDICT FILTER
+    ai_pred, ai_conf = None, None
+    if AI_PREDICT_ENABLE:
+        weekday = now_ist_dt().weekday()
+        type_is_scalp = 1
+        dir_is_up = 1 if slope_dir=="UP" else 0
+        div_bull = 1 if div.lower()=="bullish" else 0
+        div_bear = 1 if div.lower()=="bearish" else 0
+        bars = 0
+        feat_vector = [type_is_scalp, dir_is_up, pwr_final, rsi_now, div_bull, div_bear,
+                       weekday, bars, trend_match, atr_pct, adx_now, vol_mult, ang_now, ang_change]
+        ai_pred, ai_conf = predict_pnl_and_conf(feat_vector)
+
+        if ai_pred is not None and ai_conf is not None:
+            if (ai_pred*100.0) < AI_PNL_THRESHOLD or ai_conf < AI_MIN_CONF:
+                return None
+
     return {
         "symbol": sym, "type": "SCALP", "dir": slope_dir,
         "entry": entry, "tp": tp, "sl": sl,
         "power": pwr_final, "rsi": rsi_now, "div": div,
         "atr": atr_now, "atr_pct": atr_pct,
         "aligned": aligned, "trend4h": d4, "trend1d": d1,
-        "adx": adx_now, "vol_mult": vol_mult
+        "adx": adx_now, "vol_mult": vol_mult,
+        "ang_now": ang_now, "ang_prev": ang_prev, "ang_change": ang_change,
+        "ai_pred": ai_pred, "ai_conf": ai_conf
     }
 
 # ================= GÜNLÜK ÖZET & CSV =================
@@ -468,42 +606,50 @@ def build_daily_summary_for(date_str, state):
 def daily_csv_bytes(rows, date_str):
     out = io.StringIO()
     w = csv.writer(out)
-    w.writerow(["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","time_open","time_close"])
+    w.writerow(["symbol","type","direction","entry","exit","result","pnl","bars","power","rsi","divergence","ang_now","ang_change","time_open","time_close"])
     for r in rows:
         w.writerow([r.get("symbol"), r.get("type"), r.get("direction"), r.get("entry"), r.get("exit"),
                     r.get("result"), r.get("pnl"), r.get("bars"), r.get("power"), r.get("rsi"),
-                    r.get("divergence"), r.get("time_open"), r.get("time_close")])
+                    r.get("divergence"), r.get("ang_now"), r.get("ang_change"), r.get("time_open"), r.get("time_close")])
     return out.getvalue().encode("utf-8"), f"closed_trades_{date_str}.csv"
 
 # ================= AI LEARNING =================
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def apply_model_to_params(model):
+    """Parametreleri güncelle ve değişenleri {param:[old,new]} döndür."""
+    changed = {}
+
+    def change(k, new):
+        old = PARAM[k]
+        if abs(old - new) > 1e-9:
+            PARAM[k] = new
+            changed[k] = [old, new]
+
     win = model.get("winrate", 0.0)
     avg_bars = model.get("avg_bars", 0.0)
     avg_pnl  = model.get("avg_pnl", 0.0)
 
     if win >= 70:
-        PARAM["CROSS_TP_PCT"] = clamp(PARAM["CROSS_TP_PCT"] + 0.0003, 0.006, 0.015)
-        PARAM["SCALP_TP_PCT"] = clamp(PARAM["SCALP_TP_PCT"] + 0.0002, 0.004, 0.012)
-        PARAM["CROSS_SL_PCT"] = clamp(PARAM["CROSS_SL_PCT"] - 0.002, 0.02, 0.06)
+        change("CROSS_TP_PCT", clamp(PARAM["CROSS_TP_PCT"] + 0.0003, 0.006, 0.015))
+        change("SCALP_TP_PCT", clamp(PARAM["SCALP_TP_PCT"] + 0.0002, 0.004, 0.012))
+        change("CROSS_SL_PCT", clamp(PARAM["CROSS_SL_PCT"] - 0.002, 0.02, 0.06))
     elif win < 50:
-        PARAM["POWER_NORMAL_MIN"]  = clamp(PARAM["POWER_NORMAL_MIN"] + 2, 55, 72)
-        PARAM["POWER_PREMIUM_MIN"] = clamp(PARAM["POWER_PREMIUM_MIN"] + 2, 60, 80)
-        PARAM["CROSS_TP_PCT"] = clamp(PARAM["CROSS_TP_PCT"] - 0.0005, 0.004, 0.012)
-        PARAM["SCALP_TP_PCT"] = clamp(PARAM["SCALP_TP_PCT"] - 0.0004, 0.003, 0.010)
+        change("POWER_NORMAL_MIN",  clamp(PARAM["POWER_NORMAL_MIN"] + 2, 55, 72))
+        change("POWER_PREMIUM_MIN", clamp(PARAM["POWER_PREMIUM_MIN"] + 2, 60, 80))
+        change("CROSS_TP_PCT", clamp(PARAM["CROSS_TP_PCT"] - 0.0005, 0.004, 0.012))
+        change("SCALP_TP_PCT", clamp(PARAM["SCALP_TP_PCT"] - 0.0004, 0.003, 0.010))
 
     if avg_bars and avg_bars > 10:
-        PARAM["CROSS_TP_PCT"] = clamp(PARAM["CROSS_TP_PCT"] - 0.0003, 0.004, 0.012)
-        PARAM["SCALP_TP_PCT"] = clamp(PARAM["SCALP_TP_PCT"] - 0.0002, 0.003, 0.010)
+        change("CROSS_TP_PCT", clamp(PARAM["CROSS_TP_PCT"] - 0.0003, 0.004, 0.012))
+        change("SCALP_TP_PCT", clamp(PARAM["SCALP_TP_PCT"] - 0.0002, 0.003, 0.010))
 
     if avg_pnl > 0.8:
-        PARAM["ATR_BOOST_PCT"] = clamp(PARAM["ATR_BOOST_PCT"] - 0.0003, 0.0025, 0.006)
+        change("ATR_BOOST_PCT", clamp(PARAM["ATR_BOOST_PCT"] - 0.0003, 0.0025, 0.006))
     elif avg_pnl < 0.0:
-        PARAM["ATR_BOOST_PCT"] = clamp(PARAM["ATR_BOOST_PCT"] + 0.0003, 0.0025, 0.010)
+        change("ATR_BOOST_PCT", clamp(PARAM["ATR_BOOST_PCT"] + 0.0003, 0.0025, 0.010))
 
-def model_path_for_today():
-    return WEEKEND_MODEL_FILE if is_weekend_ist() else WEEK_MODEL_FILE
+    return changed
 
 def load_model_meta(path):
     m = safe_load_json(path, default={})
@@ -527,21 +673,28 @@ def collect_training_df(days_back=14, weekend=False):
     else:       df = df[~df["weekday"].isin([5,6])]
     if df.empty: return df
 
+    # === Features ===
     df["type_is_scalp"] = (df["type"].astype(str).str.upper()=="SCALP").astype(int)
     df["dir_is_up"]     = (df["direction"].astype(str).str.upper()=="UP").astype(int)
     div = df["divergence"].astype(str).str.lower().fillna("neutral")
     df["div_bull"] = (div=="bullish").astype(int)
     df["div_bear"] = (div=="bearish").astype(int)
 
+    # numeric
     df["pnl"]   = pd.to_numeric(df["pnl"], errors="coerce").fillna(0.0)
     df["power"] = pd.to_numeric(df["power"], errors="coerce").fillna(0.0)
     df["rsi"]   = pd.to_numeric(df["rsi"], errors="coerce").fillna(50.0)
     df["bars"]  = pd.to_numeric(df["bars"], errors="coerce").fillna(0)
+    df["atr_pct"] = pd.to_numeric(df.get("atr_pct", 0.0), errors="coerce").fillna(0.0)
+    df["adx"]   = pd.to_numeric(df.get("adx", 0.0), errors="coerce").fillna(0.0)
+    df["vol_mult"] = pd.to_numeric(df.get("vol_mult", 1.0), errors="coerce").fillna(1.0)
+    df["ang_now"] = pd.to_numeric(df.get("ang_now", 0.0), errors="coerce").fillna(0.0)
+    df["ang_change"] = pd.to_numeric(df.get("ang_change", 0.0), errors="coerce").fillna(0.0)
 
     if "trend_match" not in df.columns: df["trend_match"] = 0
-    if "atr_pct" not in df.columns:     df["atr_pct"] = 0.0
 
-    feats = ["type_is_scalp","dir_is_up","power","rsi","div_bull","div_bear","weekday","bars","trend_match","atr_pct"]
+    feats = ["type_is_scalp","dir_is_up","power","rsi","div_bull","div_bear",
+             "weekday","bars","trend_match","atr_pct","adx","vol_mult","ang_now","ang_change"]
     df = df.dropna(subset=["pnl"]).copy()
     return df[feats + ["pnl"]]
 
@@ -552,7 +705,7 @@ def train_random_forest(df):
     X = df[feats].values
     y = df["pnl"].values
     model = RandomForestRegressor(
-        n_estimators=200,
+        n_estimators=250,
         max_depth=None,
         random_state=42,
         n_jobs=-1
@@ -604,7 +757,7 @@ def ai_learning_update_and_apply():
             dump(rf_model, pkl_path)
             model_meta["has_model"] = True
             if importances:
-                top = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:5]
+                top = sorted(importances.items(), key=lambda x: x[1], reverse=True)[:6]
                 model_meta["top_features"] = [{"name":k, "imp":float(v)} for k,v in top]
         except Exception as e:
             log(f"[AI] model save error: {e}")
@@ -614,24 +767,55 @@ def ai_learning_update_and_apply():
 
     safe_save_json(json_path, model_meta)
 
+    # Aktifse parametre değiştir + raporla + CSV logla
     if model_meta.get("active"):
-        apply_model_to_params(model_meta)
+        changed_params = apply_model_to_params(model_meta)
+        if changed_params:
+            feat_txt = ""
+            if model_meta.get("top_features"):
+                feat_txt = "\n".join([f"{i+1}️⃣ {f['name']} ({f['imp']*100:.1f}%)" for i,f in enumerate(model_meta["top_features"])])
 
-    tf_label = "Haftasonu" if weekend else "Haftaiçi"
-    feat_txt = ""
-    if model_meta.get("top_features"):
-        feat_txt = "\n".join([f"{i+1}️⃣ {f['name']} ({f['imp']*100:.1f}%)" for i,f in enumerate(model_meta["top_features"])])
-    send_tg(
-        f"🧠 AI Model Update [{tf_label}] | Days: {model_meta['days']}\n"
-        f"Samples: {model_meta['samples']} | Winrate: {model_meta['winrate']:.1f}% | "
-        f"AvgPnL: {model_meta['avg_pnl']:.2f}% | AvgBars: {model_meta['avg_bars']:.1f}\n"
-        f"Active: {'✅' if model_meta.get('active') else '⏳'} | "
-        f"Params → CrossTP {PARAM['CROSS_TP_PCT']:.4f} SL {PARAM['CROSS_SL_PCT']:.3f} | "
-        f"ScalpTP {PARAM['SCALP_TP_PCT']:.4f} SL {PARAM['SCALP_SL_PCT']:.3f} | "
-        f"Power {PARAM['POWER_NORMAL_MIN']:.0f}/{PARAM['POWER_PREMIUM_MIN']:.0f}/{PARAM['POWER_ULTRA_MIN']:.0f}"
-        + (f"\nTop Features:\n{feat_txt}" if feat_txt else "")
-    )
+            send_tg(
+                f"🧠 AI Model Update (v12.4) | Days: {model_meta['days']}\n"
+                f"Samples: {model_meta['samples']} | Winrate: {model_meta['winrate']:.1f}% | "
+                f"AvgPnL: {model_meta['avg_pnl']:.2f}% | AvgBars: {model_meta['avg_bars']:.1f}\n"
+                f"Active: ✅ | "
+                f"Params → CrossTP {PARAM['CROSS_TP_PCT']:.4f} SL {PARAM['CROSS_SL_PCT']:.3f} | "
+                f"ScalpTP {PARAM['SCALP_TP_PCT']:.4f} SL {PARAM['SCALP_SL_PCT']:.3f} | "
+                f"Power {PARAM['POWER_NORMAL_MIN']:.0f}/{PARAM['POWER_PREMIUM_MIN']:.0f}/{PARAM['POWER_ULTRA_MIN']:.0f}"
+                + (f"\nTop Features:\n{feat_txt}" if feat_txt else "")
+            )
+
+            # Parametre değişim özeti
+            msg = "🧩 Parametre Güncellemesi:\n" + "\n".join([
+                f"{k}: {v[0]:.6f} → {v[1]:.6f}" for k,v in changed_params.items()
+            ])
+            send_tg(msg)
+
+            # Log file güncelle
+            ensure_csv(AI_LOG_FILE, ["date","winrate","avg_pnl","avg_bars","samples","changed_params"])
+            try:
+                with open(AI_LOG_FILE, "a", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow([
+                        now_ist(),
+                        f"{model_meta['winrate']:.1f}",
+                        f"{model_meta['avg_pnl']:.3f}",
+                        f"{model_meta['avg_bars']:.1f}",
+                        model_meta['samples'],
+                        json.dumps(changed_params)
+                    ])
+            except Exception as e:
+                log(f"[AI_LOG_ERR] {e}")
+
     save_param_snapshot(model_meta, weekend)
+
+    # Model pkl dosyasını anlık olarak da Telegram'a gönder (opsiyonel ama faydalı)
+    try:
+        if os.path.exists(pkl_path):
+            with open(pkl_path, "rb") as f:
+                send_tg_document(os.path.basename(pkl_path), f)
+    except Exception as e:
+        log(f"[AI_PKL_PUSH_ERR] {e}")
 
 # ================= STATE & GÜNLÜK =================
 def ensure_state(st):
@@ -660,9 +844,15 @@ def roll_daily_counters_if_needed(state):
         }
 
 def maybe_daily_summary_and_learn(state):
+    """Gün sonu raporları: önce günün (counter.date) özeti; sonra AI update + dosya push."""
     if not DAILY_SUMMARY_ENABLED: return
-    if now_ist_hhmm() >= DAILY_SUMMARY_TIME and state.get("last_daily_summary_date") != today_ist_date():
-        rep = build_daily_summary_for(today_ist_date(), state)
+
+    target_date = state.get("daily_counters", {}).get("date", today_ist_date())
+
+    # 23:59 ve sonrası için tetikleme; aynı tarihi bir kereye mahsus gönder
+    if now_ist_hhmm() >= DAILY_SUMMARY_TIME and state.get("last_daily_summary_date") != target_date:
+        # Günün özeti
+        rep = build_daily_summary_for(target_date, state)
         dc = rep["dc"]
         send_tg(
             "📊 GÜNLÜK RAPOR (İstanbul)\n"
@@ -676,13 +866,32 @@ def maybe_daily_summary_and_learn(state):
         if rep["rows"]:
             csv_bytes, fname = daily_csv_bytes(rep["rows"], rep["date"])
             send_tg_document(fname, csv_bytes)
+
+        # AI öğrenme + param update + snapshot + anlık pkl push (fonksiyon içinde)
         ai_learning_update_and_apply()
-        state["last_daily_summary_date"] = today_ist_date()
+
+        # === Gün sonu AI update dosyalarını gönder ===
+        try:
+            # AI güncelleme CSV
+            if os.path.exists(AI_LOG_FILE):
+                with open(AI_LOG_FILE, "rb") as f:
+                    send_tg_document(f"ai_updates_{target_date}.csv", f.read())
+
+            # Güncel model dosyası (günün haftaiçi/haftasonu durumuna göre)
+            model_file = WEEKEND_MODEL_PKL if is_weekend_ist() else WEEK_MODEL_PKL
+            if os.path.exists(model_file):
+                with open(model_file, "rb") as f:
+                    send_tg_document(os.path.basename(model_file), f)
+        except Exception as e:
+            log(f"[DAILY_SEND_ERR] {e}")
+
+        # Bu tarih için gönderildi olarak işaretle
+        state["last_daily_summary_date"] = target_date
 
 # ================= ANA DÖNGÜ =================
 def main():
-    send_tg("🚀 EMA ULTRA v12.2 AI Engine started… (RenderFix+)")
-    log("🚀 v12.2 başladı (Full + AI Param Archive + RenderFix+)")
+    send_tg("🚀 EMA ULTRA v12.4 Angle+AIAdaptive Engine started… (RenderFix)")
+    log("🚀 v12.4 başladı (Angle Momentum + AI Adaptive + RenderFix + Daily Reports)")
 
     state = ensure_state(safe_load_json(STATE_FILE))
 
@@ -726,6 +935,7 @@ def main():
                         confirm_tag = "Confirmed: ✅ (1-bar)" if cross["confirmed"] else "Confirmed: —"
                         adx_tag = f"ADX: {cross['adx']:.1f}"
                         vol_tag = f"VOL Spike x{cross['vol_mult']:.2f}" if cross["vol_mult"] >= VOL_SPIKE_MULT else f"VOL x{cross['vol_mult']:.2f}"
+                        ai_tag = (f" | AI: {cross['ai_pred']*100:.2f}% exp, conf {cross['ai_conf']:.2f}" if (cross.get('ai_pred') is not None and cross.get('ai_conf') is not None) else "")
                         header_map = {"ULTRA":"ULTRA CROSS","PREMIUM":"PREMIUM CROSS","NORMAL":"CROSS SIGNAL"}
                         header = f"{color} {header_map[tier]}: {sym} ({INTERVAL_1H})"
 
@@ -736,17 +946,20 @@ def main():
                             f"{align_tag}\n"
                             f"RSI: {cross['rsi']:.1f} | Power: {cross['power']:.1f}{boost_tag}\n"
                             f"Divergence: {cross['div']}\n"
-                            f"{confirm_tag} | {adx_tag} | {vol_tag}\n"
+                            f"Açı: {cross['ang_now']:+.1f}° | ΔAçı: {cross['ang_change']:.1f}°\n"
+                            f"{confirm_tag} | {adx_tag} | {vol_tag}{ai_tag}\n"
                             f"ATR({ATR_PERIOD}): {cross['atr']:.6f} ({cross['atr_pct']*100:.2f}%)\n"
                             f"Time: {now_ist()}"
                         )
                         with open(OPEN_CSV, "a", newline="", encoding="utf-8") as f:
                             csv.writer(f).writerow([sym, "CROSS", cross["dir"], f"{cross['entry']:.4f}", f"{cross['tp']:.4f}", f"{cross['sl']:.4f}",
-                                                    f"{cross['power']:.1f}", f"{cross['rsi']:.1f}", cross["div"], now_ist()])
+                                                    f"{cross['power']:.1f}", f"{cross['rsi']:.1f}", cross["div"],
+                                                    f"{cross['ang_now']:.2f}", f"{cross['ang_change']:.2f}", now_ist()])
                         state["open_positions"].append({
                             "symbol": sym, "type": "CROSS", "dir": cross["dir"],
                             "entry": cross["entry"], "tp": cross["tp"], "sl": cross["sl"],
                             "power": cross["power"], "rsi": cross["rsi"], "div": cross["div"],
+                            "ang_now": cross["ang_now"], "ang_change": cross["ang_change"],
                             "open": now_ist(), "bar": bar
                         })
                     state["last_cross_seen"][cross_key] = cross["bar_close_ms"]
@@ -763,6 +976,7 @@ def main():
                         boost_tag = " ⚡ ATR Boost" if scalp["atr_pct"] >= PARAM["ATR_BOOST_PCT"] else ""
                         adx_tag   = f"ADX: {scalp['adx']:.1f}"
                         vol_tag   = f"VOL Spike x{scalp['vol_mult']:.2f}" if scalp['vol_mult'] >= VOL_SPIKE_MULT else f"VOL x{scalp['vol_mult']:.2f}"
+                        ai_tag = (f" | AI: {scalp['ai_pred']*100:.2f}% exp, conf {scalp['ai_conf']:.2f}" if (scalp.get('ai_pred') is not None and scalp.get('ai_conf') is not None) else "")
                         header = f"{color} {'ULTRA' if tier=='ULTRA' else 'PREMIUM'} SCALP: {sym} ({INTERVAL_1H})"
                         send_tg(
                             f"{header}\n"
@@ -770,7 +984,8 @@ def main():
                             f"Direction: {scalp['dir']} (4h trend uyumlu)\n"
                             f"{align_tag}\n"
                             f"RSI: {scalp['rsi']:.1f} | Power: {scalp['power']:.1f}{boost_tag}\n"
-                            f"{adx_tag} | {vol_tag}\n"
+                            f"Açı: {scalp['ang_now']:+.1f}° | ΔAçı: {scalp['ang_change']:.1f}°\n"
+                            f"{adx_tag} | {vol_tag}{ai_tag}\n"
                             f"Time: {now_ist()}"
                         )
                         if tier=="ULTRA": state["daily_counters"]["scalp_ultra"] += 1
@@ -779,11 +994,13 @@ def main():
                         state["last_scalp_seen"][scalp_key] = bar
                         with open(OPEN_CSV, "a", newline="", encoding="utf-8") as f:
                             csv.writer(f).writerow([sym, "SCALP", scalp["dir"], f"{scalp['entry']:.4f}", f"{scalp['tp']:.4f}", f"{scalp['sl']:.4f}",
-                                                    f"{scalp['power']:.1f}", f"{scalp['rsi']:.1f}", scalp["div"], now_ist()])
+                                                    f"{scalp['power']:.1f}", f"{scalp['rsi']:.1f}", scalp["div"],
+                                                    f"{scalp['ang_now']:.2f}", f"{scalp['ang_change']:.2f}", now_ist()])
                         state["open_positions"].append({
                             "symbol": sym, "type": "SCALP", "dir": scalp["dir"],
                             "entry": scalp["entry"], "tp": scalp["tp"], "sl": scalp["sl"],
                             "power": scalp["power"], "rsi": scalp["rsi"], "div": scalp["div"],
+                            "ang_now": scalp["ang_now"], "ang_change": scalp["ang_change"],
                             "open": now_ist(), "bar": bar
                         })
 
@@ -811,12 +1028,14 @@ def main():
             )
             with open(CLOSED_CSV, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([t["symbol"], t["type"], t["dir"], f"{t['entry']:.4f}", f"{lp:.4f}", res, f"{pnl:.2f}", bars_open,
-                                        f"{t['power']:.1f}", f"{t['rsi']:.1f}", t["div"], t["open"], now_ist()])
+                                        f"{t['power']:.1f}", f"{t['rsi']:.1f}", t["div"],
+                                        f"{t.get('ang_now',0.0):.2f}", f"{t.get('ang_change',0.0):.2f}", t["open"], now_ist()])
         state["open_positions"] = still_open
 
         # Günlük yönetim
-        roll_daily_counters_if_needed(state)
+        # NOT: önce summary çalışır; sonra sayaçlar yeni güne devreder.
         maybe_daily_summary_and_learn(state)
+        roll_daily_counters_if_needed(state)
 
         # Kaydet
         safe_save_json(STATE_FILE, state)
@@ -830,3 +1049,9 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"FATAL: {e}")
         send_tg(f"❗ Bot hata verdi: {e}")
+'''
+path = "/mnt/data/EMA_ULTRA_v12_4_AngleAIAdaptive.py"
+with open(path, "w", encoding="utf-8") as f:
+    f.write(code)
+
+path
