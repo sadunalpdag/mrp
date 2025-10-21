@@ -1,15 +1,16 @@
-# Write the full EMA ULTRA v12.4 (Angle + AI Adaptive + RenderFix+, No-Trade) to an installable ema.py
-import os, textwrap
-
-ema_full_code = r'''# ==============================================================
+# ==============================================================
 #  📘 EMA ULTRA v12.4 — Angle+AIAdaptive (RenderFix+, No-Trade)
-#  Binance Futures PUBLIC data (klines/ticker) only — NO private trading/API keys
-#  EMA+ATR+RSI+ADX + SCALP + Angle Momentum + AI Adaptive + Daily CSV + PKL push
-#  - Render-safe path handling (falls back to ./data if /data not mounted)
-#  - Auto-create folders & CSVs
-#  - 3s mount wait for Render disk
-#  - Daily end-of-day (IST) summary & AI logs & model .pkl sent to Telegram
-#  - AI signal filter via predicted PnL (+ confidence from tree variance)
+#  PART 1/2
+#  - Render-safe path handling (./data fallback)
+#  - Log + Telegram helpers
+#  - CSV/State init
+#  - Indicators (EMA/ATR/RSI/ADX/SMA)
+#  - Angle (momentum) helpers
+#  - Power helpers (tiering, ATR/ADX/VOL effects)
+#  - Binance (PUBLIC endpoints only)
+#  - Trend helpers
+#  - Global settings & params
+#  (AI learning, engines, daily reports, main loop are in PART 2)
 # ==============================================================
 
 import os, json, csv, io, time, requests, math
@@ -61,11 +62,12 @@ def ensure_dir(path):
     except: pass
 
 def log(msg):
-    print(msg, flush=True)
+    line = f"{now_ist()} - {msg}"
+    print(line, flush=True)
     try:
         ensure_dir(os.path.dirname(LOG_FILE) or ".")
         with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{now_ist()} - {msg}\n")
+            f.write(line + "\n")
     except: pass
 
 def send_tg(text):
@@ -383,6 +385,10 @@ def trend_alignment(signal_dir, closes_4h, closes_1d):
     match = (signal_dir == d4) and (signal_dir == d1)
     return match, d4, d1
 
+# ==============================================================
+# =============  PART 1/2 SONU — PART 2 DEVAM EDECEK  ==========
+# ==============================================================
+
 # ================= AI PREDICT HELPERS =================
 def get_today_model_path():
     return WEEKEND_MODEL_PKL if is_weekend_ist() else WEEK_MODEL_PKL
@@ -413,7 +419,7 @@ def predict_pnl_and_conf(feat_vector, model=None):
         log(f"[AI_PRED_ERR] {e}")
         return None, None
 
-# ================= ENGINES =================
+# ================= ENGINES (CROSS + SCALP) =================
 def run_cross_engine_confirmed(sym, kl1, kl4, kl1d):
     closes = [float(k[4]) for k in kl1]
     ema7, ema25 = ema(closes,7), ema(closes,25)
@@ -485,7 +491,6 @@ def run_cross_engine_confirmed(sym, kl1, kl4, kl1d):
                        weekday, bars, trend_match, atr_pct, adx_now, vol_mult, ang_now, ang_change]
         ai_pred, ai_conf = predict_pnl_and_conf(feat_vector)
 
-        # Yetersiz tahmin veya güven → filtrele
         if ai_pred is not None and ai_conf is not None:
             if (ai_pred*100.0) < AI_PNL_THRESHOLD or ai_conf < AI_MIN_CONF:
                 return None
@@ -769,7 +774,6 @@ def ai_learning_update_and_apply():
 
     safe_save_json(json_path, model_meta)
 
-    # Aktifse parametre değiştir + raporla + CSV logla
     if model_meta.get("active"):
         changed_params = apply_model_to_params(model_meta)
         if changed_params:
@@ -819,7 +823,7 @@ def ai_learning_update_and_apply():
     except Exception as e:
         log(f"[AI_PKL_PUSH_ERR] {e}")
 
-# ================= STATE & GÜNLÜK =================
+# ================= STATE & GÜNLÜK TETİK =================
 def ensure_state(st):
     st.setdefault("last_slope_dir", {})
     st.setdefault("open_positions", [])
@@ -890,7 +894,7 @@ def maybe_daily_summary_and_learn(state):
         # Bu tarih için gönderildi olarak işaretle
         state["last_daily_summary_date"] = target_date
 
-# ================= ANA DÖNGÜ =================
+# ================= ANA DÖNGÜ (LOG HEARTBEAT İLE) =================
 def main():
     send_tg("🚀 EMA ULTRA v12.4 Angle+AIAdaptive (RenderFix+, No-Trade) started…")
     log("🚀 v12.4 başladı (Angle Momentum + AI Adaptive + RenderFix + Daily Reports, No-Trade)")
@@ -910,6 +914,7 @@ def main():
     bar = 0
     while True:
         bar += 1
+        log(f"[SCAN] Başladı (bar {bar}) - {len(symbols)} sembol taranıyor...")
         for sym in symbols:
             kl1  = get_klines(sym, INTERVAL_1H, limit=LIMIT_1H)
             kl4  = get_klines(sym, INTERVAL_4H, limit=LIMIT_4H)
@@ -1035,11 +1040,10 @@ def main():
         state["open_positions"] = still_open
 
         # Günlük yönetim
-        # NOT: önce summary çalışır; sonra sayaçlar yeni güne devreder.
         maybe_daily_summary_and_learn(state)
         roll_daily_counters_if_needed(state)
 
-        # Kaydet
+        # Kaydet + Heartbeat sonu
         safe_save_json(STATE_FILE, state)
         log(f"Scan done | Open: {len(state['open_positions'])} | Params: CrossTP {PARAM['CROSS_TP_PCT']:.4f}, ScalpTP {PARAM['SCALP_TP_PCT']:.4f}, ATR%≥{PARAM['ATR_BOOST_PCT']*100:.2f}")
         time.sleep(SCAN_INTERVAL)
@@ -1051,15 +1055,3 @@ if __name__ == "__main__":
     except Exception as e:
         log(f"FATAL: {e}")
         send_tg(f"❗ Bot hata verdi: {e}")
-'''
-
-# Prepare render-safe path and write the file
-BASE_DIR = os.getcwd()
-DATA_DIR = os.path.join(BASE_DIR, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-file_path = os.path.join(DATA_DIR, "ema.py")
-
-with open(file_path, "w", encoding="utf-8") as f:
-    f.write(ema_full_code)
-
-file_path
