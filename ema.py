@@ -1,6 +1,7 @@
-# Create the final ema.py (RenderFix+, no private trading API) and save for download
+# Write the full EMA ULTRA v12.4 (Angle + AI Adaptive + RenderFix+, No-Trade) to an installable ema.py
+import os, textwrap
 
-ema_code = r'''# ==============================================================
+ema_full_code = r'''# ==============================================================
 #  📘 EMA ULTRA v12.4 — Angle+AIAdaptive (RenderFix+, No-Trade)
 #  Binance Futures PUBLIC data (klines/ticker) only — NO private trading/API keys
 #  EMA+ATR+RSI+ADX + SCALP + Angle Momentum + AI Adaptive + Daily CSV + PKL push
@@ -1051,12 +1052,14 @@ if __name__ == "__main__":
         log(f"FATAL: {e}")
         send_tg(f"❗ Bot hata verdi: {e}")
 '''
-import os  
-    try:
-        file_path = os.path.join(DATA_DIR, "ema.py")
-        with open(file_path, "w", encoding="utf-8") as f:
-            ...
-    except Exception as e:
-    f.write(ema_code)
+
+# Prepare render-safe path and write the file
+BASE_DIR = os.getcwd()
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(DATA_DIR, exist_ok=True)
+file_path = os.path.join(DATA_DIR, "ema.py")
+
+with open(file_path, "w", encoding="utf-8") as f:
+    f.write(ema_full_code)
 
 file_path
