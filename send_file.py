@@ -4,7 +4,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # Gönderilecek dosya yolu (örnek)
-FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "open_positions.json)
+FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "open_positions.json")
 
 
 
