@@ -4,8 +4,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # Gönderilecek dosya yolu (örnek)
-FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "closed_trades.csv")
-FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "open_positions.csv")
+FILE_PATH = os.path.join(os.path.dirname(__file__), "data", "ai_updates.csv")
+
 
 
 def send_file(file_path):
