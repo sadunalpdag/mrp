@@ -1,5 +1,5 @@
-# ==============================================================
-# 📘 EMA ULTRA v13.5.3 — Ultra-Only Mode + Hedge Sync + Real TP/SL
+# ==============================================================================
+# 📘 EMA ULTRA v13.5.4 — Smart Auto-Restore + Duplicate Guard + Hedge Sync
 #  - AutoTrade ON  => gerçek Binance Futures emirleri (MARKET)
 #  - Simulate ON   => sadece veri toplar (limitsiz), emir açmaz
 #  - MAX_BUY/MAX_SELL sadece AutoTrade modunda uygulanır
@@ -10,12 +10,22 @@
 #    senkronize edilir (sync_real_positions)
 #  - Her gerçek pozisyon için TP / SL emirleri Binance'e gönderilir
 #    (TAKE_PROFIT_MARKET / STOP_MARKET, reduceOnly, hedge-aware)
+#  - Duplicate Guard:
+#       aynı symbol + yön açıkken yeni sinyal tekrar açmaz
+#  - Closed Bar Filter:
+#       kapanmamış barlardan sinyal üretmez (tekrarlı spam engeli)
+#  - Smart AutoTrade Restore:
+#       /set MAX_BUY / MAX_SELL sonrası limit uygunsa AutoTrade otomatik ON
+#       değilse OFF; manuel tekrar açma zorunluluğu azalır
+#  - Periodik Status:
+#       her 10 dakikada bir Telegram'a
+#       açık işlem sayısı / kapanan işlem sayısı / winrate / modlar raporu
 #  - Telegram komutlarıyla runtime param kontrolü
 #  - Telegram offline olursa tg_queue.json'a bufferlar
 #  - Günlük rapor /report ile veya otomatik
 #  - Dynamic LOT_SIZE precision (Binance -1111 fix)
 #  - ONLY_ULTRA_TRADES varsayılan açık (sadece ULTRA işler)
-# ==============================================================
+# ==============================================================================
 
 import os, json, time, math, requests, hmac, hashlib
 from datetime import datetime, timezone, timedelta
@@ -70,6 +80,7 @@ def log(msg: str):
         pass
 
 def now_ist_dt():
+    # Türkiye şu anda UTC+3 varsayımıyla
     return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
 
 def now_iso():
@@ -199,14 +210,20 @@ def futures_exchange_info():
         return []
 
 def futures_get_klines(symbol, interval, limit):
+    """
+    Kline çek, en son henüz kapanmamış bar varsa onu at.
+    (Closed Bar Filter)
+    """
     try:
         r = requests.get(
             BINANCE_FAPI + "/fapi/v1/klines",
             params={"symbol":symbol, "interval":interval, "limit":limit},
             timeout=10
         ).json()
+
         now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
-        if r and int(r[-1][6])>now_ms:
+        # son bar geleceği zaman bazen closeTime > now_ms => henüz kapanmamış
+        if r and int(r[-1][6]) > now_ms:
             r = r[:-1]
         return r
     except:
@@ -327,6 +344,7 @@ def calc_order_quantity(symbol, usdt_size):
                 if f["filterType"] == "LOT_SIZE":
                     step_size = float(f["stepSize"])
                     precision = abs(int(round(math.log10(step_size)))) if step_size < 1 else 0
+                    # step'e yuvarla
                     qty = math.floor(qty / step_size) * step_size
                     qty = round(qty, precision)
                     break
@@ -337,13 +355,14 @@ def calc_order_quantity(symbol, usdt_size):
 
 # ================= STATE / PARAM INIT =================
 STATE = safe_load(STATE_FILE, {
-    "open_positions": [],   # legacy alan (artık dosyada tutuluyor)
+    "open_positions": [],   # legacy alan
     "last_cross_seen": {},
     "last_scalp_seen": {},
     "bar_index": 0,
     "auto_trade": False,
     "simulate": True,
-    "last_daily_sent_date": ""
+    "last_daily_sent_date": "",
+    "last_status_sent": 0
 })
 
 DEFAULT_PARAM = {
@@ -362,14 +381,14 @@ DEFAULT_PARAM = {
     "SCALP_COOLDOWN_BARS": 3,
 
     "TRADE_SIZE_USDT": 250.0,
-    "MAX_BUY": 25,
-    "MAX_SELL": 25,
+    "MAX_BUY": 15,
+    "MAX_SELL": 15,
 
     # AI placeholders
     "AI_PNL_THRESHOLD": 0.0,
     "AI_MIN_CONF": 0.0,
 
-    # yeni: sadece ULTRA sinyalleri işlem açsın mı?
+    # sadece ULTRA sinyalleri işlem açsın mı?
     # 1.0 => sadece ULTRA
     # 0.0 => PREMIUM / NORMAL da kabul
     "ONLY_ULTRA_TRADES": 1.0
@@ -418,7 +437,7 @@ def record_open(sig, mode_flag):
         "rsi": sig["rsi"],
         "ang_now": sig["ang_now"],
         "ang_change": sig["ang_change"],
-        "mode": mode_flag  # "real" | "sim"
+        "mode": mode_flag
     })
     save_open_positions(open_positions)
 
@@ -435,7 +454,7 @@ def sync_real_positions():
 
     opens = load_open_positions()
 
-    # 1) ekle/güncelle
+    # 1) ekle / güncelle
     for p in live:
         direction = "UP" if p["positionSide"]=="LONG" else "DOWN"
         key = (p["symbol"], direction)
@@ -653,12 +672,12 @@ def filter_ultra(tier):
         return (tier == "ULTRA")
     return True
 
-def build_cross_signal(sym, kl1):
+def build_cross_signal(sym, kl1, last_seen_map):
     closes=[float(k[4]) for k in kl1]
     ema7_  = ema(closes,7)
     ema25_ = ema(closes,25)
     if len(ema7_)<6 or len(ema25_)<6:
-        return None
+        return None, None, None
 
     prev_diff    = ema7_[-3]-ema25_[-3]
     cross_diff   = ema7_[-2]-ema25_[-2]
@@ -670,7 +689,16 @@ def build_cross_signal(sym, kl1):
     elif prev_diff>0 and cross_diff<0 and confirm_diff<0:
         direction="DOWN"
     if not direction:
-        return None
+        return None, None, None
+
+    # bar timestamp'i (son kapanmış barı kullan)
+    # kl1[-1] = son kapanmış bar (çünkü futures_get_klines son açık barı kesti)
+    bar_close_time = int(kl1[-1][6])
+
+    # aynı bar için tekrar sinyal verme
+    cross_key = f"{sym}_{direction}"
+    if last_seen_map.get(cross_key) == bar_close_time:
+        return None, None, None
 
     highs=[float(k[2]) for k in kl1]
     lows =[float(k[3]) for k in kl1]
@@ -687,11 +715,9 @@ def build_cross_signal(sym, kl1):
 
     tier, color = tier_from_power(pwr)
     if tier is None:
-        return None
-
-    # ULTRA filtresi
+        return None, None, None
     if not filter_ultra(tier):
-        return None
+        return None, None, None
 
     ang_now  = slope_angle_deg(slope_now, atr_now)
     ang_dif  = angle_between_deg(slope_prev, slope_now, atr_now)
@@ -704,7 +730,7 @@ def build_cross_signal(sym, kl1):
         tp = entry*(1-PARAM["CROSS_TP_PCT"])
         sl = entry*(1+PARAM["CROSS_SL_PCT"])
 
-    return {
+    sig = {
         "symbol": sym,
         "type": "CROSS",
         "dir": direction,
@@ -719,12 +745,13 @@ def build_cross_signal(sym, kl1):
         "color": color,
         "time": now_iso()
     }
+    return sig, cross_key, bar_close_time
 
 def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index):
     closes=[float(k[4]) for k in kl1]
     ema7_1=ema(closes,7)
     if len(ema7_1)<6:
-        return None
+        return None, None, None
 
     slope_now  = ema7_1[-1]-ema7_1[-4]
     slope_prev = ema7_1[-2]-ema7_1[-5]
@@ -734,14 +761,14 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index):
     elif slope_prev>0 and slope_now<0:
         direction="DOWN"
     else:
-        return None
+        return None, None, None
 
     # cooldown
-    key=f"{sym}_{direction}"
-    last_idx=last_scalp_seen.get(key)
+    scalp_key = f"{sym}_{direction}"
+    last_idx=last_scalp_seen.get(scalp_key)
     if last_idx is not None:
         if (bar_index - last_idx) <= PARAM["SCALP_COOLDOWN_BARS"]:
-            return None
+            return None, None, None
 
     highs=[float(k[2]) for k in kl1]
     lows =[float(k[3]) for k in kl1]
@@ -757,12 +784,11 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index):
     )
 
     tier, color = tier_from_power(pwr)
-    # scalp zaten PREMIUM/ULTRA kabul ediyordu.
-    # şimdi ULTRA filtresi de geçsin:
+    # scalp PREMIUM/ULTRA kabul ediyor
     if tier not in ("PREMIUM","ULTRA"):
-        return None
+        return None, None, None
     if not filter_ultra(tier):
-        return None
+        return None, None, None
 
     ang_now  = slope_angle_deg(slope_now2, atr_now)
     ang_dif  = angle_between_deg(slope_prev2, slope_now2, atr_now)
@@ -775,7 +801,7 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index):
         tp = entry*(1-PARAM["SCALP_TP_PCT"])
         sl = entry*(1+PARAM["SCALP_SL_PCT"])
 
-    return {
+    sig = {
         "symbol": sym,
         "type": "SCALP",
         "dir": direction,
@@ -789,8 +815,9 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index):
         "tier": tier,
         "color": color,
         "time": now_iso(),
-        "cooldown_key": key
+        "cooldown_key": scalp_key
     }
+    return sig, scalp_key, bar_index
 
 # ================== AUTOTRADE / EXECUTION ==================
 def enforce_limits_autotrade():
@@ -808,12 +835,25 @@ def enforce_limits_autotrade():
         return False
     return True
 
+def already_open_same_direction(symbol, direction):
+    """
+    Duplicate Guard:
+    Aynı symbol ve yön (UP/DOWN) zaten açık mı?
+    Eğer varsa yeni sinyal açmayacağız.
+    """
+    opens = load_open_positions()
+    for o in opens:
+        if o.get("symbol")==symbol and o.get("dir")==direction:
+            return True
+    return False
+
 def execute_signal(sig):
     """
     Sinyal geldiğinde:
-      1. simulate=True -> sadece sim kaydı
-      2. simulate=False ama auto_trade=False -> sim kaydı
-      3. simulate=False ve auto_trade=True:
+      1. duplicate guard kontrol
+      2. simulate=True -> sadece sim kaydı
+      3. simulate=False ama auto_trade=False -> sim kaydı
+      4. simulate=False ve auto_trade=True:
             - limit uygunsa MARKET emir aç
             - qty hesaplanamazsa sim fallback
             - emir açıldıysa TP/SL emirlerini gönder
@@ -822,6 +862,11 @@ def execute_signal(sig):
     """
     symbol = sig["symbol"]
     direction = sig["dir"]  # "UP" -> LONG/BUY, "DOWN" -> SHORT/SELL
+
+    # --- Duplicate Guard ---
+    if already_open_same_direction(symbol, direction):
+        log(f"[SKIP DUP] {symbol} {direction} zaten var")
+        return
 
     # 1) sadece sim
     if STATE["simulate"]:
@@ -883,7 +928,7 @@ def execute_signal(sig):
         tg_send(f"❌ REAL TRADE ERR {symbol}\n{e}\nSim olarak kaydedildi.")
         log(f"[REAL TRADE ERR] {e}")
 
-# ================== DAILY REPORT ==================
+# ================== DAILY / PERIODIC REPORTS ==================
 def build_daily_summary_payload():
     closed_list = safe_load(CLOSED_TRADES_FILE, [])
     total = len(closed_list)
@@ -927,6 +972,46 @@ def maybe_daily_summary():
     STATE["last_daily_sent_date"] = today_str
     safe_save(STATE_FILE, STATE)
 
+def maybe_status_report():
+    """
+    Her 10 dakikada bir Telegram'a durum raporu yollar:
+    - açık işlem sayısı
+    - kapanan işlem sayısı
+    - winrate
+    - AutoTrade/Sim status
+    """
+    now_sec = int(time.time())
+    last_sent = STATE.get("last_status_sent", 0)
+    if now_sec - last_sent < 600:  # 10 dakika
+        return
+
+    opens = load_open_positions()
+    closed = safe_load(CLOSED_TRADES_FILE, [])
+    total_closed = len(closed)
+    total_open = len(opens)
+
+    wins = [c for c in closed if c.get("result") == "TP"]
+    winrate = (len(wins)/total_closed*100.0) if total_closed > 0 else 0.0
+
+    long_real, short_real, livepos = count_real_from_binance()
+
+    tg_send(
+        "📊 STATUS RAPORU\n"
+        f"Açık İşlem (local): {total_open}\n"
+        f"Kapanan İşlem: {total_closed}\n"
+        f"Winrate: {winrate:.1f}%\n"
+        f"REAL Long: {long_real} / {PARAM['MAX_BUY']}\n"
+        f"REAL Short:{short_real} / {PARAM['MAX_SELL']}\n"
+        f"AutoTrade: {'✅' if STATE['auto_trade'] else '❌'} | "
+        f"Simulate: {'✅' if STATE['simulate'] else '❌'}\n"
+        f"UltraOnly: {PARAM.get('ONLY_ULTRA_TRADES',0)}\n"
+        f"LivePos: {len(livepos)} hedge slots\n"
+        f"Time: {now_iso()}"
+    )
+
+    STATE["last_status_sent"] = now_sec
+    safe_save(STATE_FILE, STATE)
+
 # ================== TELEGRAM COMMANDS ==================
 def tg_poll_commands(last_update_id):
     if not BOT_TOKEN:
@@ -955,6 +1040,12 @@ def tg_poll_commands(last_update_id):
 
         if lower == "/status":
             long_real, short_real, livepos = count_real_from_binance()
+
+            opens_local = load_open_positions()
+            closed_local = safe_load(CLOSED_TRADES_FILE, [])
+            wins_local = [c for c in closed_local if c.get("result")=="TP"]
+            winrate_local = (len(wins_local)/len(closed_local)*100.0) if closed_local else 0.0
+
             tg_send(
                 "🤖 STATUS\n"
                 f"AutoTrade: {'✅' if STATE['auto_trade'] else '❌'}\n"
@@ -964,6 +1055,7 @@ def tg_poll_commands(last_update_id):
                 f"TradeSize: {PARAM['TRADE_SIZE_USDT']} USDT\n"
                 f"UltraOnly: {PARAM.get('ONLY_ULTRA_TRADES',0)}\n"
                 f"LivePos: {len(livepos)} hedge slots\n"
+                f"Open(local): {len(opens_local)} | Closed(local): {len(closed_local)} | Winrate(local): {winrate_local:.1f}%\n"
                 f"Time: {now_iso()}"
             )
 
@@ -1027,6 +1119,7 @@ def tg_poll_commands(last_update_id):
         elif lower.startswith("/set"):
             raw = text.replace("\n"," ").strip()
             if " " in raw and "=" not in raw:
+                # "/set KEY VALUE"
                 parts = raw.split()
                 if len(parts) != 3:
                     tg_send("kullanım:\n/set KEY VALUE\nya da\n/set KEY=VALUE")
@@ -1035,6 +1128,7 @@ def tg_poll_commands(last_update_id):
                 key_txt = parts[1]
                 val_txt = parts[2]
             else:
+                # "/set KEY=VALUE"
                 try:
                     after = raw.split(" ",1)[1]
                 except:
@@ -1081,15 +1175,19 @@ def tg_poll_commands(last_update_id):
             STATE["params"] = PARAM
             safe_save(STATE_FILE, STATE)
 
-            tg_send(f"⚙️ {key_txt} = {PARAM[key_txt]} olarak ayarlandı")
-
-            # limit değişince kontrol et
+            # SMART AUTOTRADE RESTORE:
+            # limit değişirse anında kontrol et
             if key_txt in ("MAX_BUY","MAX_SELL"):
                 long_real, short_real, _lp = count_real_from_binance()
                 if long_real >= PARAM["MAX_BUY"] or short_real >= PARAM["MAX_SELL"]:
                     STATE["auto_trade"] = False
-                    safe_save(STATE_FILE, STATE)
-                    tg_send("⛔ Yeni limit aşıldı → AutoTrade OFF (Sim açık kalır)")
+                    tg_send("⛔ Limit aşıldı → AutoTrade OFF (Sim açık)")
+                else:
+                    STATE["auto_trade"] = True
+                    tg_send("✅ Limit uygun → AutoTrade ON (gerçek emir aktif)")
+                safe_save(STATE_FILE, STATE)
+
+            tg_send(f"⚙️ {key_txt} = {PARAM[key_txt]} olarak ayarlandı")
 
         last_update_id = uid
 
@@ -1097,7 +1195,7 @@ def tg_poll_commands(last_update_id):
 
 # ================== MAIN LOOP ==================
 def main():
-    tg_send("🚀 EMA ULTRA v13.5.3 başladı (Hedge Sync + Real TP/SL + UltraOnly)")
+    tg_send("🚀 EMA ULTRA v13.5.4 başladı (Hedge Sync + TP/SL + AutoRestore + DupGuard)")
     last_update_id = 0
 
     exinfo = futures_exchange_info()
@@ -1121,6 +1219,9 @@ def main():
         if closed_any:
             tg_send("ℹ️ Pozisyon kapandı (local TP/SL). Gerekirse /autotrade on ile devam.")
 
+        # periyodik status raporu (10 dk)
+        maybe_status_report()
+
         # sinyal tara
         STATE["bar_index"] += 1
         bar_i = STATE["bar_index"]
@@ -1131,32 +1232,30 @@ def main():
                 continue
 
             # CROSS sinyal
-            cross_sig = build_cross_signal(sym, kl1)
+            cross_sig, cross_key, cross_bar_ts = build_cross_signal(sym, kl1, STATE["last_cross_seen"])
             if cross_sig:
-                cross_key = f"{sym}_{cross_sig['dir']}"
-                if STATE["last_cross_seen"].get(cross_key) != cross_sig["time"]:
-                    tg_send(
-                        f"{cross_sig['color']} {cross_sig['tier']} CROSS {sym} {cross_sig['dir']}\n"
-                        f"Pow:{cross_sig['power']:.1f} RSI:{cross_sig['rsi']:.1f}\n"
-                        f"Açı:{cross_sig['ang_now']:+.1f}° Δ:{cross_sig['ang_change']:.1f}°"
-                        f"\nUltraOnly:{PARAM.get('ONLY_ULTRA_TRADES',0)}"
-                    )
-                    execute_signal(cross_sig)
-                    STATE["last_cross_seen"][cross_key] = cross_sig["time"]
+                tg_send(
+                    f"{cross_sig['color']} {cross_sig['tier']} CROSS {sym} {cross_sig['dir']}\n"
+                    f"Pow:{cross_sig['power']:.1f} RSI:{cross_sig['rsi']:.1f}\n"
+                    f"Açı:{cross_sig['ang_now']:+.1f}° Δ:{cross_sig['ang_change']:.1f}°"
+                    f"\nUltraOnly:{PARAM.get('ONLY_ULTRA_TRADES',0)}"
+                )
+                execute_signal(cross_sig)
+                if cross_key is not None:
+                    STATE["last_cross_seen"][cross_key] = cross_bar_ts
 
             # SCALP sinyal
-            scalp_sig = build_scalp_signal(sym, kl1, STATE["last_scalp_seen"], bar_i)
+            scalp_sig, scalp_key, scalp_bar_idx = build_scalp_signal(sym, kl1, STATE["last_scalp_seen"], bar_i)
             if scalp_sig:
-                scalp_key = scalp_sig["cooldown_key"]
-                if STATE["last_scalp_seen"].get(scalp_key) != bar_i:
-                    tg_send(
-                        f"{scalp_sig['color']} {scalp_sig['tier']} SCALP {sym} {scalp_sig['dir']}\n"
-                        f"Pow:{scalp_sig['power']:.1f} RSI:{scalp_sig['rsi']:.1f}\n"
-                        f"Açı:{scalp_sig['ang_now']:+.1f}° Δ:{scalp_sig['ang_change']:.1f}°"
-                        f"\nUltraOnly:{PARAM.get('ONLY_ULTRA_TRADES',0)}"
-                    )
-                    execute_signal(scalp_sig)
-                    STATE["last_scalp_seen"][scalp_key] = bar_i
+                tg_send(
+                    f"{scalp_sig['color']} {scalp_sig['tier']} SCALP {sym} {scalp_sig['dir']}\n"
+                    f"Pow:{scalp_sig['power']:.1f} RSI:{scalp_sig['rsi']:.1f}\n"
+                    f"Açı:{scalp_sig['ang_now']:+.1f}° Δ:{scalp_sig['ang_change']:.1f}°"
+                    f"\nUltraOnly:{PARAM.get('ONLY_ULTRA_TRADES',0)}"
+                )
+                execute_signal(scalp_sig)
+                if scalp_key is not None:
+                    STATE["last_scalp_seen"][scalp_key] = scalp_bar_idx
 
             time.sleep(0.08)
 
