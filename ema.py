@@ -1,5 +1,5 @@
 # ==============================================================
-# 📘 EMA ULTRA v13.5 — Data Hybrid + Real Trade
+# 📘 EMA ULTRA v13.5.1 — Data Hybrid + Real Trade + Dynamic Precision
 #  - AutoTrade ON  => gerçek Binance Futures emirleri (MARKET)
 #  - Simulate ON   => sadece veri toplar (limitsiz), emir açmaz
 #  - MAX_BUY/MAX_SELL sadece AutoTrade modunda uygulanır
@@ -8,6 +8,7 @@
 #  - Telegram komutlarıyla runtime param kontrolü (/set vb)
 #  - Telegram offline olursa tg_queue.json'a bufferlar
 #  - Günlük rapor /report ile veya otomatik
+#  - Dynamic LOT_SIZE precision (Binance -1111 fix)
 # ==============================================================
 
 import os, json, time, math, requests, hmac, hashlib
@@ -216,7 +217,7 @@ def futures_market_order(symbol, side, qty, positionSide):
     Gerçek emir gönderir (AutoTrade ON durumunda).
     side: BUY / SELL
     positionSide: LONG / SHORT
-    qty: coin miktarı (örnek: 0.1234 BTC)
+    qty: coin miktarı
     """
     payload = {
         "symbol": symbol,
@@ -230,15 +231,34 @@ def futures_market_order(symbol, side, qty, positionSide):
 
 def calc_order_quantity(symbol, usdt_size):
     """
-    USDT büyüklüğünden kabaca contract qty hesapla.
-    qty = USDT / price
-    round(.,4) yapıyoruz (basit). Ret gelirse Telegram'a error döner.
+    USDT büyüklüğünden contract qty hesapla.
+    Quantity hassasiyetini Binance exchangeInfo'dan dinamik alır.
+    (Precision fix v13.5.1)
     """
     price = futures_get_price(symbol)
     if not price or price <= 0:
         return None
+
     qty = usdt_size / price
-    return round(qty,4)
+
+    # 🔧 Dinamik precision düzeltmesi (LOT_SIZE → stepSize)
+    try:
+        r = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
+        sym_info = next((s for s in r["symbols"] if s["symbol"] == symbol), None)
+        if sym_info:
+            for f in sym_info["filters"]:
+                if f["filterType"] == "LOT_SIZE":
+                    step_size = float(f["stepSize"])
+                    # step_size 0.001 -> precision=3 gibi
+                    precision = abs(int(round(math.log10(step_size)))) if step_size < 1 else 0
+                    # Binance'in kabul edeceği en yakın alt çokluğa indir (floor)
+                    qty = math.floor(qty / step_size) * step_size
+                    qty = round(qty, precision)
+                    break
+    except Exception as e:
+        log(f"[PRECISION WARN] {e}")
+
+    return qty if qty > 0 else None
 
 # ================= STATE / PARAM INIT =================
 STATE = safe_load(STATE_FILE, {
@@ -252,9 +272,9 @@ STATE = safe_load(STATE_FILE, {
 })
 
 DEFAULT_PARAM = {
-    "POWER_NORMAL_MIN": 60.0,
+    "POWER_NORMAL_MIN": 65.0,
     "POWER_PREMIUM_MIN": 68.0,
-    "POWER_ULTRA_MIN": 75.0,
+    "POWER_ULTRA_MIN": 79.0,
 
     "ATR_BOOST_PCT": 0.004,
     "ADX_BASE": 25.0,
@@ -262,7 +282,7 @@ DEFAULT_PARAM = {
     "SCALP_TP_PCT": 0.006,
     "SCALP_SL_PCT": 0.10,
     "CROSS_TP_PCT": 0.010,
-    "CROSS_SL_PCT": 0.030,
+    "CROSS_SL_PCT": 0.060,
 
     "SCALP_COOLDOWN_BARS": 3,
 
@@ -270,7 +290,7 @@ DEFAULT_PARAM = {
     "MAX_BUY": 15,
     "MAX_SELL": 15,
 
-    # basit AI eşikleri (şu an kullanılmıyor ama yerleri sabit)
+    # basit AI eşikleri (placeholder)
     "AI_PNL_THRESHOLD": 0.0,
     "AI_MIN_CONF": 0.0
 }
@@ -291,7 +311,7 @@ safe_save(PARAM_FILE, PARAM)
 def count_open_directions(open_positions, real_only=False):
     """
     real_only=True => sadece gerçek açılmış trade'leri say.
-    sim/gerçek farkını anlamak için kaydederken "mode": "real"/"sim" tutacağız.
+    sim/gerçek farkını anlamak için kaydederken "mode": "real"/"sim" tutuyoruz.
     """
     long_cnt = 0
     short_cnt= 0
@@ -303,6 +323,7 @@ def count_open_directions(open_positions, real_only=False):
         elif p.get("dir")=="DOWN":
             short_cnt+= 1
     return long_cnt, short_cnt
+
 # ================== INDICATORS ==================
 def ema(vals, n):
     k = 2.0/(n+1.0)
@@ -537,7 +558,7 @@ def try_close_positions():
     """
     TP/SL tetiklenenleri kapatır.
     Kapatınca closed_trades.json'a taşır.
-    Return True => en az 1 pozisyon kapandı (buna göre AutoTrade tekrar açabiliriz)
+    Return True => en az 1 pozisyon kapandı
     """
     open_positions = safe_load(OPEN_POS_FILE, [])
     if not open_positions:
@@ -627,9 +648,9 @@ def execute_signal(sig):
       - STATE["simulate"] True ise => sadece kayda al, sim trade mesajı
       - STATE["simulate"] False ve STATE["auto_trade"] True ise =>
             limit uygunsa gerçek emir dene
-            gerçek emir başarılı/başarısız olsa da kayda al (mode="real")
+            (başarılı/başarısız olsa da kayda al mode="real" dene)
       - STATE["simulate"] False ve STATE["auto_trade"] False ise =>
-            hiçbir gerçek emir atma ama kayda al (mode="sim")
+            sim olarak kaydet
     """
     symbol = sig["symbol"]
     direction = sig["dir"]
@@ -735,6 +756,7 @@ def maybe_daily_summary():
 
     STATE["last_daily_sent_date"] = today_str
     safe_save(STATE_FILE, STATE)
+
 # ================== TELEGRAM COMMANDS ==================
 def tg_poll_commands(last_update_id):
     """
@@ -933,7 +955,7 @@ def tg_poll_commands(last_update_id):
 
 # ================== MAIN LOOP ==================
 def main():
-    tg_send("🚀 EMA ULTRA v13.5 başladı (Hybrid Sim/Real + Runtime Params)")
+    tg_send("🚀 EMA ULTRA v13.5.1 başladı (Hybrid Sim/Real + Dynamic Precision)")
     last_update_id = 0
 
     # sembolleri topla
