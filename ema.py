@@ -362,8 +362,8 @@ DEFAULT_PARAM = {
     "SCALP_COOLDOWN_BARS": 3,
 
     "TRADE_SIZE_USDT": 250.0,
-    "MAX_BUY": 15,
-    "MAX_SELL": 15,
+    "MAX_BUY": 25,
+    "MAX_SELL": 25,
 
     # AI placeholders
     "AI_PNL_THRESHOLD": 0.0,
