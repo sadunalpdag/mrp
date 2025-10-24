@@ -1,39 +1,56 @@
 # ==============================================================================
-# 📘 EMA ULTRA v13.5.5 — Soft Limit Mode + Auto-Restore + Hedge Sync
+# 📘 EMA ULTRA v13.5.6 — Auto-Sim Sync + Soft Limit Full Restore
+#
 #  - AutoTrade ON  => gerçek Binance Futures emirleri (MARKET)
 #  - Simulate ON   => sadece veri toplar (limitsiz), emir açmaz
+#
 #  - MAX_BUY/MAX_SELL sadece AutoTrade modunda uygulanır
 #  - open_positions.json hem sim hem real pozisyonları tutar
 #  - closed_trades.json TP/SL kapananları toplar
+#
 #  - Binance hedge mode aktif (LONG/SHORT ayrı)
 #  - Her loop'ta Binance üzerindeki gerçek açık pozisyonlar
 #    senkronize edilir (sync_real_positions)
+#
 #  - Her gerçek pozisyon için TP / SL emirleri Binance'e gönderilir
 #    (TAKE_PROFIT_MARKET / STOP_MARKET, reduceOnly, hedge-aware)
+#
 #  - Duplicate Guard:
 #       aynı symbol + yön açıkken yeni sinyal tekrar açmaz
+#
 #  - Closed Bar Filter:
 #       kapanmamış barlardan sinyal üretmez (tekrarlı spam engeli)
-#  - Smart AutoTrade Restore (SOFT LIMIT MODE):
-#       LONG ve SHORT yönleri ayrı izlenir.
-#       - LONG tarafı limit aşarsa sadece LONG kapatılır
-#       - SHORT tarafı limit aşarsa sadece SHORT kapatılır
-#       limit altına inince otomatik yeniden açılır.
-#       (Artık tüm sistemi komple kilitlemiyoruz.)
+#
+#  - Smart AutoTrade Restore v2:
+#       * LONG ve SHORT yönleri ayrı izlenir.
+#       * MAX_BUY dolarsa sadece LONG kapanır.
+#       * MAX_SELL dolarsa sadece SHORT kapanır.
+#       * Limit altına inince yön otomatik yeniden açılır.
+#       * Eğer her iki yön de kapalıysa:
+#             simulate=True (sadece veri toplar)
+#         En az bir yön açıksa:
+#             simulate=False (gerçek emir atar)
+#
+#       Yani sistem kendi kendini kilitleyip geri açıyor.
+#
 #  - Periodik Status:
 #       her 10 dakikada bir Telegram'a
 #       açık işlem sayısı / kapanan işlem sayısı / winrate / modlar raporu
 #       + LONG Trade / SHORT Trade flag'leri
+#
 #  - Telegram komutlarıyla runtime param kontrolü
 #  - Telegram offline olursa tg_queue.json'a bufferlar
 #  - Günlük rapor /report ile veya otomatik
+#
 #  - Dynamic LOT_SIZE precision (Binance -1111 fix)
+#
 #  - ONLY_ULTRA_TRADES varsayılan açık (sadece ULTRA işler)
 #
-#  Sürüm farkı vs v13.5.4:
-#   * STATE["auto_trade_long"] / STATE["auto_trade_short"]
-#     eklendi, limit mantığı yumuşatıldı.
-#   * Status / /status çıktısı bu iki flag'i gösteriyor.
+#  Ekstra 13.5.6 değişikliği:
+#    * enforce_limits_autotrade_soft() artık simulate flag'ini de OTO yönetiyor
+#    * /autotrade on -> auto_trade=True + simulate=False
+#      /autotrade off -> auto_trade=False + simulate=True
+#
 # ==============================================================================
 
 import os, json, time, math, requests, hmac, hashlib
@@ -89,7 +106,7 @@ def log(msg: str):
         pass
 
 def now_ist_dt():
-    # Türkiye şu anda UTC+3 varsayımıyla
+    # Türkiye UTC+3
     return (datetime.now(timezone.utc) + timedelta(hours=3)).replace(microsecond=0)
 
 def now_iso():
@@ -231,7 +248,6 @@ def futures_get_klines(symbol, interval, limit):
         ).json()
 
         now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
-        # son bar geleceği zaman bazen closeTime > now_ms => henüz kapanmamış
         if r and int(r[-1][6]) > now_ms:
             r = r[:-1]
         return r
@@ -258,7 +274,7 @@ def futures_market_order(symbol, side, qty, positionSide):
 def futures_set_tp_sl(symbol, side, positionSide, qty, tp, sl):
     """
     Hedge mode TP/SL emirleri.
-    Kapatan taraf entry'nin tersi:
+    Kapatma yönü side'ın tersi:
       LONG açtıysak kapatmak için SELL
       SHORT açtıysak kapatmak için BUY
     Emirler reduceOnly ve quantity ile veriliyor.
@@ -353,7 +369,6 @@ def calc_order_quantity(symbol, usdt_size):
                 if f["filterType"] == "LOT_SIZE":
                     step_size = float(f["stepSize"])
                     precision = abs(int(round(math.log10(step_size)))) if step_size < 1 else 0
-                    # step'e yuvarla
                     qty = math.floor(qty / step_size) * step_size
                     qty = round(qty, precision)
                     break
@@ -368,23 +383,30 @@ STATE = safe_load(STATE_FILE, {
     "last_cross_seen": {},
     "last_scalp_seen": {},
     "bar_index": 0,
-    "auto_trade": False,            # eski flag (tutuyoruz geriye uyum için)
+
+    # global autotrade flag (legacy)
+    "auto_trade": True,
+
+    # simulate flag (true => sadece kayıt)
     "simulate": True,
+
     "last_daily_sent_date": "",
     "last_status_sent": 0,
 
-    # v13.5.5 yeni alanlar:
+    # yön bazlı kontrol
     "auto_trade_long": True,
     "auto_trade_short": True
 })
 
-# Eğer eski state dosyasında bu alanlar yoksa ekle:
+# field eksikse tamamla
 if "auto_trade_long" not in STATE:
     STATE["auto_trade_long"] = True
 if "auto_trade_short" not in STATE:
     STATE["auto_trade_short"] = True
 if "auto_trade" not in STATE:
-    STATE["auto_trade"] = True  # eski sürümler için fallback
+    STATE["auto_trade"] = True
+if "simulate" not in STATE:
+    STATE["simulate"] = True
 
 DEFAULT_PARAM = {
     "POWER_NORMAL_MIN": 60.0,
@@ -402,15 +424,14 @@ DEFAULT_PARAM = {
     "SCALP_COOLDOWN_BARS": 3,
 
     "TRADE_SIZE_USDT": 250.0,
-    "MAX_BUY": 25,
-    "MAX_SELL": 25,
+    "MAX_BUY": 30,
+    "MAX_SELL": 30,
 
     # AI placeholders
     "AI_PNL_THRESHOLD": 0.0,
     "AI_MIN_CONF": 0.0,
 
-    # sadece ULTRA sinyalleri işlem açsın mı?
-    # 1.0 => sadece ULTRA
+    # 1.0 => sadece ULTRA aç
     # 0.0 => PREMIUM / NORMAL da kabul
     "ONLY_ULTRA_TRADES": 1.0
 }
@@ -483,7 +504,6 @@ def sync_real_positions():
         for o in opens:
             if o.get("mode")=="real" and (o["symbol"],o["dir"])==key:
                 exists = True
-                # canlı entry fiyatını güncelle
                 o["entry"] = p["entry"]
         if not exists:
             opens.append({
@@ -503,6 +523,7 @@ def sync_real_positions():
 
     # 2) real olup da Binance'ta artık olmayanları kapat
     new_opens = []
+    closed_list=safe_load(CLOSED_TRADES_FILE, [])
     for o in opens:
         if o.get("mode")!="real":
             new_opens.append(o)
@@ -512,7 +533,6 @@ def sync_real_positions():
             new_opens.append(o)
         else:
             # bu real pozisyon kapanmış
-            closed_list=safe_load(CLOSED_TRADES_FILE, [])
             cur_px = futures_get_price(o["symbol"])
             if cur_px is None:
                 cur_px = o.get("entry",0)
@@ -537,9 +557,12 @@ def sync_real_positions():
                 "ang_now": o.get("ang_now"),
                 "ang_change": o.get("ang_change")
             })
-            safe_save(CLOSED_TRADES_FILE, closed_list)
-
+            tg_send(
+                f"📘 CLOSE {o['symbol']} {o['type']} {o['dir']} [SYNC]\n"
+                f"Exit:{cur_px:.4f} SYNC_CLOSE {pnl_pct:.2f}%"
+            )
     save_open_positions(new_opens)
+    safe_save(CLOSED_TRADES_FILE, closed_list)
 
 def try_close_positions():
     """
@@ -712,11 +735,8 @@ def build_cross_signal(sym, kl1, last_seen_map):
     if not direction:
         return None, None, None
 
-    # bar timestamp'i (son kapanmış barı kullan)
-    # kl1[-1] = son kapanmış bar (çünkü futures_get_klines son açık barı kesti)
-    bar_close_time = int(kl1[-1][6])
+    bar_close_time = int(kl1[-1][6])  # kapanmış bar
 
-    # aynı bar için tekrar sinyal verme
     cross_key = f"{sym}_{direction}"
     if last_seen_map.get(cross_key) == bar_close_time:
         return None, None, None
@@ -840,14 +860,20 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index):
     }
     return sig, scalp_key, bar_index
 
-# ================== SOFT LIMIT ENFORCER ==================
+# ================== SOFT LIMIT ENFORCER (AUTO SIM SYNC) ==================
 def enforce_limits_autotrade_soft():
     """
     Soft limit:
     - LONG taraf (BUY yönü) ayrı
     - SHORT taraf (SELL yönü) ayrı
     Limit aşıldığında sadece o yön kapanır.
-    Limit normale döndüğünde yön yeniden açılır.
+    Limit normale döndüğünde yön otomatik yeniden açılır.
+
+    Ek olarak:
+      * Eğer her iki yön kapalıysa -> simulate ON (yalnızca veri toplar)
+      * En az bir yön açıksa -> simulate OFF (gerçek mod)
+
+    Ayrıca değişim oldukça Telegram'a log atar.
     """
     long_cnt, short_cnt, _live = count_real_from_binance()
     changed = False
@@ -876,14 +902,20 @@ def enforce_limits_autotrade_soft():
             tg_send("✅ SELL limit altında → SHORT yönü yeniden aktif.")
             changed = True
 
+    # Simulate / Real senkron
+    all_off = (not STATE["auto_trade_long"]) and (not STATE["auto_trade_short"])
+    if all_off and not STATE["simulate"]:
+        STATE["simulate"] = True
+        tg_send("🧠 AutoTrade yönleri kapalı → Simulate ON (yalnızca veri toplama).")
+        changed = True
+    elif (not all_off) and STATE["simulate"]:
+        STATE["simulate"] = False
+        tg_send("💸 En az bir yön aktif → Simulate OFF (gerçek mod).")
+        changed = True
+
     if changed:
         safe_save(STATE_FILE, STATE)
 
-    # AutoTrade genel aktif mi?
-    # (eski STATE["auto_trade"] geriye uyumluluk için tutuluyor,
-    #  ama yön bazlı engel burada override ediliyor)
-    # Burada True/False dönmesi execute_signal içinde direkt
-    # kullanılmıyor artık; execute_signal yön bazlı bakıyor.
     return (STATE["auto_trade_long"] or STATE["auto_trade_short"])
 
 def already_open_same_direction(symbol, direction):
@@ -902,29 +934,30 @@ def already_open_same_direction(symbol, direction):
 def execute_signal(sig):
     """
     Sinyal geldiğinde:
-      1. duplicate guard kontrol
-      2. simulate=True -> sadece sim kaydı
-      3. simulate=False ama global autotrade=False -> sim kaydı
-      4. simulate=False ve autotrade=True:
-            - enforce_limits_autotrade_soft() çağrılır
-            - yön bazlı flag kontrol edilir:
-                * dir=="UP"  -> LONG yönü izni?
-                * dir=="DOWN"-> SHORT yönü izni?
-            - qty hesaplanır
-            - MARKET emir açılır
-            - TP/SL emirleri gönderilir
-            - real olarak kaydedilir
+      1. duplicate guard
+      2. enforce_limits_autotrade_soft() -> yön izinlerini ve simulate'i günceller
+      3. Eğer simulate=True -> SIM kaydı
+      4. Eğer simulate=False ama STATE["auto_trade"] False -> SIM kaydı
+      5. Eğer simulate=False ve auto_trade=True:
+            - yön bazlı flaglere bak
+            - qty hesapla
+            - MARKET emir aç
+            - TP/SL emirleri gönder
+            - real olarak kaydet
             - hata olursa sim fallback
     """
     symbol = sig["symbol"]
     direction = sig["dir"]  # "UP" -> LONG/BUY, "DOWN" -> SHORT/SELL
 
-    # --- Duplicate Guard ---
+    # Duplicate guard
     if already_open_same_direction(symbol, direction):
         log(f"[SKIP DUP] {symbol} {direction} zaten var")
         return
 
-    # 1) Eğer simulate açıksa zaten gerçek emir denemeden sim'e yazarız
+    # Limit enforcement + simulate sync
+    enforce_limits_autotrade_soft()
+
+    # Eğer simulate aktifse zaten gerçek emir atmayacağız
     if STATE["simulate"]:
         record_open(sig, "sim")
         tg_send(
@@ -933,9 +966,7 @@ def execute_signal(sig):
         )
         return
 
-    # 2) simulate kapalıysa ama eski global auto_trade flag False ise:
-    #    (geriye uyumluluk - biz yine soft limit moduna rağmen
-    #     adam global OFF ettiyse gerçek emir atmayacağız)
+    # Eğer global auto_trade user tarafından kapatıldıysa yine sim
     if not STATE.get("auto_trade", True):
         record_open(sig, "sim")
         tg_send(
@@ -944,10 +975,7 @@ def execute_signal(sig):
         )
         return
 
-    # 3) Soft limit enforcement -> yön izinlerini günceller
-    enforce_limits_autotrade_soft()
-
-    # 4) Yön bazlı engel kontrol
+    # Yön bazlı engel
     if direction=="UP" and not STATE.get("auto_trade_long", True):
         tg_send(f"🚫 LONG yönü durduruldu, {symbol} skip.")
         return
@@ -955,21 +983,20 @@ def execute_signal(sig):
         tg_send(f"🚫 SHORT yönü durduruldu, {symbol} skip.")
         return
 
-    # 5) qty hesapla
+    # qty hesapla
     qty = calc_order_quantity(symbol, PARAM["TRADE_SIZE_USDT"])
     if qty is None or qty<=0:
         record_open(sig, "sim")
         tg_send(f"❌ qty hesaplanamadı. SIM kaydedildi {symbol}")
         return
 
-    # 6) gerçek emir dene
+    # gerçek emir dene
     side = "BUY" if direction=="UP" else "SELL"
     pos_side = "LONG" if direction=="UP" else "SHORT"
     try:
         resp = futures_market_order(symbol, side, qty, pos_side)
         log(f"[REAL TRADE OK] {resp}")
 
-        # TP/SL emirleri hedge mode uyumlu
         futures_set_tp_sl(
             symbol=symbol,
             side=side,
@@ -1046,7 +1073,7 @@ def maybe_status_report():
     """
     now_sec = int(time.time())
     last_sent = STATE.get("last_status_sent", 0)
-    if now_sec - last_sent < 600:  # 10 dakika
+    if now_sec - last_sent < 600:
         return
 
     opens = load_open_positions()
@@ -1139,16 +1166,16 @@ def tg_poll_commands(last_update_id):
             )
 
         elif lower.startswith("/autotrade"):
-            # Bu komut global legacy flag'i yönetiyor.
-            # Yön bazlı soft limit yine enforce_limits_autotrade_soft içinde.
             parts = lower.split()
             if len(parts)==2 and parts[1] in ("on","off"):
                 if parts[1]=="on":
-                    STATE["auto_trade"]=True
-                    tg_send("🔓 AutoTrade global ON (yön limit kontrolüne tabi)")
+                    STATE["auto_trade"] = True
+                    STATE["simulate"] = False  # gerçek moda zorla
+                    tg_send("🔓 AutoTrade ON → Simulate OFF (gerçek mod)")
                 else:
-                    STATE["auto_trade"]=False
-                    tg_send("🔒 AutoTrade global OFF (sadece SIM)")
+                    STATE["auto_trade"] = False
+                    STATE["simulate"] = True   # veri toplama moduna zorla
+                    tg_send("🔒 AutoTrade OFF → Simulate ON (veri toplama)")
                 safe_save(STATE_FILE, STATE)
             else:
                 tg_send("kullanım: /autotrade on | /autotrade off")
@@ -1228,7 +1255,7 @@ def tg_poll_commands(last_update_id):
                 last_update_id = uid
                 continue
 
-            # parse number (int/float aynı mantık)
+            # parse number
             try:
                 if key_txt in ("MAX_BUY","MAX_SELL"):
                     new_val = int(val_txt)
@@ -1244,8 +1271,7 @@ def tg_poll_commands(last_update_id):
             STATE["params"] = PARAM
             safe_save(STATE_FILE, STATE)
 
-            # SMART AUTOTRADE RESTORE (soft limit ile birlikte)
-            # Bu kısım sadece limitleri yeniden değerlendiriyor.
+            # limitler değişince hemen yeniden değerlendir
             if key_txt in ("MAX_BUY","MAX_SELL"):
                 enforce_limits_autotrade_soft()
 
@@ -1257,7 +1283,7 @@ def tg_poll_commands(last_update_id):
 
 # ================== MAIN LOOP ==================
 def main():
-    tg_send("🚀 EMA ULTRA v13.5.5 başladı (Soft Limit Mode + Hedge Sync + TP/SL + DupGuard)")
+    tg_send("🚀 EMA ULTRA v13.5.6 başladı (Auto-Sim Sync + Soft Limit Full Restore)")
     last_update_id = 0
 
     exinfo = futures_exchange_info()
@@ -1284,9 +1310,12 @@ def main():
         # periyodik status raporu (10 dk)
         maybe_status_report()
 
-        # sinyal tara
+        # sinyal tarama
         STATE["bar_index"] += 1
         bar_i = STATE["bar_index"]
+
+        # LIMIT VE SIMULATE DURUMUNU HER LOOP GÜNCELLE (canlı restore)
+        enforce_limits_autotrade_soft()
 
         for sym in symbols:
             kl1 = futures_get_klines(sym, "1h", 200)
