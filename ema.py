@@ -1,93 +1,54 @@
 # ==============================================================================
-# 📘 EMA ULTRA v13.6.2 — SCALP ONLY (1H) + Volatility Filter + Soft Limit + True Market Entry
+# 📘 EMA ULTRA v13.8 — Temporal SCALP AI
 #
-# Tek dosya deploy için hazır.
+# Özellikler:
+# - SCALP ONLY (EMA7 slope reversal)
+# - 1h kapanmış mumlar üzerinden sinyal üretimi
+# - Volatility Filter (24h %change abs() >= VOLATILITY_LIMIT => SKIP)
+# - Soft Limit Mode (MAX_BUY/MAX_SELL = 30) + simulate auto toggle
+# - True Market Entry (canlı ticker fiyatıyla giriş)
+# - reduceOnly kaldırıldı (-1106 fix)
+# - Dual-Record Mode:
+#     ULTRA  -> gerçek emir açmaya çalış, aynı anda sim twin kaydet
+#     PREMIUM/NORMAL -> sadece sim kaydet
+# - APPROVE_BARS:
+#     Sinyal hemen açılmaz. Önce pending havuzuna girer.
+#     APPROVE_BARS kadar bar geçtikten sonra hala geçerliyse işleme girer.
+#     Telegram: /set APPROVE_BARS 2
+# - BAR_INTERVAL:
+#     Param olarak tutulur ve AI analiz kayıtlarına girer:
+#     /set BAR_INTERVAL 1h  (örn "30m", "1h", "90m", "2h")
+# - AI kayıtları:
+#     ai_signals.json:
+#         her pending sinyalde snapshot (power/rsi/atr/açı/volatility/params/state/approve_bars)
+#     ai_analysis.json:
+#         trade kapanınca TP/SL/SYNC_CLOSE için:
+#         kaç bar sürdü, ne kadar zamanda kapandı, PnL, tier, approve_bars, bar_interval ...
 #
-# 🔧 Nasıl Çalıştırırsın
-# ----------------------
-# 1) Sisteme environment değişkenlerini gir:
-#    export BINANCE_API_KEY="API_KEYIN"
-#    export BINANCE_SECRET_KEY="SECRET_KEYIN"
-#    export BOT_TOKEN="TELEGRAM_BOT_TOKENIN"
-#    export CHAT_ID="SANA_MESAJ_GELECEK_CHAT_ID"
+# Telegram komutları:
+#   /status
+#   /params
+#   /set KEY VALUE   veya  /set KEY=VALUE
+#   /simulate on|off
+#   /autotrade on|off
+#   /report
+#   /export closed
+#   /export ai
+#   /export analysis
+#   /export state
+#   /export params
 #
-# 2) Bağımlılıkları kur:
-#    pip install requests numpy
+# Kurulum:
+#   pip install requests numpy
 #
-# 3) Çalıştır:
-#    python3 ema.py
+# Ortam değişkenleri:
+#   export BINANCE_API_KEY="..."
+#   export BINANCE_SECRET_KEY="..."
+#   export BOT_TOKEN="..."
+#   export CHAT_ID="..."
 #
-# 📂 Runtime sırasında oluşan dosyalar (otomatik):
-#    data/state.json
-#    data/params.json
-#    data/open_positions.json
-#    data/closed_trades.json
-#    data/log.txt
-#
-# 🧠 Strateji Özeti
-# -----------------
-# - Sadece SCALP sinyali açılır. CROSS tamamen kaldırıldı.
-# - SCALP sinyali: EMA7 eğiminin yön değiştirmesi
-#     slope_prev < 0 ve slope_now > 0  ⇒ LONG (UP)
-#     slope_prev > 0 ve slope_now < 0  ⇒ SHORT (DOWN)
-#
-# - Zaman dilimi: 1h kapanmış mumlar (henüz kapanmamış bar yok).
-#
-# - True Market Entry:
-#     Pozisyon açarken entry = anlık Binance futures fiyatı
-#     (mum kapanış fiyatı değil)
-#
-# - Volatility Filter (VOLATILITY_LIMIT):
-#     /fapi/v1/ticker/24hr 'priceChangePercent' çekiliyor.
-#     abs(change) >= VOLATILITY_LIMIT ise bu coinde işlem açmıyoruz.
-#
-#     Varsayılan VOLATILITY_LIMIT = 7.0 (%7)
-#     Telegram'dan değiştirilebilir: /set VOLATILITY_LIMIT 5
-#
-# - Soft Limit (hedge aware):
-#     • Binance hedge pozisyonlarını sayar.
-#     • MAX_BUY = 30 (LONG), MAX_SELL = 30 (SHORT)
-#     • Eğer LONG tarafı limiti geçtiyse auto_trade_long=False olur,
-#       SHORT tarafı limiti geçtiyse auto_trade_short=False olur.
-#     • Limit altına inince ilgili yön geri açılır.
-#
-#     • İki yön de kapalıysa bot otomatik simulate=True yapar
-#       (sadece kayıt tutar, gerçek emir atmaz).
-#     • En az bir yön açıksa simulate=False (gerçek emir atabilir).
-#
-# - TP/SL emirleri:
-#     • TP: TAKE_PROFIT_MARKET
-#     • SL: STOP_MARKET
-#     • reduceOnly parametresi YOK (Binance -1106 fix)
-#     • Fiyatlar tickSize'e snap edilir.
-#     • Miktar (qty) LOT_SIZE.stepSize'e snap edilir.
-#
-# - Telegram komutları:
-#     /status
-#     /params
-#     /set KEY VALUE      veya /set KEY=VALUE
-#     /simulate on|off
-#     /autotrade on|off
-#     /report
-#     /export closed      -> closed_trades.json dosyasını Telegram'a yollar
-#
-#   Desteklenen /set anahtarları:
-#     VOLATILITY_LIMIT
-#     TRADE_SIZE_USDT
-#     MAX_BUY
-#     MAX_SELL
-#     SCALP_TP_PCT
-#     SCALP_SL_PCT
-#     SCALP_COOLDOWN_BARS
-#     ONLY_ULTRA_TRADES
-#
-# - simulate davranışı:
-#     • STATE["simulate"] True ise hiçbir gerçek emir açılmaz.
-#     • FALSE ise gerçek emir açılabilir (limit ve yön izinleri uygunsa).
-#
-# - auto_trade davranışı:
-#     • /autotrade off -> global kapatır, simulate=True zorlanır.
-#     • /autotrade on  -> global açar, simulate=False (ama soft limit tekrar override edebilir).
+# Çalıştır:
+#   python3 ema.py
 #
 # ==============================================================================
 
@@ -100,11 +61,13 @@ BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR  = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
-STATE_FILE         = os.path.join(DATA_DIR, "state.json")
-PARAM_FILE         = os.path.join(DATA_DIR, "params.json")
-OPEN_POS_FILE      = os.path.join(DATA_DIR, "open_positions.json")
-CLOSED_TRADES_FILE = os.path.join(DATA_DIR, "closed_trades.json")
-LOG_FILE           = os.path.join(DATA_DIR, "log.txt")
+STATE_FILE          = os.path.join(DATA_DIR, "state.json")
+PARAM_FILE          = os.path.join(DATA_DIR, "params.json")
+OPEN_POS_FILE       = os.path.join(DATA_DIR, "open_positions.json")
+CLOSED_TRADES_FILE  = os.path.join(DATA_DIR, "closed_trades.json")
+AI_SIGNALS_FILE     = os.path.join(DATA_DIR, "ai_signals.json")
+AI_ANALYSIS_FILE    = os.path.join(DATA_DIR, "ai_analysis.json")
+LOG_FILE            = os.path.join(DATA_DIR, "log.txt")
 
 # ================= ENV VARS =================
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
@@ -133,6 +96,22 @@ def safe_save(path, data):
     except Exception as e:
         print(f"[SAVE ERR] {e}", flush=True)
 
+def append_ai_signal(entry):
+    """
+    entry dict -> append to ai_signals.json
+    """
+    arr = safe_load(AI_SIGNALS_FILE, [])
+    arr.append(entry)
+    safe_save(AI_SIGNALS_FILE, arr)
+
+def append_ai_analysis(entry):
+    """
+    entry dict -> append to ai_analysis.json
+    """
+    arr = safe_load(AI_ANALYSIS_FILE, [])
+    arr.append(entry)
+    safe_save(AI_ANALYSIS_FILE, arr)
+
 def log(msg: str):
     print(msg, flush=True)
     try:
@@ -147,6 +126,23 @@ def now_ts_ms():
 def now_iso():
     # Türkiye UTC+3 varsayımıyla
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
+
+def now_local_dt():
+    # datetime objesi (UTC+3 varsayımı)
+    return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0)
+
+# barlar arası dakika farkını hesaplamak için yardımcı
+def minutes_between(iso_start, iso_end):
+    try:
+        s = datetime.fromisoformat(iso_start.replace("Z","+00:00"))
+    except:
+        s = datetime.fromisoformat(iso_start)
+    try:
+        e = datetime.fromisoformat(iso_end.replace("Z","+00:00"))
+    except:
+        e = datetime.fromisoformat(iso_end)
+    diff = e - s
+    return diff.total_seconds()/60.0
 
 # ================= TELEGRAM HELPERS =================
 def tg_send(text: str):
@@ -233,7 +229,7 @@ def futures_get_price(symbol):
 def futures_24h_change(symbol):
     """
     24 saatlik fiyat değişim yüzdesi.
-    priceChangePercent döner. Örn "8.52"
+    priceChangePercent döner. Örn "8.52".
     """
     try:
         r = requests.get(
@@ -256,7 +252,7 @@ def futures_get_klines(symbol, interval, limit):
             timeout=10
         ).json()
         now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
-        # son bar kapanmadıysa at
+        # son bar henüz kapanmadıysa at
         if r and int(r[-1][6]) > now_ms:
             r = r[:-1]
         return r
@@ -334,7 +330,7 @@ def futures_market_order(symbol, side, qty, positionSide):
 
 def futures_set_tp_sl(symbol, side, positionSide, qty, tp, sl, filters_cache=None):
     """
-    TP/SL emirleri. reduceOnly parametresi yok.
+    TP/SL emirleri. reduceOnly yok.
     workingType=CONTRACT_PRICE
     """
     f = get_symbol_filters(symbol, filters_cache)
@@ -476,37 +472,32 @@ def calc_power(e7_now,e7_prev,e7_prev2, atr_now, price_now, rsi_now):
 
 def tier_from_power(power, params):
     """
-    ULTRA / PREMIUM derecelendirme.
-    NORMAL yok çünkü scalp'te zayıf sinyal istemiyoruz.
+    ULTRA / PREMIUM / NORMAL
     """
-    if power >= params["POWER_ULTRA_MIN"]:   return "ULTRA","🟩"
-    if power >= params["POWER_PREMIUM_MIN"]: return "PREMIUM","🟦"
+    if power >= params["POWER_ULTRA_MIN"]:
+        return "ULTRA","🟩"
+    if power >= params["POWER_PREMIUM_MIN"]:
+        return "PREMIUM","🟦"
+    if power >= params.get("POWER_NORMAL_MIN",60.0):
+        return "NORMAL","🟨"
     return None,""
-
-def filter_ultra(tier, params):
-    """
-    ONLY_ULTRA_TRADES:
-    1.0 => sadece ULTRA kabul
-    0.0 => PREMIUM de kabul
-    """
-    if tier == "ULTRA":
-        return True
-    if tier == "PREMIUM" and params.get("ONLY_ULTRA_TRADES",0.0) < 1.0:
-        return True
-    return False
 
 # ================= STATE / PARAM =================
 STATE_DEFAULT = {
     "auto_trade": True,          # global izin
-    "simulate": True,            # sadece veri toplama modu
+    "simulate": True,            # simulate mod
     "auto_trade_long": True,     # long yön aktif mi
     "auto_trade_short": True,    # short yön aktif mi
 
     "last_status_sent": 0,
     "bar_index": 0,
 
-    "last_scalp_seen": {},       # scalp cooldown için
-    "last_daily_sent_date": ""
+    "last_scalp_seen": {},       # cooldown için
+    "last_daily_sent_date": "",
+
+    # APPROVE SYSTEM
+    # pending sinyaller (onay bekleyen): { "key": {...sigdata..., "born_bar":int} }
+    "pending_signals": {}
 }
 STATE = safe_load(STATE_FILE, STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items():
@@ -521,21 +512,25 @@ PARAM_DEFAULT = {
     "SCALP_TP_PCT": 0.006,     # %0.6 TP
     "SCALP_SL_PCT": 0.10,      # %10 SL
 
-    "SCALP_COOLDOWN_BARS": 3,  # scalp spam engeli (bar bazlı, 1h)
+    "SCALP_COOLDOWN_BARS": 3,  # aynı yönde aynı coin tekrar süresi (bar bazlı)
 
+    "POWER_NORMAL_MIN": 60.0,
     "POWER_PREMIUM_MIN": 68.0,
     "POWER_ULTRA_MIN":   75.0,
 
-    "ONLY_ULTRA_TRADES": 1.0,  # 1.0-> sadece ULTRA, 0.0-> PREMIUM da kabul
+    "ONLY_ULTRA_TRADES": 1.0,  # real trade sadece ULTRA
 
-    "VOLATILITY_LIMIT": 7.0    # |24h change| >= 7% ise SKIP
+    "VOLATILITY_LIMIT": 7.0,   # |24h change| >= 7% => SKIP
+
+    "APPROVE_BARS": 1,         # sinyal bu kadar bar sonra onaylanıp işleme girecek
+    "BAR_INTERVAL": "1h"       # analitik kayıt için (örn "30m","1h","90m","2h")
 }
 PARAM = safe_load(PARAM_FILE, PARAM_DEFAULT)
 for k,v in PARAM_DEFAULT.items():
     PARAM.setdefault(k,v)
 safe_save(PARAM_FILE, PARAM)
 
-# ================= POSITION TRACKING =================
+# ================= POSITION TRACKING & ANALYSIS =================
 def load_open_positions():
     return safe_load(OPEN_POS_FILE, [])
 
@@ -566,24 +561,62 @@ def record_open(sig, mode_flag):
     opens.append({
         "symbol": sig["symbol"],
         "dir": sig["dir"],
-        "type": "SCALP",
+        "type": sig.get("type","SCALP"),
+        "tier": sig.get("tier"),
         "entry": sig["entry"],
         "tp": sig["tp"],
         "sl": sig["sl"],
         "time_open": sig["time"],
         "mode": mode_flag,
         "power": sig.get("power"),
-        "tier": sig.get("tier"),
         "rsi": sig.get("rsi"),
+        "atr": sig.get("atr"),
         "ang_now": sig.get("ang_now"),
-        "ang_change": sig.get("ang_change")
+        "ang_change": sig.get("ang_change"),
+        "volatility_24h": sig.get("volatility_24h"),
+        "approve_bars": sig.get("approve_bars"),
+        "bar_interval": sig.get("bar_interval"),
+        "param_snapshot": sig.get("param_snapshot"),
+        "born_bar": sig.get("born_bar"),            # sinyal ilk doğduğu bar
+        "approved_bar": sig.get("approved_bar")     # işleme girdiği bar
     })
     save_open_positions(opens)
+
+def add_ai_signal_snapshot(sig):
+    """
+    Her yeni sinyal pending'e alındığında ai_signals.json'a snapshot düş.
+    """
+    ai_entry = {
+        "symbol": sig["symbol"],
+        "tier": sig.get("tier"),
+        "dir": sig["dir"],
+        "entry": sig["entry"],
+        "tp": sig["tp"],
+        "sl": sig["sl"],
+        "power": sig.get("power"),
+        "rsi": sig.get("rsi"),
+        "atr": sig.get("atr"),
+        "ang_now": sig.get("ang_now"),
+        "ang_change": sig.get("ang_change"),
+        "volatility_24h": sig.get("volatility_24h"),
+        "time": sig.get("time"),
+        "approve_bars": sig.get("approve_bars"),
+        "bar_interval": sig.get("bar_interval"),
+        "param_snapshot": sig.get("param_snapshot"),
+        "state_snapshot": {
+            "auto_trade": STATE.get("auto_trade", True),
+            "simulate": STATE.get("simulate", True),
+            "auto_trade_long": STATE.get("auto_trade_long", True),
+            "auto_trade_short": STATE.get("auto_trade_short", True)
+        }
+    }
+    append_ai_signal(ai_entry)
 
 def close_local_position(row, reason, exit_px):
     """
     Local pozisyonu kapatır, closed_trades'e taşır.
     reason: "TP", "SL", "SYNC_CLOSE"
+    Aynı zamanda ai_analysis.json'a kayıt atar (kaç bar sürdü vb.)
     """
     opens = load_open_positions()
     closed = load_closed_trades()
@@ -597,27 +630,77 @@ def close_local_position(row, reason, exit_px):
             else:
                 pnl_pct = (row["entry"]-exit_px)/row["entry"]*100 if row["entry"] else 0.0
 
+            time_open_iso  = row.get("time_open")
+            time_close_iso = now_iso()
+
+            # kaç bar sürdü?
+            born_bar      = row.get("born_bar")
+            approved_bar  = row.get("approved_bar")
+            bars_to_close = None
+            if approved_bar is not None and isinstance(approved_bar,int) and isinstance(born_bar,int):
+                # "kapanma" analizi = from approved_bar to close
+                bars_to_close = STATE.get("bar_index",0) - approved_bar
+
+            # dakika bazlı süre
+            mins_to_close = None
+            if time_open_iso:
+                mins_to_close = minutes_between(time_open_iso, time_close_iso)
+
+            # kapatma datasını closed_trades'e yaz
             closed.append({
                 "symbol": row["symbol"],
                 "dir": row["dir"],
-                "type": "SCALP",
+                "type": row.get("type","SCALP"),
+                "tier": row.get("tier"),
                 "entry": row.get("entry"),
                 "exit": exit_px,
                 "result": reason,
                 "pnl_pct": pnl_pct,
-                "time_open": row.get("time_open"),
-                "time_close": now_iso(),
+                "time_open": time_open_iso,
+                "time_close": time_close_iso,
                 "mode": row.get("mode","?"),
                 "power": row.get("power"),
-                "tier": row.get("tier"),
                 "rsi": row.get("rsi"),
+                "atr": row.get("atr"),
                 "ang_now": row.get("ang_now"),
-                "ang_change": row.get("ang_change")
+                "ang_change": row.get("ang_change"),
+                "volatility_24h": row.get("volatility_24h"),
+                "approve_bars": row.get("approve_bars"),
+                "bar_interval": row.get("bar_interval"),
+                "param_snapshot": row.get("param_snapshot"),
+                "born_bar": born_bar,
+                "approved_bar": approved_bar,
+                "bars_to_close": bars_to_close,
+                "mins_to_close": mins_to_close
             })
 
+            # AI analysis kaydı
+            analysis_entry = {
+                "symbol": row["symbol"],
+                "tier": row.get("tier"),
+                "dir": row["dir"],
+                "result": reason,
+                "pnl_pct": pnl_pct,
+                "volatility_24h": row.get("volatility_24h"),
+                "power": row.get("power"),
+                "rsi": row.get("rsi"),
+                "atr": row.get("atr"),
+                "approve_bars": row.get("approve_bars"),
+                "bar_interval": row.get("bar_interval"),
+                "bars_to_close": bars_to_close,
+                "mins_to_close": mins_to_close,
+                "time_open": time_open_iso,
+                "time_close": time_close_iso,
+                "born_bar": born_bar,
+                "approved_bar": approved_bar
+            }
+            append_ai_analysis(analysis_entry)
+
+            # Telegram'a kapanış bilgisi
             tg_send(
-                f"📘 CLOSE {row['symbol']} SCALP {row['dir']} [{row.get('mode','?')}]\n"
-                f"Exit:{exit_px:.6f} {reason} {pnl_pct:.2f}%"
+                f"📘 CLOSE {row['symbol']} {row.get('type','SCALP')} {row['dir']} [{row.get('mode','?')}]\n"
+                f"Exit:{exit_px:.6f} {reason} {pnl_pct:.2f}%\n"
+                f"Tier:{row.get('tier')} Pow:{row.get('power')}"
             )
         else:
             new_opens.append(o)
@@ -655,16 +738,23 @@ def sync_real_positions():
                 "symbol": p["symbol"],
                 "dir": direction,
                 "type": "SCALP",
+                "tier": None,
                 "entry": p["entry"],
                 "tp": None,
                 "sl": None,
                 "time_open": now_iso(),
                 "mode": "real",
                 "power": None,
-                "tier": None,
                 "rsi": None,
+                "atr": None,
                 "ang_now": None,
-                "ang_change": None
+                "ang_change": None,
+                "volatility_24h": None,
+                "approve_bars": None,
+                "bar_interval": PARAM.get("BAR_INTERVAL"),
+                "param_snapshot": None,
+                "born_bar": None,
+                "approved_bar": None
             })
 
     # Binance'te yoksa local kapat
@@ -788,7 +878,6 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
     volatility filter:
       24h change % |x| >= VOLATILITY_LIMIT => SKIP
     """
-    # volatility filter (günlük değişim çok büyükse atla)
     chg_24h = futures_24h_change(sym)
     if abs(chg_24h) >= params["VOLATILITY_LIMIT"]:
         log(f"[SKIP VOLATILE] {sym} {chg_24h:.2f}% >= {params['VOLATILITY_LIMIT']}%")
@@ -810,8 +899,6 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
         return None, None, None
 
     scalp_key = f"{sym}_{direction}"
-
-    # cooldown bar
     last_idx=last_scalp_seen.get(scalp_key)
     if last_idx is not None:
         if (bar_index - last_idx) <= params["SCALP_COOLDOWN_BARS"]:
@@ -831,61 +918,138 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
     )
 
     tier, color = tier_from_power(pwr, params)
-    # ULTRA her zaman kabul,
-    # PREMIUM sadece ONLY_ULTRA_TRADES <1.0 ise kabul
-    if not filter_ultra(tier, params):
+    if tier is None:
         return None, None, None
+
+    param_snapshot = {
+        "SCALP_TP_PCT": params["SCALP_TP_PCT"],
+        "SCALP_SL_PCT": params["SCALP_SL_PCT"],
+        "POWER_NORMAL_MIN": params["POWER_NORMAL_MIN"],
+        "POWER_PREMIUM_MIN": params["POWER_PREMIUM_MIN"],
+        "POWER_ULTRA_MIN": params["POWER_ULTRA_MIN"],
+        "VOLATILITY_LIMIT": params["VOLATILITY_LIMIT"],
+        "TRADE_SIZE_USDT": params["TRADE_SIZE_USDT"],
+        "APPROVE_BARS": params["APPROVE_BARS"],
+        "BAR_INTERVAL": params["BAR_INTERVAL"]
+    }
 
     ang_now  = slope_angle_deg(slope_now2, atr_now)
     ang_dif  = angle_between_deg(slope_prev2, slope_now2, atr_now)
 
-    entry = futures_get_price(sym)
-    if not entry:
+    entry_live = futures_get_price(sym)
+    if not entry_live:
         return None, None, None
 
     if direction=="UP":
-        tp = entry*(1+params["SCALP_TP_PCT"])
-        sl = entry*(1-params["SCALP_SL_PCT"])
+        tp = entry_live*(1+params["SCALP_TP_PCT"])
+        sl = entry_live*(1-params["SCALP_SL_PCT"])
     else:
-        tp = entry*(1-params["SCALP_TP_PCT"])
-        sl = entry*(1+params["SCALP_SL_PCT"])
+        tp = entry_live*(1-params["SCALP_TP_PCT"])
+        sl = entry_live*(1+params["SCALP_SL_PCT"])
 
     sig = {
         "symbol": sym,
         "type": "SCALP",
         "dir": direction,
-        "entry": entry,
+        "tier": tier,
+        "color": color,
+        "entry": entry_live,
         "tp": tp,
         "sl": sl,
         "power": pwr,
         "rsi": rsi_now,
+        "atr": atr_now,
         "ang_now": ang_now,
         "ang_change": ang_dif,
-        "tier": tier,
-        "color": color,
-        "time": now_iso()
+        "volatility_24h": chg_24h,
+        "time": now_iso(),
+        "param_snapshot": param_snapshot,
+        "approve_bars": params["APPROVE_BARS"],
+        "bar_interval": params["BAR_INTERVAL"],
+        "born_bar": bar_index  # bu bar'da sinyal doğdu
     }
 
     return sig, scalp_key, bar_index
 
-# ================= EXECUTION LOGIC =================
+# ================= APPROVAL SYSTEM =================
+def add_pending_signal(sig, scalp_key):
+    """
+    Sinyali STATE["pending_signals"] içine koyuyoruz.
+    Bu sinyal APPROVE_BARS kadar sonra işleme girebilecek.
+    Key: symbol_dir_bornbar
+    """
+    pending = STATE.get("pending_signals", {})
+    unique_key = f"{sig['symbol']}_{sig['dir']}_{sig['born_bar']}"
+    if unique_key in pending:
+        # zaten var
+        return
+
+    pending[unique_key] = {
+        "sig": sig,
+        "scalp_key": scalp_key
+    }
+    STATE["pending_signals"] = pending
+    safe_save(STATE_FILE, STATE)
+
+    # ilk snapshot AI datasına girsin
+    add_ai_signal_snapshot(sig)
+
+def approve_and_execute_pending_signals():
+    """
+    Her loop'ta çağrılır.
+    APPROVE_BARS dolmuş sinyalleri bul:
+      if current_bar_index - sig['born_bar'] >= APPROVE_BARS:
+          sinyali işleme sok.
+    """
+    current_bar = STATE.get("bar_index",0)
+    new_pending = {}
+    for ukey, payload in STATE.get("pending_signals", {}).items():
+        sig = payload["sig"]
+        scalp_key = payload["scalp_key"]
+        born_bar = sig.get("born_bar", current_bar)
+        need_bars = sig.get("approve_bars", 1)
+
+        if current_bar - born_bar >= need_bars:
+            # Bu sinyal onay süresini doldurdu, şimdi trade etmeyi dene
+            # cooldown mark'ı güncelleyelim ki aynı yönde spam açmasın
+            if scalp_key not in STATE["last_scalp_seen"]:
+                STATE["last_scalp_seen"][scalp_key] = born_bar
+
+            # Artık sinyal "approved"
+            sig["approved_bar"] = current_bar
+
+            # İşlemi gerçekleştir (dual record dahil)
+            execute_signal(sig)
+
+        else:
+            # hala beklemede
+            new_pending[ukey] = payload
+
+    STATE["pending_signals"] = new_pending
+    safe_save(STATE_FILE, STATE)
+
+# ================= EXECUTION LOGIC (DUAL RECORD) =================
+def open_dual_records(sig, real_executed: bool):
+    """
+    Bu sinyali open_positions.json'a kaydederiz:
+    - real_executed True ise "real" ve ayrıca "sim"
+    - aksi halde sadece "sim"
+    """
+    if real_executed:
+        record_open(sig, "real")
+        record_open(sig, "sim")
+    else:
+        record_open(sig, "sim")
+
 def execute_signal(sig, filters_cache=None):
     """
-    Sinyal objesi:
-    {
-        "symbol":...,
-        "dir":"UP"/"DOWN",
-        "type":"SCALP",
-        "entry":...,
-        "tp":...,
-        "sl":...,
-        "time":...,
-        ...
-    }
+    Dual-Record + APPROVAL sonrası çağrılır.
+    ULTRA -> gerçek emir dene (uygunsa), her durumda sim kaydı aç
+    PREMIUM/NORMAL -> sadece sim kaydı
     """
-
     symbol    = sig["symbol"]
-    direction = sig["dir"]      # "UP" => LONG/BUY, "DOWN" => SHORT/SELL
+    direction = sig["dir"]
+    tier      = sig.get("tier","?")
 
     # Limitleri ve simulate durumunu güncelle
     enforce_limits_autotrade_soft()
@@ -895,34 +1059,39 @@ def execute_signal(sig, filters_cache=None):
         log(f"[SKIP DUP] {symbol} {direction} zaten açık")
         return
 
-    # Global autotrade OFF ise -> simulate zorla
+    # PREMIUM ve NORMAL sinyaller gerçek emir açmaz.
+    # ULTRA sinyal gerçek emir adayıdır.
+    if tier in ("PREMIUM","NORMAL"):
+        open_dual_records(sig, real_executed=False)
+        # premium/normal sinyal açıldığında Telegram spam Yok.
+        return
+
+    # ULTRA ise buraya geliriz ↓
+
+    # Global autotrade kapalıysa -> simulate zorunlu kalsın:
     if not STATE.get("auto_trade", True):
         STATE["simulate"] = True
         safe_save(STATE_FILE, STATE)
 
-    # Simulate modundaysak asla gerçek emir atma
-    if STATE["simulate"]:
-        record_open(sig, "sim")
+    blocked_long  = (direction=="UP"   and not STATE.get("auto_trade_long", True))
+    blocked_short = (direction=="DOWN" and not STATE.get("auto_trade_short", True))
+
+    # Eğer simulate modundaysak veya yön kapalıysa gerçek emir atmayacağız
+    if STATE["simulate"] or blocked_long or blocked_short:
+        open_dual_records(sig, real_executed=False)
         tg_send(
-            f"📒 SIM TRADE {symbol} SCALP {direction}\n"
-            f"entry={sig['entry']:.6f} tp={sig['tp']:.6f} sl={sig['sl']:.6f}\n"
-            f"Pow:{sig.get('power','?'):.1f} Tier:{sig.get('tier','?')}"
+            f"⚠️ SKIP REAL {symbol} {direction} ULTRA\n"
+            f"Neden: simulate={STATE['simulate']} "
+            f"longOn={STATE.get('auto_trade_long',True)} "
+            f"shortOn={STATE.get('auto_trade_short',True)}"
         )
         return
 
-    # Yön bazlı kontrol
-    if direction=="UP" and not STATE.get("auto_trade_long", True):
-        tg_send(f"🚫 LONG yönü kapalı ({symbol} skip).")
-        return
-    if direction=="DOWN" and not STATE.get("auto_trade_short", True):
-        tg_send(f"🚫 SHORT yönü kapalı ({symbol} skip).")
-        return
-
-    # Miktar hesapla
+    # qty hesapla
     qty, f, live_px_for_qty = calc_order_quantity(symbol, PARAM["TRADE_SIZE_USDT"], filters_cache)
     if not qty or qty <= 0:
-        record_open(sig, "sim")
-        tg_send(f"❌ qty hesaplanamadı → {symbol} SIM olarak kaydedildi.")
+        open_dual_records(sig, real_executed=False)
+        tg_send(f"❌ qty hesaplanamadı → {symbol} sadece sim kaydı açıldı.")
         return
 
     side     = "BUY"  if direction=="UP"   else "SELL"
@@ -933,17 +1102,18 @@ def execute_signal(sig, filters_cache=None):
         futures_set_tp_sl(symbol, side, pos_side, qty, sig["tp"], sig["sl"], filters_cache)
 
         tg_send(
-            f"💸 REAL TRADE {symbol} {direction} SCALP\n"
+            f"💸 REAL TRADE {symbol} {direction} ULTRA\n"
             f"qty={qty} {side} {pos_side}\n"
             f"entry≈{sig['entry']:.6f} tp={sig['tp']:.6f} sl={sig['sl']:.6f}\n"
-            f"Pow:{sig.get('power','?'):.1f} Tier:{sig.get('tier','?')}"
+            f"Pow:{sig.get('power','?'):.1f} apprBars:{sig.get('approve_bars')}"
         )
-        record_open(sig, "real")
+
+        open_dual_records(sig, real_executed=True)
 
     except Exception as e:
-        record_open(sig, "sim")
-        tg_send(f"❌ REAL TRADE ERR {symbol}\n{e}\nSim olarak kaydedildi.")
         log(f"[REAL TRADE ERR] {e}")
+        tg_send(f"❌ REAL TRADE ERR {symbol}\n{e}\nSim olarak kaydedildi.")
+        open_dual_records(sig, real_executed=False)
 
 # ================= STATUS / REPORT =================
 def maybe_status_report():
@@ -972,6 +1142,9 @@ def maybe_status_report():
         f"auto_trade global: {'✅' if STATE.get('auto_trade',True) else '❌'}\n"
         f"TradeSize: {PARAM['TRADE_SIZE_USDT']} USDT\n"
         f"VOLATILITY_LIMIT: {PARAM.get('VOLATILITY_LIMIT')}\n"
+        f"APPROVE_BARS: {PARAM.get('APPROVE_BARS')}\n"
+        f"BAR_INTERVAL: {PARAM.get('BAR_INTERVAL')}\n"
+        f"Pending signals: {len(STATE.get('pending_signals',{}))}\n"
         f"Time: {now_iso()}"
     )
 
@@ -1018,7 +1191,7 @@ def maybe_daily_summary():
 # ================= TELEGRAM COMMANDS =================
 def tg_poll_commands(last_update_id):
     """
-    Desteklenen komutlar:
+    Komutlar:
       /status
       /params
       /set KEY VALUE  veya  /set KEY=VALUE
@@ -1026,6 +1199,10 @@ def tg_poll_commands(last_update_id):
       /simulate on|off
       /report
       /export closed
+      /export ai
+      /export analysis
+      /export state
+      /export params
     """
     if not BOT_TOKEN:
         return last_update_id
@@ -1065,6 +1242,9 @@ def tg_poll_commands(last_update_id):
                 f"auto_trade global: {'✅' if STATE.get('auto_trade',True) else '❌'}\n"
                 f"TradeSize: {PARAM['TRADE_SIZE_USDT']} USDT\n"
                 f"VOLATILITY_LIMIT: {PARAM.get('VOLATILITY_LIMIT')}\n"
+                f"APPROVE_BARS: {PARAM.get('APPROVE_BARS')}\n"
+                f"BAR_INTERVAL: {PARAM.get('BAR_INTERVAL')}\n"
+                f"Pending: {len(STATE.get('pending_signals',{}))} sinyal bekliyor\n"
                 f"Open(local): {len(opens_local)} | Closed(local): {len(closed_local)} | Winrate(local): {winrate_local:.1f}%\n"
                 f"Time: {now_iso()}"
             )
@@ -1075,7 +1255,7 @@ def tg_poll_commands(last_update_id):
                 pretty.append(f"{k} = {v}")
             pretty_text = "\n".join(pretty)
             tg_send(
-                "🔧 Aktif Parametreler:\n"
+                "🔧 Parametreler:\n"
                 f"{pretty_text}\n"
                 f"\nSimulate: {'✅' if STATE['simulate'] else '❌'}\n"
                 f"LONG: {'✅' if STATE.get('auto_trade_long',True) else '❌'} / "
@@ -1122,10 +1302,22 @@ def tg_poll_commands(last_update_id):
 
         elif lower.startswith("/export"):
             parts = lower.split()
-            if len(parts)==2 and parts[1]=="closed":
-                tg_send_document(CLOSED_TRADES_FILE, caption="📊 closed_trades.json")
+            if len(parts)==2:
+                arg = parts[1]
+                if arg=="closed":
+                    tg_send_document(CLOSED_TRADES_FILE, caption="📊 closed_trades.json")
+                elif arg=="ai":
+                    tg_send_document(AI_SIGNALS_FILE, caption="🧠 ai_signals.json")
+                elif arg=="analysis":
+                    tg_send_document(AI_ANALYSIS_FILE, caption="🧠 ai_analysis.json")
+                elif arg=="state":
+                    tg_send_document(STATE_FILE, caption="⚙️ state.json")
+                elif arg=="params":
+                    tg_send_document(PARAM_FILE, caption="🔧 params.json")
+                else:
+                    tg_send("Kullanım: /export closed | ai | analysis | state | params")
             else:
-                tg_send("Kullanım: /export closed")
+                tg_send("Kullanım: /export closed | ai | analysis | state | params")
 
         elif lower.startswith("/set"):
             # /set KEY VALUE  veya  /set KEY=VALUE
@@ -1173,6 +1365,24 @@ def tg_poll_commands(last_update_id):
                 key_txt = "SCALP_COOLDOWN_BARS"
             if key_txt in ("VOL","VOLATILITY","VOLATILITY_LIMIT"):
                 key_txt = "VOLATILITY_LIMIT"
+            if key_txt in ("PNORM","POWER_NORMAL_MIN"):
+                key_txt = "POWER_NORMAL_MIN"
+            if key_txt in ("PPREM","POWER_PREMIUM_MIN"):
+                key_txt = "POWER_PREMIUM_MIN"
+            if key_txt in ("PULT","POWER_ULTRA_MIN"):
+                key_txt = "POWER_ULTRA_MIN"
+            if key_txt in ("APPROVE","APPROVE_BARS"):
+                key_txt = "APPROVE_BARS"
+            if key_txt in ("BARINT","BAR_INTERVAL"):
+                key_txt = "BAR_INTERVAL"
+
+            # BAR_INTERVAL numeric değil olabilir (örn "1h", "30m")
+            if key_txt == "BAR_INTERVAL":
+                PARAM[key_txt] = val_txt
+                safe_save(PARAM_FILE, PARAM)
+                tg_send(f"⚙️ {key_txt} = {PARAM[key_txt]} olarak ayarlandı")
+                last_update_id = uid
+                continue
 
             if key_txt not in PARAM:
                 tg_send(f"❌ bilinmeyen param: {key_txt}")
@@ -1181,7 +1391,7 @@ def tg_poll_commands(last_update_id):
 
             # sayı parse
             try:
-                if key_txt in ("MAX_BUY","MAX_SELL","SCALP_COOLDOWN_BARS"):
+                if key_txt in ("MAX_BUY","MAX_SELL","SCALP_COOLDOWN_BARS","APPROVE_BARS"):
                     new_val = int(val_txt)
                 else:
                     new_val = float(val_txt)
@@ -1194,7 +1404,7 @@ def tg_poll_commands(last_update_id):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"⚙️ {key_txt} = {PARAM[key_txt]} olarak ayarlandı")
 
-            # limit güncellendiyse, hemen tekrar değerlendir
+            # limit güncellendiyse hemen tekrar değerlendir
             if key_txt in ("MAX_BUY","MAX_SELL"):
                 enforce_limits_autotrade_soft()
 
@@ -1204,7 +1414,7 @@ def tg_poll_commands(last_update_id):
 
 # ================= MAIN LOOP =================
 def main():
-    tg_send("🚀 EMA ULTRA v13.6.2 SCALP-ONLY başladı (1H + Volatility Filter + SoftLimit + TrueMarket)")
+    tg_send("🚀 EMA ULTRA v13.8 Temporal SCALP AI başladı (Approve Bars, Dual Record)")
     # sembolleri al
     exinfo = futures_exchange_info()
     symbols = [s["symbol"] for s in exinfo
@@ -1230,11 +1440,12 @@ def main():
         # 5) Periyodik status raporu
         maybe_status_report()
 
-        # 6) Bar sayacı
+        # 6) Bar sayacı artır
         STATE["bar_index"] += 1
         bar_i = STATE["bar_index"]
 
-        # 7) Sinyalleri tara (SCALP ONLY, 1h verisi)
+        # 7) Yeni scalp sinyallerini tara (1h verisi)
+        #    -> pending_signals havuzuna koy
         for sym in symbols:
             kl1 = futures_get_klines(sym, "1h", 200)
             if len(kl1) < 60:
@@ -1249,28 +1460,35 @@ def main():
             )
 
             if scalp_sig:
-                tg_send(
-                    f"{scalp_sig.get('color','')} {scalp_sig.get('tier','')} "
-                    f"SCALP {sym} {scalp_sig['dir']}\n"
-                    f"Pow:{scalp_sig.get('power','?'):.1f}\n"
-                    f"Entry:{scalp_sig['entry']:.6f} TP:{scalp_sig['tp']:.6f} SL:{scalp_sig['sl']:.6f}"
-                )
+                # scalp_sig şu anda sadece pending moduna alınacak
+                add_pending_signal(scalp_sig, scalp_key)
 
-                execute_signal(scalp_sig)
-
-                if scalp_key is not None:
-                    STATE["last_scalp_seen"][scalp_key] = scalp_bar_idx
+                # sadece ULTRA sinyalini Telegram'a duyur (bilgilendirme)
+                if scalp_sig.get("tier") == "ULTRA":
+                    tg_send(
+                        f"{scalp_sig.get('color','')} {scalp_sig.get('tier','')} "
+                        f"SCALP {sym} {scalp_sig['dir']} (pending)\n"
+                        f"Pow:{scalp_sig.get('power','?'):.1f}\n"
+                        f"Vol24h:{scalp_sig.get('volatility_24h','?'):.2f}%\n"
+                        f"ApproveBars:{scalp_sig.get('approve_bars')} "
+                        f"BarInt:{scalp_sig.get('bar_interval')}\n"
+                        f"Entry:{scalp_sig['entry']:.6f} TP:{scalp_sig['tp']:.6f} SL:{scalp_sig['sl']:.6f}"
+                    )
 
             time.sleep(0.08)
 
-        # 8) Günlük rapor
+        # 8) APPROVAL aşaması:
+        #    APPROVE_BARS dolan pending sinyalleri işleme sok
+        approve_and_execute_pending_signals()
+
+        # 9) Günlük rapor
         maybe_daily_summary()
 
-        # 9) Persist state/params
+        # 10) Persist state/params
         safe_save(STATE_FILE, STATE)
         safe_save(PARAM_FILE, PARAM)
 
-        # 10) Loop bekle
+        # 11) Loop bekle
         time.sleep(120)
 
 # ================= ENTRY =================
