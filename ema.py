@@ -1,36 +1,37 @@
 # ==============================================================================
-# 📘 EMA ULTRA v13.5.8-FULL
+# 📘 EMA ULTRA v13.6-SCALP
 #  File: ema.py
 #
-#  🔄 Ana Özellikler
+#  🔄 Bu sürüm sadece SCALP açar. CROSS tamamen silindi.
+#
+#  Özellikler:
 #  - TRUE MARKET ENTRY:
-#       Entry artık kapanan mumun fiyatı değil, Binance canlı ticker fiyatı.
-#  - CROSS sinyali:
-#       EMA7 vs EMA25 kesişimi. TP/SL -> CROSS_TP_PCT / CROSS_SL_PCT
+#       Entry = Binance canlı fiyatı (ticker), mum kapanışı değil.
 #  - SCALP sinyali:
-#       EMA7 eğim yön değişimi. TP/SL -> SCALP_TP_PCT / SCALP_SL_PCT
-#  - CROSS_STOP_LOSS %10 (0.10) -> senin talebin
-#  - MAX_BUY / MAX_SELL = 30 -> senin talebin
-#  - Soft Limit Full Restore:
-#       Long sayısı limitteyse sadece LONG yön durur.
-#       Short sayısı limitteyse sadece SHORT yön durur.
-#       Limit altına inince yön otomatik geri açılır.
-#       İki yön de kapalıysa simulate=True (sadece veri toplar)
-#       En az bir yön açıksa simulate=False (gerçek emir açabilir)
-#  - /autotrade on/off:
-#       on  => auto_trade=True  & simulate=False
-#       off => auto_trade=False & simulate=True
+#       EMA7 eğimi yön değiştirince (neg->poz = LONG / poz->neg = SHORT)
+#       SCALP_TP_PCT / SCALP_SL_PCT ile TP/SL hesaplanır.
+#  - reduceOnly tamamen kaldırıldı (MARKET ve TP/SL emirlerinde yok)
 #  - Precision Fix:
 #       qty -> LOT_SIZE stepSize'e snap
 #       TP/SL -> PRICE_FILTER tickSize'e snap
-#  - reduceOnly kaldırıldı:
-#       MARKET emirlerinde yok
-#       TP/SL emirlerinde yok
-#       (Binance -1106 fix)
+#  - Soft Limit Full Restore:
+#       Long sayısı MAX_BUY (30) üstündeyse LONG yönü durur
+#       Short sayısı MAX_SELL (30) üstündeyse SHORT yönü durur
+#       Limit altına inince yön otomatik tekrar açılır
+#       İki yön birden kapalıysa simulate=True
+#       En az bir yön açıksa simulate=False
+#  - /autotrade on|off:
+#       on  => auto_trade=True  & simulate=False
+#       off => auto_trade=False & simulate=True
+#  - Telegram komutları:
+#       /status /params /set /simulate /autotrade /report
 #
-#  Veri dosyaları:
-#    state.json, params.json, open_positions.json, closed_trades.json, log.txt
-#
+#  Dosyalar:
+#     data/state.json
+#     data/params.json
+#     data/open_positions.json
+#     data/closed_trades.json
+#     data/log.txt
 # ==============================================================================
 
 import os, json, time, math, requests, hmac, hashlib
@@ -56,7 +57,7 @@ BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 BINANCE_FAPI   = "https://fapi.binance.com"
 
-# ================= LOW-LEVEL HELPERS =================
+# ================= BASIC HELPERS =================
 def safe_load(path, default):
     try:
         if os.path.exists(path):
@@ -75,7 +76,7 @@ def safe_save(path, data):
     except Exception as e:
         print(f"[SAVE ERR] {e}", flush=True)
 
-def log(msg):
+def log(msg: str):
     print(msg, flush=True)
     try:
         with open(LOG_FILE,"a",encoding="utf-8") as f:
@@ -108,7 +109,7 @@ def tg_send(text: str):
 # ================= BINANCE CORE =================
 def _signed_request(method, path, payload):
     """
-    Universal signed call to Binance Futures.
+    Signed Binance Futures request.
     """
     if not BINANCE_KEY or not BINANCE_SECRET:
         raise RuntimeError("Binance API keys not set")
@@ -139,8 +140,7 @@ def _signed_request(method, path, payload):
 
 def futures_get_price(symbol):
     """
-    Live ticker price (gerçek market fiyatı).
-    Bu fiyatı entry olarak kullanıyoruz.
+    Anlık ticker fiyatı. Entry olarak bunu kullanıyoruz.
     """
     try:
         r = requests.get(
@@ -154,7 +154,7 @@ def futures_get_price(symbol):
 
 def futures_get_klines(symbol, interval, limit):
     """
-    Kline çekiyoruz. Son kapanmamış barı atıyoruz (spam/tekrar sinyal engellemek için).
+    Kline çek. Son kapanmamış barı at.
     """
     try:
         r = requests.get(
@@ -163,7 +163,6 @@ def futures_get_klines(symbol, interval, limit):
             timeout=10
         ).json()
         now_ms = int(datetime.now(timezone.utc).timestamp()*1000)
-        # son bar kapanmadıysa at
         if r and int(r[-1][6]) > now_ms:
             r = r[:-1]
         return r
@@ -172,7 +171,7 @@ def futures_get_klines(symbol, interval, limit):
 
 def futures_exchange_info():
     """
-    Precision bilgileri için sembol detayları.
+    Sembol precision bilgileri.
     """
     try:
         r = requests.get(
@@ -185,7 +184,7 @@ def futures_exchange_info():
 
 def get_symbol_filters(symbol, cache=None):
     """
-    stepSize / tickSize çek.
+    LOT_SIZE.stepSize ve PRICE_FILTER.tickSize'i al.
     """
     if cache is None:
         cache = futures_exchange_info()
@@ -203,20 +202,18 @@ def get_symbol_filters(symbol, cache=None):
     }
 
 def snap_qty(qty, step):
-    if step<=0: 
+    if step<=0:
         return round(qty,3)
-    # floor'a snap
     return math.floor(qty/step)*step
 
 def snap_price(px, tick):
     if tick<=0:
         return round(px,6)
-    # Binance genelde fazla hassasiyeti reddediyor, aşağı snap etmek güvenli
     return round(math.floor(px/tick)*tick, 8)
 
 def calc_order_quantity(symbol, usdt_size, filters_cache=None):
     """
-    TRADE_SIZE_USDT büyüklüğü ile qty hesapla.
+    TRADE_SIZE_USDT büyüklüğünden qty hesapla.
     stepSize'e snap et.
     """
     live_px = futures_get_price(symbol)
@@ -232,8 +229,7 @@ def calc_order_quantity(symbol, usdt_size, filters_cache=None):
 
 def futures_market_order(symbol, side, qty, positionSide):
     """
-    Pozisyon açılışı MARKET.
-    reduceOnly GÖNDERMİYORUZ. (Binance -1106 fix)
+    Market giriş. reduceOnly YOK.
     """
     payload = {
         "symbol": symbol,
@@ -247,9 +243,9 @@ def futures_market_order(symbol, side, qty, positionSide):
 
 def futures_set_tp_sl(symbol, side, positionSide, qty, tp, sl, filters_cache=None):
     """
-    TP/SL emirleri.
-    Artık reduceOnly YOK (yeni Binance gereği).
-    Fiyatlar tickSize'e snap'leniyor.
+    TP/SL emirlerini yerleştir.
+    reduceOnly yok.
+    Fiyatlar tickSize'e snapleniyor.
     """
     f = get_symbol_filters(symbol, filters_cache)
     tick = f["tickSize"] if f else 0.01
@@ -295,7 +291,7 @@ def futures_set_tp_sl(symbol, side, positionSide, qty, tp, sl, filters_cache=Non
 
 def futures_fetch_positions():
     """
-    Şu an açık hedge pozisyonlarını getirir.
+    Açık hedge pozisyonlarını getir.
     LONG -> positionAmt > 0
     SHORT -> positionAmt < 0
     """
@@ -315,7 +311,7 @@ def futures_fetch_positions():
             out.append({"symbol":sym,"side":"SHORT","qty":abs(amt),"entry":entry_px})
     return out
 
-# ================= INDICATORS =================
+# ================= INDICATORS (SCALP uses EMA7 slope flip) =================
 def ema(vals, n):
     if not vals:
         return []
@@ -377,7 +373,7 @@ def angle_between_deg(s1,s2,atr_val):
 
 def calc_power(e7_now,e7_prev,e7_prev2, atr_now, price_now, rsi_now):
     """
-    CROSS / SCALP sinyallerinde momentum kalitesi için "power" puanı.
+    Güç skoru.
     """
     slope_now  = e7_now  - e7_prev2
     slope_prev = e7_prev - e7_prev2
@@ -389,10 +385,24 @@ def calc_power(e7_now,e7_prev,e7_prev2, atr_now, price_now, rsi_now):
     return base, slope_prev, slope_now
 
 def tier_from_power(power, params):
+    """
+    ULTRA / PREMIUM derecelendirme.
+    NORMAL yok çünkü scalp'te sadece güçlü momentum istiyoruz.
+    """
     if power >= params["POWER_ULTRA_MIN"]:   return "ULTRA","🟩"
     if power >= params["POWER_PREMIUM_MIN"]: return "PREMIUM","🟦"
-    # NORMAL tier is intentionally optional in scalp gating
     return None,""
+
+def filter_ultra(tier, params):
+    """
+    ONLY_ULTRA_TRADES = 1.0 ise sadece ULTRA kabul et.
+    ONLY_ULTRA_TRADES <1.0 ise PREMIUM da kabul.
+    """
+    if tier == "ULTRA":
+        return True
+    if tier == "PREMIUM" and params.get("ONLY_ULTRA_TRADES",0.0) < 1.0:
+        return True
+    return False
 
 # ================= STATE / PARAM =================
 STATE_DEFAULT = {
@@ -404,34 +414,27 @@ STATE_DEFAULT = {
     "last_status_sent": 0,
     "bar_index": 0,
 
-    "last_cross_seen": {},       # symbol_dir -> last_bar_close_time
-    "last_scalp_seen": {}        # symbol_dir -> last_bar_index (cooldown)
+    "last_scalp_seen": {}        # scalp cooldown için
 }
 STATE = safe_load(STATE_FILE, STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items():
     STATE.setdefault(k,v)
 
 PARAM_DEFAULT = {
-    "MAX_BUY":  30.0,         # <-- senin istediğin 30
-    "MAX_SELL": 30.0,         # <-- senin istediğin 30
+    "MAX_BUY":  30.0,          # LONG limit
+    "MAX_SELL": 30.0,          # SHORT limit
 
     "TRADE_SIZE_USDT": 250.0,
 
-    "CROSS_TP_PCT": 0.010,    # %1 TP
-    "CROSS_SL_PCT": 0.10,     # %10 SL (senin istediğin)
-    "SCALP_TP_PCT": 0.006,    # %0.6 TP
-    "SCALP_SL_PCT": 0.10,     # %10 SL scalp'te
+    "SCALP_TP_PCT": 0.006,     # %0.6 TP
+    "SCALP_SL_PCT": 0.10,      # %10 SL
 
-    "SCALP_COOLDOWN_BARS": 3, # scalp sinyal spam engeli
+    "SCALP_COOLDOWN_BARS": 3,  # scalp spam engeli
 
-    # power tier eşikleri
     "POWER_PREMIUM_MIN": 68.0,
     "POWER_ULTRA_MIN":   75.0,
 
-    # sadece ULTRA mı işleme girsin?
-    # 1.0 => sadece ULTRA
-    # 0.0 => PREMIUM da kabul
-    "ONLY_ULTRA_TRADES": 1.0
+    "ONLY_ULTRA_TRADES": 1.0   # 1.0 -> sadece ULTRA, 0.0 -> PREMIUM da
 }
 PARAM = safe_load(PARAM_FILE, PARAM_DEFAULT)
 for k,v in PARAM_DEFAULT.items():
@@ -453,7 +456,7 @@ def save_closed_trades(lst):
 
 def already_open_same_direction(symbol, direction):
     """
-    direction: "UP" (LONG) veya "DOWN" (SHORT)
+    direction: "UP"(LONG) veya "DOWN"(SHORT)
     Aynı coin aynı yön zaten açık mı?
     """
     for o in load_open_positions():
@@ -468,9 +471,9 @@ def record_open(sig, mode_flag):
     opens = load_open_positions()
     opens.append({
         "symbol": sig["symbol"],
-        "dir": sig["dir"],              # "UP" / "DOWN"
-        "type": sig["type"],            # "CROSS"/"SCALP"
-        "entry": sig["entry"],          # gerçek market entry
+        "dir": sig["dir"],        # "UP"/"DOWN"
+        "type": "SCALP",
+        "entry": sig["entry"],
         "tp": sig["tp"],
         "sl": sig["sl"],
         "time_open": sig["time"],
@@ -484,25 +487,22 @@ def record_open(sig, mode_flag):
     save_open_positions(opens)
 
 def close_local_position(row, reason, exit_px):
-    """
-    Bir open_positions girdisini kapatıp closed_trades'e taşı.
-    reason: "TP", "SL", "SYNC_CLOSE"
-    """
     opens = load_open_positions()
     closed = load_closed_trades()
     new_opens = []
 
     for o in opens:
         if o is row:
-            # PnL yüzde hesapla
+            # PnL %
             if row["dir"]=="UP":
                 pnl_pct = (exit_px-row["entry"])/row["entry"]*100 if row["entry"] else 0.0
             else:
                 pnl_pct = (row["entry"]-exit_px)/row["entry"]*100 if row["entry"] else 0.0
+
             closed.append({
                 "symbol": row["symbol"],
                 "dir": row["dir"],
-                "type": row.get("type","?"),
+                "type": "SCALP",
                 "entry": row.get("entry"),
                 "exit": exit_px,
                 "result": reason,
@@ -516,8 +516,9 @@ def close_local_position(row, reason, exit_px):
                 "ang_change": row.get("ang_change"),
                 "tier": row.get("tier")
             })
+
             tg_send(
-                f"📘 CLOSE {row['symbol']} {row.get('type','?')} {row['dir']} [{row.get('mode','?')}]\n"
+                f"📘 CLOSE {row['symbol']} SCALP {row['dir']} [{row.get('mode','?')}]\n"
                 f"Exit:{exit_px:.6f} {reason} {pnl_pct:.2f}%"
             )
         else:
@@ -528,11 +529,10 @@ def close_local_position(row, reason, exit_px):
 
 def sync_real_positions():
     """
-    Binance hedge pozisyonlarını oku ve open_positions.json içinde
-    "real" mod girdileri ile hizala:
-      - Binance'te artık yoksa local'de kapat.
-      - Binance'te varsa ama local'de yoksa ekle.
-      - Binance varsa local varsa entry fiyatını güncelle.
+    Binance hedge pozisyonlarını oku, open_positions.json'ı senkronla:
+      - varsa entry güncelle
+      - yeniyse ekle
+      - Binance'te yoksa local'de kapat
     """
     live = futures_fetch_positions()
     live_keyset = set()
@@ -542,7 +542,7 @@ def sync_real_positions():
 
     opens = load_open_positions()
 
-    # 1) Güncelle + ekle
+    # Güncelle / ekle
     for p in live:
         direction = "UP" if p["side"]=="LONG" else "DOWN"
         key = (p["symbol"], direction)
@@ -550,12 +550,12 @@ def sync_real_positions():
         for o in opens:
             if o.get("mode")=="real" and (o["symbol"],o["dir"])==key:
                 exists = True
-                o["entry"] = p["entry"]  # gerçek ortalama entryPrice ile güncelle
+                o["entry"] = p["entry"]
         if not exists:
             opens.append({
                 "symbol": p["symbol"],
                 "dir": direction,
-                "type": "SYNC",
+                "type": "SCALP",
                 "entry": p["entry"],
                 "tp": None,
                 "sl": None,
@@ -568,7 +568,7 @@ def sync_real_positions():
                 "tier": None
             })
 
-    # 2) Binance'te artık olmayanları kapat (SYNC_CLOSE)
+    # Binance'te yoksa local kapat
     for o in list(opens):
         if o.get("mode")=="real":
             k=(o["symbol"],o["dir"])
@@ -582,9 +582,7 @@ def sync_real_positions():
 
 def try_local_tp_sl_hits():
     """
-    Local failsafe:
-    Fiyat TP/SL'e vurduysa hala open_positions.json'da duruyorsak kapat.
-    Bu Binance'e emir göndermez, sadece local kayıt + Telegram rapor.
+    failsafe: TP/SL dokunduysa local olarak kapat (Binance'e ekstra emir atmaz)
     """
     opens = load_open_positions()
     if not opens:
@@ -612,10 +610,10 @@ def try_local_tp_sl_hits():
         elif hit_sl:
             close_local_position(row, "SL", px)
 
-# ================= SOFT LIMIT & SIMULATE SYNC =================
+# ================= LIMIT / SIMULATE CONTROL =================
 def count_real_long_short():
     """
-    Binance hedge pozisyonlarına bakıp kaç LONG / SHORT var bul.
+    Hedge pozisyon sayıları (kaç LONG, kaç SHORT).
     """
     pos = futures_fetch_positions()
     long_cnt = sum(1 for p in pos if p["side"]=="LONG")
@@ -624,13 +622,10 @@ def count_real_long_short():
 
 def enforce_limits_autotrade_soft():
     """
-    MAX_BUY / MAX_SELL kontrolü.
-    - LONG yön limit üstüne çıktıysa auto_trade_long=False yapılır.
-    - SHORT yön limit üstüne çıktıysa auto_trade_short=False yapılır.
-    - Limit altına inince yön yeniden açılır.
-    Ek:
-    - Eğer her iki yön de kapalıysa simulate=True
-    - En az bir yön açıksa simulate=False
+    MAX_BUY / MAX_SELL'e göre yön bazlı dur-kalk.
+    Ayrıca:
+    - her iki yön de kapalıysa simulate=True
+    - en az bir yön açıksa simulate=False
     """
     long_cnt, short_cnt, livepos = count_real_long_short()
     changed = False
@@ -675,112 +670,13 @@ def enforce_limits_autotrade_soft():
 
     return (STATE["auto_trade_long"] or STATE["auto_trade_short"])
 
-# ================= SIGNAL ENGINES =================
-def filter_ultra(tier, params):
-    """
-    ONLY_ULTRA_TRADES = 1.0 ise sadece ULTRA kabul et.
-    ONLY_ULTRA_TRADES = 0.0 ise PREMIUM da kabul.
-    CROSS sinyali: ULTRA / PREMIUM / NORMAL üçlüsünü kullanıyorduk,
-    scalp sinyal için NORMAL yok dedik, sadece PREMIUM/ULTRA kabul.
-    Biz burada ortak basit yaklaşım kullanıyoruz:
-    - ULTRA her zaman kabul
-    - PREMIUM sadece ONLY_ULTRA_TRADES < 1.0 ise kabul
-    """
-    if tier == "ULTRA":
-        return True
-    if tier == "PREMIUM" and params.get("ONLY_ULTRA_TRADES",0.0) < 1.0:
-        return True
-    return False
-
-def build_cross_signal(sym, kl1, last_seen_map, params):
-    """
-    EMA7 vs EMA25 kesişimi.
-    True Market Entry farkı:
-      Eskiden entry=closes[-1] diyorduk.
-      Artık entry = canlı futures_get_price(sym)
-    """
-    closes=[float(k[4]) for k in kl1]
-    ema7_  = ema(closes,7)
-    ema25_ = ema(closes,25)
-    if len(ema7_)<6 or len(ema25_)<6:
-        return None, None, None
-
-    prev_diff    = ema7_[-3]-ema25_[-3]
-    cross_diff   = ema7_[-2]-ema25_[-2]
-    confirm_diff = ema7_[-1]-ema25_[-1]
-
-    direction=None
-    if prev_diff<0 and cross_diff>0 and confirm_diff>0:
-        direction="UP"
-    elif prev_diff>0 and cross_diff<0 and confirm_diff<0:
-        direction="DOWN"
-    if not direction:
-        return None, None, None
-
-    # bu sinyali hangi barın kapanışı tetikledi?
-    bar_close_time = int(kl1[-1][6])
-
-    cross_key = f"{sym}_{direction}"
-    # aynı bar için tekrar verme
-    if last_seen_map.get(cross_key) == bar_close_time:
-        return None, None, None
-
-    highs=[float(k[2]) for k in kl1]
-    lows =[float(k[3]) for k in kl1]
-    atr_arr=atr_like(highs,lows,closes,14)
-    atr_now=atr_arr[-1] if atr_arr else 0.0
-
-    rsi_arr=rsi(closes,14)
-    rsi_now=rsi_arr[-1]
-
-    pwr, slope_prev, slope_now_ = calc_power(
-        ema7_[-1], ema7_[-2], ema7_[-5],
-        atr_now, closes[-1], rsi_now
-    )
-
-    tier, color = tier_from_power(pwr, params)
-    if not filter_ultra(tier, params):
-        return None, None, None
-
-    ang_now  = slope_angle_deg(slope_now_, atr_now)
-    ang_dif  = angle_between_deg(slope_prev, slope_now_, atr_now)
-
-    # TRUE MARKET ENTRY: anlık fiyat
-    live_px = futures_get_price(sym)
-    if not live_px:
-        return None, None, None
-    entry = live_px
-
-    if direction=="UP":
-        tp = entry*(1+params["CROSS_TP_PCT"])
-        sl = entry*(1-params["CROSS_SL_PCT"])
-    else:
-        tp = entry*(1-params["CROSS_TP_PCT"])
-        sl = entry*(1+params["CROSS_SL_PCT"])
-
-    sig = {
-        "symbol": sym,
-        "type": "CROSS",
-        "dir": direction,
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "power": pwr,
-        "rsi": rsi_now,
-        "ang_now": ang_now,
-        "ang_change": ang_dif,
-        "tier": tier,
-        "color": color,
-        "time": now_iso()
-    }
-    return sig, cross_key, bar_close_time
-
+# ================= SCALP SIGNAL ENGINE =================
 def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
     """
     SCALP sinyali:
-    EMA7 eğim yön değiştirdi mi?
-    slope_prev <0 & slope_now>0 => UP
-    slope_prev >0 & slope_now<0 => DOWN
+    EMA7 eğim yön değiştirince tetiklenir.
+    slope_prev<0 & slope_now>0 => UP
+    slope_prev>0 & slope_now<0 => DOWN
 
     cooldown:
       aynı yönde aynı coinde tekrar spam atmasın diye SCALP_COOLDOWN_BARS
@@ -821,12 +717,8 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
         atr_now, closes[-1], rsi_now
     )
 
-    # scalp PREMIUM/ULTRA kabul ediyor
     tier, color = tier_from_power(pwr, params)
-    # filter_ultra:
-    # ULTRA her zaman tamam
-    # PREMIUM sadece ONLY_ULTRA_TRADES <1.0 ise tamam
-    # NORMAL ise direkt reddediyoruz ztn (tier_from_power() NORMAL'i dönmüyor şu an)
+    # ULTRA her zaman kabul, PREMIUM sadece ONLY_ULTRA_TRADES<1.0 ise kabul
     if not filter_ultra(tier, params):
         return None, None, None
 
@@ -836,7 +728,7 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
     live_px = futures_get_price(sym)
     if not live_px:
         return None, None, None
-    entry = live_px
+    entry = live_px  # TRUE MARKET ENTRY
 
     if direction=="UP":
         tp = entry*(1+params["SCALP_TP_PCT"])
@@ -863,26 +755,26 @@ def build_scalp_signal(sym, kl1, last_scalp_seen, bar_index, params):
 
     return sig, scalp_key, bar_index
 
-# ================= EXECUTION LOGIC =================
+# ================= EXECUTION =================
 def execute_signal(sig, filters_cache=None):
     """
-    Sinyal objesi:
+    Yalnızca SCALP artık.
+    sig:
     {
-        "symbol": ...,
-        "dir": "UP"/"DOWN",
-        "type": "CROSS"/"SCALP",
-        "entry": <live_price>,
-        "tp": <float>,
-        "sl": <float>,
-        "time": now_iso(),
+        "symbol":...,
+        "dir":"UP"/"DOWN",
+        "type":"SCALP",
+        "entry":...,
+        "tp":...,
+        "sl":...,
+        "time":...,
         "power":..., "rsi":..., "ang_now":..., "ang_change":..., "tier":...
     }
     """
-
     symbol    = sig["symbol"]
     direction = sig["dir"]      # "UP" => LONG/BUY, "DOWN" => SHORT/SELL
 
-    # Limitleri, simulate durumunu güncelle
+    # Soft limit uygula (LONG/SHORT slot dolduysa engelle vs.)
     enforce_limits_autotrade_soft()
 
     # Duplicate guard
@@ -890,22 +782,22 @@ def execute_signal(sig, filters_cache=None):
         log(f"[SKIP DUP] {symbol} {direction} zaten açık")
         return
 
-    # Global autotrade OFF ise asla gerçek emir yok, sim kaydet
+    # Global autotrade OFF ise -> simulate zorla
     if not STATE.get("auto_trade", True):
         STATE["simulate"] = True
         safe_save(STATE_FILE, STATE)
 
-    # Simulate moddaysa sadece kaydet
+    # Simulate modundaysak asla gerçek emir atma
     if STATE["simulate"]:
         record_open(sig, "sim")
         tg_send(
-            f"📒 SIM TRADE {symbol} {sig['type']} {direction}\n"
+            f"📒 SIM TRADE {symbol} SCALP {direction}\n"
             f"entry={sig['entry']:.6f} tp={sig['tp']:.6f} sl={sig['sl']:.6f}\n"
             f"Pow:{sig.get('power','?')} RSI:{sig.get('rsi','?')} Tier:{sig.get('tier','?')}"
         )
         return
 
-    # Yön bazlı engeller
+    # Yön bazlı kontrol
     if direction=="UP" and not STATE.get("auto_trade_long", True):
         tg_send(f"🚫 LONG yönü kapalı ({symbol} skip).")
         return
@@ -920,7 +812,6 @@ def execute_signal(sig, filters_cache=None):
         tg_send(f"❌ qty hesaplanamadı → {symbol} SIM olarak kaydedildi.")
         return
 
-    # Gerçek emir
     side     = "BUY"  if direction=="UP"   else "SELL"
     pos_side = "LONG" if direction=="UP"   else "SHORT"
 
@@ -929,7 +820,7 @@ def execute_signal(sig, filters_cache=None):
         futures_set_tp_sl(symbol, side, pos_side, qty, sig["tp"], sig["sl"], filters_cache)
 
         tg_send(
-            f"💸 REAL TRADE {symbol} {direction} {sig['type']}\n"
+            f"💸 REAL TRADE {symbol} {direction} SCALP\n"
             f"qty={qty} {side} {pos_side}\n"
             f"entry≈{sig['entry']:.6f} tp={sig['tp']:.6f} sl={sig['sl']:.6f}\n"
             f"Pow:{sig.get('power','?')} RSI:{sig.get('rsi','?')} Tier:{sig.get('tier','?')}"
@@ -937,19 +828,18 @@ def execute_signal(sig, filters_cache=None):
         record_open(sig, "real")
 
     except Exception as e:
-        # fallback SIM kayıt
         record_open(sig, "sim")
         tg_send(f"❌ REAL TRADE ERR {symbol}\n{e}\nSim olarak kaydedildi.")
         log(f"[REAL TRADE ERR] {e}")
 
-# ================= STATUS / REPORT =================
+# ================= REPORT / STATUS =================
 def maybe_status_report():
     """
-    Her 10 dakikada bir durum raporu gönder.
+    Her 10 dakikada bir durum raporu at.
     """
     now_sec = int(time.time())
     last_sent = STATE.get("last_status_sent", 0)
-    if now_sec - last_sent < 600:  # 10 dk
+    if now_sec - last_sent < 600:
         return
 
     long_cnt, short_cnt, livepos = count_real_long_short()
@@ -1004,21 +894,18 @@ def maybe_daily_summary():
         f"Winrate: {summary['winrate']:.1f}%\n"
         f"AvgPnL: {summary['avg_pnl']:.2f}%"
     )
-    # snapshotları Telegram dosya olarak atabiliriz istersen burada da,
-    # ama burada minimal tutuyoruz.
     STATE["last_daily_sent_date"] = today_str
     safe_save(STATE_FILE, STATE)
 
 # ================= TELEGRAM COMMANDS =================
 def tg_poll_commands(last_update_id):
     """
-    Desteklenen komutlar:
-      /status
-      /params
-      /set KEY VALUE (veya /set KEY=VALUE)
-      /autotrade on|off
-      /simulate on|off
-      /report
+    /status
+    /params
+    /set KEY VALUE  veya  /set KEY=VALUE
+    /autotrade on|off
+    /simulate on|off
+    /report
     """
     if not BOT_TOKEN:
         return last_update_id
@@ -1113,7 +1000,7 @@ def tg_poll_commands(last_update_id):
             )
 
         elif lower.startswith("/set"):
-            # destek: /set KEY VALUE  veya  /set KEY=VALUE
+            # /set KEY VALUE  veya  /set KEY=VALUE
             raw = text.replace("\n"," ").strip()
             if " " in raw and "=" not in raw:
                 parts = raw.split()
@@ -1148,14 +1035,12 @@ def tg_poll_commands(last_update_id):
                 key_txt = "MAX_SELL"
             if key_txt in ("ULTRA","ONLY_ULTRA","ONLY_ULTRA_TRADES"):
                 key_txt = "ONLY_ULTRA_TRADES"
-            if key_txt in ("CROSSTP","CROSS_TP","CROSS_TP_PCT"):
-                key_txt = "CROSS_TP_PCT"
-            if key_txt in ("CROSSSL","CROSS_SL","CROSS_SL_PCT"):
-                key_txt = "CROSS_SL_PCT"
             if key_txt in ("SCALPTP","SCALP_TP","SCALP_TP_PCT"):
                 key_txt = "SCALP_TP_PCT"
             if key_txt in ("SCALPSL","SCALP_SL","SCALP_SL_PCT"):
                 key_txt = "SCALP_SL_PCT"
+            if key_txt in ("COOLDOWN","SCALP_COOLDOWN","SCALP_COOLDOWN_BARS"):
+                key_txt = "SCALP_COOLDOWN_BARS"
 
             if key_txt not in PARAM:
                 tg_send(f"❌ bilinmeyen param: {key_txt}")
@@ -1176,7 +1061,7 @@ def tg_poll_commands(last_update_id):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"⚙️ {key_txt} = {PARAM[key_txt]} olarak ayarlandı")
 
-            # limit değiştiyse soft limit hemen yeniden değerlendirilsin
+            # limit değiştiyse hemen yeniden değerlendir
             if key_txt in ("MAX_BUY","MAX_SELL"):
                 enforce_limits_autotrade_soft()
 
@@ -1186,9 +1071,9 @@ def tg_poll_commands(last_update_id):
 
 # ================= MAIN LOOP =================
 def main():
-    tg_send("🚀 ema.py v13.5.8-FULL başladı (True Market Entry + CROSS+SCALP + reduceOnly OFF + Precision Fix + SoftLimit AutoSim)")
+    tg_send("🚀 ema.py v13.6-SCALP başladı (SCALP ONLY + True Market Entry + reduceOnly OFF + Precision Fix + SoftLimit AutoSim)")
 
-    # Sembolleri al (USDT pariteleri, TRADING olanlar)
+    # Semboller (USDT quote ve TRADING durumda olanlar)
     exinfo = futures_exchange_info()
     symbols = [s["symbol"] for s in exinfo
                if s.get("quoteAsset")=="USDT"
@@ -1204,7 +1089,7 @@ def main():
         # 2) Binance pozisyonlarını local'e senkronize et
         sync_real_positions()
 
-        # 3) Local pozisyonların TP/SL tetiklenip tetiklenmediğini kontrol et (failsafe)
+        # 3) Local pozisyonların TP/SL tetiklerini kontrol et (failsafe)
         try_local_tp_sl_hits()
 
         # 4) Soft limit + simulate restore mantığını uygula
@@ -1217,42 +1102,37 @@ def main():
         STATE["bar_index"] += 1
         bar_i = STATE["bar_index"]
 
-        # 7) Sinyalleri tara
-        #    Hem CROSS hem SCALP
+        # 7) SCALP sinyalleri tara ve uygula
         for sym in symbols:
             kl1 = futures_get_klines(sym, "1h", 200)
-            if len(kl1) < 120:
+            if len(kl1) < 60:
                 continue
 
-            # CROSS sinyal
-            cross_sig, cross_key, cross_bar_ts = build_cross_signal(sym, kl1, STATE["last_cross_seen"], PARAM)
-            if cross_sig:
-                tg_send(
-                    f"{cross_sig.get('color','')} {cross_sig.get('tier','')} CROSS {sym} {cross_sig['dir']}\n"
-                    f"Pow:{cross_sig.get('power','?'):.1f} RSI:{cross_sig.get('rsi','?'):.1f}\n"
-                    f"Açı:{cross_sig.get('ang_now','?'):+.1f}° Δ:{cross_sig.get('ang_change','?'):.1f}°\n"
-                    f"Entry:{cross_sig['entry']:.6f} TP:{cross_sig['tp']:.6f} SL:{cross_sig['sl']:.6f}"
-                )
-                execute_signal(cross_sig)
-                if cross_key is not None:
-                    STATE["last_cross_seen"][cross_key] = cross_bar_ts
+            scalp_sig, scalp_key, scalp_bar_idx = build_scalp_signal(
+                sym,
+                kl1,
+                STATE["last_scalp_seen"],
+                bar_i,
+                PARAM
+            )
 
-            # SCALP sinyal
-            scalp_sig, scalp_key, scalp_bar_idx = build_scalp_signal(sym, kl1, STATE["last_scalp_seen"], bar_i, PARAM)
             if scalp_sig:
                 tg_send(
-                    f"{scalp_sig.get('color','')} {scalp_sig.get('tier','')} SCALP {sym} {scalp_sig['dir']}\n"
+                    f"{scalp_sig.get('color','')} {scalp_sig.get('tier','')} "
+                    f"SCALP {sym} {scalp_sig['dir']}\n"
                     f"Pow:{scalp_sig.get('power','?'):.1f} RSI:{scalp_sig.get('rsi','?'):.1f}\n"
                     f"Açı:{scalp_sig.get('ang_now','?'):+.1f}° Δ:{scalp_sig.get('ang_change','?'):.1f}°\n"
                     f"Entry:{scalp_sig['entry']:.6f} TP:{scalp_sig['tp']:.6f} SL:{scalp_sig['sl']:.6f}"
                 )
+
                 execute_signal(scalp_sig)
+
                 if scalp_key is not None:
                     STATE["last_scalp_seen"][scalp_key] = scalp_bar_idx
 
             time.sleep(0.08)
 
-        # 8) Günlük rapor
+        # 8) Günlük özet
         maybe_daily_summary()
 
         # 9) Persist state/params
