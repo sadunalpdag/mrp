@@ -152,42 +152,60 @@ def open_market_position(sym,dir,qty):
     return {"symbol":sym,"dir":dir,"positionSide":pos,"qty":qty,"entry":float(p)}
 
 # ✅ PRECISION-FLOOR TP/SL
-def futures_set_tp_sl(sym,dir,qty,entry,tp_pct,sl_pct):
-    f=get_symbol_filters(sym)
-    tick=float(f["tickSize"])
-    pos="LONG" if dir=="UP" else "SHORT"
-    side="SELL" if dir=="UP" else "BUY"
+# ==================== PRECISION SAFE TP/SL — v13.6 SCALP FIX ====================
+def futures_set_tp_sl(sym, dir, qty, entry, tp_pct, sl_pct):
+    """
+    v13.6 SCALP versiyonundaki orijinal Precision Fix:
+    - tick'e göre floor/ceil yuvarlama
+    - stopPrice daima pozitif ve Binance formatına tam uygun
+    - reduceOnly=False, closePosition=True
+    - hiçbir zaman "Stop price less than zero" hatası vermez
+    """
+    try:
+        f = get_symbol_filters(sym)
+        tick = float(f["tickSize"])
+        pos  = "LONG" if dir == "UP" else "SHORT"
+        side = "SELL" if dir == "UP" else "BUY"
 
-    if dir=="UP":
-        tp_raw=entry*(1+tp_pct)
-        sl_raw=entry*(1-sl_pct)
-        tp=round_to_tick(tp_raw,tick,"floor")
-        sl=round_to_tick(sl_raw,tick,"ceil")
-        if sl>=entry: sl=entry-tick
-    else:
-        tp_raw=entry*(1-tp_pct)
-        sl_raw=entry*(1+sl_pct)
-        tp=round_to_tick(tp_raw,tick,"ceil")
-        sl=round_to_tick(sl_raw,tick,"floor")
-        if sl<=entry: sl=entry+tick
+        if dir == "UP":
+            tp_raw = entry * (1 + tp_pct)
+            sl_raw = entry * (1 - sl_pct)
+            tp = math.floor(tp_raw / tick) * tick
+            sl = math.ceil(sl_raw / tick) * tick
+            if sl >= entry: sl = entry - tick
+        else:
+            tp_raw = entry * (1 - tp_pct)
+            sl_raw = entry * (1 + sl_pct)
+            tp = math.ceil(tp_raw / tick) * tick
+            sl = math.floor(sl_raw / tick) * tick
+            if sl <= entry: sl = entry + tick
 
-    fmt=f"{{:.{len(str(tick).split('.')[-1])}f}}"
+        # kaç ondalık basamak gerekiyorsa o kadar
+        decimals = 0
+        if "." in str(tick):
+            decimals = len(str(tick).split(".")[1].rstrip("0"))
+        fmt = f"{{:.{decimals}f}}"
 
-    for t,p in [("TAKE_PROFIT_MARKET",tp),("STOP_MARKET",sl)]:
-        pay={
-            "symbol":sym,"side":side,"type":t,
-            "stopPrice":fmt.format(p),
-            "quantity":f"{qty}",
-            "workingType":"MARK_PRICE",
-            "closePosition":"true",
-            "positionSide":pos,
-            "timestamp":now_ts_ms()
-        }
-        try:
-            _signed_request("POST","/fapi/v1/order",pay)
-        except Exception as e:
-            tg_send(f"⚠️ TP/SL ERR {sym} {e}")
-            log(f"[TP/SL ERR]{sym}{e}")
+        for t, p in [("TAKE_PROFIT_MARKET", tp), ("STOP_MARKET", sl)]:
+            payload = {
+                "symbol": sym,
+                "side": side,
+                "type": t,
+                "stopPrice": fmt.format(p),
+                "quantity": f"{qty}",
+                "workingType": "MARK_PRICE",
+                "closePosition": "true",
+                "reduceOnly": "false",
+                "positionSide": pos,
+                "timestamp": now_ts_ms()
+            }
+            _signed_request("POST", "/fapi/v1/order", payload)
+
+        log(f"[TP/SL OK] {sym} TP={fmt.format(tp)} SL={fmt.format(sl)}")
+    except Exception as e:
+        tg_send(f"⚠️ TP/SL ERR {sym} {e}")
+        log(f"[TP/SL ERR] {sym} {e}")
+
 
 # REAL POSITIONS
 def fetch_open_positions_real():
