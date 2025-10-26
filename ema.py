@@ -4,11 +4,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # ==============================================================
-# EMA ULTRA v15.9.12 FULL+HB
+# EMA ULTRA v15.9.13 FULL+HB
 #  - AI log
 #  - SilentSim (delayed sim entries)
 #  - AutoTrade (ULTRA sinyaller gerçek emir açar)
-#  - TP/SL => v13.6++ Precision Fix (tick + minPrice)
+#  - TP/SL => v13.6++ Precision Fix (tick + minPrice + no reduceOnly)
 #  - TrendLock / MAX_BUY_SELL guard
 #  - Heartbeat+Status her 10 dk Telegram
 #  - 4 saatlik auto-backup JSON dump
@@ -36,7 +36,7 @@ BINANCE_FAPI   = "https://fapi.binance.com"
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
 TREND_LOCK = {}     # "SYMBOL": "UP"/"DOWN" -> aynı yönde tekrar açmayı kilitler
-SIM_QUEUE = []      # gecikmeli sim entries burada bekliyor
+SIM_QUEUE = []      # gecikmeli simülasyon bekleme kuyruğu
 
 def safe_load(p,d):
     try:
@@ -68,6 +68,7 @@ def log(msg):
 
 def now_ts_ms(): return int(datetime.now(timezone.utc).timestamp()*1000)
 def now_ts_s():  return int(datetime.now(timezone.utc).timestamp())
+
 def now_local_iso():
     # UTC+3 gösterimi
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
@@ -114,7 +115,7 @@ def _signed_request(m,path,payload):
 
 def get_symbol_filters(sym):
     """
-    cache + exchangeInfo'tan tickSize, stepSize ve minPrice (PRICE_FILTER)
+    cache + exchangeInfo'tan tickSize, stepSize, minPrice çek
     """
     if sym in PRECISION_CACHE:
         return PRECISION_CACHE[sym]
@@ -125,7 +126,7 @@ def get_symbol_filters(sym):
         pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
         step=float(lot.get("stepSize","1"))
         tick=float(pricef.get("tickSize","0.01"))
-        min_price = float(pricef.get("minPrice","0.00000001"))
+        min_price=float(pricef.get("minPrice","0.00000001"))
         PRECISION_CACHE[sym]={
             "stepSize":step,
             "tickSize":tick,
@@ -145,7 +146,7 @@ def adjust_precision(sym,v,kind="qty"):
     step = f["stepSize"] if kind=="qty" else f["tickSize"]
     if step<=0:
         return v
-    # round to nearest allowed increment
+    # round to nearest allowed step
     return round((round(v/step)*step),12)
 
 def calc_order_qty(sym,entry,usd):
@@ -211,7 +212,7 @@ def open_market_position(sym,dir,qty):
 def fetch_open_positions_real():
     """
     Binance üstündeki gerçek pozisyonları çek.
-    long/short sayısını ve hangi semboller olduğunu döner.
+    Hem MAX_BUY/MAX_SELL guard hem duplicate guard için kullanılıyor.
     """
     out={"long":{}, "short":{},"long_count":0,"short_count":0}
     try:
@@ -229,14 +230,14 @@ def fetch_open_positions_real():
         log(f"[FETCH POS ERR]{e}")
     return out
 
-# ====== v13.6++ Precision TP/SL Fix (tick, minPrice, no invalid stopPrice) ======
+# ====== v13.6++ Precision TP/SL Fix (tick, minPrice, no reduceOnly) ======
 def futures_set_tp_sl(sym, dir, qty, entry, tp_pct, sl_pct):
     """
     Geliştirilmiş güvenli TP/SL:
     - tickSize'e göre floor/ceil
-    - minPrice filtresinin altına düşmesine izin yok
-    - reduceOnly=false, closePosition=true
-    - STOP_MARKET ve TAKE_PROFIT_MARKET ile correct stopPrice
+    - minPrice altına inmez
+    - closePosition=true ile kapatma
+    - reduceOnly parametresi gönderilmez (Binance -1106 fix)
     """
     try:
         f          = get_symbol_filters(sym)
@@ -266,13 +267,13 @@ def futures_set_tp_sl(sym, dir, qty, entry, tp_pct, sl_pct):
         if tp < min_price:
             tp = min_price * 1.2
 
-        # tick'e göre decimal format çıkart
+        # tick'e göre decimal format seçimi
         decimals=0
         if "." in str(tick):
             decimals=len(str(tick).split(".")[1].rstrip("0"))
         fmt=f"{{:.{decimals}f}}"
 
-        # Emirleri sırayla yolla
+        # TP / SL emirlerini gönder
         for t,p in [("TAKE_PROFIT_MARKET",tp),("STOP_MARKET",sl)]:
             payload={
                 "symbol":sym,
@@ -282,7 +283,6 @@ def futures_set_tp_sl(sym, dir, qty, entry, tp_pct, sl_pct):
                 "quantity":f"{qty}",
                 "workingType":"MARK_PRICE",
                 "closePosition":"true",
-                "reduceOnly":"false",
                 "positionSide":pos_side,
                 "timestamp":now_ts_ms()
             }
@@ -326,7 +326,7 @@ AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
 AI_RL         = safe_load(AI_RL_FILE,[])
 SIM_POSITIONS = safe_load(SIM_POS_FILE,[])
 SIM_CLOSED    = safe_load(SIM_CLOSED_FILE,[])
-# SIM_QUEUE is global list
+# SIM_QUEUE is the global list we mutate
 # ================== INDICATORS ==================
 def ema(vals,n):
     k=2/(n+1)
@@ -381,11 +381,11 @@ def tier_from_power(p):
 # ================== SIGNAL BUILDER ==================
 def build_scalp_signal(sym,kl,bar_i):
     """
-    1h confirmed bar reversal
+    1h confirmed bar reversal scalp sinyali:
     - EMA7 slope reversal (down->up => UP, up->down => DOWN)
-    - slope_impulse küçükse yok
-    - 24h |change| >=10% ise yok
-    - güç skoru (power) -> tier
+    - slope_impulse ANGLE_MIN altındaysa sinyal yok
+    - 24h |chg| >=10% ise sinyal yok
+    - güç (power) -> tier seçim
     """
     if len(kl)<60:
         return None
@@ -399,6 +399,8 @@ def build_scalp_signal(sym,kl,bar_i):
     lows  =[float(k[3]) for k in kl]
 
     e7=ema(closes,7)
+
+    # slope değişimi (yalnız kapanmış mumlardan)
     s_now  = e7[-2]-e7[-5]
     s_prev = e7[-3]-e7[-6]
     slope_impulse=abs(s_now-s_prev)
@@ -419,6 +421,7 @@ def build_scalp_signal(sym,kl,bar_i):
         closes[-1],
         r_val
     )
+
     tier,emoji=tier_from_power(pwr)
     if not tier:
         return None
@@ -458,8 +461,10 @@ def run_parallel(symbols,bar_i):
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs=[ex.submit(scan_symbol,s,bar_i) for s in symbols]
         for f in as_completed(futs):
-            try: sig=f.result()
-            except: sig=None
+            try:
+                sig=f.result()
+            except:
+                sig=None
             if sig:
                 out.append(sig)
     return out
@@ -468,7 +473,7 @@ def run_parallel(symbols,bar_i):
 def queue_sim_variants(sig):
     """
     ULTRA -> gerçek trade.
-    PREMIUM / NORMAL -> 30/60/90/120 dk gecikmeli sim varyant kuyruk
+    PREMIUM / NORMAL -> 30/60/90/120 dk gecikmeli sim varyant kuyruğu.
     """
     if sig["tier"]=="ULTRA":
         return
@@ -515,7 +520,7 @@ def process_sim_queue_and_open_due():
 def process_sim_closes():
     """
     Sim pozisyonlarda TP/SL vurdu mu?
-    Vurduysa kapat, gain_pct hesapla ve SIM_CLOSED'e taşı.
+    Vurduysa kapat, gain_pct hesapla, SIM_CLOSED'e taşı.
     """
     global SIM_POSITIONS
     if not SIM_POSITIONS:
@@ -567,8 +572,8 @@ def process_sim_closes():
 def dynamic_autotrade_state():
     """
     MAX_BUY / MAX_SELL guard:
-    limit dolarsa bot yeni pozisyon açmaz;
-    yer açılırsa tekrar açar (auto_trade_active toggle)
+    limit dolarsa auto_trade_active=False
+    boşluk açılınca True
     """
     live=fetch_open_positions_real()
 
@@ -587,10 +592,10 @@ def dynamic_autotrade_state():
 
 def execute_real_trade(sig):
     """
-    Sadece ULTRA sinyal gerçek pozisyon açar.
-    TrendLock: aynı sembol aynı yönden tekrar tekrar açma.
-    DuplicateGuard: zaten aynı yönde açık poz varsa açma.
-    TP/SL: v13.6++ güvenli yerleştirilir.
+    Sadece ULTRA sinyaller gerçek pozisyon açar.
+    TrendLock: aynı sembol aynı yönden tekrar tekrar açmayı engeller.
+    DuplicateGuard: zaten aynı yönde açık poz varsa bir daha açmaz.
+    TP/SL: v13.6++ güvenli fonksiyon.
     """
     if sig["tier"]!="ULTRA":
         return
@@ -604,14 +609,14 @@ def execute_real_trade(sig):
     if TREND_LOCK.get(sym)==direction:
         return
 
-    # DuplicateGuard Binance üstünde
+    # Duplicate guard (gerçek pozlar)
     live=fetch_open_positions_real()
     if direction=="UP" and sym in live["long"]:
         return
     if direction=="DOWN" and sym in live["short"]:
         return
 
-    # miktar hesapla (USDT boyutuna göre)
+    # Miktar hesapla
     qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
     if not qty or qty<=0:
         tg_send(f"❗ {sym} qty hesaplanamadı.")
@@ -621,7 +626,7 @@ def execute_real_trade(sig):
         opened=open_market_position(sym,direction,qty)
         entry_exec=opened["entry"]
 
-        # TP/SL emirlerini yerleştir
+        # TP/SL emirlerini koy
         futures_set_tp_sl(
             sym,
             direction,
@@ -631,10 +636,10 @@ def execute_real_trade(sig):
             PARAM["SCALP_SL_PCT"]
         )
 
-        # TrendLock set et
+        # işlem açıldıktan sonra TrendLock aktif edelim
         TREND_LOCK[sym]=direction
 
-        # Telegram bilgi
+        # Telegram trade bildirimi
         tg_send(
             f"✅ REAL {sym} {direction} ULTRA qty:{qty}\n"
             f"Entry:{entry_exec:.12f}\n"
@@ -644,7 +649,7 @@ def execute_real_trade(sig):
         )
         log(f"[REAL] {sym} {direction} {qty} entry={entry_exec}")
 
-        # RL learning log
+        # RL log kaydı
         AI_RL.append({
             "time":now_local_iso(),
             "symbol":sym,
@@ -665,8 +670,8 @@ def execute_real_trade(sig):
 def heartbeat_and_status_check():
     """
     Her 10 dakikada bir:
-      - Binance API health
-      - Bot durumu
+     - Binance API health
+     - Bot durumu
     Telegram + log.
     """
     now=time.time()
@@ -710,10 +715,6 @@ def heartbeat_and_status_check():
     log(msg)
 # ================== AI LOGGING / BACKUP ==================
 def ai_log_signal(sig):
-    """
-    Her sinyali (ULTRA / PREMIUM / NORMAL) kaydet.
-    Telegram spam yok; dosyaya yazıyoruz.
-    """
     AI_SIGNALS.append({
         "time":now_local_iso(),
         "symbol":sig["symbol"],
@@ -730,39 +731,36 @@ def ai_log_signal(sig):
     safe_save(AI_SIGNALS_FILE,AI_SIGNALS)
 
 def ai_update_analysis_snapshot():
-    """
-    mini dashboard snapshot -> AI_ANALYSIS listesine append
-    """
     ultra_count = sum(1 for x in AI_SIGNALS if x.get("tier")=="ULTRA")
     prem_count  = sum(1 for x in AI_SIGNALS if x.get("tier")=="PREMIUM")
     norm_count  = sum(1 for x in AI_SIGNALS if x.get("tier")=="NORMAL")
 
-    snapshot = {
+    snapshot={
         "time":now_local_iso(),
-        "ultra_signals_total": ultra_count,
-        "premium_signals_total": prem_count,
-        "normal_signals_total": norm_count,
-        "sim_open_count": len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
-        "sim_closed_count": len(SIM_CLOSED)
+        "ultra_signals_total":ultra_count,
+        "premium_signals_total":prem_count,
+        "normal_signals_total":norm_count,
+        "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
+        "sim_closed_count":len(SIM_CLOSED)
     }
 
     AI_ANALYSIS.append(snapshot)
-    safe_save(AI_ANALYSIS_FILE, AI_ANALYSIS)
+    safe_save(AI_ANALYSIS_FILE,AI_ANALYSIS)
 
 def auto_report_if_due():
     """
     Her 4 saatte bir:
-      - snapshot ekle
-      - büyük jsonları kuyruğundan kes (son %20)
-      - Telegram'a dumpla
+    - snapshot güncelle
+    - json dosyalarını Telegram'a gönder
+    - dosya çok şişmişse son %20'sini tut
     """
-    now_now = time.time()
-    if now_now - STATE.get("last_report",0) < 14400:
+    now_now=time.time()
+    if now_now-STATE.get("last_report",0)<14400:
         return
 
     ai_update_analysis_snapshot()
 
-    files_to_push = [
+    files_to_push=[
         AI_SIGNALS_FILE,
         AI_ANALYSIS_FILE,
         AI_RL_FILE,
@@ -773,11 +771,11 @@ def auto_report_if_due():
     for fpath in files_to_push:
         try:
             if os.path.exists(fpath):
-                sz = os.path.getsize(fpath)
-                if sz > 10*1024*1024:
+                sz=os.path.getsize(fpath)
+                if sz>10*1024*1024:
                     with open(fpath,"r",encoding="utf-8") as f:
                         raw=f.read()
-                    tail = raw[-int(len(raw)*0.2):]
+                    tail=raw[-int(len(raw)*0.2):]
                     with open(fpath,"w",encoding="utf-8") as f:
                         f.write(tail)
         except:
@@ -786,56 +784,55 @@ def auto_report_if_due():
         tg_send_file(fpath, f"📊 AutoBackup {os.path.basename(fpath)}")
 
     tg_send("🕐 4 saatlik yedek gönderildi.")
-    STATE["last_report"] = now_now
+    STATE["last_report"]=now_now
     safe_save(STATE_FILE,STATE)
 
 # ================== MAIN LOOP ==================
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.12 FULL+HB başladı")
-    log("[START] EMA ULTRA v15.9.12 FULL+HB")
+    tg_send("🚀 EMA ULTRA v15.9.11 FULL+HB başladı")
+    log("[START] EMA ULTRA v15.9.11 FULL+Heartbeat")
 
-    # Binance'ten USDT pair listesini çek
+    # Binance USDT sembollerini al
     try:
-        info = requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
-        symbols = [
+        info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
+        symbols=[
             s["symbol"]
             for s in info["symbols"]
             if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"
         ]
     except Exception as e:
         log(f"[INIT SYMBOLS ERR]{e}")
-        symbols = []
+        symbols=[]
     symbols.sort()
 
     while True:
         try:
-            # bar sayacı
-            STATE["bar_index"] += 1
-            bar_i = STATE["bar_index"]
+            # bar index ilerlet
+            STATE["bar_index"]+=1
+            bar_i=STATE["bar_index"]
 
-            # 1) sinyal tara
-            sigs = run_parallel(symbols, bar_i)
+            # 1) sinyalleri tara
+            sigs=run_parallel(symbols,bar_i)
 
             # 2) sinyalleri işle
             for sig in sigs:
-                # 2a) her sinyali AI_SIGNALS'e logla
+                # tüm sinyali kaydet
                 ai_log_signal(sig)
 
-                # 2b) PREMIUM / NORMAL -> sessiz sim kuyruğuna gönder
+                # PREMIUM / NORMAL -> sessiz sim'i sıraya al
                 queue_sim_variants(sig)
 
-                # 2c) ULTRA dışındakiler için gerçek trade açmıyoruz
-                if sig["tier"] != "ULTRA":
+                # ULTRA değilse devam etme (trade açma vs yok)
+                if sig["tier"]!="ULTRA":
                     continue
 
-                sym = sig["symbol"]
-                direction = sig["dir"]
+                sym=sig["symbol"]; direction=sig["dir"]
 
-                # TrendLock: coin aynı yönden zaten açılmış mı
-                if TREND_LOCK.get(sym) == direction:
+                # TrendLock spam engeli
+                if TREND_LOCK.get(sym)==direction:
                     continue
 
-                # Telegram'a ULTRA uyarısını at
+                # Telegram ULTRA bildirimi
                 tg_send(
                     f"{sig['emoji']} {sig['tier']} {sym} {direction}\n"
                     f"Pow:{sig['power']:.1f} RSI:{sig.get('rsi',0):.1f} "
@@ -843,30 +840,28 @@ def main():
                     f"Entry:{sig['entry']:.12f}\nTP:{sig['tp']:.12f}\nSL:{sig['sl']:.12f}\n"
                     f"born_bar:{sig['born_bar']}"
                 )
-                log(f"[ULTRA SIG] {sym} {direction} Pow:{sig['power']:.1f} 24hΔ:{sig['chg24h']:.2f}%")
+                log(f"[ULTRA SIG] {sym} {direction} Pow:{sig['power']:.1f} Δ24h:{sig['chg24h']:.2f}%")
 
-                # 2d) MAX_BUY / MAX_SELL guardını güncelle
+                # LIMIT kontrolü güncelle
                 dynamic_autotrade_state()
 
-                # 2e) gerçek trade aç ve TP/SL kur
+                # gerçek trade aç
                 execute_real_trade(sig)
 
-            # 3) sim kuyruğunu çalıştır (vakti gelenleri OPEN yap)
+            # 3) sim engine: bekleyen sim pozları aç / TP-SL vuranları kapat
             process_sim_queue_and_open_due()
-
-            # 4) açık sim pozisyonları TP/SL'e göre kapat
             process_sim_closes()
 
-            # 5) otomatik backup (4 saatte bir dosyaları Telegram'a at)
+            # 4) periyodik backup
             auto_report_if_due()
 
-            # 6) heartbeat + status (10 dakikada bir Telegram health check)
+            # 5) 10dk heartbeat / status
             heartbeat_and_status_check()
 
-            # 7) state kayıt
-            safe_save(STATE_FILE, STATE)
+            # 6) state kaydet
+            safe_save(STATE_FILE,STATE)
 
-            # 8) bekleme
+            # 7) bekle
             time.sleep(30)
 
         except Exception as e:
