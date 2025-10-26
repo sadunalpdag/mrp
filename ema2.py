@@ -3,8 +3,8 @@ import hmac, hashlib, time, requests
 # ===============================
 # 🔑 BURAYA API BİLGİLERİNİ GİR
 # ===============================
-API_KEY    = VRVm4ljUQ8opSkoSpkWxSMPDXGXOwKmlDkRsu7F0HhRLORTOAvlREILIPxfJ43jI
-API_SECRET = cSvMMzcPFh2DnIHYMtKgCgYwdU1ZLFz4sMCPACzJ52VjIuX54sMLKXjTMMNCrFZ5
+API_KEY    = "VRVm4ljUQ8opSkoSpkWxSMPDXGXOwKmlDkRsu7F0HhRLORTOAvlREILIPxfJ43jI"
+API_SECRET = "cSvMMzcPFh2DnIHYMtKgCgYwdU1ZLFz4sMCPACzJ52VjIuX54sMLKXjTMMNCrFZ5"
 
 # Binance Futures endpoint
 BASE_URL = "https://fapi.binance.com"
