@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # ==============================================================
-# EMA ULTRA v15.9.11 FULL + Heartbeat
+# EMA ULTRA v15.9.11-r1 FULL + Heartbeat
 #  - AI log
 #  - SilentSim
 #  - AutoTrade (gerçek emir)
@@ -13,6 +13,7 @@ import numpy as np
 #  - TrendLock spam koruması
 #  - 10dk heartbeat + status Telegram
 #  - 4 saatlik auto-backup
+#  - 🧩 reduceOnly kaldırıldı (TP/SL emirlerinden)
 # ==============================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -217,11 +218,13 @@ def fetch_open_positions_real():
     return out
 
 # ✅ v13.6 Precision Legacy TP/SL Fix (stopPrice hatası yok)
+# ⚠ reduceOnly kaldırıldı
 def futures_set_tp_sl(sym,dir,qty,entry,tp_pct,sl_pct):
     """
     - tickSize'a göre floor/ceil rounding
-    - closePosition=true, reduceOnly=false
+    - closePosition=true
     - stopPrice asla 0/negatif ya da malformed olmaz
+    - reduceOnly parametresi YOK
     """
     try:
         f=get_symbol_filters(sym)
@@ -258,7 +261,6 @@ def futures_set_tp_sl(sym,dir,qty,entry,tp_pct,sl_pct):
                 "quantity":f"{qty}",
                 "workingType":"MARK_PRICE",
                 "closePosition":"true",
-                "reduceOnly":"false",
                 "positionSide":pos_side,
                 "timestamp":now_ts_ms()
             }
@@ -303,6 +305,7 @@ AI_RL         = safe_load(AI_RL_FILE,[])
 SIM_POSITIONS = safe_load(SIM_POS_FILE,[])
 SIM_CLOSED    = safe_load(SIM_CLOSED_FILE,[])
 # SIM_QUEUE already global
+
 # ================== INDICATORS ==================
 def ema(vals,n):
     k=2/(n+1)
@@ -678,6 +681,7 @@ def heartbeat_and_status_check():
          f"sim_closed:{len(SIM_CLOSED)}")
     tg_send(msg)
     log(msg)
+
 # ================== AI LOGGING / BACKUP ==================
 def ai_log_signal(sig):
     AI_SIGNALS.append({
@@ -754,8 +758,8 @@ def auto_report_if_due():
 
 # ================== MAIN LOOP ==================
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.11 FULL+HB başladı")
-    log("[START] EMA ULTRA v15.9.11 FULL+Heartbeat")
+    tg_send("🚀 EMA ULTRA v15.9.11-r1 FULL+HB başladı")
+    log("[START] EMA ULTRA v15.9.11-r1 FULL+Heartbeat")
 
     # Binance USDT sembollerini al
     try:
