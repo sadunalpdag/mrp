@@ -70,7 +70,18 @@ def calc_tp_sl(sym, entry, tp_pct=0.006, sl_pct=0.2, dir="UP"):
 # ===============================
 # 🔹 Test çalıştırıcı
 # ===============================
-symbols = ["BTCUSDT", "ETHUSDT", "AIOUSDT", "PEPEUSDT", "HOTUSDT"]
+symbols = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "AIOUSDT",
+    "PEPEUSDT",
+    "HOTUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "SOLUSDT",
+    "ADAUSDT",
+    "DOGEUSDT",
+]
 
 print("\n🔍 TP/SL TEST BAŞLIYOR\n")
 
