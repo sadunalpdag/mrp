@@ -209,7 +209,7 @@ PARAM_DEFAULT = {
     "TRADE_SIZE_USDT":250.0,
     "MAX_BUY":30,
     "MAX_SELL":30,
-    "ANGLE_MIN":0.0001
+    "ANGLE_MIN":0.00008
 }
 PARAM = safe_load(PARAM_FILE, PARAM_DEFAULT)
 if not isinstance(PARAM, dict):
