@@ -3,16 +3,19 @@ from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
-# ==============================================================
-# 📘 EMA ULTRA v15.9.26 — High Sensitivity + 6h TrendLock
+# ==============================================================================
+# 📘 EMA ULTRA v15.9.27 — High Sensitivity + 6h TrendLock Cooldown + Smart TP
 #  - High sensitivity: ANGLE_MIN↓, ATR_SPIKE_RATIO=0.10
 #  - EARLY & REAL: Power 65–75, TradeSize 250 USDT
-#  - TP only: 1.6→2.0 USD (0.1) → 0.01 tarama → STOP_MARKET fallback
+#  - TP only:
+#       * Büyük fiyatlı semboller: 1.6→2.0 USD (0.1 → 0.01 tarama) → STOP_MARKET fallback
+#       * Mikro fiyatlı semboller: %0.5 → %1.0 aralığında tarama (0.05% adım)
+#       * minPrice / tickSize hizalama
 #  - SL yok, reduceOnly yok
-#  - TrendLock: 6 saat sonra auto-expire + close'da unlock
-#  - Telegram: sadece gerçek fill (EARLY/REAL) + heartbeat
+#  - TrendLock: Açılışta set; kapanışta hemen kalkmaz → 6 saat cooldown (auto-expire)
+#  - Telegram: yalnız gerçek fill (EARLY/REAL) + heartbeat
 #  - SIM: approve 30m / 1h / 1.5h / 2h, RL log, backups
-# ==============================================================
+# ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR  = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
@@ -36,7 +39,7 @@ BINANCE_FAPI   = "https://fapi.binance.com"
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
 TREND_LOCK = {}          # { "SYMBOL": "UP"/"DOWN" }
-TREND_LOCK_TIME = {}     # { "SYMBOL": last_set_ts }
+TREND_LOCK_TIME = {}     # { "SYMBOL": last_set_ts }  # cooldown başlangıç anı
 TRENDLOCK_EXPIRY_SEC = 6 * 3600  # 6 saat
 
 SIM_QUEUE = []           # sim: gecikmeli approve kuyruğu
@@ -146,6 +149,13 @@ def adjust_precision(sym,v,kind="qty"):
         return v
     return round(round(v/step)*step,12)
 
+def round_to_tick(sym, price):
+    f=get_symbol_filters(sym)
+    t=f["tickSize"]
+    if t<=0: return price
+    # en yakın tick'e yuvarla
+    return round(round(price / t) * t, 12)
+
 def calc_order_qty(sym,entry,usd):
     raw = usd/max(entry,1e-12)
     return adjust_precision(sym,raw,"qty")
@@ -228,8 +238,7 @@ def tier_from_power(p):
     if p>=75:    return "ULTRA","🟦"
     if p>=60:    return "NORMAL","🟨"
     return None,""
-# ==============================================================
-# PARAM / STATE INIT
+
 # ==============================================================
 
 PARAM_DEFAULT = {
@@ -266,8 +275,6 @@ AI_RL         = safe_load(AI_RL_FILE,[])
 SIM_POSITIONS = safe_load(SIM_POS_FILE,[])
 SIM_CLOSED    = safe_load(SIM_CLOSED_FILE,[])
 
-# ==============================================================
-# NORMAL SIGNAL (EMA7 REVERSAL)
 # ==============================================================
 
 def build_scalp_signal(sym, kl, bar_i):
@@ -324,10 +331,6 @@ def build_scalp_signal(sym, kl, bar_i):
         "tp":tp_guess,"sl":sl_guess,"power":pwr,"rsi":r_val,"atr":atr_v,
         "chg24h":chg,"time":now_local_iso(),"born_bar":bar_i,"early":False
     }
-
-# ==============================================================
-# EARLY SIGNAL (EMA3–EMA7 CROSS + ATR SPIKE)
-# ==============================================================
 
 def build_early_signal(sym, kl, bar_i):
     """
@@ -417,7 +420,6 @@ def run_parallel(symbols,bar_i):
             if sigs:
                 out.extend(sigs)
     return out
-
 # ==============================================================
 # RL ENRICH / SIM ENGINE (approve 30/60/90/120)
 # ==============================================================
@@ -473,7 +475,19 @@ def process_sim_queue_and_open_due():
     if opened:
         safe_save(SIM_POS_FILE,SIM_POSITIONS)
 
-def _unlock_trend_for(sym):
+# ------------- TrendLock Helpers (Cooldown Edition) -------------
+
+def _unlock_trend_for(sym, delay_unlock=False):
+    """
+    TrendLock kaldırma mantığı (v15.9.27):
+    - delay_unlock=True ise hemen kaldırma; sadece cooldown sayacı başlat.
+      6 saat dolunca _cleanup_trend_lock_expired ile kaldırılır.
+    - delay_unlock=False ise derhal temizler.
+    """
+    if delay_unlock:
+        TREND_LOCK_TIME[sym] = now_ts_s()  # cooldown başlangıcı
+        log(f"[TRENDLOCK DELAY CLEAR] {sym} (6h cooldown started)")
+        return
     if sym in TREND_LOCK:
         TREND_LOCK.pop(sym, None)
     if sym in TREND_LOCK_TIME:
@@ -483,7 +497,7 @@ def _unlock_trend_for(sym):
 def process_sim_closes():
     """
     Sim pozisyonlarda TP/SL vurdu mu?
-    Kapanınca TrendLock (aynı sembol) da açılır.
+    Kapanınca TrendLock: cooldown başlat (hemen kaldırma).
     """
     global SIM_POSITIONS
     if not SIM_POSITIONS:
@@ -512,8 +526,8 @@ def process_sim_closes():
                 "status":"CLOSED","close_time":close_time,
                 "exit_price":last,"exit_reason":hit,"gain_pct":gain_pct
             })
-            # close olduğunda trendlock kaldır
-            _unlock_trend_for(pos["symbol"])
+            # v15.9.27: kapanışta cooldown başlat
+            _unlock_trend_for(pos["symbol"], delay_unlock=True)
             changed=True
             log(f"[SIM CLOSE] {pos['symbol']} {pos['dir']} {hit} {gain_pct:.3f}% approve={pos.get('approve_delay_min')}m early={pos.get('early')}")
         else:
@@ -523,9 +537,7 @@ def process_sim_closes():
         safe_save(SIM_POS_FILE,SIM_POSITIONS)
         safe_save(SIM_CLOSED_FILE,SIM_CLOSED)
 
-# ==============================================================
-# TP ONLY (1.6→2.0 → 0.01 tarama → STOP_MARKET fallback)
-# ==============================================================
+# ------------- TP ONLY (Smart USD/% with tick/minPrice guards) -------------
 
 def _fmt_by_tick(tick):
     if "." in str(tick):
@@ -538,12 +550,18 @@ def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
     tp_pct = tp_usd / max(trade_usd,1e-12)
     return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
 
+def _tp_price_from_pct(direction, entry_exec, tp_pct):
+    return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct))
+
 def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0):
     """
-    0) reduceOnly yok, SL yok
-    1) TAKE_PROFIT_MARKET 0.1 adım: 1.6→2.0
-    2) TAKE_PROFIT_MARKET 0.01 adım tarama
-    3) STOP_MARKET 0.01 adım fallback
+    0) Büyük fiyatlı semboller (entry_exec > 0.1 USDT):
+         TAKE_PROFIT_MARKET 0.1 adım: 1.6→2.0
+         TAKE_PROFIT_MARKET 0.01 adım tarama
+         STOP_MARKET 0.01 adım fallback
+    1) Mikro fiyatlı semboller (entry_exec <= 0.1 USDT):
+         USD yerine YÜZDE tabanlı aralık: %0.5 → %1.0 (0.05% adım)
+    Her durumda minPrice / maxPrice / tickSize hizalama yapılır.
     """
     try:
         f=get_symbol_filters(sym)
@@ -554,41 +572,60 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         fmt=_fmt_by_tick(tick)
         trade_usd=PARAM.get("TRADE_SIZE_USDT",250.0)
 
-        def try_once(tp_usd, order_type):
-            tp_price, tp_pct = _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd)
-            if tp_price < minp or tp_price > maxp:
-                log(f"[TP RANGE] {sym} skip ${tp_usd} price={tp_price}")
-                return False, None, None
+        def try_once(tp_price_candidate, order_type, tp_usd_used=None, tp_pct_used=None):
+            # tick hizalama + min/max guard
+            price = round_to_tick(sym, tp_price_candidate)
+            if price < minp: price = round_to_tick(sym, minp)
+            if price > maxp: price = round_to_tick(sym, maxp)
+
+            # Binance closePosition=true stop emir formatı
             payload={
                 "symbol":sym,"side":side,"type":order_type,
-                "stopPrice":fmt.format(tp_price),"quantity":f"{qty}",
+                "stopPrice":fmt.format(price),"quantity":f"{qty}",
                 "workingType":"MARK_PRICE","closePosition":"true",
                 "positionSide":pos_side,"timestamp":now_ts_ms()
             }
             try:
                 _signed_request("POST","/fapi/v1/order",payload)
-                log(f"[TP OK] {sym} {order_type} tp=${tp_usd} stop={fmt.format(tp_price)} qty={qty}")
-                return True, tp_usd, tp_pct
+                log(f"[TP OK] {sym} {order_type} stop={fmt.format(price)} qty={qty} tp_usd={tp_usd_used} tp_pct={tp_pct_used}")
+                return True, tp_usd_used, tp_pct_used
             except Exception as e:
-                log(f"[TP FAIL] {sym} {order_type} tp=${tp_usd} err={e}")
+                log(f"[TP FAIL] {sym} {order_type} stop={fmt.format(price)} err={e}")
                 return False, None, None
 
-        # 0.1 adım
-        for tp_usd in [round(x,1) for x in np.arange(tp_low_usd, tp_high_usd+0.001, 0.1)]:
-            ok,u,p=try_once(tp_usd,"TAKE_PROFIT_MARKET")
+        # --- Yol A: USD tabanlı (büyük fiyatlı semboller) ---
+        if entry_exec > 0.1:
+            # 0.1 adım USD
+            for tp_usd in [round(x,1) for x in np.arange(tp_low_usd, tp_high_usd+0.001, 0.1)]:
+                tp_price, tp_pct = _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd)
+                ok,u,p = try_once(tp_price, "TAKE_PROFIT_MARKET", tp_usd_used=tp_usd, tp_pct_used=tp_pct)
+                if ok: return True,u,p
+
+            # 0.01 adım USD
+            for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
+                tp_price, tp_pct = _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd)
+                ok,u,p = try_once(tp_price, "TAKE_PROFIT_MARKET", tp_usd_used=tp_usd, tp_pct_used=tp_pct)
+                if ok: return True,u,p
+
+            # STOP_MARKET fallback
+            for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
+                tp_price, tp_pct = _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd)
+                ok,u,p = try_once(tp_price, "STOP_MARKET", tp_usd_used=tp_usd, tp_pct_used=tp_pct)
+                if ok: return True,u,p
+
+        # --- Yol B: % tabanlı (mikro fiyatlı semboller) ---
+        # %0.5 → %1.0 arası, 0.05% adım (0.005 → 0.010, step: 0.0005)
+        for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
+            tp_price = _tp_price_from_pct(direction, entry_exec, tp_pct)
+            ok,u,p = try_once(tp_price, "TAKE_PROFIT_MARKET", tp_usd_used=None, tp_pct_used=tp_pct)
             if ok: return True,u,p
 
-        # 0.01 adım
-        for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
-            ok,u,p=try_once(tp_usd,"TAKE_PROFIT_MARKET")
+        for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
+            tp_price = _tp_price_from_pct(direction, entry_exec, tp_pct)
+            ok,u,p = try_once(tp_price, "STOP_MARKET", tp_usd_used=None, tp_pct_used=tp_pct)
             if ok: return True,u,p
 
-        # STOP_MARKET fallback
-        for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
-            ok,u,p=try_once(tp_usd,"STOP_MARKET")
-            if ok: return True,u,p
-
-        log(f"[NO TP] {sym} 1.6–2.0$ aralığında geçerli TP bulunamadı.")
+        log(f"[NO TP] {sym} USD/% aralığında geçerli TP bulunamadı.")
         return False, None, None
 
     except Exception as e:
@@ -623,13 +660,13 @@ def update_directional_limits():
 
 def _cleanup_trend_lock_expired():
     """
-    6 saat dolan TrendLock kayıtlarını kaldır.
+    6 saat dolan TrendLock cooldown kayıtlarını kaldır.
     """
     now_s=now_ts_s()
     expired=[sym for sym,t in TREND_LOCK_TIME.items() if now_s - t >= TRENDLOCK_EXPIRY_SEC]
     for sym in expired:
-        _unlock_trend_for(sym)
-        log(f"[TRENDLOCK TIMEOUT] {sym} (6h)")
+        _unlock_trend_for(sym)  # immediate clear
+        log(f"[TRENDLOCK TIMEOUT] {sym} (6h cooldown bitti)")
 
 def heartbeat_and_status_check(live_positions_snapshot):
     now=time.time()
@@ -743,7 +780,7 @@ def _can_direction(direction):
 
 def _set_trend_lock(sym, direction):
     TREND_LOCK[sym]=direction
-    TREND_LOCK_TIME[sym]=now_ts_s()
+    TREND_LOCK_TIME.pop(sym, None)  # varsa cooldown kaydını sıfırla
     log(f"[TRENDLOCK SET] {sym} {direction}")
 
 def execute_real_trade(sig):
@@ -751,8 +788,9 @@ def execute_real_trade(sig):
     - EARLY: early=True ve power 65–75 ise gerçek trade açar.
     - REAL:  tier='REAL' ve power 65–75 ise gerçek trade açar.
     - TradeSize: 250 USDT
-    - TP: futures_set_tp_only (1.6–2.0 USD; 0.1→0.01→STOP_MARKET)
+    - TP: futures_set_tp_only (USD/% akıllı fallback)
     - SL ve reduceOnly yok.
+    - TrendLock: açılışta set edilir; kapanışta cooldown ile kalkar.
     """
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]; is_early=bool(sig.get("early",False))
 
@@ -787,16 +825,19 @@ def execute_real_trade(sig):
         # Telegram (yalnız gerçek fill)
         prefix = ("⚡️ EARLY" if is_early else "✅ REAL")
         if tp_ok:
+            tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
+                       else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
+            tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',250.0),1e-12))*100
             tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
                     f"Power:{pwr:.2f}\n"
                     f"Entry:{entry_exec:.12f}\n"
-                    f"TP hedefi:{tp_usd_used:.2f}$ ({(tp_pct_used or 0)*100:.3f}%)\n"
+                    f"{tp_line} ({tp_pct_show:.3f}%)\n"
                     f"time:{now_local_iso()}")
         else:
             tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
                     f"Power:{pwr:.2f}\n"
                     f"Entry:{entry_exec:.12f}\n"
-                    f"TP: YOK (1.6–2.0$ tarama başarısız)\n"
+                    f"TP: YOK (USD/% tarama başarısız)\n"
                     f"time:{now_local_iso()}")
 
         # RL log
@@ -815,8 +856,8 @@ def execute_real_trade(sig):
 # ==============================================================
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.26 aktif (High Sensitivity, 6h TrendLock, TP 1.6–2.0$, no SL/reduceOnly)")
-    log("[START] EMA ULTRA v15.9.26 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.27 aktif (High Sensitivity, 6h TrendLock Cooldown, Smart TP USD/%)")
+    log("[START] EMA ULTRA v15.9.27 FULL")
 
     # USDT pariteleri
     try:
@@ -852,7 +893,7 @@ def main():
             # sim open due
             process_sim_queue_and_open_due()
 
-            # sim closes (ve trendlock unlock)
+            # sim closes (ve trendlock cooldown başlat)
             process_sim_closes()
 
             # auto backup/report
