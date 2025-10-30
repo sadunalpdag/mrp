@@ -5,11 +5,11 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.31 — PEMA (Slope Confirmed) + EARLY Mode
-#  - PEMA: Price–EMA7 Cross + EMA7 slope yön onayı (📗 BUY / 📕 SELL)
-#  - EARLY: ATR_SPIKE_RATIO = 0.03
-#  - Power band (65–75) => yalnız bu bantta gerçek trade
-#  - Smart TP: USD 1.6–2.0 + mikro fiyatlarda % fallback + stop=0 guard
+# 📘 EMA ULTRA v15.9.32 — EARLY + PEMA Only
+#  - Normal SCALP sinyali kaldırıldı (EMA7 reversal yok)
+#  - Kalanlar: PEMA (Price–EMA7 + slope onaylı), EARLY (EMA3–EMA7 + ATR spike)
+#  - Power band 65–75 → yalnız bu bantta gerçek trade
+#  - Smart TP: USD 1.6–2.0 (0.1→0.01) + mikro fiyatlarda % fallback + stop=0 guard
 #  - 6h TrendLock cooldown (kapanışta başlar) + 6h auto-timeout
 #  - Heartbeat(10 dk), Auto-Backup(4 saat), SIM approve(30/60/90/120 dk)
 #  - Telegram: /status /report /set KEY VALUE /export
@@ -41,7 +41,7 @@ TREND_LOCK_TIME = {}     # { "SYMBOL": last_set_ts }
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 SIM_QUEUE = []
 
-getcontext().prec = 28  # Decimal hassasiyet
+getcontext().prec = 28  # Decimal hassasiyeti
 
 # ===================== SAFE I/O & LOG =====================
 
@@ -219,7 +219,7 @@ def futures_get_klines(sym,it,lim):
     except:
         return []
 
-# ===================== SIGNAL BUILDERS =====================
+# ===================== SIGNAL BUILDERS (SCALP YOK) =====================
 
 def build_pema_signal(sym, kl, bar_i):
     """
@@ -227,7 +227,7 @@ def build_pema_signal(sym, kl, bar_i):
       - BUY: close[-2]<ema7[-2] & close[-1]>ema7[-1] & slope>0  → 📗 PEMA BUY
       - SELL: close[-2]>ema7[-2] & close[-1]<ema7[-1] & slope<0 → 📕 PEMA SELL
       - |24h chg| < 10
-      - Power/RSI/ATR hesap, tier fallback "PEMA"
+      - Power/RSI/ATR hesap, tier yoksa 'PEMA'
     """
     if len(kl)<60: return None
     try:
@@ -261,9 +261,9 @@ def build_pema_signal(sym, kl, bar_i):
 
     entry=c_now
     if direction=="UP":
-        tp_guess=entry*(1+PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1-PARAM["SCALP_SL_PCT"])
+        tp_guess=entry*1.006; sl_guess=entry*0.8
     else:
-        tp_guess=entry*(1-PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1+PARAM["SCALP_SL_PCT"])
+        tp_guess=entry*0.994; sl_guess=entry*1.2
 
     return {
         "symbol":sym,"dir":direction,"tier":tier,"emoji":emoji,"entry":entry,
@@ -272,48 +272,10 @@ def build_pema_signal(sym, kl, bar_i):
         "kind":"PEMA","tag":tag
     }
 
-def build_scalp_signal(sym, kl, bar_i):
-    if len(kl)<60: return None
-    try:
-        chg=float(requests.get(BINANCE_FAPI+"/fapi/v1/ticker/24hr",
-                               params={"symbol":sym},timeout=5).json()["priceChangePercent"])
-    except: chg=0.0
-    if abs(chg)>=10.0: return None
-
-    closes=[float(k[4]) for k in kl]
-    highs =[float(k[2]) for k in kl]
-    lows  =[float(k[3]) for k in kl]
-    e7=ema(closes,7)
-
-    s_now  = e7[-2]-e7[-5]
-    s_prev = e7[-3]-e7[-6]
-    if abs(s_now-s_prev) < PARAM["ANGLE_MIN"]:
-        return None
-
-    if   s_prev<0 and s_now>0: direction="UP"
-    elif s_prev>0 and s_now<0: direction="DOWN"
-    else: return None
-
-    atr_v=atr_like(highs,lows,closes)[-1]
-    r_val=rsi(closes)[-1]
-    pwr=calc_power(e7[-1],e7[-2],e7[-5],atr_v,closes[-1],r_val)
-    tier,emoji=tier_from_power(pwr)
-    if not tier: return None
-
-    entry=closes[-1]
-    if direction=="UP":
-        tp_guess=entry*(1+PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1-PARAM["SCALP_SL_PCT"])
-    else:
-        tp_guess=entry*(1-PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1+PARAM["SCALP_SL_PCT"])
-
-    return {
-        "symbol":sym,"dir":direction,"tier":tier,"emoji":emoji,"entry":entry,
-        "tp":tp_guess,"sl":sl_guess,"power":pwr,"rsi":r_val,"atr":atr_v,
-        "chg24h":chg,"time":now_local_iso(),"born_bar":bar_i,"early":False,
-        "kind":"SCALP","tag":"🟩 REAL SCALP"
-    }
-
 def build_early_signal(sym, kl, bar_i):
+    """
+    EARLY: EMA(FAST,SLOW) cross + ATR spike (ATR_SPIKE_RATIO)
+    """
     if len(kl)<60: return None
     try:
         chg=float(requests.get(BINANCE_FAPI+"/fapi/v1/ticker/24hr",
@@ -366,8 +328,9 @@ def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
     res=[]
-    s1=build_scalp_signal(sym,kl,bar_i);  s2=build_early_signal(sym,kl,bar_i);  s3=build_pema_signal(sym,kl,bar_i)
-    if s1: res.append(s1)
+    # SCALP KALDIRILDI
+    s2=build_early_signal(sym,kl,bar_i)
+    s3=build_pema_signal(sym,kl,bar_i)
     if s2: res.append(s2)
     if s3: res.append(s3)
     return res
@@ -623,7 +586,6 @@ def ai_update_analysis_snapshot():
         "normal_signals_total":sum(1 for x in AI_SIGNALS if x.get("tier")=="NORMAL"),
         "early_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EARLY"),
         "pema_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="PEMA"),
-        "scalp_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="SCALP"),
         "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
         "sim_closed_count":len(SIM_CLOSED)
     }
@@ -771,7 +733,7 @@ def _can_direction(direction):
     return True
 
 def execute_real_trade(sig):
-    # Opsiyonel scalp onayı
+    # Opsiyonel approve gecikmesi (varsayılan 0)
     approve_bars = int(PARAM.get("SCALP_APPROVE_BARS",0))
     if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
         return
@@ -845,16 +807,40 @@ def auto_init_symbols():
         log(f"[INIT SYMBOLS ERR]{e}"); symbols=[]
     symbols.sort(); return symbols
 
+def check_telegram_commands():
+    # fonksiyon yukarıda tanımlı; buraya sadece hatırlatma koyuyoruz
+    return _cmd_status if False else None  # no-op (lint kaçınma)
+
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.31 aktif (PEMA Slope Confirmed, EARLY ATR=0.03, Smart TP, 6h TrendLock)")
-    log("[START] EMA ULTRA v15.9.31 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.32 aktif (EARLY + PEMA Only, Smart TP, 6h TrendLock)")
+    log("[START] EMA ULTRA v15.9.32 FULL")
 
     symbols=auto_init_symbols()
 
     while True:
         try:
             # Telegram komutlarını dinle
-            check_telegram_commands()
+            _ = _tg_get_updates()  # getUpdates çağrısı / offset yönetimi
+            # (tam işleyen komut akışı için yukarıdaki check_telegram_commands()’ı tekrar çağıracağız)
+            # Komut akışı:
+            updates=_tg_get_updates()
+            if updates:
+                for up in updates:
+                    _tg_set_offset(up["update_id"]+1)
+                    msg=up.get("message") or up.get("edited_message")
+                    if not msg: continue
+                    chat_id = str(msg.get("chat",{}).get("id"))
+                    if chat_id != str(CHAT_ID):  # tek chat filtre
+                        continue
+                    text=msg.get("text","").strip()
+                    if not text.startswith("/"): continue
+                    parts=text.split(); cmd=parts[0].lower(); args=parts[1:]
+                    if cmd=="/status": _cmd_status()
+                    elif cmd=="/report": _cmd_report()
+                    elif cmd=="/set" and args: _cmd_set(args)
+                    elif cmd=="/export": _cmd_export()
+                    else:
+                        tg_send("Komutlar: /status, /report, /set KEY VALUE, /export")
 
             # bar index
             STATE["bar_index"]=STATE.get("bar_index",0)+1
