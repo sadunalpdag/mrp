@@ -5,13 +5,14 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.30 — EARLY + PEMA (Price–EMA7 Cross) Mode
-#  - EARLY: ATR_SPIKE_RATIO = 0.03 (daha sık erken sinyal)
-#  - PEMA: Fiyat EMA7'yi kesince sinyal (📗 BUY / 📕 SELL tag)
-#  - Power band (65–75) korunur → yalnız bu bantta gerçek trade
-#  - Smart TP (USD/% fallback) + Decimal/tick fix (stop=0 çözümü)
-#  - 6h TrendLock cooldown, Heartbeat (10 dk), Auto-Backup (4 saat)
-#  - SIM approve kuyruğu, Telegram komutları (/status /report /set /export)
+# 📘 EMA ULTRA v15.9.31 — PEMA (Slope Confirmed) + EARLY Mode
+#  - PEMA: Price–EMA7 Cross + EMA7 slope yön onayı (📗 BUY / 📕 SELL)
+#  - EARLY: ATR_SPIKE_RATIO = 0.03
+#  - Power band (65–75) => yalnız bu bantta gerçek trade
+#  - Smart TP: USD 1.6–2.0 + mikro fiyatlarda % fallback + stop=0 guard
+#  - 6h TrendLock cooldown (kapanışta başlar) + 6h auto-timeout
+#  - Heartbeat(10 dk), Auto-Backup(4 saat), SIM approve(30/60/90/120 dk)
+#  - Telegram: /status /report /set KEY VALUE /export
 # ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -38,9 +39,9 @@ PRECISION_CACHE = {}
 TREND_LOCK = {}          # { "SYMBOL": "UP"/"DOWN" }
 TREND_LOCK_TIME = {}     # { "SYMBOL": last_set_ts }
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
-SIM_QUEUE = []           # approve bekleyenler
+SIM_QUEUE = []
 
-getcontext().prec = 28  # Decimal hassasiyeti
+getcontext().prec = 28  # Decimal hassasiyet
 
 # ===================== SAFE I/O & LOG =====================
 
@@ -77,7 +78,7 @@ def log(msg):
 def now_ts_ms(): return int(datetime.now(timezone.utc).timestamp()*1000)
 def now_ts_s():  return int(datetime.now(timezone.utc).timestamp())
 def now_local_iso():
-    # Türkiye (UTC+3) gösterimi
+    # Türkiye (UTC+3)
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
 
 def tg_send(t):
@@ -159,7 +160,6 @@ def format_price_by_tick(sym, price_float):
     p_dec=Decimal(str(price_float)).quantize(Decimal(f"1e-{dec}"), rounding=ROUND_HALF_UP)
     if p_dec==Decimal("-0"): p_dec=Decimal("0")
     return f"{float(p_dec):.{dec}f}"
-
 # ===================== INDICATORS =====================
 
 def ema(vals,n):
@@ -198,65 +198,58 @@ def tier_from_power(p):
     if p>=60: return "NORMAL","🟨"
     return None,""
 
-# ===================== PARAM / STATE / DATA =====================
+# ===================== PRICE / KLINES HELPERS =====================
 
-PARAM_DEFAULT={
-    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":250.0,
-    "MAX_BUY":30, "MAX_SELL":30,
-    "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
-    "ATR_SPIKE_RATIO":0.03,    # ↓ EARLY daha sık
-    "SCALP_APPROVE_BARS":0     # istersen >0 yap
-}
-PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
-if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
+def futures_get_price(sym):
+    try:
+        r=requests.get(BINANCE_FAPI+"/fapi/v1/ticker/price",
+                       params={"symbol":sym},timeout=5).json()
+        return float(r["price"])
+    except:
+        return None
 
-STATE_DEFAULT={
-    "bar_index":0, "last_report":0, "auto_trade_active":True,
-    "last_api_check":0, "long_blocked":False, "short_blocked":False,
-    "tg_update_offset":0
-}
-STATE=safe_load(STATE_FILE,STATE_DEFAULT)
-for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
+def futures_get_klines(sym,it,lim):
+    try:
+        r=requests.get(BINANCE_FAPI+"/fapi/v1/klines",
+                       params={"symbol":sym,"interval":it,"limit":lim},
+                       timeout=10).json()
+        if r and int(r[-1][6])>now_ts_ms():
+            r=r[:-1]
+        return r
+    except:
+        return []
 
-AI_SIGNALS    = safe_load(AI_SIGNALS_FILE,[])
-AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
-AI_RL         = safe_load(AI_RL_FILE,[])
-SIM_POSITIONS = safe_load(SIM_POS_FILE,[])
-SIM_CLOSED    = safe_load(SIM_CLOSED_FILE,[])
-# ===================== PRICE–EMA7 CROSS (PEMA) =====================
+# ===================== SIGNAL BUILDERS =====================
 
 def build_pema_signal(sym, kl, bar_i):
     """
-    Price–EMA7 Cross:
-      - BUY: close[-2] < ema7[-2]  ve close[-1] > ema7[-1]
-      - SELL: close[-2] > ema7[-2] ve close[-1] < ema7[-1]
-      - 24h değişim |%| < 10
-      - Power, RSI, ATR hesapları
-      - kind="PEMA", tag telegram için (📗 BUY / 📕 SELL)
+    Price–EMA7 Cross + EMA7 Slope Confirmed:
+      - BUY: close[-2]<ema7[-2] & close[-1]>ema7[-1] & slope>0  → 📗 PEMA BUY
+      - SELL: close[-2]>ema7[-2] & close[-1]<ema7[-1] & slope<0 → 📕 PEMA SELL
+      - |24h chg| < 10
+      - Power/RSI/ATR hesap, tier fallback "PEMA"
     """
     if len(kl)<60: return None
     try:
         chg=float(requests.get(BINANCE_FAPI+"/fapi/v1/ticker/24hr",
                                params={"symbol":sym},timeout=5).json()["priceChangePercent"])
     except: chg=0.0
-    if abs(chg)>=10.0:
-        return None
+    if abs(chg)>=10.0: return None
 
     closes=[float(k[4]) for k in kl]
     highs =[float(k[2]) for k in kl]
     lows  =[float(k[3]) for k in kl]
-
     e7=ema(closes,7)
-    c_prev, c_now = closes[-2], closes[-1]
-    e_prev, e_now = e7[-2], e7[-1]
 
-    direction=None
-    if c_prev < e_prev and c_now > e_now:
-        direction="UP"
-        tag="📗 PEMA BUY"
-    elif c_prev > e_prev and c_now < e_now:
-        direction="DOWN"
-        tag="📕 PEMA SELL"
+    c_prev,c_now=closes[-2],closes[-1]
+    e_prev,e_now=e7[-2],e7[-1]
+    slope=e_now-e_prev
+
+    direction=None; tag=""
+    if c_prev<e_prev and c_now>e_now and slope>0:
+        direction="UP"; tag="📗 PEMA BUY"
+    elif c_prev>e_prev and c_now<e_now and slope<0:
+        direction="DOWN"; tag="📕 PEMA SELL"
     else:
         return None
 
@@ -264,9 +257,7 @@ def build_pema_signal(sym, kl, bar_i):
     r_val=rsi(closes)[-1]
     pwr=calc_power(e_now,e_prev,e7[-5] if len(e7)>=6 else e_prev,atr_v,c_now,r_val)
     tier,emoji=tier_from_power(pwr)
-    if not tier:
-        # PEMA sinyal doğdu ama power alt bantta olabilir; gerçek trade 65–75 zaten execute'da kontrol edilir.
-        tier="PEMA"; emoji="🟪"
+    if not tier: tier,emoji="PEMA","🟪"
 
     entry=c_now
     if direction=="UP":
@@ -280,8 +271,6 @@ def build_pema_signal(sym, kl, bar_i):
         "chg24h":chg,"time":now_local_iso(),"born_bar":bar_i,"early":False,
         "kind":"PEMA","tag":tag
     }
-
-# ===================== SCALP & EARLY BUILDERS =====================
 
 def build_scalp_signal(sym, kl, bar_i):
     if len(kl)<60: return None
@@ -359,8 +348,7 @@ def build_early_signal(sym, kl, bar_i):
         atrs[-1], entry, r_val
     )
     tier,emoji=tier_from_power(pwr)
-    if not tier:
-        tier,emoji="EARLY","⚡️"
+    if not tier: tier,emoji="EARLY","⚡️"
 
     if direction=="UP":
         tp_guess=entry*(1+PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1-PARAM["SCALP_SL_PCT"])
@@ -374,36 +362,13 @@ def build_early_signal(sym, kl, bar_i):
         "kind":"EARLY","tag":"⚡️ EARLY"
     }
 
-# ===================== PRICE / KLINES HELPERS =====================
-
-def futures_get_price(sym):
-    try:
-        r=requests.get(BINANCE_FAPI+"/fapi/v1/ticker/price",
-                       params={"symbol":sym},timeout=5).json()
-        return float(r["price"])
-    except:
-        return None
-
-def futures_get_klines(sym,it,lim):
-    try:
-        r=requests.get(BINANCE_FAPI+"/fapi/v1/klines",
-                       params={"symbol":sym,"interval":it,"limit":lim},
-                       timeout=10).json()
-        if r and int(r[-1][6])>now_ts_ms():
-            r=r[:-1]
-        return r
-    except:
-        return []
-
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
     res=[]
-    s1=build_scalp_signal(sym,kl,bar_i)
+    s1=build_scalp_signal(sym,kl,bar_i);  s2=build_early_signal(sym,kl,bar_i);  s3=build_pema_signal(sym,kl,bar_i)
     if s1: res.append(s1)
-    s2=build_early_signal(sym,kl,bar_i)
     if s2: res.append(s2)
-    s3=build_pema_signal(sym,kl,bar_i)
     if s3: res.append(s3)
     return res
 
@@ -412,31 +377,30 @@ def run_parallel(symbols,bar_i):
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs=[ex.submit(scan_symbol,s,bar_i) for s in symbols]
         for f in as_completed(futs):
-            try:
-                sigs=f.result()
-            except:
-                sigs=[]
-            if sigs:
-                out.extend(sigs)
+            try: sigs=f.result()
+            except: sigs=[]
+            if sigs: out.extend(sigs)
     return out
 
 # ===================== RL ENRICH / SIM ENGINE =====================
 
+AI_SIGNALS    = safe_load(AI_SIGNALS_FILE,[])
+AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
+AI_RL         = safe_load(AI_RL_FILE,[])
+SIM_POSITIONS = safe_load(SIM_POS_FILE,[])
+SIM_CLOSED    = safe_load(SIM_CLOSED_FILE,[])
+
 def enrich_with_ai_context(pos):
     best=None
     for s in reversed(AI_SIGNALS):
-        if s.get("symbol")!=pos.get("symbol"):
-            continue
+        if s.get("symbol")!=pos.get("symbol"): continue
         e_sig=s.get("entry"); e_pos=pos.get("entry")
-        if not e_sig or not e_pos:
-            continue
+        if not e_sig or not e_pos: continue
         if abs(e_sig-e_pos)/max(e_sig,1e-12) < 0.002:
-            best=s
-            break
+            best=s; break
     if best:
         for k in ("rsi","atr","chg24h","born_bar","tier","power","early","kind","tag"):
-            if k in best:
-                pos[k]=best.get(k)
+            if k in best: pos[k]=best.get(k)
     return pos
 
 def queue_sim_variants(sig):
@@ -465,16 +429,14 @@ def process_sim_queue_and_open_due():
         else:
             remain.append(q)
     SIM_QUEUE[:]=remain
-    if opened:
-        safe_save(SIM_POS_FILE,SIM_POSITIONS)
+    if opened: safe_save(SIM_POS_FILE,SIM_POSITIONS)
 
 def _unlock_trend_for(sym, delay_unlock=False):
     if delay_unlock:
         TREND_LOCK_TIME[sym]=now_ts_s()
         log(f"[TRENDLOCK DELAY CLEAR] {sym} (6h cooldown started)")
         return
-    TREND_LOCK.pop(sym,None)
-    TREND_LOCK_TIME.pop(sym,None)
+    TREND_LOCK.pop(sym,None); TREND_LOCK_TIME.pop(sym,None)
     log(f"[TRENDLOCK CLEAR] {sym}")
 
 def process_sim_closes():
@@ -501,8 +463,7 @@ def process_sim_closes():
                 "status":"CLOSED","close_time":close_time,
                 "exit_price":last,"exit_reason":hit,"gain_pct":gain_pct
             })
-            # kapanışta trendlock hemen kalkmaz → cooldown başlat
-            _unlock_trend_for(pos["symbol"], delay_unlock=True)
+            _unlock_trend_for(pos["symbol"], delay_unlock=True)  # kapanışta cooldown
             changed=True
             log(f"[SIM CLOSE] {pos['symbol']} {pos['dir']} {hit} {gain_pct:.3f}% approve={pos.get('approve_delay_min')}m kind={pos.get('kind')}")
         else:
@@ -525,7 +486,6 @@ def _cleanup_trend_lock_expired():
     for sym in expired:
         _unlock_trend_for(sym)
         log(f"[TRENDLOCK TIMEOUT] {sym} (6h cooldown bitti)")
-
 # ===================== SMART TP (USD/% + Decimal Fix) =====================
 
 def adjust_precision(sym,v,kind="qty"):
@@ -548,7 +508,7 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         minp=f["minPrice"]; maxp=f["maxPrice"]
         pos_side="LONG" if direction=="UP" else "SHORT"; side="SELL" if direction=="UP" else "BUY"
         trade_usd=PARAM.get("TRADE_SIZE_USDT",250.0)
-        usd_based = entry_exec>0.2
+        usd_based = entry_exec>0.2  # mikro fiyatlarda % fallback
 
         def try_once(tp_price_candidate, order_type, tp_usd_used=None, tp_pct_used=None):
             price=round_to_tick(sym,tp_price_candidate)
@@ -586,14 +546,13 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                 ok,u,p=try_once(tp_price,"STOP_MARKET",tp_usd,tp_pct)
                 if ok: return True,u,p
         else:
-            for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
+            for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:  # %0.5 → %1.0
                 tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
                 ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",None,tp_pct)
                 if ok: return True,u,p
 
         log(f"[NO TP] {sym} uygun TP bulunamadı.")
         return False,None,None
-
     except Exception as e:
         log(f"[TP ERR]{sym} {e}")
         return False,None,None
@@ -668,8 +627,7 @@ def ai_update_analysis_snapshot():
         "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
         "sim_closed_count":len(SIM_CLOSED)
     }
-    AI_ANALYSIS.append(snapshot)
-    safe_save(AI_ANALYSIS_FILE,AI_ANALYSIS)
+    AI_ANALYSIS.append(snapshot); safe_save(AI_ANALYSIS_FILE,AI_ANALYSIS)
 
 def auto_report_if_due():
     now_now=time.time()
@@ -688,6 +646,22 @@ def auto_report_if_due():
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
 
 # ===================== TELEGRAM COMMANDS =====================
+
+STATE_DEFAULT={
+    "bar_index":0, "last_report":0, "auto_trade_active":True,
+    "last_api_check":0, "long_blocked":False, "short_blocked":False,
+    "tg_update_offset":0
+}
+PARAM_DEFAULT={
+    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":250.0,
+    "MAX_BUY":30, "MAX_SELL":30,
+    "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
+    "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0
+}
+PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
+if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
+STATE=safe_load(STATE_FILE,STATE_DEFAULT)
+for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
 
 def _tg_get_updates():
     if not BOT_TOKEN: return []
@@ -754,9 +728,7 @@ def check_telegram_commands():
             continue
         text=msg.get("text","").strip()
         if not text.startswith("/"): continue
-        parts=text.split()
-        cmd=parts[0].lower()
-        args=parts[1:]
+        parts=text.split(); cmd=parts[0].lower(); args=parts[1:]
         if cmd=="/status": _cmd_status()
         elif cmd=="/report": _cmd_report()
         elif cmd=="/set" and args: _cmd_set(args)
@@ -783,16 +755,13 @@ def _duplicate_or_locked(sym, direction):
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
     except Exception as e:
-        log(f"[POSRISK ERR]{e}")
-        acc=[]
+        log(f"[POSRISK ERR]{e}"); acc=[]
     if direction=="UP":
         if sym in [p["symbol"] for p in acc if float(p["positionAmt"])>0]:
-            log(f"[DUP-LONG] {sym}")
-            return True
+            log(f"[DUP-LONG] {sym}"); return True
     else:
         if sym in [p["symbol"] for p in acc if float(p["positionAmt"])<0]:
-            log(f"[DUP-SHORT] {sym}")
-            return True
+            log(f"[DUP-SHORT] {sym}"); return True
     return False
 
 def _can_direction(direction):
@@ -802,7 +771,7 @@ def _can_direction(direction):
     return True
 
 def execute_real_trade(sig):
-    # İsteğe bağlı scalp onayı
+    # Opsiyonel scalp onayı
     approve_bars = int(PARAM.get("SCALP_APPROVE_BARS",0))
     if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
         return
@@ -812,23 +781,20 @@ def execute_real_trade(sig):
     is_early = (kind=="EARLY")
     is_pema  = (kind=="PEMA")
 
-    # Gerçek trade koşulları (power 65–75 bandı)
-    ok = (65 <= pwr < 75)
-    if not ok: return
+    # Gerçek trade koşulu: power 65–75
+    if not (65 <= pwr < 75): return
     if not _can_direction(direction): return
     if _duplicate_or_locked(sym,direction): return
 
     qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
     if not qty or qty<=0:
-        log(f"[QTY ERR] {sym} qty hesaplanamadı.")
-        return
+        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return
 
     try:
         opened=open_market_position(sym,direction,qty)
         entry_exec=opened.get("entry") or futures_get_price(sym)
         if not entry_exec or entry_exec<=0:
-            log(f"[OPEN FAIL] {sym} entry alınamadı.")
-            return
+            log(f"[OPEN FAIL] {sym} entry alınamadı."); return
 
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
             sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
@@ -837,12 +803,9 @@ def execute_real_trade(sig):
         _set_trend_lock(sym, direction)
 
         # Telegram etiketi
-        if is_early:
-            prefix = "⚡️ EARLY"
-        elif is_pema:
-            prefix = sig.get("tag","🟪 PEMA")
-        else:
-            prefix = "🟩 REAL"
+        if is_early: prefix="⚡️ EARLY"
+        elif is_pema: prefix=sig.get("tag","🟪 PEMA")
+        else: prefix="🟩 REAL"
 
         if tp_ok:
             tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
@@ -860,7 +823,6 @@ def execute_real_trade(sig):
                     f"TP: YOK (USD/% tarama başarısız)\n"
                     f"time:{now_local_iso()}")
 
-        # RL log
         AI_RL.append({
             "time":now_local_iso(),"symbol":sym,"dir":direction,"entry":entry_exec,
             "tp_usd_used":tp_usd_used,"tp_pct_used":tp_pct_used,"tp_ok":tp_ok,
@@ -874,23 +836,24 @@ def execute_real_trade(sig):
 
 # ===================== MAIN LOOP =====================
 
-def main():
-    tg_send("🚀 EMA ULTRA v15.9.30 aktif (EARLY+PEMA, ATR=0.03, Smart TP, 6h TrendLock)")
-    log("[START] EMA ULTRA v15.9.30 FULL")
-
-    # USDT pariteleri
+def auto_init_symbols():
     try:
         info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
         symbols=[s["symbol"] for s in info["symbols"]
                  if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
     except Exception as e:
-        log(f"[INIT SYMBOLS ERR]{e}")
-        symbols=[]
-    symbols.sort()
+        log(f"[INIT SYMBOLS ERR]{e}"); symbols=[]
+    symbols.sort(); return symbols
+
+def main():
+    tg_send("🚀 EMA ULTRA v15.9.31 aktif (PEMA Slope Confirmed, EARLY ATR=0.03, Smart TP, 6h TrendLock)")
+    log("[START] EMA ULTRA v15.9.31 FULL")
+
+    symbols=auto_init_symbols()
 
     while True:
         try:
-            # Telegram komutlarını oku
+            # Telegram komutlarını dinle
             check_telegram_commands()
 
             # bar index
