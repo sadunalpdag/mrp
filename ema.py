@@ -5,14 +5,15 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.48 — Multi-Strategy (EARLY + PEMA + UT/STC + EMA/MACD + FVG)
-#  - Mevcut sistem (EARLY + PEMA) korunmuştur.
-#  - Yeni stratejiler:
-#       • UT/STC : Ultimate Trend + Schaff Trend Cycle momentum filtreli
-#       • EMA20/200 + MACD : trend + momentum onaylı giriş
-#       • FVG Break : Fair Value Gap kırılımı algılayan
-#  - Power band 65–75 → yalnız bu bantta gerçek trade
-#  - Smart TP ve 6 saat TrendLock devam eder
+# 📘 EMA ULTRA v15.9.49 — EARLY + UT/STC + EMA/MACD + FVG (PEMA Removed)
+#  - PEMA stratejisi tamamen kaldırılmıştır
+#  - Aktif stratejiler:
+#       ⚡ EARLY (EMA3–EMA7 + ATR spike)
+#       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
+#       📈 MACD (EMA20/200 + MACD)
+#       🟩 FVG (Fair Value Gap Break)
+#  - Power band 65–75 → sadece bu bantta gerçek trade
+#  - Smart TP ve 6 saat TrendLock aktif
 # ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -43,35 +44,34 @@ SIM_QUEUE = []
 
 getcontext().prec = 28
 
-# ===================== UTILITY & LOG =====================
+# ===================== UTILITIES =====================
 
 def log(msg):
     print(msg, flush=True)
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        with open(LOG_FILE,"a",encoding="utf-8") as f:
             f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
     except:
         pass
 
-def safe_load(p, d):
+def safe_load(p,d):
     try:
         if os.path.exists(p):
-            with open(p, "r", encoding="utf-8") as f:
+            with open(p,"r",encoding="utf-8") as f:
                 return json.load(f)
-    except:
-        pass
+    except: pass
     return d
 
-def safe_save(p, d):
+def safe_save(p,d):
     try:
         with SAVE_LOCK:
-            tmp = p + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(d, f, ensure_ascii=False, indent=2)
+            tmp=p+".tmp"
+            with open(tmp,"w",encoding="utf-8") as f:
+                json.dump(d,f,ensure_ascii=False,indent=2)
                 f.flush(); os.fsync(f.fileno())
-            os.replace(tmp, p)
+            os.replace(tmp,p)
     except Exception as e:
-        log(f"[SAVE ERR] {e}")
+        log(f"[SAVE ERR]{e}")
 
 def now_local_iso():
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
@@ -115,10 +115,9 @@ def atr_like(h,l,c,period=14):
     for i in range(period,len(tr)): a.append((a[-1]*(period-1)+tr[i])/period)
     return [0]*(len(h)-len(a))+a
 
-# ===================== NEW STRATEGIES =====================
+# ===================== STRATEGIES =====================
 
 def build_utstc_signal(sym, kl, bar_i):
-    """UT/STC momentum filtreli trend girişi"""
     if len(kl)<60: return None
     closes=[float(k[4]) for k in kl]; highs=[float(k[2]) for k in kl]; lows=[float(k[3]) for k in kl]
     e13=ema(closes,13); e50=ema(closes,50)
@@ -140,7 +139,6 @@ def build_utstc_signal(sym, kl, bar_i):
             "kind":"UTSTC","tag":tag}
 
 def build_macd_trend_signal(sym, kl, bar_i):
-    """EMA20/200 + MACD trend uyum sinyali"""
     if len(kl)<200: return None
     closes=[float(k[4]) for k in kl]; highs=[float(k[2]) for k in kl]; lows=[float(k[3]) for k in kl]
     e20=ema(closes,20); e200=ema(closes,200)
@@ -162,7 +160,6 @@ def build_macd_trend_signal(sym, kl, bar_i):
             "kind":"MACD","tag":tag}
 
 def build_fvg_break_signal(sym, kl, bar_i):
-    """Fair Value Gap kırılımı"""
     if len(kl)<5: return None
     closes=[float(k[4]) for k in kl]; highs=[float(k[2]) for k in kl]; lows=[float(k[3]) for k in kl]
     h1,h2,h3=highs[-3:]; l1,l2,l3=lows[-3:]; c_now=closes[-1]
@@ -181,7 +178,7 @@ def build_fvg_break_signal(sym, kl, bar_i):
             "tp":tp,"sl":sl,"power":pwr,"rsi":r_val,"atr":atr_v,
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"FVG","tag":tag}
-# ===================== TELEGRAM HELPERS (aynı) =====================
+# ===================== TELEGRAM HELPERS =====================
 
 def tg_send(t):
     if not BOT_TOKEN or not CHAT_ID: return
@@ -205,7 +202,7 @@ def tg_send_file(p, cap):
             )
     except: pass
 
-# ===================== BINANCE CORE (aynı) =====================
+# ===================== BINANCE CORE =====================
 
 def now_ts_ms(): return int(datetime.now(timezone.utc).timestamp()*1000)
 def now_ts_s():  return int(datetime.now(timezone.utc).timestamp())
@@ -239,9 +236,7 @@ def get_symbol_filters(sym):
         PRECISION_CACHE[sym]={"stepSize":0.0001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
     return PRECISION_CACHE[sym]
 
-# ===================== DECIMAL/TICK HELPERS (aynı) =====================
-
-from decimal import Decimal, ROUND_HALF_UP
+# ===================== DECIMAL/TICK HELPERS =====================
 
 def _decimals_from_tick(tick_str):
     try:
@@ -268,7 +263,7 @@ def format_price_by_tick(sym, price_float):
     if p_dec==Decimal("-0"): p_dec=Decimal("0")
     return f"{float(p_dec):.{dec}f}"
 
-# ===================== POWER/TIER (aynı) =====================
+# ===================== POWER/TIER =====================
 
 def calc_power(e_now,e_prev,e_prev2,atr_v,price,rsi_val):
     diff=abs(e_now-e_prev)/(atr_v*0.6) if atr_v>0 else 0
@@ -281,7 +276,7 @@ def tier_from_power(p):
     if p>=60: return "NORMAL","🟨"
     return None,""
 
-# ===================== PRICE / KLINES (aynı) =====================
+# ===================== PRICE / KLINES =====================
 
 def futures_get_price(sym):
     try:
@@ -302,51 +297,7 @@ def futures_get_klines(sym,it,lim):
     except:
         return []
 
-# ===================== MEVCUT STRATEJİLER (EARLY + PEMA aynı) =====================
-
-def build_pema_signal(sym, kl, bar_i):
-    if len(kl)<60: return None
-    try:
-        chg=float(requests.get(BINANCE_FAPI+"/fapi/v1/ticker/24hr",
-                               params={"symbol":sym},timeout=5).json()["priceChangePercent"])
-    except: chg=0.0
-    if abs(chg)>=10.0: return None
-
-    closes=[float(k[4]) for k in kl]
-    highs =[float(k[2]) for k in kl]
-    lows  =[float(k[3]) for k in kl]
-    e7=ema(closes,7)
-
-    c_prev,c_now=closes[-2],closes[-1]
-    e_prev,e_now=e7[-2],e7[-1]
-    slope=e_now-e_prev
-
-    direction=None; tag=""
-    if c_prev<e_prev and c_now>e_now and slope>0:
-        direction="UP"; tag="📗 PEMA BUY"
-    elif c_prev>e_prev and c_now<e_now and slope<0:
-        direction="DOWN"; tag="📕 PEMA SELL"
-    else:
-        return None
-
-    atr_v=atr_like(highs,lows,closes)[-1]
-    r_val=rsi(closes)[-1]
-    pwr=calc_power(e_now,e_prev,e7[-5] if len(e7)>=6 else e_prev,atr_v,c_now,r_val)
-    tier,emoji=tier_from_power(pwr)
-    if not tier: tier,emoji="PEMA","🟪"
-
-    entry=c_now
-    if direction=="UP":
-        tp_guess=entry*1.006; sl_guess=entry*0.8
-    else:
-        tp_guess=entry*0.994; sl_guess=entry*1.2
-
-    return {
-        "symbol":sym,"dir":direction,"tier":tier,"emoji":emoji,"entry":entry,
-        "tp":tp_guess,"sl":sl_guess,"power":pwr,"rsi":r_val,"atr":atr_v,
-        "chg24h":chg,"time":now_local_iso(),"born_bar":bar_i,"early":False,
-        "kind":"PEMA","tag":tag
-    }
+# ===================== EARLY (EMA3–EMA7 + ATR Spike) =====================
 
 def build_early_signal(sym, kl, bar_i):
     if len(kl)<60: return None
@@ -397,23 +348,20 @@ def build_early_signal(sym, kl, bar_i):
         "kind":"EARLY","tag":"⚡️ EARLY"
     }
 
-# ===================== SİNYAL TOPLAYICI =====================
+# ===================== SİNYAL TOPLAYICI (PEMA YOK) =====================
 
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
     res=[]
 
-    # Mevcutlar
+    # Aktif stratejiler (PEMA kaldırıldı)
     s_early = build_early_signal(sym,kl,bar_i)
-    s_pema  = build_pema_signal(sym,kl,bar_i)
-
-    # Yeni stratejiler (v15.9.48)
     s_utstc = build_utstc_signal(sym,kl,bar_i)
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
 
-    for s in (s_early, s_pema, s_utstc, s_macd, s_fvg):
+    for s in (s_early, s_utstc, s_macd, s_fvg):
         if s: res.append(s)
     return res
 
@@ -427,13 +375,7 @@ def run_parallel(symbols,bar_i):
             if sigs: out.extend(sigs)
     return out
 
-# ===================== RL ENRICH / SIM ENGINE (aynı) =====================
-
-AI_SIGNALS_FILE  = AI_SIGNALS_FILE
-AI_ANALYSIS_FILE = AI_ANALYSIS_FILE
-AI_RL_FILE       = AI_RL_FILE
-SIM_POS_FILE     = SIM_POS_FILE
-SIM_CLOSED_FILE  = SIM_CLOSED_FILE
+# ===================== RL ENRICH / SIM ENGINE =====================
 
 AI_SIGNALS    = safe_load(AI_SIGNALS_FILE,[])
 AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
@@ -479,7 +421,7 @@ def process_sim_queue_and_open_due():
             log(f"[SIM OPEN] {q['symbol']} {q['dir']} approve={q['approve_delay_min']}m kind={q.get('kind')}")
         else:
             remain.append(q)
-    SIM_QUEUE[:]=remain
+    SIM_QUEUE[:] = remain
     if opened: safe_save(SIM_POS_FILE,SIM_POSITIONS)
 
 def _unlock_trend_for(sym, delay_unlock=False):
@@ -524,7 +466,7 @@ def process_sim_closes():
         safe_save(SIM_POS_FILE,SIM_POSITIONS)
         safe_save(SIM_CLOSED_FILE,SIM_CLOSED)
 
-# ===================== GUARDS / HB / REPORT (aynı) =====================
+# ===================== GUARDS / HEARTBEAT / REPORT =====================
 
 def update_directional_limits():
     live={"long":{}, "short":{},"long_count":0,"short_count":0}
@@ -589,7 +531,6 @@ def ai_update_analysis_snapshot():
         "real_signals_total":  sum(1 for x in AI_SIGNALS if x.get("tier")=="REAL"),
         "normal_signals_total":sum(1 for x in AI_SIGNALS if x.get("tier")=="NORMAL"),
         "early_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EARLY"),
-        "pema_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="PEMA"),
         "utstc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="UTSTC"),
         "macd_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="MACD"),
         "fvg_signals_total":   sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG"),
@@ -614,7 +555,7 @@ def auto_report_if_due():
     tg_send("🕐 4 saatlik yedek gönderildi.")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
 
-# ===================== TELEGRAM KOMUTLARI (aynı) =====================
+# ===================== TELEGRAM KOMUTLARI =====================
 
 STATE_DEFAULT={
     "bar_index":0, "last_report":0, "auto_trade_active":True,
@@ -705,7 +646,7 @@ def check_telegram_commands():
         else:
             tg_send("Komutlar: /status, /report, /set KEY VALUE, /export")
 
-# ===================== SMART TP (aynı) =====================
+# ===================== SMART TP =====================
 
 def adjust_precision(sym,v,kind="qty"):
     f=get_symbol_filters(sym)
@@ -776,7 +717,7 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         log(f"[TP ERR]{sym} {e}")
         return False,None,None
 
-# ===================== REAL TRADE (aynı) =====================
+# ===================== REAL TRADE =====================
 
 def open_market_position(sym, direction, qty):
     side="BUY" if direction=="UP" else "SELL"
@@ -817,8 +758,6 @@ def execute_real_trade(sig):
 
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
-    is_early = (kind=="EARLY")
-    is_pema  = (kind=="PEMA")
 
     if not (65 <= pwr < 75): return
     if not _can_direction(direction): return
@@ -838,15 +777,10 @@ def execute_real_trade(sig):
             sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
         )
 
-        # trend lock
         TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
         log(f"[TRENDLOCK SET] {sym} {direction}")
 
-        # Telegram etiketi
-        if is_early: prefix="⚡️ EARLY"
-        elif is_pema: prefix=sig.get("tag","🟪 PEMA")
-        else: prefix=sig.get("tag",f"🟩 {kind}")
-
+        prefix = sig.get("tag", f"🟩 {kind}")
         if tp_ok:
             tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
                        else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
@@ -867,15 +801,13 @@ def execute_real_trade(sig):
             "time":now_local_iso(),"symbol":sym,"dir":direction,"entry":entry_exec,
             "tp_usd_used":tp_usd_used,"tp_pct_used":tp_pct_used,"tp_ok":tp_ok,
             "power":pwr,"born_bar":sig.get("born_bar"),
-            "early":is_early,"kind":kind,"tag":sig.get("tag","")
+            "early":bool(sig.get("early",False)),"kind":kind,"tag":sig.get("tag","")
         })
         safe_save(AI_RL_FILE,AI_RL)
 
     except Exception as e:
         log(f"[OPEN ERR]{sym}{e}")
-# ===================== TRENDLOCK TEMİZLİK (aynı) =====================
-
-TRENDLOCK_EXPIRY_SEC = TRENDLOCK_EXPIRY_SEC
+# ===================== TRENDLOCK TEMİZLİK =====================
 
 def _cleanup_trend_lock_expired():
     now_s=now_ts_s()
@@ -884,7 +816,7 @@ def _cleanup_trend_lock_expired():
         TREND_LOCK.pop(sym,None); TREND_LOCK_TIME.pop(sym,None)
         log(f"[TRENDLOCK TIMEOUT] {sym} (6h cooldown bitti)")
 
-# ===================== SİNYAL DÖNGÜSÜ / MAIN (aynı) =====================
+# ===================== SİNYAL DÖNGÜSÜ / MAIN =====================
 
 def auto_init_symbols():
     try:
@@ -896,8 +828,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.48 aktif (EARLY + PEMA + UT/STC + MACD + FVG)")
-    log("[START] EMA ULTRA v15.9.48 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.49 aktif (EARLY + UT/STC + MACD + FVG) — PEMA KALDIRILDI")
+    log("[START] EMA ULTRA v15.9.49 FULL (PEMA removed)")
 
     symbols=auto_init_symbols()
 
