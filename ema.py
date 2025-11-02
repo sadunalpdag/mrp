@@ -108,7 +108,7 @@ STATE = {
     "filters_cache": {},              # exchangeInfo cache
     "open_positions": {}              # { "SYMBOL": {"side":"BUY/SELL","entry":..., "qty":...} } (quick map)
 }
-
+POSITION_MODE_CACHE = {"dual": None, "ts": 0}
 AI_SIGNALS = []     # son sinyaller
 AI_ANALYSIS = {}    # özet/istatistik
 SIM_POSITIONS = []  # sim açık
@@ -277,7 +277,33 @@ def lot_round_to_filters(symbol, qty):
     if minQty > 0 and qty < minQty:
         qty = minQty
     return qty
+def is_dual_position_mode(force_refresh=False):
+    now = now_ts()
+    if not force_refresh and POSITION_MODE_CACHE["dual"] is not None:
+        # refresh every 10 minutes
+        if now - POSITION_MODE_CACHE["ts"] < 600:
+            return POSITION_MODE_CACHE["dual"]
+    try:
+        r = fapi_signed("GET", "/fapi/v1/positionSide/dual")
+        dual = str(r.get("dualSidePosition", "false")).lower() == "true"
+        POSITION_MODE_CACHE["dual"] = dual
+        POSITION_MODE_CACHE["ts"] = now
+        return dual
+    except Exception as e:
+        log(f"[POSITION MODE ERR]{e}")
+        # preserve previous cache; default to False if unknown
+        if POSITION_MODE_CACHE["dual"] is None:
+            POSITION_MODE_CACHE["dual"] = False
+        return POSITION_MODE_CACHE["dual"]
 
+def maybe_apply_position_side(params, side):
+    """Append positionSide when account is in dual-side (hedge) mode."""
+    try:
+        if is_dual_position_mode():
+            params["positionSide"] = "LONG" if side == "BUY" else "SHORT"
+    except Exception as e:
+        log(f"[POSITION SIDE WARN]{e}")
+    return params
 def mark_price(symbol):
     try:
         r = fapi_get("/fapi/v1/premiumIndex", {"symbol":symbol})
@@ -739,6 +765,7 @@ def place_tp_market(symbol, side, entry_price):
         # !!! price GÖNDERME !!!
         "timestamp": int(time.time()*1000)
     }
+    params = maybe_apply_position_side(params, side)
     # İmza manuel:
     data = _sign({k:v for k,v in params.items() if k!="timestamp"} | {"timestamp":params["timestamp"]})
     try:
@@ -775,6 +802,7 @@ def open_market(symbol, direction):
         # reduceOnly YOK!
         "timestamp": int(time.time()*1000)
     }
+    params = maybe_apply_position_side(params, side)
     data = _sign({k:v for k,v in params.items() if k!="timestamp"} | {"timestamp":params["timestamp"]})
     try:
         r = requests.post(f"{BINANCE_FAPI}/fapi/v1/order", headers=_headers(), data=data, timeout=7).json()
@@ -797,7 +825,8 @@ def close_all_for_symbol(symbol):
     # market close (failsafe)
     pos = STATE["open_positions"].get(symbol)
     if not pos: return
-    side = "SELL" if pos["side"]=="BUY" else "BUY"
+    original_side = pos["side"]
+    side = "SELL" if original_side=="BUY" else "BUY"
     qty = float(pos["qty"])
     params = {
         "symbol": symbol,
@@ -806,6 +835,7 @@ def close_all_for_symbol(symbol):
         "quantity": f"{qty:.8f}",
         "timestamp": int(time.time()*1000)
     }
+    params = maybe_apply_position_side(params, original_side)
     data = _sign({k:v for k,v in params.items() if k!="timestamp"} | {"timestamp":params["timestamp"]})
     try:
         r = requests.post(f"{BINANCE_FAPI}/fapi/v1/order", headers=_headers(), data=data, timeout=7).json()
