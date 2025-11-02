@@ -918,6 +918,12 @@ def main():
 
     symbols = auto_init_symbols()
     log(f"[SYMBOLS] {len(symbols)} loaded")
+    # --- HEDGE MODE'u etkinleştir ---
+    try:
+        fapi_signed("POST", "/fapi/v1/positionSide/dual", {"dualSidePosition": "true"})
+        log("[INIT] Hedge Mode aktif edildi (dualSidePosition=true)")
+    except Exception as e:
+        log(f"[DUAL MODE SET ERR]{e}")
 
     while True:
         try:
