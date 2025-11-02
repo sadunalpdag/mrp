@@ -761,7 +761,7 @@ def place_tp_market(symbol, side, entry_price):
         "timeInForce": "GTC",
         "stopPrice": f"{tp['stopPrice']:.16f}",
         "closePosition": "true",
-        "workingType": "CONTRACT_PRICE",  # mark/contract price; istersen "MARK_PRICE"
+        "workingType": "MARK_PRICE",  # mark/contract price; istersen "MARK_PRICE"
         # !!! price GÖNDERME !!!
         "timestamp": int(time.time()*1000)
     }
