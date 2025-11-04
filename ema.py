@@ -797,9 +797,13 @@ def check_and_handle_cashout():
         log(f"[CASHOUT ERR]{e}")
 
 def get_futures_balance_usdt():
+    """
+    Futures hesabındaki toplam marjin bakiyesi (totalMarginBalance) döndürür.
+    Bu, unrealized PnL dahil edilerek hesaplanan gerçek marjin değeridir.
+    """
     try:
         acc = _signed_request("GET","/fapi/v2/account",{"timestamp": now_ts_ms()})
-        return float(acc.get("totalWalletBalance", 0) or 0)
+        return float(acc.get("totalMarginBalance", 0) or 0)
     except Exception as e:
         log(f"[BALANCE ERR]{e}")
         return 0.0
