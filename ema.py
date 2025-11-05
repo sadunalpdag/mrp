@@ -770,8 +770,9 @@ def check_and_handle_cashout():
             try:
                 with open(init_file, "r", encoding="utf-8") as f:
                     initial_bal = float(json.load(f).get("initial_margin_balance_usdt", 0))
-            except:
-                pass
+            except Exception as e:
+                log(f"[INIT BAL READ ERR]{e}")
+                initial_bal = 0.0
 
         current_bal = get_futures_balance_usdt()
         target_gain = float(PARAM.get("CASHOUT_USDT", 60))
@@ -779,6 +780,7 @@ def check_and_handle_cashout():
 
         log(f"[BALCHK] initial={initial_bal:.2f}, current={current_bal:.2f}, diff={diff:.2f}")
 
+        # 💰 Eşik geçildiyse CASHOUT tetikle
         if not STATE.get("cashout_active") and diff >= target_gain:
             STATE["cashout_active"] = True
             STATE["auto_trade_active"] = False
@@ -787,18 +789,23 @@ def check_and_handle_cashout():
             cashout_at_mark_prices()
             return
 
+        # 💬 CASHOUT aktifse, açık pozisyon var mı kontrol et
         if STATE.get("cashout_active"):
+            any_open = True
             try:
                 acc = _signed_request("GET","/fapi/v2/positionRisk",{"timestamp": now_ts_ms()})
                 any_open = any(abs(float(p.get("positionAmt") or 0)) > 0 for p in acc)
             except Exception as e:
                 log(f"[CASHOUT OPENCHK ERR]{e}")
                 any_open = True
+
             if not any_open:
                 STATE["cashout_active"] = False
                 STATE["auto_trade_active"] = True
                 safe_save(STATE_FILE, STATE)
                 tg_send("✅ Tüm işlemler kapandı — Auto-Trade yeniden aktif.")
+    except Exception as e:
+        log(f"[CASHOUT ERR]{e}")
 # ===================== SMART TP =====================
 
 def adjust_precision(sym,v,kind="qty"):
