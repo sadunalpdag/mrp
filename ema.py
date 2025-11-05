@@ -5,11 +5,15 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.52 — Mean Reversion Guard (No TP)
-#  - Taban: v15.9.51 (hiçbir yapı bozulmadı)
-#  - Eklenen: Mean Reversion Guard modülü (SuperTrend+MA99 uzaklık kontrolü)
-#  - Bu strateji: TP yok, işlem bozulma sinyaliyle kapanır
-#  - Limit: 3 BUY + 3 SELL, 250 USDT büyüklük
+# 📘 EMA ULTRA v15.9.53 — Smart Mean Reversion Guard (No TP)
+#  - Taban: v15.9.51 (tüm yapı korundu)
+#  - YENİ: Smart Mean Reversion Guard (MA99 + SuperTrend uzaklık)
+#      • %Eşik: 0.08 varsayılan (mikro fiyatlı coinlerde erken kapanmayı azaltır)
+#      • Kapanış: ardışık 2 ölçümde eşik üstü ise
+#      • Kontrol: 120 sn
+#  - Strateji: Sadece 1. strateji (UT/STC) gerçek işlem açar, TP yok
+#  - Limit: Maks 3 BUY + 3 SELL (toplam 6), 30 genel limit içinde sayılır
+#  - Fix: reduceOnly=false açılış, avgPrice fallback
 # ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -150,124 +154,6 @@ def build_utstc_signal(sym, kl, bar_i):
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"UTSTC","tag":tag}
 
-# ===================== BINANCE CORE & HELPERS =====================
-
-def now_ts_ms(): return int(datetime.now(timezone.utc).timestamp()*1000)
-def now_ts_s():  return int(datetime.now(timezone.utc).timestamp())
-
-def _signed_request(m,path,payload):
-    q="&".join([f"{k}={payload[k]}" for k in payload])
-    sig=hmac.new(BINANCE_SECRET.encode(),q.encode(),hashlib.sha256).hexdigest()
-    headers={"X-MBX-APIKEY":BINANCE_KEY}
-    url=BINANCE_FAPI+path+"?"+q+"&signature="+sig
-    r=(requests.post(url,headers=headers,timeout=10) if m=="POST" else requests.get(url,headers=headers,timeout=10))
-    if r.status_code!=200: raise RuntimeError(f"Binance {r.status_code}: {r.text}")
-    return r.json()
-
-def get_symbol_filters(sym):
-    if sym in PRECISION_CACHE: return PRECISION_CACHE[sym]
-    try:
-        info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
-        s=next((x for x in info["symbols"] if x["symbol"]==sym),None)
-        lot=next((f for f in s["filters"] if f["filterType"]=="LOT_SIZE"),{})
-        pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
-        PRECISION_CACHE[sym]={"stepSize":float(lot.get("stepSize","1")),
-                              "tickSize":float(pricef.get("tickSize","0.01")),
-                              "minPrice":float(pricef.get("minPrice","0.00000001")),
-                              "maxPrice":float(pricef.get("maxPrice","100000000"))}
-    except Exception as e:
-        log(f"[PREC WARN]{sym}{e}")
-        PRECISION_CACHE[sym]={"stepSize":0.0001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
-    return PRECISION_CACHE[sym]
-
-def futures_get_price(sym):
-    try:
-        r=requests.get(BINANCE_FAPI+"/fapi/v1/ticker/price",params={"symbol":sym},timeout=5).json()
-        return float(r["price"])
-    except: return None
-
-def futures_get_klines(sym,it,lim):
-    try:
-        r=requests.get(BINANCE_FAPI+"/fapi/v1/klines",params={"symbol":sym,"interval":it,"limit":lim},timeout=10).json()
-        if r and int(r[-1][6])>now_ts_ms(): r=r[:-1]
-        return r
-    except: return []
-
-# ===================== MEAN REVERSION GUARD MODULE =====================
-
-MEAN_REV_MAX_BUY  = 3
-MEAN_REV_MAX_SELL = 3
-MEAN_REV_DISTANCE = 0.04  # %4 uzaklaşma
-
-def calc_ma99(prices):
-    return ema(prices,99)[-1] if len(prices)>=99 else np.mean(prices)
-
-def calc_supertrend_like(highs,lows,closes,period=10,mult=3.0):
-    atr=atr_like(highs,lows,closes,period)
-    mid=(np.array(highs)+np.array(lows))/2
-    upper=mid+mult*np.array(atr); lower=mid-mult*np.array(atr)
-    dir_up=True
-    for i in range(1,len(closes)):
-        if closes[i]>upper[i-1]: dir_up=True
-        elif closes[i]<lower[i-1]: dir_up=False
-        upper[i]=max(upper[i],closes[i]) if dir_up else upper[i]
-        lower[i]=lower[i] if dir_up else min(lower[i],closes[i])
-    return upper[-1] if dir_up else lower[-1]
-
-def mean_reversion_distance(sym):
-    kl=futures_get_klines(sym,"1h",120)
-    if not kl: return 0.0
-    highs=[float(k[2]) for k in kl]; lows=[float(k[3]) for k in kl]; closes=[float(k[4]) for k in kl]
-    c_now=closes[-1]; ma99v=calc_ma99(closes); stv=calc_supertrend_like(highs,lows,closes)
-    dist_ma=abs(c_now-ma99v)/max(ma99v,1e-9)
-    dist_st=abs(c_now-stv)/max(stv,1e-9)
-    return max(dist_ma,dist_st)
-
-def mean_reversion_guard_close(sym,direction):
-    dist=mean_reversion_distance(sym)
-    if dist>=MEAN_REV_DISTANCE:
-        side="SELL" if direction=="UP" else "BUY"
-        pos_side="LONG" if direction=="UP" else "SHORT"
-        qty_info=calc_order_qty(sym,futures_get_price(sym),PARAM["TRADE_SIZE_USDT"])
-        try:
-            _signed_request("POST","/fapi/v1/order",{
-                "symbol":sym,"side":side,"type":"MARKET",
-                "quantity":f"{qty_info}","positionSide":pos_side,"timestamp":now_ts_ms()
-            })
-            tg_send(f"⚠️ {sym} Mean-Reversion Exit — fiyat ortalamadan uzaklaştı (%{dist*100:.2f})")
-            log(f"[MEAN-REV EXIT] {sym} dist={dist:.4f}")
-            _unlock_trend_for(sym,delay_unlock=True)
-        except Exception as e:
-            log(f"[MEAN-REV EXIT ERR]{sym}{e}")
-
-def execute_mean_reversion_trade(sig):
-    sym=sig["symbol"]; direction=sig["dir"]
-    if not _can_direction(direction): return
-    if _duplicate_or_locked(sym,direction): return
-    live=update_directional_limits()
-    if direction=="UP" and live["long_count"]>=MEAN_REV_MAX_BUY: return
-    if direction=="DOWN" and live["short_count"]>=MEAN_REV_MAX_SELL: return
-
-    qty=calc_order_qty(sym,sig["entry"],250.0)
-    if qty<=0: return
-    try:
-        opened=open_market_position(sym,direction,qty)
-        entry_exec=opened.get("entry",futures_get_price(sym))
-        TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
-        tg_send(f"📘 Mean-Reversion Strategy — No TP\n{sym} {direction} qty:{qty}\nEntry:{entry_exec:.12f}")
-        log(f"[MEAN-REV OPEN] {sym} {direction} entry={entry_exec}")
-    except Exception as e:
-        log(f"[MEAN-REV OPEN ERR]{sym}{e}")
-        return
-
-    # arka planda fiyatı izler
-    def watcher():
-        while True:
-            mean_reversion_guard_close(sym,direction)
-            time.sleep(60)
-    threading.Thread(target=watcher,daemon=True).start()
-# ===================== DİĞER STRATEJİLER (ORİJİNAL V15.9.51 İLE AYNI) =====================
-
 def build_macd_trend_signal(sym, kl, bar_i):
     if len(kl)<200: return None
     closes=[float(k[4]) for k in kl]; highs=[float(k[2]) for k in kl]; lows=[float(k[3]) for k in kl]
@@ -307,49 +193,6 @@ def build_fvg_break_signal(sym, kl, bar_i):
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"FVG","tag":tag}
 
-def build_early_signal(sym, kl, bar_i):
-    if len(kl)<60: return None
-    try:
-        chg=float(requests.get(BINANCE_FAPI+"/fapi/v1/ticker/24hr",
-                               params={"symbol":sym},timeout=5).json()["priceChangePercent"])
-    except: chg=0.0
-    if abs(chg)>=10.0: return None
-
-    closes=[float(k[4]) for k in kl]
-    highs =[float(k[2]) for k in kl]
-    lows  =[float(k[3]) for k in kl]
-
-    fper=PARAM.get("FAST_EMA_PERIOD",3)
-    sper=PARAM.get("SLOW_EMA_PERIOD",7)
-    ema_fast=ema(closes,fper)
-    ema_slow=ema(closes,sper)
-
-    up_cross = (ema_fast[-2] > ema_slow[-2]) and (ema_fast[-3] <= ema_slow[-3])
-    dn_cross = (ema_fast[-2] < ema_slow[-2]) and (ema_fast[-3] >= ema_slow[-3])
-    if not (up_cross or dn_cross): return None
-
-    atrs=atr_like(highs,lows,closes)
-    if len(atrs)<2: return None
-    if not (atrs[-1] >= atrs[-2]*(1.0 + PARAM.get("ATR_SPIKE_RATIO",0.03))):
-        return None
-
-    direction="UP" if up_cross else "DOWN"
-    entry=closes[-1]
-    r_val=rsi(closes)[-1]
-    pwr=55 + (abs(ema_slow[-1]-ema_slow[-2])/(atrs[-1] or 1e-12))*20 + ((r_val-50)/50)*15 + (atrs[-1]/entry)*200
-
-    if direction=="UP":
-        tp_guess=entry*(1+PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1-PARAM["SCALP_SL_PCT"])
-    else:
-        tp_guess=entry*(1-PARAM["SCALP_TP_PCT"]); sl_guess=entry*(1+PARAM["SCALP_SL_PCT"])
-
-    return {
-        "symbol":sym,"dir":direction,"tier":"EARLY","emoji":"⚡️","entry":entry,
-        "tp":tp_guess,"sl":sl_guess,"power":pwr,"rsi":r_val,"atr":atrs[-1],
-        "chg24h":chg,"time":now_local_iso(),"born_bar":bar_i,"early":True,
-        "kind":"EARLY","tag":"⚡️ EARLY"
-    }
-
 def _last_swing_high_low(highs, lows, lookback=5):
     if len(highs) < lookback+2 or len(lows) < lookback+2:
         return None, None
@@ -370,7 +213,8 @@ def build_ema_pullback_signal(sym, kl, bar_i):
         direction="UP"; tag="📘 EMA PULLBACK BUY"
     elif downtrend and dn_pullback_done and (c_now < swing_l):
         direction="DOWN"; tag="📘 EMA PULLBACK SELL"
-    else: return None
+    else:
+        return None
     sl_ref=e30[-1]
     if direction=="UP":
         risk=max(1e-12,c_now-sl_ref); tp_est=c_now+1.5*risk; sl_est=sl_ref
@@ -384,33 +228,185 @@ def build_ema_pullback_signal(sym, kl, bar_i):
          "kind":"EMA_PULLBACK","tag":tag}
     sig["market_state"]=detect_market_state(closes,highs,lows)
     return sig
+# ===================== BINANCE CORE & HELPERS =====================
 
-# ===================== SCANNER =====================
+def now_ts_ms(): return int(datetime.now(timezone.utc).timestamp()*1000)
+def now_ts_s():  return int(datetime.now(timezone.utc).timestamp())
 
-def scan_symbol(sym,bar_i):
-    kl=futures_get_klines(sym,"1h",200)
-    if len(kl)<60: return []
-    res=[]
-    s_early = build_early_signal(sym,kl,bar_i)
-    s_utstc = build_utstc_signal(sym,kl,bar_i)
-    s_macd  = build_macd_trend_signal(sym,kl,bar_i)
-    s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
-    kl2 = kl if len(kl)>=210 else futures_get_klines(sym,"1h",210)
-    s_pull = build_ema_pullback_signal(sym, kl2, bar_i)
-    for s in (s_early, s_utstc, s_macd, s_fvg, s_pull):
-        if s: res.append(s)
-    return res
+def _signed_request(m,path,payload):
+    q="&".join([f"{k}={payload[k]}" for k in payload])
+    sig=hmac.new(BINANCE_SECRET.encode(),q.encode(),hashlib.sha256).hexdigest()
+    headers={"X-MBX-APIKEY":BINANCE_KEY}
+    url=BINANCE_FAPI+path+"?"+q+"&signature="+sig
+    r = (requests.post(url,headers=headers,timeout=10) if m=="POST" else requests.get(url,headers=headers,timeout=10))
+    if r.status_code!=200:
+        raise RuntimeError(f"Binance {r.status_code}: {r.text}")
+    return r.json()
 
-def run_parallel(symbols,bar_i):
-    out=[]
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        futs=[ex.submit(scan_symbol,s,bar_i) for s in symbols]
-        for f in as_completed(futs):
-            try: sigs=f.result()
-            except: sigs=[]
-            if sigs: out.extend(sigs)
-    return out
+def get_symbol_filters(sym):
+    if sym in PRECISION_CACHE:
+        return PRECISION_CACHE[sym]
+    try:
+        info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
+        s=next((x for x in info["symbols"] if x["symbol"]==sym),None)
+        lot=next((f for f in s["filters"] if f["filterType"]=="LOT_SIZE"),{})
+        pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
+        PRECISION_CACHE[sym]={
+            "stepSize":float(lot.get("stepSize","1")),
+            "tickSize":float(pricef.get("tickSize","0.01")),
+            "minPrice":float(pricef.get("minPrice","0.00000001")),
+            "maxPrice":float(pricef.get("maxPrice","100000000"))
+        }
+    except Exception as e:
+        log(f"[PREC WARN]{sym}{e}")
+        PRECISION_CACHE[sym]={"stepSize":0.0001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
+    return PRECISION_CACHE[sym]
 
+def futures_get_price(sym):
+    try:
+        r=requests.get(BINANCE_FAPI+"/fapi/v1/ticker/price",
+                       params={"symbol":sym},timeout=5).json()
+        return float(r["price"])
+    except:
+        return None
+
+def futures_get_klines(sym,it,lim):
+    try:
+        r=requests.get(BINANCE_FAPI+"/fapi/v1/klines",
+                       params={"symbol":sym,"interval":it,"limit":lim},
+                       timeout=10).json()
+        if r and int(r[-1][6])>now_ts_ms():
+            r=r[:-1]
+        return r
+    except:
+        return []
+
+# ===================== SMART MEAN REVERSION GUARD (NO TP) =====================
+
+MEAN_REV_MAX_BUY  = 3
+MEAN_REV_MAX_SELL = 3
+MEAN_REV_DISTANCE = 0.08   # %8 varsayılan (mikro fiyatlı coinlerde erken kapanmayı azaltır)
+MEAN_REV_CONFIRM  = 2      # ardışık ölçüm adedi
+MEAN_REV_INTERVAL = 120    # sn, watcher kontrol aralığı
+
+def calc_ma99(prices):
+    return ema(prices,99)[-1] if len(prices)>=99 else np.mean(prices)
+
+def calc_supertrend_like(highs,lows,closes,period=10,mult=3.0):
+    atr=atr_like(highs,lows,closes,period)
+    mid=(np.array(highs)+np.array(lows))/2
+    upper=mid+mult*np.array(atr); lower=mid-mult*np.array(atr)
+    dir_up=True
+    for i in range(1,len(closes)):
+        if closes[i]>upper[i-1]: dir_up=True
+        elif closes[i]<lower[i-1]: dir_up=False
+        upper[i]=max(upper[i],closes[i]) if dir_up else upper[i]
+        lower[i]=lower[i] if dir_up else min(lower[i],closes[i])
+    return upper[-1] if dir_up else lower[-1]
+
+def mean_reversion_distance(sym):
+    kl=futures_get_klines(sym,"1h",120)
+    if not kl: return 0.0
+    highs=[float(k[2]) for k in kl]; lows=[float(k[3]) for k in kl]; closes=[float(k[4]) for k in kl]
+    c_now=closes[-1]; ma99v=calc_ma99(closes); stv=calc_supertrend_like(highs,lows,closes)
+    dist_ma=abs(c_now-ma99v)/max(ma99v,1e-9)
+    dist_st=abs(c_now-stv)/max(stv,1e-9)
+    return max(dist_ma,dist_st)
+
+def mean_reversion_guard_close(sym,direction):
+    """
+    Ardışık iki ölçümde eşik üstü ise kapanır.
+    """
+    dist=mean_reversion_distance(sym)
+    prev=getattr(mean_reversion_guard_close,"_prev",{}).get(sym,0.0)
+    store=getattr(mean_reversion_guard_close,"_store",{})
+    count_prev=store.get(sym,0)
+    if dist>=MEAN_REV_DISTANCE:
+        count_prev+=1
+    else:
+        count_prev=0
+    store[sym]=count_prev
+    mean_reversion_guard_close._store=store
+    mean_reversion_guard_close._prev={**getattr(mean_reversion_guard_close,"_prev",{}), sym: dist}
+
+    if count_prev>=MEAN_REV_CONFIRM:
+        side="SELL" if direction=="UP" else "BUY"
+        pos_side="LONG" if direction=="UP" else "SHORT"
+        qty_info=calc_order_qty(sym,futures_get_price(sym),PARAM.get("TRADE_SIZE_USDT",250.0))
+        try:
+            _signed_request("POST","/fapi/v1/order",{
+                "symbol":sym,"side":side,"type":"MARKET",
+                "quantity":f"{qty_info}",
+                "positionSide":pos_side,
+                "reduceOnly":"false",
+                "timestamp":now_ts_ms()
+            })
+            tg_send(f"⚠️ {sym} Mean-Reversion Exit — fiyat ortalamadan uzaklaştı (%{dist*100:.2f})")
+            log(f"[MEAN-REV EXIT] {sym} dist={dist:.4f} confirm={count_prev}")
+            _unlock_trend_for(sym,delay_unlock=True)
+            store[sym]=0
+            mean_reversion_guard_close._store=store
+        except Exception as e:
+            log(f"[MEAN-REV EXIT ERR]{sym}{e}")
+
+def execute_mean_reversion_trade(sig):
+    """
+    - Sadece UT/STC sinyalinde çağrılır
+    - TP yok
+    - 250 USDT büyüklük
+    - 3 BUY + 3 SELL limit
+    - reduceOnly fix + entry fallback
+    - Watcher: 120 sn
+    """
+    sym=sig["symbol"]; direction=sig["dir"]
+    if not _can_direction(direction): return
+    if _duplicate_or_locked(sym,direction): return
+
+    live=update_directional_limits()
+    if direction=="UP" and live.get("long_count",0)>=MEAN_REV_MAX_BUY:
+        log(f"[MEAN-REV LIMIT] max BUY ulaşıldı"); return
+    if direction=="DOWN" and live.get("short_count",0)>=MEAN_REV_MAX_SELL:
+        log(f"[MEAN-REV LIMIT] max SELL ulaşıldı"); return
+
+    qty=calc_order_qty(sym,sig["entry"],PARAM.get("TRADE_SIZE_USDT",250.0))
+    if not qty or qty<=0: return
+
+    side = "BUY" if direction=="UP" else "SELL"
+    pos_side = "LONG" if direction=="UP" else "SHORT"
+
+    # Açılış: reduceOnly=false, gerekirse positionSide ile retry
+    payload = {
+        "symbol": sym,
+        "side": side,
+        "type": "MARKET",
+        "quantity": f"{qty}",
+        "reduceOnly": "false",
+        "timestamp": now_ts_ms()
+    }
+    try:
+        res = _signed_request("POST","/fapi/v1/order",payload)
+    except Exception as e:
+        payload["positionSide"]=pos_side
+        res = _signed_request("POST","/fapi/v1/order",payload)
+
+    entry_exec = None
+    try:
+        entry_exec = float(res.get("avgPrice") or res.get("price") or 0.0)
+    except:
+        entry_exec = 0.0
+    if not entry_exec or entry_exec <= 0:
+        entry_exec = futures_get_price(sym)
+
+    TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
+    tg_send(f"📘 Mean-Reversion Strategy — No TP\n{sym} {direction} qty:{qty}\nEntry:{entry_exec:.12f}")
+    log(f"[MEAN-REV OPEN] {sym} {direction} entry={entry_exec}")
+
+    # watcher
+    def watcher():
+        while True:
+            mean_reversion_guard_close(sym,direction)
+            time.sleep(MEAN_REV_INTERVAL)
+    threading.Thread(target=watcher,daemon=True).start()
 # ===================== RL ENRICH / SIM ENGINE =====================
 
 AI_SIGNALS    = safe_load(AI_SIGNALS_FILE,[])
@@ -474,7 +470,7 @@ def process_sim_closes():
     if not SIM_POSITIONS: return
     still=[]; changed=False
     for pos in SIM_POSITIONS:
-        if pos.get("status")!="OPEN": 
+        if pos.get("status")!="OPEN":
             still.append(pos); 
             continue
         last=futures_get_price(pos["symbol"])
@@ -505,25 +501,31 @@ def process_sim_closes():
         safe_save(SIM_POS_FILE,SIM_POSITIONS)
         safe_save(SIM_CLOSED_FILE,SIM_CLOSED)
 
-# ===================== TELEGRAM HELPERS (AYNI) =====================
+# ===================== TELEGRAM HELPERS =====================
 
 def tg_send(t):
     if not BOT_TOKEN or not CHAT_ID: return
     try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id":CHAT_ID,"text":t},timeout=10)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id":CHAT_ID,"text":t},
+            timeout=10
+        )
     except: pass
 
 def tg_send_file(p, cap):
     if not BOT_TOKEN or not CHAT_ID or not os.path.exists(p): return
     try:
         with open(p,"rb") as f:
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                          data={"chat_id":CHAT_ID,"caption":cap},
-                          files={"document":(os.path.basename(p),f)},timeout=30)
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id":CHAT_ID,"caption":cap},
+                files={"document":(os.path.basename(p),f)},
+                timeout=30
+            )
     except: pass
 
-# ===================== POWER/TIER & GUARDS/REPORT (AYNI) =====================
+# ===================== POWER/TIER (Bilgi amaçlı) =====================
 
 def calc_power(e_now,e_prev,e_prev2,atr_v,price,rsi_val):
     diff=abs(e_now-e_prev)/(atr_v*0.6) if atr_v>0 else 0
@@ -535,6 +537,8 @@ def tier_from_power(p):
     if p>=75: return "ULTRA","🟦"
     if p>=60: return "NORMAL","🟨"
     return None,""
+
+# ===================== GUARDS / HEARTBEAT / REPORT =====================
 
 STATE_DEFAULT={
     "bar_index":0, "last_report":0, "auto_trade_active":True,
@@ -584,9 +588,9 @@ def heartbeat_and_status_check(_snapshot):
         key_ok=True
         try: _=_signed_request("GET","/fapi/v2/account",{"timestamp":now_ts_ms()})
         except: key_ok=False
-        hb=(f"✅ HEARTBEAT drift={int(drift)}ms ping={ping_ok} key={key_ok}"
-            if ping_ok and key_ok and drift<1500 else
-            f"⚠️ HEARTBEAT ping={ping_ok} key={key_ok} drift={int(drift)}")
+        hb = (f"✅ HEARTBEAT drift={int(drift)}ms ping={ping_ok} key={key_ok}"
+              if ping_ok and key_ok and drift<1500 else
+              f"⚠️ HEARTBEAT ping={ping_ok} key={key_ok} drift={int(drift)}")
         tg_send(hb); log(hb)
     except Exception as e:
         tg_send(f"❌ HEARTBEAT {e}"); log(f"[HBERR]{e}")
@@ -641,7 +645,247 @@ def auto_report_if_due():
     tg_send("🕐 4 saatlik yedek gönderildi.")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
 
-# ===================== TELEGRAM KOMUTLARI (AYNI) =====================
+# ===================== SMART TP (orijinal korunur — bu strateji TP kullanmaz) =====================
+
+def adjust_precision(sym,v,kind="qty"):
+    f=get_symbol_filters(sym)
+    step=f["stepSize"] if kind=="qty" else f["tickSize"]
+    if step<=0: return v
+    return round(round(v/step)*step,12)
+
+def calc_order_qty(sym,entry,usd):
+    raw = usd/max(entry,1e-12)
+    return adjust_precision(sym,raw,"qty")
+
+def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
+    tp_pct = tp_usd / max(trade_usd,1e-12)
+    return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
+
+def round_to_tick(sym, price_float):
+    f=get_symbol_filters(sym)
+    t=Decimal(str(f["tickSize"]))
+    p=Decimal(str(price_float))
+    if t<=0: return float(p)
+    q=(p/t).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    out=(q*t)
+    return float(out)
+
+def format_price_by_tick(sym, price_float):
+    f=get_symbol_filters(sym)
+    dec=_decimals_from_tick(str(f["tickSize"]))
+    p_dec=Decimal(str(price_float)).quantize(Decimal(f"1e-{dec}"), rounding=ROUND_HALF_UP)
+    if p_dec==Decimal("-0"): p_dec=Decimal("0")
+    return f"{float(p_dec):.{dec}f}"
+
+def _decimals_from_tick(tick_str):
+    try:
+        d=Decimal(str(tick_str))
+        return max(0,-d.as_tuple().exponent)
+    except:
+        s=str(tick_str)
+        if "." in s: return len(s.split(".")[1])
+        return 0
+
+# (futures_set_tp_only ve open_market_position orijinalde var; bu strateji onları kullanmıyor)
+
+def open_market_position(sym, direction, qty):
+    # Orijinal fonksiyon — diğer stratejiler için
+    side="BUY" if direction=="UP" else "SELL"
+    pos_side="LONG" if direction=="UP" else "SHORT"
+    res=_signed_request("POST","/fapi/v1/order",{
+        "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
+        "positionSide":pos_side,"timestamp":now_ts_ms()
+    })
+    fill = res.get("avgPrice") or res.get("price") or futures_get_price(sym)
+    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
+
+def _duplicate_or_locked(sym, direction):
+    if TREND_LOCK.get(sym)==direction:
+        log(f"[TRENDLOCK HIT] {sym} {direction}")
+        return True
+    try:
+        acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
+    except Exception as e:
+        log(f"[POSRISK ERR]{e}"); acc=[]
+    if direction=="UP":
+        if sym in [p["symbol"] for p in acc if float(p["positionAmt"])>0]:
+            log(f"[DUP-LONG] {sym}"); return True
+    else:
+        if sym in [p["symbol"] for p in acc if float(p["positionAmt"])<0]:
+            log(f"[DUP-SHORT] {sym}"); return True
+    return False
+
+def _can_direction(direction):
+    if not STATE.get("auto_trade_active", True): return False
+    if direction=="UP" and STATE.get("long_blocked",False):  return False
+    if direction=="DOWN" and STATE.get("short_blocked",False): return False
+    return True
+
+def execute_real_trade(sig):
+    # Orijinal — bu stratejide kullanılmıyor (TP içerir)
+    approve_bars = int(PARAM.get("SCALP_APPROVE_BARS",0))
+    if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
+        return
+
+    sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
+    kind=sig.get("kind","")
+
+    if not _can_direction(direction): return
+    if _duplicate_or_locked(sym,direction): return
+
+    if kind == "EARLY":
+        if not (65 <= pwr < 75):
+            log(f"[POWER FILTER] EARLY {sym} {direction} power={pwr:.2f} skipped")
+            return
+
+    qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
+    if not qty or qty<=0:
+        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return
+
+    try:
+        opened=open_market_position(sym,direction,qty)
+        entry_exec=opened.get("entry") or futures_get_price(sym)
+        if not entry_exec or entry_exec<=0:
+            log(f"[OPEN FAIL] {sym} entry alınamadı."); return
+
+        # TP kurulumları (bu stratejide kullanılmıyor, ama orijinal fonksiyon korunuyor)
+        # tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(sym,direction,qty,entry_exec,1.6,2.0)
+        tp_ok=False; tp_usd_used=None; tp_pct_used=None
+
+        TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
+        log(f"[TRENDLOCK SET] {sym} {direction}")
+
+        prefix = sig.get("tag", f"🟩 {kind}")
+        ms = sig.get("market_state","")
+        ms_line = f"State:{ms} " if ms else ""
+        tg_send(f"{prefix} {sym} {direction} qty:{qty}\n{ms_line}Power:{pwr:.2f}\nEntry:{entry_exec:.12f}\nTP: YOK\n"
+                f"time:{now_local_iso()}")
+
+        AI_RL.append({
+            "time":now_local_iso(),"symbol":sym,"dir":direction,"entry":entry_exec,
+            "tp_usd_used":tp_usd_used,"tp_pct_used":tp_pct_used,"tp_ok":tp_ok,
+            "power":pwr,"born_bar":sig.get("born_bar"),
+            "early":bool(sig.get("early",False)),"kind":kind,"tag":sig.get("tag",""),
+            "market_state":sig.get("market_state","")
+        })
+        safe_save(AI_RL_FILE,AI_RL)
+
+    except Exception as e:
+        log(f"[OPEN ERR]{sym}{e}")
+
+# ===================== TRENDLOCK TEMİZLİK =====================
+
+def _cleanup_trend_lock_expired():
+    now_s=now_ts_s()
+    expired=[sym for sym,t in TREND_LOCK_TIME.items() if now_s - t >= TRENDLOCK_EXPIRY_SEC]
+    for sym in expired:
+        TREND_LOCK.pop(sym,None); TREND_LOCK_TIME.pop(sym,None)
+        log(f"[TRENDLOCK TIMEOUT] {sym} (6h cooldown bitti)")
+
+# ===================== SCANNER + RUNNER =====================
+
+def scan_symbol(sym,bar_i):
+    kl=futures_get_klines(sym,"1h",200)
+    if len(kl)<60: return []
+    res=[]
+    s_early = build_early_signal(sym,kl,bar_i)
+    s_utstc = build_utstc_signal(sym,kl,bar_i)
+    s_macd  = build_macd_trend_signal(sym,kl,bar_i)
+    s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
+    kl2 = kl if len(kl)>=210 else futures_get_klines(sym,"1h",210)
+    s_pull = build_ema_pullback_signal(sym, kl2, bar_i)
+    for s in (s_early, s_utstc, s_macd, s_fvg, s_pull):
+        if s: res.append(s)
+    return res
+
+def run_parallel(symbols,bar_i):
+    out=[]
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futs=[ex.submit(scan_symbol,s,bar_i) for s in symbols]
+        for f in as_completed(futs):
+            try: sigs=f.result()
+            except: sigs=[]
+            if sigs: out.extend(sigs)
+    return out
+
+def auto_init_symbols():
+    try:
+        info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
+        symbols=[s["symbol"] for s in info["symbols"]
+                 if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
+    except Exception as e:
+        log(f"[INIT SYMBOLS ERR]{e}"); symbols=[]
+    symbols.sort(); return symbols
+
+# ===================== MAIN =====================
+
+def main():
+    tg_send("🚀 EMA ULTRA v15.9.53 aktif (Smart Mean Reversion Guard — No TP, UT/STC only)")
+    log("[START] EMA ULTRA v15.9.53")
+
+    symbols=auto_init_symbols()
+
+    while True:
+        try:
+            # Telegram komutları
+            updates=_tg_get_updates() if 'BOT_TOKEN' in globals() else []
+            if updates:
+                for up in updates:
+                    _tg_set_offset(up["update_id"]+1)
+                    msg=up.get("message") or up.get("edited_message")
+                    if not msg: continue
+                    chat_id = str(msg.get("chat",{}).get("id"))
+                    if chat_id != str(CHAT_ID):  # tek chat filtre
+                        continue
+                    text=msg.get("text","").strip()
+                    if not text.startswith("/"): continue
+                    parts=text.split(); cmd=parts[0].lower(); args=parts[1:]
+                    if cmd=="/status": _cmd_status()
+                    elif cmd=="/report": _cmd_report()
+                    elif cmd=="/set" and args: _cmd_set(args)
+                    elif cmd=="/export": _cmd_export()
+                    else:
+                        tg_send("Komutlar: /status, /report, /set KEY VALUE, /export")
+
+            # bar index
+            STATE["bar_index"]=STATE.get("bar_index",0)+1
+            bar_i=STATE["bar_index"]
+
+            # 1) Sinyal tarama
+            sigs=run_parallel(symbols,bar_i)
+
+            # 2) Kayıt + SIM + Sadece UT/STC için gerçek trade (No TP + Smart Guard)
+            for sig in sigs:
+                ai_log_signal(sig)
+                queue_sim_variants(sig)
+                update_directional_limits()
+
+                if sig.get("kind")=="UTSTC":
+                    execute_mean_reversion_trade(sig)
+                # diğer stratejiler: sadece log/sim
+
+            # 3) SIM open/close
+            process_sim_queue_and_open_due()
+            process_sim_closes()
+
+            # 4) Auto-backup (4h)
+            auto_report_if_due()
+
+            # 5) Heartbeat (10 dk)
+            heartbeat_and_status_check({})
+
+            # 6) TrendLock cooldown temizliği
+            _cleanup_trend_lock_expired()
+
+            # 7) state save & sleep
+            safe_save(STATE_FILE,STATE)
+            time.sleep(30)
+
+        except Exception as e:
+            log(f"[LOOP ERR]{e}")
+            time.sleep(10)
+
+# ===================== TELEGRAM KOMUTLARI (orijinal) =====================
 
 def _tg_get_updates():
     if not BOT_TOKEN: return []
@@ -695,314 +939,7 @@ def _cmd_export():
     for fpath in [PARAM_FILE,STATE_FILE,AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,SIM_POS_FILE,SIM_CLOSED_FILE,LOG_FILE]:
         tg_send_file(fpath, f"📦 {os.path.basename(fpath)}")
 
-def check_telegram_commands():
-    if not BOT_TOKEN or not CHAT_ID: return
-    updates=_tg_get_updates()
-    if not updates: return
-    for up in updates:
-        _tg_set_offset(up["update_id"]+1)
-        msg=up.get("message") or up.get("edited_message")
-        if not msg: continue
-        chat_id = str(msg.get("chat",{}).get("id"))
-        if chat_id != str(CHAT_ID):
-            continue
-        text=msg.get("text","").strip()
-        if not text.startswith("/"): continue
-        parts=text.split(); cmd=parts[0].lower(); args=parts[1:]
-        if cmd=="/status": _cmd_status()
-        elif cmd=="/report": _cmd_report()
-        elif cmd=="/set" and args: _cmd_set(args)
-        elif cmd=="/export": _cmd_export()
-        else:
-            tg_send("Komutlar: /status, /report, /set KEY VALUE, /export")
-
-# ===================== SMART TP (ORİJİNAL) =====================
-# (Bu strateji TP kullanmıyor; fonksiyonlar korunuyor)
-
-def adjust_precision(sym,v,kind="qty"):
-    f=get_symbol_filters(sym)
-    step=f["stepSize"] if kind=="qty" else f["tickSize"]
-    if step<=0: return v
-    return round(round(v/step)*step,12)
-
-def calc_order_qty(sym,entry,usd):
-    raw = usd/max(entry,1e-12)
-    return adjust_precision(sym,raw,"qty")
-
-# (futures_set_tp_only ve ilgili yardımcıları orijinal metindeki gibi kalsın)
-
-def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
-    tp_pct = tp_usd / max(trade_usd,1e-12)
-    return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
-
-def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0):
-    try:
-        f=get_symbol_filters(sym)
-        minp=f["minPrice"]; maxp=f["maxPrice"]
-        pos_side="LONG" if direction=="UP" else "SHORT"; side="SELL" if direction=="UP" else "BUY"
-        trade_usd=PARAM.get("TRADE_SIZE_USDT",250.0)
-        usd_based = entry_exec>0.2
-
-        def try_once(tp_price_candidate, order_type, tp_usd_used=None, tp_pct_used=None):
-            price=round_to_tick(sym,tp_price_candidate)
-            if price<minp: price=round_to_tick(sym,minp)
-            if price>maxp: price=round_to_tick(sym,maxp)
-            stop_str=format_price_by_tick(sym,price)
-            if float(stop_str)<=0:
-                price=round_to_tick(sym,max(minp,1e-12))
-                stop_str=format_price_by_tick(sym,price)
-                if float(stop_str)<=0:
-                    log(f"[TP GUARD] {sym} stop=0 minp jump failed")
-                    return False,None,None
-            payload={"symbol":sym,"side":side,"type":order_type,"stopPrice":stop_str,
-                     "quantity":f"{qty}","workingType":"MARK_PRICE","closePosition":"true",
-                     "positionSide":pos_side,"timestamp":now_ts_ms()}
-            try:
-                _signed_request("POST","/fapi/v1/order",payload)
-                log(f"[TP OK] {sym} {order_type} stop={stop_str} qty={qty}")
-                return True,tp_usd_used,tp_pct_used
-            except Exception as e:
-                log(f"[TP FAIL] {sym} {order_type} stop={stop_str} err={e}")
-                return False,None,None
-
-        if usd_based:
-            for tp_usd in [round(x,1) for x in np.arange(tp_low_usd, tp_high_usd+0.001, 0.1)]:
-                tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",tp_usd,tp_pct)
-                if ok: return True,u,p
-            for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
-                tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",tp_usd,tp_pct)
-                if ok: return True,u,p
-            for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
-                tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"STOP_MARKET",tp_usd,tp_pct)
-                if ok: return True,u,p
-        else:
-            for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
-                tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",None,tp_pct)
-                if ok: return True,u,p
-
-        log(f"[NO TP] {sym} uygun TP bulunamadı.")
-        return False,None,None
-    except Exception as e:
-        log(f"[TP ERR]{sym} {e}")
-        return False,None,None
-
-# ===================== REAL TRADE (ORİJİNAL) =====================
-
-def round_to_tick(sym, price_float):
-    f=get_symbol_filters(sym)
-    t=Decimal(str(f["tickSize"]))
-    p=Decimal(str(price_float))
-    if t<=0: return float(p)
-    q=(p/t).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-    out=(q*t)
-    return float(out)
-
-def format_price_by_tick(sym, price_float):
-    f=get_symbol_filters(sym)
-    dec=_decimals_from_tick(str(f["tickSize"]))
-    p_dec=Decimal(str(price_float)).quantize(Decimal(f"1e-{dec}"), rounding=ROUND_HALF_UP)
-    if p_dec==Decimal("-0"): p_dec=Decimal("0")
-    return f"{float(p_dec):.{dec}f}"
-
-def _decimals_from_tick(tick_str):
-    try:
-        d=Decimal(str(tick_str))
-        return max(0,-d.as_tuple().exponent)
-    except:
-        s=str(tick_str)
-        if "." in s: return len(s.split(".")[1])
-        return 0
-
-def open_market_position(sym, direction, qty):
-    side="BUY" if direction=="UP" else "SELL"
-    pos_side="LONG" if direction=="UP" else "SHORT"
-    res=_signed_request("POST","/fapi/v1/order",{
-        "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
-        "positionSide":pos_side,"timestamp":now_ts_ms()
-    })
-    fill = res.get("avgPrice") or res.get("price") or futures_get_price(sym)
-    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
-
-def _duplicate_or_locked(sym, direction):
-    if TREND_LOCK.get(sym)==direction:
-        log(f"[TRENDLOCK HIT] {sym} {direction}")
-        return True
-    try:
-        acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
-    except Exception as e:
-        log(f"[POSRISK ERR]{e}"); acc=[]
-    if direction=="UP":
-        if sym in [p["symbol"] for p in acc if float(p["positionAmt"])>0]:
-            log(f"[DUP-LONG] {sym}"); return True
-    else:
-        if sym in [p["symbol"] for p in acc if float(p["positionAmt"])<0]:
-            log(f"[DUP-SHORT] {sym}"); return True
-    return False
-
-def _can_direction(direction):
-    if not STATE.get("auto_trade_active", True): return False
-    if direction=="UP" and STATE.get("long_blocked",False):  return False
-    if direction=="DOWN" and STATE.get("short_blocked",False): return False
-    return True
-
-def execute_real_trade(sig):
-    # Orijinal fonksiyon korunuyor (bu stratejide kullanılmayacak)
-    approve_bars = int(PARAM.get("SCALP_APPROVE_BARS",0))
-    if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
-        return
-
-    sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
-    kind=sig.get("kind","")
-
-    if not _can_direction(direction): return
-    if _duplicate_or_locked(sym,direction): return
-
-    if kind == "EARLY":
-        if not (65 <= pwr < 75):
-            log(f"[POWER FILTER] EARLY {sym} {direction} power={pwr:.2f} skipped")
-            return
-
-    qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
-    if not qty or qty<=0:
-        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return
-
-    try:
-        opened=open_market_position(sym,direction,qty)
-        entry_exec=opened.get("entry") or futures_get_price(sym)
-        if not entry_exec or entry_exec<=0:
-            log(f"[OPEN FAIL] {sym} entry alınamadı."); return
-
-        tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
-            sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
-        )
-
-        TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
-        log(f"[TRENDLOCK SET] {sym} {direction}")
-
-        prefix = sig.get("tag", f"🟩 {kind}")
-        ms = sig.get("market_state","")
-        ms_line = f"State:{ms} " if ms else ""
-        if tp_ok:
-            tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
-                       else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
-            tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',250.0),1e-12))*100
-            tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
-                    f"{ms_line}Power:{pwr:.2f}\n"
-                    f"Entry:{entry_exec:.12f}\n"
-                    f"{tp_line} ({tp_pct_show:.3f}%)\n"
-                    f"time:{now_local_iso()}")
-        else:
-            tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
-                    f"{ms_line}Power:{pwr:.2f}\n"
-                    f"Entry:{entry_exec:.12f}\n"
-                    f"TP: YOK (USD/% tarama başarısız)\n"
-                    f"time:{now_local_iso()}")
-
-        AI_RL.append({
-            "time":now_local_iso(),"symbol":sym,"dir":direction,"entry":entry_exec,
-            "tp_usd_used":tp_usd_used,"tp_pct_used":tp_pct_used,"tp_ok":tp_ok,
-            "power":pwr,"born_bar":sig.get("born_bar"),
-            "early":bool(sig.get("early",False)),"kind":kind,"tag":sig.get("tag",""),
-            "market_state":sig.get("market_state","")
-        })
-        safe_save(AI_RL_FILE,AI_RL)
-
-    except Exception as e:
-        log(f"[OPEN ERR]{sym}{e}")
-
-# ===================== TRENDLOCK TEMİZLİK (AYNI) =====================
-
-def _cleanup_trend_lock_expired():
-    now_s=now_ts_s()
-    expired=[sym for sym,t in TREND_LOCK_TIME.items() if now_s - t >= TRENDLOCK_EXPIRY_SEC]
-    for sym in expired:
-        TREND_LOCK.pop(sym,None); TREND_LOCK_TIME.pop(sym,None)
-        log(f"[TRENDLOCK TIMEOUT] {sym} (6h cooldown bitti)")
-
-# ===================== MAIN =====================
-
-def auto_init_symbols():
-    try:
-        info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
-        symbols=[s["symbol"] for s in info["symbols"]
-                 if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
-    except Exception as e:
-        log(f"[INIT SYMBOLS ERR]{e}"); symbols=[]
-    symbols.sort(); return symbols
-
-def main():
-    tg_send("🚀 EMA ULTRA v15.9.52 aktif (Mean Reversion Guard — No TP, UT/STC only)")
-    log("[START] EMA ULTRA v15.9.52")
-
-    symbols=auto_init_symbols()
-
-    while True:
-        try:
-            # Telegram komutları
-            updates=_tg_get_updates()
-            if updates:
-                for up in updates:
-                    _tg_set_offset(up["update_id"]+1)
-                    msg=up.get("message") or up.get("edited_message")
-                    if not msg: continue
-                    chat_id = str(msg.get("chat",{}).get("id"))
-                    if chat_id != str(CHAT_ID):  # tek chat filtre
-                        continue
-                    text=msg.get("text","").strip()
-                    if not text.startswith("/"): continue
-                    parts=text.split(); cmd=parts[0].lower(); args=parts[1:]
-                    if cmd=="/status": _cmd_status()
-                    elif cmd=="/report": _cmd_report()
-                    elif cmd=="/set" and args: _cmd_set(args)
-                    elif cmd=="/export": _cmd_export()
-                    else:
-                        tg_send("Komutlar: /status, /report, /set KEY VALUE, /export")
-
-            # bar index
-            STATE["bar_index"]=STATE.get("bar_index",0)+1
-            bar_i=STATE["bar_index"]
-
-            # 1) Sinyal tarama
-            sigs=run_parallel(symbols,bar_i)
-
-            # 2) Sinyal kayıt + SIM approve + Sadece UT/STC için gerçek trade (No TP + Guard)
-            for sig in sigs:
-                ai_log_signal(sig)
-                queue_sim_variants(sig)
-                update_directional_limits()
-
-                # 🔴 Sadece 1. strateji (UT/STC) gerçek işlem açar
-                if sig.get("kind")=="UTSTC":
-                    execute_mean_reversion_trade(sig)
-                # Diğer stratejiler için hiçbir şey açılmıyor (log/sim devam)
-
-            # 3) SIM open/close
-            process_sim_queue_and_open_due()
-            process_sim_closes()
-
-            # 4) 4 saatlik auto-backup
-            auto_report_if_due()
-
-            # 5) Heartbeat (10 dk)
-            heartbeat_and_status_check({})
-
-            # 6) TrendLock cooldown temizliği
-            _cleanup_trend_lock_expired()
-
-            # 7) state save & sleep
-            safe_save(STATE_FILE,STATE)
-            time.sleep(30)
-
-        except Exception as e:
-            log(f"[LOOP ERR]{e}")
-            time.sleep(10)
-
 # ===================== ENTRY =====================
 
 if __name__=="__main__":
     main()
-
