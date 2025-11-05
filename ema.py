@@ -224,6 +224,22 @@ def mean_reversion_distance(sym):
     return max(dist_ma,dist_st)
 
 def mean_reversion_guard_close(sym,direction):
+    # First check if position still exists
+    try:
+        acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
+        pos_exists=False
+        for p in acc:
+            if p["symbol"]!=sym: continue
+            amt=float(p["positionAmt"])
+            if direction=="UP" and amt>0: pos_exists=True
+            elif direction=="DOWN" and amt<0: pos_exists=True
+        if not pos_exists:
+            log(f"[MEAN-REV WATCHER] {sym} position already closed, stopping watcher")
+            return False  # Signal watcher to stop
+    except Exception as e:
+        log(f"[MEAN-REV POS CHECK ERR]{sym}{e}")
+        return True  # Continue watching on error
+    
     dist=mean_reversion_distance(sym)
     if dist>=MEAN_REV_DISTANCE:
         side="SELL" if direction=="UP" else "BUY"
@@ -232,13 +248,17 @@ def mean_reversion_guard_close(sym,direction):
         try:
             _signed_request("POST","/fapi/v1/order",{
                 "symbol":sym,"side":side,"type":"MARKET",
-                "quantity":f"{qty_info}","positionSide":pos_side,"timestamp":now_ts_ms()
+                "quantity":f"{qty_info}","positionSide":pos_side,
+                "reduceOnly":"true","timestamp":now_ts_ms()
             })
             tg_send(f"⚠️ {sym} Mean-Reversion Exit — fiyat ortalamadan uzaklaştı (%{dist*100:.2f})")
             log(f"[MEAN-REV EXIT] {sym} dist={dist:.4f}")
             _unlock_trend_for(sym,delay_unlock=True)
+            return False  # Signal watcher to stop
         except Exception as e:
             log(f"[MEAN-REV EXIT ERR]{sym}{e}")
+            return True  # Continue watching on error
+    return True  # Continue watching
 
 def execute_mean_reversion_trade(sig):
     sym=sig["symbol"]; direction=sig["dir"]
@@ -252,9 +272,19 @@ def execute_mean_reversion_trade(sig):
     if qty<=0: return
     try:
         opened=open_market_position(sym,direction,qty)
-        entry_exec=opened.get("entry",futures_get_price(sym))
+        entry_exec=opened.get("entry")
+        # Fallback to current price if entry not available
+        if not entry_exec or entry_exec <= 0:
+            entry_exec=futures_get_price(sym)
+            log(f"[MEAN-REV OPEN WARN] {sym} using fallback price {entry_exec}")
+        
         TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
-        tg_send(f"📘 Mean-Reversion Strategy — No TP\n{sym} {direction} qty:{qty}\nEntry:{entry_exec:.12f}")
+        
+        # Format entry price properly for display
+        if entry_exec and entry_exec > 0:
+            tg_send(f"📘 Mean-Reversion Strategy — No TP\n{sym} {direction} qty:{qty}\nEntry:{entry_exec:.12f}")
+        else:
+            tg_send(f"📘 Mean-Reversion Strategy — No TP\n{sym} {direction} qty:{qty}\nEntry: PRICE ERROR")
         log(f"[MEAN-REV OPEN] {sym} {direction} entry={entry_exec}")
     except Exception as e:
         log(f"[MEAN-REV OPEN ERR]{sym}{e}")
@@ -263,7 +293,10 @@ def execute_mean_reversion_trade(sig):
     # arka planda fiyatı izler
     def watcher():
         while True:
-            mean_reversion_guard_close(sym,direction)
+            should_continue = mean_reversion_guard_close(sym,direction)
+            if not should_continue:
+                log(f"[MEAN-REV WATCHER STOP] {sym} {direction}")
+                break
             time.sleep(60)
     threading.Thread(target=watcher,daemon=True).start()
 # ===================== DİĞER STRATEJİLER (ORİJİNAL V15.9.51 İLE AYNI) =====================
