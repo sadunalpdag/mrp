@@ -255,13 +255,7 @@ def _cleanup_trend_lock_expired():
     expired = [sym for sym,t in TREND_LOCK_TIME.items() if now_s - t >= TRENDLOCK_EXPIRY_SEC]
     for sym in expired:
         TREND_LOCK.pop(sym, None); TREND_LOCK_TIME.pop(sym, None)
-        log(f"[TRENDLOCK TIMEOUT] {sym}")
-
         
-            lower[i] = min(lower[i], closes[i])
-    st_val = upper[-1] if dir_up else lower[-1]
-    st_dir = "UP" if dir_up else "DOWN"
-    return st_val, st_dir
 
 # ===================== Kıvanç Confirm Signal (SuperTrend + EMA Cross) =====================
 
