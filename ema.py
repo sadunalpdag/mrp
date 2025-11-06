@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.51 — All Strategies + Market State Analyzer (Pullback)
+# 📘 EMA ULTRA v15.9.52 — All Strategies + Market State Analyzer + EMA-Structure
 #  - PEMA tamamen kaldırıldı
 #  - Aktif stratejiler:
 #       ⚡ EARLY (EMA3–EMA7 + ATR spike)
@@ -13,6 +13,8 @@ import numpy as np
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
+#       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
+#       📊 EMA-STRUCTURE (123 Move + EMA50 + Confirmation Candles)
 #  - Power filtresi kaldırıldı
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
@@ -202,6 +204,116 @@ def detect_market_state(closes, highs, lows):
         return "RANGE"
     else:
         return "NORMAL"
+
+# ===================== EMA-STRUCTURE HELPERS =====================
+
+def detect_higher_high_higher_low(highs, lows, lookback=5):
+    """
+    Detect Higher High (HH) and Higher Low (HL) pattern
+    Returns: (has_hh, has_hl, last_hh_idx, last_hl_idx)
+    """
+    if len(highs) < lookback * 2:
+        return False, False, None, None
+    
+    # Look for Higher High in recent bars
+    hh_found = False
+    hh_idx = None
+    for i in range(len(highs) - 1, max(len(highs) - lookback - 1, lookback), -1):
+        if highs[i] > max(highs[max(0, i-lookback):i]):
+            hh_found = True
+            hh_idx = i
+            break
+    
+    # Look for Higher Low in recent bars
+    hl_found = False
+    hl_idx = None
+    for i in range(len(lows) - 1, max(len(lows) - lookback - 1, lookback), -1):
+        if lows[i] > min(lows[max(0, i-lookback):i]):
+            hl_found = True
+            hl_idx = i
+            break
+    
+    return hh_found, hl_found, hh_idx, hl_idx
+
+def detect_lower_low_lower_high(highs, lows, lookback=5):
+    """
+    Detect Lower Low (LL) and Lower High (LH) pattern
+    Returns: (has_ll, has_lh, last_ll_idx, last_lh_idx)
+    """
+    if len(highs) < lookback * 2:
+        return False, False, None, None
+    
+    # Look for Lower Low in recent bars
+    ll_found = False
+    ll_idx = None
+    for i in range(len(lows) - 1, max(len(lows) - lookback - 1, lookback), -1):
+        if lows[i] < min(lows[max(0, i-lookback):i]):
+            ll_found = True
+            ll_idx = i
+            break
+    
+    # Look for Lower High in recent bars
+    lh_found = False
+    lh_idx = None
+    for i in range(len(highs) - 1, max(len(highs) - lookback - 1, lookback), -1):
+        if highs[i] < max(highs[max(0, i-lookback):i]):
+            lh_found = True
+            lh_idx = i
+            break
+    
+    return ll_found, lh_found, ll_idx, lh_idx
+
+def detect_confirmation_candle(opens, highs, lows, closes, direction):
+    """
+    Detect confirmation candle patterns:
+    - Bullish: hammer, bullish engulfing
+    - Bearish: shooting star, bearish engulfing
+    Returns: True if confirmation candle detected
+    """
+    if len(closes) < 2:
+        return False
+    
+    curr_open = opens[-1]
+    curr_high = highs[-1]
+    curr_low = lows[-1]
+    curr_close = closes[-1]
+    prev_open = opens[-2]
+    prev_close = closes[-2]
+    
+    body_size = abs(curr_close - curr_open)
+    candle_size = curr_high - curr_low
+    
+    if candle_size == 0:
+        return False
+    
+    if direction == "UP":
+        # Hammer: small body at top, long lower wick
+        lower_wick = min(curr_open, curr_close) - curr_low
+        upper_wick = curr_high - max(curr_open, curr_close)
+        is_hammer = (lower_wick > 2 * body_size and upper_wick < body_size and curr_close > curr_open)
+        
+        # Bullish Engulfing: current candle body engulfs previous
+        is_engulfing = (curr_close > curr_open and 
+                       prev_close < prev_open and 
+                       curr_close > prev_open and 
+                       curr_open < prev_close)
+        
+        return is_hammer or is_engulfing
+    
+    else:  # direction == "DOWN"
+        # Shooting Star: small body at bottom, long upper wick
+        lower_wick = min(curr_open, curr_close) - curr_low
+        upper_wick = curr_high - max(curr_open, curr_close)
+        is_shooting_star = (upper_wick > 2 * body_size and lower_wick < body_size and curr_close < curr_open)
+        
+        # Bearish Engulfing: current candle body engulfs previous
+        is_engulfing = (curr_close < curr_open and 
+                       prev_close > prev_open and 
+                       curr_close < prev_open and 
+                       curr_open > prev_close)
+        
+        return is_shooting_star or is_engulfing
+
 # ===================== STRATEGIES =====================
 
 def build_utstc_signal(sym, kl, bar_i):
@@ -366,6 +478,145 @@ def build_ema_pullback_signal(sym, kl, bar_i):
     sig["market_state"] = detect_market_state(closes, highs, lows)
     return sig
 
+def build_ema_structure_signal(sym, kl, bar_i):
+    """
+    EMA-Structure Trend Strategy (123 Move + EMA Confirmation)
+    
+    Strategy Rules:
+    1. Trend Definition: Price above/below EMA50 + HH-HL or LL-LH pattern
+    2. Entry Point: 123 Move Setup (HH -> HL -> HH or LL -> LH -> LL)
+    3. Area of Value Filter: Price pullback to EMA50/EMA20 + Support/Resistance
+    4. Confirmation Candle: Engulfing, Hammer, or Shooting Star
+    
+    Returns signal or None
+    """
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    
+    # Calculate EMAs
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    
+    c_now = closes[-1]
+    
+    # ========== STEP 1: Trend Definition ==========
+    # Uptrend: Price > EMA50 + HH and HL pattern
+    # Downtrend: Price < EMA50 + LL and LH pattern
+    
+    uptrend = c_now > e50[-1]
+    downtrend = c_now < e50[-1]
+    
+    hh_found, hl_found, _, _ = detect_higher_high_higher_low(highs, lows, lookback=5)
+    ll_found, lh_found, _, _ = detect_lower_low_lower_high(highs, lows, lookback=5)
+    
+    # Check if trend structure is valid
+    uptrend_valid = uptrend and hh_found and hl_found
+    downtrend_valid = downtrend and ll_found and lh_found
+    
+    if not (uptrend_valid or downtrend_valid):
+        return None
+    
+    # ========== STEP 2: 123 Move Setup ==========
+    # For uptrend: HH(1) -> HL(2) -> HH(3) - break above previous HH
+    # For downtrend: LL(1) -> LH(2) -> LL(3) - break below previous LL
+    
+    # Simplified check: look for recent breakout
+    if uptrend_valid:
+        # Check if current price broke above recent swing high
+        recent_swing_high = max(highs[-6:-1]) if len(highs) >= 6 else highs[-2]
+        if c_now <= recent_swing_high:
+            return None
+        direction = "UP"
+    else:  # downtrend_valid
+        # Check if current price broke below recent swing low
+        recent_swing_low = min(lows[-6:-1]) if len(lows) >= 6 else lows[-2]
+        if c_now >= recent_swing_low:
+            return None
+        direction = "DOWN"
+    
+    # ========== STEP 3: Area of Value Filter ==========
+    # Check if price recently touched EMA50 or EMA20 (pullback)
+    # Look back 3-5 bars for EMA touch
+    
+    touched_ema = False
+    for i in range(1, min(6, len(closes))):
+        ema50_dist = abs(closes[-i] - e50[-i]) / max(e50[-i], 1e-12)
+        ema20_dist = abs(closes[-i] - e20[-i]) / max(e20[-i], 1e-12)
+        
+        # Consider "touched" if within 0.5% of EMA
+        if ema50_dist < 0.005 or ema20_dist < 0.005:
+            touched_ema = True
+            break
+    
+    # Optional: relax this filter if strong breakout
+    atr_v = atr_like(highs, lows, closes)[-1]
+    strong_move = abs(c_now - closes[-2]) / max(atr_v, 1e-12) > 0.5
+    
+    if not touched_ema and not strong_move:
+        return None
+    
+    # ========== STEP 4: Confirmation Candle ==========
+    # Check for confirmation candle pattern
+    has_confirmation = detect_confirmation_candle(opens, highs, lows, closes, direction)
+    
+    # If no confirmation candle, require stronger structure
+    if not has_confirmation:
+        # Only proceed if we have very clear structure
+        if direction == "UP" and not (hh_found and hl_found and c_now > e50[-1] * 1.002):
+            return None
+        elif direction == "DOWN" and not (ll_found and lh_found and c_now < e50[-1] * 0.998):
+            return None
+    
+    # ========== Position Management ==========
+    # Stop Loss: Below last swing low (for long) or above last swing high (for short)
+    # Take Profit: Minimum 1:2 or 1:3 risk-reward
+    
+    if direction == "UP":
+        # Find last swing low for stop loss
+        swing_low = min(lows[-6:-1]) if len(lows) >= 6 else lows[-2]
+        sl_est = swing_low - atr_v  # 1 ATR below swing low
+        risk = max(1e-12, c_now - sl_est)
+        tp_est = c_now + 2.0 * risk  # 1:2 risk-reward
+        tag = "📊 EMA-STRUCTURE BUY"
+    else:
+        # Find last swing high for stop loss
+        swing_high = max(highs[-6:-1]) if len(highs) >= 6 else highs[-2]
+        sl_est = swing_high + atr_v  # 1 ATR above swing high
+        risk = max(1e-12, sl_est - c_now)
+        tp_est = c_now - 2.0 * risk  # 1:2 risk-reward
+        tag = "📊 EMA-STRUCTURE SELL"
+    
+    # Calculate power
+    r_val = rsi(closes)[-1]
+    pwr = 60 + abs(e50[-1] - e50[-2]) * 150 + (r_val - 50) / 2.0
+    if has_confirmation:
+        pwr += 5  # Bonus for confirmation candle
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "EMA_STRUCTURE",
+        "emoji": "📊",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "EMA_STRUCTURE",
+        "tag": tag,
+        "has_confirmation": has_confirmation,
+        "touched_ema": touched_ema
+    }
+
 def build_kivanc_confirm_signal(sym, kl, bar_i):
     """
     Kıvanç Özbilgıç SuperTrend + EMA Cross Strategy
@@ -480,8 +731,11 @@ def scan_symbol(sym,bar_i):
     # EMA Pullback için 210 bar güvenliği
     kl2 = kl if len(kl)>=210 else futures_get_klines(sym,"1h",210)
     s_pull = build_ema_pullback_signal(sym, kl2, bar_i)
+    
+    # EMA Structure Strategy
+    s_structure = build_ema_structure_signal(sym, kl, bar_i)
 
-    for s in (s_early, s_utstc, s_macd, s_fvg, s_kivanc, s_pull):
+    for s in (s_early, s_utstc, s_macd, s_fvg, s_kivanc, s_pull, s_structure):
         if s: res.append(s)
     
     return res
@@ -790,6 +1044,8 @@ def ai_update_analysis_snapshot():
         "macd_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="MACD"),
         "fvg_signals_total":   sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG"),
         "pullback_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_PULLBACK"),
+        "kivanc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="KIVANC_CONFIRM"),
+        "ema_structure_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_STRUCTURE"),
         "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
         "sim_closed_count":len(SIM_CLOSED)
     }
@@ -1099,8 +1355,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.51 aktif (All Strategies + MarketState for EMA Pullback) — Power filter removed")
-    log("[START] EMA ULTRA v15.9.51 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.52 aktif (All Strategies + EMA-Structure 123 Move) — Power filter removed")
+    log("[START] EMA ULTRA v15.9.52 FULL")
 
     symbols=auto_init_symbols()
 
