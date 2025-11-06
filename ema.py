@@ -238,6 +238,16 @@ def futures_get_klines(sym, interval, limit):
         return r
     except:
         return []
+def auto_init_symbols():
+    try:
+        info = requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo", timeout=10).json()
+        symbols = [s["symbol"] for s in info["symbols"]
+                   if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
+    except Exception as e:
+        log(f"[INIT SYMBOLS ERR] {e}")
+        symbols = []
+    symbols.sort()
+    return symbols
 # ------------------------------ Load state/params ------------------------------
 PARAM = safe_load(PARAM_FILE, PARAM_DEFAULT)
 if not isinstance(PARAM, dict): PARAM = PARAM_DEFAULT
