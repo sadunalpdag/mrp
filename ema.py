@@ -362,7 +362,7 @@ def detect_double_bottom(highs, lows, closes, ma50_values, lookback=10, toleranc
     bottom2_price = lows[bottom2_idx]
     
     # Check if bottoms are similar in price (within tolerance)
-    price_diff = abs(bottom1_price - bottom2_price) / max(bottom1_price, 1e-12)
+    price_diff = abs(bottom1_price - bottom2_price) / max(abs(bottom1_price), abs(bottom2_price), 1e-12)
     if price_diff > tolerance:
         return False, None, None, False
     
@@ -374,9 +374,9 @@ def detect_double_bottom(highs, lows, closes, ma50_values, lookback=10, toleranc
     for idx in [bottom1_idx, bottom2_idx]:
         ma50 = ma50_values[idx]
         # Check if any part of the candle touched MA50
-        if (abs(lows[idx] - ma50) / max(ma50, 1e-12) < touch_tolerance or
-            abs(highs[idx] - ma50) / max(ma50, 1e-12) < touch_tolerance or
-            abs(closes[idx] - ma50) / max(ma50, 1e-12) < touch_tolerance):
+        if (abs(lows[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(highs[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(closes[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance):
             touches_ma = True
             break
     
@@ -422,7 +422,7 @@ def detect_double_top(highs, lows, closes, ma50_values, lookback=10, tolerance=0
     top2_price = highs[top2_idx]
     
     # Check if tops are similar in price (within tolerance)
-    price_diff = abs(top1_price - top2_price) / max(top1_price, 1e-12)
+    price_diff = abs(top1_price - top2_price) / max(abs(top1_price), abs(top2_price), 1e-12)
     if price_diff > tolerance:
         return False, None, None, False
     
@@ -433,9 +433,9 @@ def detect_double_top(highs, lows, closes, ma50_values, lookback=10, tolerance=0
     for idx in [top1_idx, top2_idx]:
         ma50 = ma50_values[idx]
         # Check if any part of the candle touched MA50
-        if (abs(lows[idx] - ma50) / max(ma50, 1e-12) < touch_tolerance or
-            abs(highs[idx] - ma50) / max(ma50, 1e-12) < touch_tolerance or
-            abs(closes[idx] - ma50) / max(ma50, 1e-12) < touch_tolerance):
+        if (abs(lows[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(highs[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(closes[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance):
             touches_ma = True
             break
     
@@ -978,7 +978,7 @@ def build_cest_signal(sym, kl, bar_i):
                 
                 # Calculate power
                 r_val = rsi(closes)[-1]
-                pwr = 60 + abs(ma50_now - c_now) * 100 + (r_val - 50) / 2.0
+                pwr = 60 + abs(c_now - ma50_now) * 100 + (r_val - 50) / 2.0
                 
                 return {
                     "symbol": sym,
