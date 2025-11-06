@@ -495,6 +495,8 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
             with open(STATE_FILE, "w") as f:
                 json.dump(st, f, ensure_ascii=False, indent=2)
             log(f"[REVERSAL CLOSE] {sym} closed {closed_count} KIVANC_CONFIRM position(s)")
+            # Clear trendlock with delay (6h cooldown)
+            _unlock_trend_for(sym, delay_unlock=True)
     except Exception as e:
         log(f"[CLOSE KIVANC ERR] {sym} {e}")
 
@@ -503,6 +505,14 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
     Open a KIVANC_CONFIRM position and save to STATE_FILE
     """
     try:
+        # Convert side to direction for trendlock check
+        direction = "UP" if side == "BUY" else "DOWN"
+        
+        # Check trendlock
+        if TREND_LOCK.get(sym) == direction:
+            log(f"[KIVANC TRENDLOCK HIT] {sym} {direction}")
+            return False
+        
         # Get current price
         entry_price = futures_get_price(sym)
         if entry_price is None:
@@ -532,6 +542,11 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         # Save state
         with open(STATE_FILE, "w") as f:
             json.dump(st, f, ensure_ascii=False, indent=2)
+        
+        # Set trendlock
+        TREND_LOCK[sym] = direction
+        TREND_LOCK_TIME[sym] = now_ts_s()
+        log(f"[KIVANC TRENDLOCK SET] {sym} {direction}")
         
         log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
         return True
