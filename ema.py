@@ -461,89 +461,7 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "crossover": True
     }
 
-def check_kivanc_reversal(sym, kl, bar_i):
-    """
-    Trend reversal uyarısı geldiğinde o yöndeki tüm KIVANC_CONFIRM işlemlerini kapatır
-    """
-    if len(kl) < 60:
-        return
-    
-    closes = [float(k[4]) for k in kl]
-    highs = [float(k[2]) for k in kl]
-    lows = [float(k[3]) for k in kl]
-    
-    # Calculate SuperTrend
-    st_values, st_direction = supertrend(highs, lows, closes)
-    
-    if len(st_direction) < 2:
-        return
-    
-    st_now = st_direction[-1]
-    st_prev = st_direction[-2]
-    
-    if st_now != st_prev:
-        log(f"[REVERSAL] {sym} | {st_prev} → {st_now}")
-        close_kivanc_positions(sym, strategy="KIVANC_CONFIRM")
 
-def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
-    """
-    Close all KIVANC_CONFIRM positions for a symbol on Binance (on reversal)
-    This is called when SuperTrend reverses
-    """
-    try:
-        # Cancel all open orders for this symbol first
-        try:
-            _signed_request("DELETE", "/fapi/v1/allOpenOrders", {
-                "symbol": sym,
-                "timestamp": now_ts_ms()
-            })
-            log(f"[KIVANC CANCEL ORDERS] {sym}")
-        except Exception as cancel_err:
-            log(f"[KIVANC CANCEL ORDERS WARN] {sym} {cancel_err}")
-        
-        # Get current positions from Binance
-        try:
-            acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
-        except Exception as e:
-            log(f"[POSRISK ERR] {e}")
-            return
-        
-        closed_count = 0
-        for pos in acc:
-            if pos.get("symbol") != sym:
-                continue
-            
-            amt = float(pos.get("positionAmt", 0))
-            if amt == 0:
-                continue
-            
-            # Close position with market order
-            side = "SELL" if amt > 0 else "BUY"
-            pos_side = "LONG" if amt > 0 else "SHORT"
-            qty = abs(amt)
-            
-            try:
-                _signed_request("POST", "/fapi/v1/order", {
-                    "symbol": sym,
-                    "side": side,
-                    "type": "MARKET",
-                    "quantity": f"{qty}",
-                    "positionSide": pos_side,
-                    "timestamp": now_ts_ms()
-                })
-                
-                log(f"[CLOSE KIVANC] {sym} {pos_side} qty={qty} strategy={strategy}")
-                tg_send(f"🔄 KIVANC REVERSAL CLOSE\n{sym} {pos_side}\nQty:{qty}\nReason:SuperTrend Reversal")
-                closed_count += 1
-            except Exception as e:
-                log(f"[CLOSE KIVANC BINANCE ERR] {sym} {e}")
-        
-        if closed_count > 0:
-            log(f"[REVERSAL CLOSE] {sym} closed {closed_count} KIVANC_CONFIRM position(s)")
-            # Clear trendlock with delay (6h cooldown)
-            _unlock_trend_for(sym, delay_unlock=True)
-    except Exception as e:
-        log(f"[CLOSE KIVANC ERR] {sym} {e}")
 
 
 # ===================== SCANNER =====================
@@ -565,9 +483,6 @@ def scan_symbol(sym,bar_i):
 
     for s in (s_early, s_utstc, s_macd, s_fvg, s_kivanc, s_pull):
         if s: res.append(s)
-    
-    # Check for Kıvanç reversal
-    check_kivanc_reversal(sym, kl, bar_i)
     
     return res
 
