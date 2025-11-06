@@ -5,13 +5,21 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.61 — Kıvanç Confirm Only + MR Closer + 4L/4S Limit + Guard + Hedge
-#  - Kıvanç Confirm: SuperTrend + EMA Cross (trend onaylı)
-#  - Mean-Reversion: yeni işlem açmaz, sadece açık pozisyonları kapatır
-#  - Pozisyon limiti: aynı anda en fazla 4 LONG ve 4 SHORT
-#  - TrendLock: aynı sembol & yön tekrar açılmaz (6h cooldown)
+# 📘 EMA ULTRA v15.9.62 — Kıvanç Confirm + EARLY + SCALP + UT/STC + MACD + FVG
+#   (PEMA Disabled) + MR Closer Only + Guard + Hedge
+# ------------------------------------------------------------------------------
+# - Kıvanç Confirm: SuperTrend + EMA9/EMA30 Cross (4 LONG + 4 SHORT limiti)
+# - EARLY: EMA3/EMA7 + ATR spike
+# - SCALP: EMA7 reversal + mini ATR filtresi
+# - UT/STC: (UT benzeri trend filtresi) + MACD/RSI momentum onayı
+# - MACD Trend: MACD line & signal kesişimleri
+# - FVG Break: Son gap bölgesinin kırılımı yönüne işlem
+# - Mean-Reversion: YENİ İŞLEM AÇMAZ, sadece açık MR pozisyonlarını kapatır
+# - PEMA: TAMAMEN DEVRE DIŞI
+# - Hedge uyumlu; Duplicate-Guard (TrendLock) + 6 saat cooldown
 # ==============================================================================
 
+# ---- Dosya yolları & temel ayarlar
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR  = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -29,10 +37,12 @@ BINANCE_FAPI     = "https://fapi.binance.com"
 SAVE_LOCK = threading.Lock()
 getcontext().prec = 28
 
+# ---- TrendLock (duplicate guard)
 TREND_LOCK = {}
 TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 
+# ---- Utils
 def log(msg):
     print(msg, flush=True)
     try:
@@ -75,7 +85,7 @@ def tg_send(t):
         )
     except: pass
 
-# ---- Indicators ---------------------------------------------------------------
+# ---- Indicators
 def ema(vals, n):
     if not vals: return []
     k = 2/(n+1)
@@ -118,6 +128,7 @@ def atr_like(highs, lows, closes, period=14):
         a.append((a[-1]*(period-1) + tr[i]) / period)
     return [0]*(len(highs)-len(a)) + a
 
+# ---- SuperTrend & EMA Cross (Kıvanç Confirm için)
 def supertrend_last(highs, lows, closes, period=10, mult=3.0):
     atr = atr_like(highs, lows, closes, period)
     mid = (np.array(highs) + np.array(lows)) / 2.0
@@ -136,7 +147,7 @@ def supertrend_last(highs, lows, closes, period=10, mult=3.0):
     st_val = upper[-1] if dir_up else lower[-1]
     st_dir = "UP" if dir_up else "DOWN"
     return st_val, st_dir
-# ---- Binance helpers ----------------------------------------------------------
+# ---- Binance helpers
 def _signed_request(method, path, params):
     q = "&".join([f"{k}={params[k]}" for k in params])
     sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
@@ -163,7 +174,7 @@ def futures_get_klines(sym, interval, limit):
         r = requests.get(BINANCE_FAPI+"/fapi/v1/klines",
                          params={"symbol":sym,"interval":interval,"limit":limit},
                          timeout=10).json()
-        # Son bar kapansın
+        # Son bar kapansın:
         if r and int(r[-1][6]) > now_ts_ms():
             r = r[:-1]
         return r
@@ -217,7 +228,7 @@ def calc_order_qty(sym, entry_price, usd):
     f = get_symbol_filters(sym)
     step = f["stepSize"]
     raw = usd / max(entry_price,1e-12)
-    # stepSize'a yuvarla
+    # stepSize'a yuvarla (banker rounding yerine ROUND_HALF_UP)
     step_dec = Decimal(str(step))
     raw_dec = Decimal(str(raw))
     q = (raw_dec/step_dec).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step_dec
@@ -234,7 +245,7 @@ def auto_init_symbols():
     symbols.sort()
     return symbols
 
-# ---- Param & State ------------------------------------------------------------
+# ---- Param & State
 STATE_DEFAULT = {"bar_index": 0}
 PARAM_DEFAULT = {"TRADE_SIZE_USDT": 250.0}
 
@@ -250,7 +261,7 @@ def _cleanup_trend_lock_expired():
         TREND_LOCK.pop(sym, None); TREND_LOCK_TIME.pop(sym, None)
         log(f"[TRENDLOCK TIMEOUT] {sym}")
 
-# ---- Kıvanç Confirm (SuperTrend + EMA Cross) ----------------------------------
+# ===================== Kıvanç Confirm (SuperTrend + EMA Cross) =================
 def ema_cross_dir(closes, fast=9, slow=30):
     if len(closes) < slow+3: return None
     ef = ema(closes, fast); es = ema(closes, slow)
@@ -280,7 +291,7 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
     direction = cross_dir
     tag = "✅ KIVANC CONFIRM " + ("BUY" if direction=="UP" else "SELL")
 
-    # Bilgi amaçlı tp/sl (kapanış Kıvanç/manuel; MR açmaz)
+    # Bilgi amaçlı
     tp = entry * (1.006 if direction=="UP" else 0.994)
     sl = entry * (0.80  if direction=="UP" else 1.20)
 
@@ -290,26 +301,104 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "time": now_local_iso(), "born_bar": bar_i, "early": False,
         "kind": "KIVANC_CONFIRM", "tag": tag
     }
+# ===================== Diğer Stratejiler (PEMA devre dışı) ====================
+# EARLY: EMA3/EMA7 + ATR spike oranı
+def build_early_signal(sym, kl, bar_i):
+    if len(kl) < 50: return None
+    closes = [float(k[4]) for k in kl]
+    highs  = [float(k[2]) for k in kl]
+    lows   = [float(k[3]) for k in kl]
+    e3 = ema(closes,3); e7 = ema(closes,7)
+    atrv = atr_like(highs,lows,closes,14)[-1]
+    if atrv <= 0: return None
+    # Spike oranı (son bar gerçek gövdesi / ATR)
+    body = abs(closes[-1]-closes[-2])
+    spike_ratio = body / max(atrv,1e-9)
+    # Koşullar
+    if e3[-1] > e7[-1] and e3[-2] <= e7[-2] and spike_ratio >= 0.03:
+        return {"symbol":sym,"dir":"UP","entry":closes[-1],"kind":"EARLY","tag":"⚡ EARLY BUY","born_bar":bar_i}
+    if e3[-1] < e7[-1] and e3[-2] >= e7[-2] and spike_ratio >= 0.03:
+        return {"symbol":sym,"dir":"DOWN","entry":closes[-1],"kind":"EARLY","tag":"⚡ EARLY SELL","born_bar":bar_i}
+    return None
 
-def scan_symbol(sym, bar_i):
-    kl = futures_get_klines(sym, "1h", 200)
-    if len(kl) < 60: return []
-    res = []
-    s_kiv = build_kivanc_confirm_signal(sym, kl, bar_i)
-    if s_kiv: res.append(s_kiv)
-    return res
-# ===================== Mean-Reversion (Sadece Kapatıcı Mod) ====================
+# SCALP: EMA7 reversal + mini ATR filtresi
+def build_scalp_signal(sym, kl, bar_i):
+    if len(kl) < 40: return None
+    closes = [float(k[4]) for k in kl]
+    highs  = [float(k[2]) for k in kl]
+    lows   = [float(k[3]) for k in kl]
+    e7 = ema(closes,7)
+    atrv = atr_like(highs,lows,closes,14)[-1]
+    if atrv <= 0: return None
+    # Reversal: fiyat EMA7'yi aşağıdan yukarı/ yukarıdan aşağı keser + gövde ATR'in min %10'u
+    body = abs(closes[-1]-closes[-2])
+    if closes[-2] <= e7[-2] and closes[-1] > e7[-1] and body >= 0.10*atrv:
+        return {"symbol":sym,"dir":"UP","entry":closes[-1],"kind":"SCALP","tag":"🎯 SCALP BUY","born_bar":bar_i}
+    if closes[-2] >= e7[-2] and closes[-1] < e7[-1] and body >= 0.10*atrv:
+        return {"symbol":sym,"dir":"DOWN","entry":closes[-1],"kind":"SCALP","tag":"🎯 SCALP SELL","born_bar":bar_i}
+    return None
+
+# UT/STC benzeri: SuperTrend yönü + MACD/RSI momentum onayı
+def build_ut_stc_signal(sym, kl, bar_i):
+    if len(kl) < 120: return None
+    closes = [float(k[4]) for k in kl]
+    highs  = [float(k[2]) for k in kl]
+    lows   = [float(k[3]) for k in kl]
+    st_val, st_dir = supertrend_last(highs, lows, closes, period=10, mult=3.0)
+    macd_line, macd_sig, _ = macd(closes,12,26,9)
+    r = rsi(closes,14)[-1]
+    # Momentum onayı: MACD line > signal & RSI>52 (UP), tersi DOWN
+    if st_dir=="UP" and macd_line[-1] > macd_sig[-1] and r>52:
+        return {"symbol":sym,"dir":"UP","entry":closes[-1],"kind":"UT_STC","tag":"🟢 UT/STC BUY","born_bar":bar_i}
+    if st_dir=="DOWN" and macd_line[-1] < macd_sig[-1] and r<48:
+        return {"symbol":sym,"dir":"DOWN","entry":closes[-1],"kind":"UT_STC","tag":"🔴 UT/STC SELL","born_bar":bar_i}
+    return None
+
+# MACD Trend: Sade MACD line/signal kesişimi
+def build_macd_trend_signal(sym, kl, bar_i):
+    if len(kl) < 40: return None
+    closes = [float(k[4]) for k in kl]
+    line, sig, _ = macd(closes,12,26,9)
+    up = line[-1] > sig[-1] and line[-2] <= sig[-2]
+    dn = line[-1] < sig[-1] and line[-2] >= sig[-2]
+    if up: return {"symbol":sym,"dir":"UP","entry":closes[-1],"kind":"MACD","tag":"📈 MACD BUY","born_bar":bar_i}
+    if dn: return {"symbol":sym,"dir":"DOWN","entry":closes[-1],"kind":"MACD","tag":"📉 MACD SELL","born_bar":bar_i}
+    return None
+
+# FVG Break: Son 10 bar içinde oluşan boşluk (gap) bölgesinin kırılması
+def _find_last_fvg(highs, lows):
+    # Basit FVG: up-gap (low[i] > high[i-1]) veya down-gap (high[i] < low[i-1])
+    for i in range(len(highs)-1, 0, -1):
+        if lows[i] > highs[i-1]:
+            return ("UPGAP", highs[i-1], lows[i])   # [top, bottom] değil; gap aralığı (high[i-1]..low[i])
+        if highs[i] < lows[i-1]:
+            return ("DOWNGAP", highs[i], lows[i-1])
+    return (None, None, None)
+
+def build_fvg_break_signal(sym, kl, bar_i):
+    if len(kl) < 30: return None
+    highs  = [float(k[2]) for k in kl]
+    lows   = [float(k[3]) for k in kl]
+    closes = [float(k[4]) for k in kl]
+    kind, a, b = _find_last_fvg(highs[-10:], lows[-10:])
+    if not kind: return None
+    c = closes[-1]
+    if kind=="UPGAP":
+        # Gap bölgesine geri dönüş sonrası yukarı kırılım
+        if c > b:  # gap üst sınırı yeniden aşıldı
+            return {"symbol":sym,"dir":"UP","entry":c,"kind":"FVG","tag":"🪟 FVG BREAK BUY","born_bar":bar_i}
+    if kind=="DOWNGAP":
+        if c < a:
+            return {"symbol":sym,"dir":"DOWN","entry":c,"kind":"FVG","tag":"🪟 FVG BREAK SELL","born_bar":bar_i}
+    return None
+
+# ====== Mean-Reversion (Sadece Kapatıcı) ======================================
 MEAN_REV_FILE        = os.path.join(DATA_DIR,"mean_reversion_positions.json")
 MEAN_REV_POS         = safe_load(MEAN_REV_FILE, [])
-MEAN_REV_OPEN_LOW    = 5.0     # (kullanılmayacak: açılış kapalı)
-MEAN_REV_OPEN_HIGH   = 8.0
 MEAN_REV_EXIT_DIST   = 15.0    # %15 ve üstü, 2 onayla kapanış
 MEAN_REV_EXIT_MAX    = 30.0    # güvenlik hard cap
 MEAN_REV_CONFIRM     = 2
 MEAN_REV_INTERVAL    = 120     # watcher aralığı (s)
-MEAN_REV_USD_SIZE    = 250.0
-MEAN_REV_MAX_BUY     = 3
-MEAN_REV_MAX_SELL    = 3
 
 def _mr_save(): safe_save(MEAN_REV_FILE, MEAN_REV_POS)
 
@@ -326,29 +415,6 @@ def mean_reversion_distance_pct(sym):
     d_st = abs(c_now - stv ) / max(stv , 1e-9) * 100.0
     return max(d_ma, d_st), c_now, ma99, stv
 
-def detect_mean_reversion_signal(sym):
-    # Açılışlar devre dışı — sinyal üretme (None döndür)
-    return None
-
-def _count_live_positions():
-    try:
-        acc = _signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
-    except Exception as e:
-        log(f"[POSRISK ERR] {e}")
-        return 0,0
-    long_cnt  = sum(1 for p in acc if float(p.get("positionAmt",0)) > 0)
-    short_cnt = sum(1 for p in acc if float(p.get("positionAmt",0)) < 0)
-    return long_cnt, short_cnt
-
-def open_market(sym, direction, qty):
-    side = "BUY" if direction=="UP" else "SELL"
-    pos_side = "LONG" if direction=="UP" else "SHORT"
-    res = _signed_request("POST","/fapi/v1/order",{
-        "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
-        "positionSide":pos_side,"timestamp":now_ts_ms()
-    })
-    return float(res.get("avgPrice") or res.get("price") or futures_get_price(sym) or 0)
-
 def close_market(sym, direction, qty):
     side = "SELL" if direction=="UP" else "BUY"
     pos_side = "LONG" if direction=="UP" else "SHORT"
@@ -356,11 +422,6 @@ def close_market(sym, direction, qty):
         "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
         "positionSide":pos_side,"timestamp":now_ts_ms()
     })
-
-def open_mean_reversion(sym, direction):
-    # Açılışlar kalıcı olarak kapalı
-    log(f"[MEAN-REV OPEN DISABLED] {sym} {direction} skip")
-    return False
 
 def close_mean_reversion(sym, direction, reason):
     try:
@@ -402,15 +463,17 @@ def mean_reversion_watcher():
         except Exception as e:
             log(f"[MEAN-REV WATCH ERR] {e}")
         time.sleep(MEAN_REV_INTERVAL)
+# ===================== Trade Helpers & Executors ===============================
+def open_market(sym, direction, qty):
+    side = "BUY" if direction=="UP" else "SELL"
+    pos_side = "LONG" if direction=="UP" else "SHORT"
+    res = _signed_request("POST","/fapi/v1/order",{
+        "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
+        "positionSide":pos_side,"timestamp":now_ts_ms()
+    })
+    return float(res.get("avgPrice") or res.get("price") or futures_get_price(sym) or 0.0)
 
-def mean_reversion_loop(symbols):
-    # Açılış döngüsü devre dışı — yalnızca watcher açıkta kalır
-    log("[MEAN-REV] Açılışlar devre dışı (sadece kapanış izleme aktif).")
-    while True:
-        time.sleep(600)
-# ===================== Kıvanç Confirm Trade + Limitler =========================
-def _count_kivanc_positions():
-    """Toplam LONG/SHORT sayısını sayar (tüm semboller için)."""
+def _count_positions_all():
     try:
         acc = _signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
     except Exception as e:
@@ -420,71 +483,123 @@ def _count_kivanc_positions():
     short_cnt = sum(1 for p in acc if float(p.get("positionAmt",0)) < 0)
     return long_cnt, short_cnt
 
-def execute_kivanc_trade(sig):
-    """
-    Kıvanç Confirm sinyali geldiğinde market pozisyon açar (hedge uyumlu).
-    Pozisyon limiti: en fazla 4 LONG + 4 SHORT.
-    """
-    sym = sig["symbol"]; direction = sig["dir"]
+def _calc_qty(sym, entry_ref):
+    usd = PARAM.get("TRADE_SIZE_USDT", 250.0)
+    q = calc_order_qty(sym, entry_ref, usd)
+    return q if q and q>0 else 0.0
 
-    # 4L/4S limit
-    long_cnt, short_cnt = _count_kivanc_positions()
+# ---- Kıvanç Confirm: 4 LONG + 4 SHORT limiti
+def execute_kivanc_trade(sig):
+    sym = sig["symbol"]; direction = sig["dir"]
+    # Pozisyon limit kontrolü (sadece Kıvanç için)
+    long_cnt, short_cnt = _count_positions_all()
     if direction == "UP" and long_cnt >= 4:
         log(f"[KIVANC LIMIT] Maksimum 4 LONG açık, {sym} atlandı.")
         return
     if direction == "DOWN" and short_cnt >= 4:
         log(f"[KIVANC LIMIT] Maksimum 4 SHORT açık, {sym} atlandı.")
         return
-
     # Duplicate guard
     if TREND_LOCK.get(sym) == direction:
         log(f"[KIVANC GUARD] {sym} {direction} aktif, atlandı.")
         return
-
     entry_ref = sig.get("entry") or futures_get_price(sym)
     if not entry_ref: return
-    qty = calc_order_qty(sym, entry_ref, PARAM.get("TRADE_SIZE_USDT", 250.0))
-    if not qty or qty<=0: return
+    qty = _calc_qty(sym, entry_ref)
+    if qty<=0: return
     try:
         fill = open_market(sym, direction, qty)
         TREND_LOCK[sym] = direction; TREND_LOCK_TIME[sym] = now_ts_s()
-        log(f"[KIVANC OPEN] {sym} {direction} entry={fill}")
         tg_send(f"✅ KIVANC CONFIRM OPEN\n{sym} {direction} qty:{qty}\nEntry:{fill:.12f}")
+        log(f"[KIVANC OPEN] {sym} {direction} entry={fill}")
     except Exception as e:
-        log(f"[KIVANC OPEN ERR] {sym} {e}")
         tg_send(f"❌ KIVANC OPEN ERR {sym}\n{e}")
+        log(f"[KIVANC OPEN ERR] {sym} {e}")
+
+# ---- Diğer stratejiler: limit yok (TREND_LOCK sembol&yön bazlı korur)
+def execute_generic_trade(sig):
+    sym = sig["symbol"]; direction = sig["dir"]; kind = sig.get("kind","GEN")
+    if TREND_LOCK.get(sym) == direction:
+        log(f"[{kind} GUARD] {sym} {direction} aktif, atlandı.")
+        return
+    entry_ref = sig.get("entry") or futures_get_price(sym)
+    if not entry_ref: return
+    qty = _calc_qty(sym, entry_ref)
+    if qty<=0: return
+    try:
+        fill = open_market(sym, direction, qty)
+        TREND_LOCK[sym] = direction; TREND_LOCK_TIME[sym] = now_ts_s()
+        tg_send(f"🟦 {kind} OPEN\n{sym} {direction} qty:{qty}\nEntry:{fill:.12f}\n{sig.get('tag','')}")
+        log(f"[{kind} OPEN] {sym} {direction} entry={fill}")
+    except Exception as e:
+        tg_send(f"❌ {kind} OPEN ERR {sym}\n{e}")
+        log(f"[{kind} OPEN ERR] {sym} {e}")
+
+# ===================== Sinyal Taraması ========================================
+def scan_symbol(sym, bar_i):
+    kl = futures_get_klines(sym, "1h", 200)  # Kıvanç ve çoğu strateji 1H
+    if len(kl) < 60: return []
+
+    res = []
+
+    # Kıvanç Confirm
+    s_kiv = build_kivanc_confirm_signal(sym, kl, bar_i)
+    if s_kiv: res.append(s_kiv)
+
+    # PEMA DEVRE DIŞI — hiçbir çağrı YOK
+
+    # Diğer stratejiler (aktif)
+    s_early = build_early_signal(sym, kl, bar_i)
+    if s_early: res.append(s_early)
+
+    s_scalp = build_scalp_signal(sym, kl, bar_i)
+    if s_scalp: res.append(s_scalp)
+
+    s_ut = build_ut_stc_signal(sym, kl, bar_i)
+    if s_ut: res.append(s_ut)
+
+    s_macd = build_macd_trend_signal(sym, kl, bar_i)
+    if s_macd: res.append(s_macd)
+
+    s_fvg = build_fvg_break_signal(sym, kl, bar_i)
+    if s_fvg: res.append(s_fvg)
+
+    return res
 
 # ===================== Main ====================================================
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.61 aktif — Kıvanç Confirm Only + MR Closer + 4L/4S Limit")
-    log("[START] EMA ULTRA v15.9.61")
+    tg_send("🚀 EMA ULTRA v15.9.62 aktif — KC + EARLY + SCALP + UT/STC + MACD + FVG | PEMA OFF | MR Closer")
+    log("[START] EMA ULTRA v15.9.62")
 
     symbols = auto_init_symbols()
 
-    # Mean-Reversion: sadece watcher (kapanış için), açılış döngüsü kapalı
-    # threading.Thread(target=mean_reversion_loop,   args=(symbols,), daemon=True).start()
-    threading.Thread(target=mean_reversion_watcher,               daemon=True).start()
+    # MR: sadece kapatıcı izleyici
+    threading.Thread(target=mean_reversion_watcher, daemon=True).start()
 
     while True:
         try:
             STATE["bar_index"] = STATE.get("bar_index", 0) + 1
             bar_i = STATE["bar_index"]
 
-            # Sinyal tarama (KIVANC)
+            # Sinyal tarama
             sigs = []
             with ThreadPoolExecutor(max_workers=6) as ex:
                 futs = [ex.submit(scan_symbol, s, bar_i) for s in symbols]
                 for f in as_completed(futs):
                     try:
                         r = f.result()
-                    except:
+                    except Exception as e:
+                        log(f"[SCAN ERR] {e}")
                         r = []
                     if r: sigs.extend(r)
 
-            # Kıvanç Confirm sinyallerini işle (4L/4S limitli)
+            # İşlemler
             for sig in sigs:
-                if sig.get("kind") == "KIVANC_CONFIRM":
-                    execute_kivanc_trade(sig)
+                kind = sig.get("kind","GEN")
+                if kind == "KIVANC_CONFIRM":
+                    execute_kivanc_trade(sig)      # 4L/4S limitli
+                else:
+                    execute_generic_trade(sig)     # limit yok, TREND_LOCK aktif
 
             # Guard timeout
             _cleanup_trend_lock_expired()
