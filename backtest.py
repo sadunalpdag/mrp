@@ -24,10 +24,25 @@ from ema import (
 
 BINANCE_FAPI = "https://fapi.binance.com"
 
-# Backtest configuration
+# Backtest configuration - can be modified for different test scenarios
 INITIAL_CAPITAL = 10000.0  # Starting capital in USDT
 TRADE_SIZE_USDT = 250.0    # Size per trade
 COMMISSION_RATE = 0.0004   # 0.04% per trade (maker/taker combined)
+
+
+def set_backtest_config(initial_capital=10000.0, trade_size=250.0, commission=0.0004):
+    """
+    Configure backtest parameters
+    
+    Args:
+        initial_capital: Starting capital in USDT
+        trade_size: Size per trade in USDT
+        commission: Commission rate (0.0004 = 0.04%)
+    """
+    global INITIAL_CAPITAL, TRADE_SIZE_USDT, COMMISSION_RATE
+    INITIAL_CAPITAL = initial_capital
+    TRADE_SIZE_USDT = trade_size
+    COMMISSION_RATE = commission
 
 class BacktestPosition:
     """Represents an open position in the backtest"""
@@ -153,6 +168,29 @@ class BacktestEngine:
             print(f"Error fetching data: {e}")
             return False
     
+    def _adjust_stop_loss_if_placeholder(self, entry: float, sl: float, direction: str) -> float:
+        """
+        Adjust stop loss if it's using placeholder values (too wide)
+        
+        Args:
+            entry: Entry price
+            sl: Original stop loss price
+            direction: "UP" or "DOWN"
+            
+        Returns:
+            Adjusted stop loss price
+        """
+        sl_pct = abs((sl / entry) - 1)
+        
+        # If SL is more than 15%, it's likely a placeholder - use reasonable 2% SL
+        if sl_pct > 0.15:
+            if direction == "UP":
+                return entry * 0.98  # 2% below entry for long
+            else:
+                return entry * 1.02  # 2% above entry for short
+        
+        return sl
+    
     def run_strategy_backtest(self, strategy_name: str, 
                               strategy_func) -> Dict[str, Any]:
         """Run backtest for a specific strategy"""
@@ -217,22 +255,11 @@ class BacktestEngine:
                     
                     if signal:
                         # Adjust SL if it's using placeholder values (0.8 or 1.2 multipliers)
-                        # These indicate "no real SL" in the original code
                         entry = signal["entry"]
                         tp = signal["tp"]
-                        sl = signal["sl"]
-                        
-                        # Check if SL is a placeholder (too wide)
-                        if signal["dir"] == "UP":
-                            sl_pct = abs((sl / entry) - 1)
-                            if sl_pct > 0.15:  # More than 15% = placeholder
-                                # Use reasonable 2% SL
-                                sl = entry * 0.98
-                        else:  # DOWN
-                            sl_pct = abs((sl / entry) - 1)
-                            if sl_pct > 0.15:  # More than 15% = placeholder
-                                # Use reasonable 2% SL
-                                sl = entry * 1.02
+                        sl = self._adjust_stop_loss_if_placeholder(
+                            entry, signal["sl"], signal["dir"]
+                        )
                         
                         # Open new position
                         pos = BacktestPosition(
@@ -371,7 +398,16 @@ class BacktestEngine:
 
 
 def run_comprehensive_backtest(symbols: List[str], lookback_days: int = 90):
-    """Run backtest for all strategies on multiple symbols"""
+    """
+    Run backtest for all strategies on multiple symbols
+    
+    Args:
+        symbols: List of trading symbols to test (e.g., ["BTCUSDT", "ETHUSDT"])
+        lookback_days: Number of days of historical data to use
+        
+    Returns:
+        List of dictionaries containing backtest results for each symbol/strategy combination
+    """
     
     # Define all strategies to test
     strategies = [
