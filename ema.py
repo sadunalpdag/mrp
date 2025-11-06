@@ -5,16 +5,15 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.63 — KC (no TP, 4L/4S) + EARLY + SCALP + UT/STC + MACD + FVG
-#  - Global cap: 30 BUY + 30 SELL
-#  - Power Band: 65–75 (diğer stratejiler gerçek trade sadece bu bantta)
-#  - Smart TP Finder: 1.6–2.0 USD, mikro fiyatlarda % fallback
+# 📘 EMA ULTRA v15.9.64 — KC(no TP, 4L/4S+Global 30/30) + EARLY/SCALP/UT/MACD/FVG
+#  - Power Band: 65–75 (diğer stratejilerde gerçek trade bu bantta)
+#  - Smart TP Finder: 1.6–2.0 USD (+ mikro fiyatlarda % fallback)
+#  - TP/SL emri: v15.9.51 stabil blok (CONTRACT_PRICE + reduceOnly + priceProtect)
 #  - Mean-Reversion: sadece kapatıcı (open kapalı)
 #  - PEMA: devre dışı
 #  - Hedge uyumlu + TrendLock (6 saat cooldown)
 # ==============================================================================
 
-# ---- Dosya yolları & temel ayarlar
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR  = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -22,6 +21,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 STATE_FILE       = os.path.join(DATA_DIR,"state.json")
 PARAM_FILE       = os.path.join(DATA_DIR,"params.json")
 LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
+
+# Kıvanç açık pozisyon seti (gerçek 4/4 kontrolü için)
+KIVANC_FILE      = os.path.join(DATA_DIR,"kivanc_open.json")
 
 BOT_TOKEN        = os.getenv("BOT_TOKEN")
 CHAT_ID          = os.getenv("CHAT_ID")
@@ -33,7 +35,6 @@ SAVE_LOCK = threading.Lock()
 getcontext().prec = 28
 random.seed(42)
 
-# ---- Parametreler
 STATE_DEFAULT = {"bar_index": 0}
 PARAM_DEFAULT = {
     "TRADE_SIZE_USDT": 250.0,
@@ -42,7 +43,7 @@ PARAM_DEFAULT = {
     "TP_USD_MIN": 1.6,
     "TP_USD_MAX": 2.0,
     "FALLBACK_TP_PCT": 0.0020,   # %0.20
-    "FALLBACK_SL_PCT": 0.0200,   # %2.00 (yaklaşık 40–50 USD eşleniği)
+    "FALLBACK_SL_PCT": 0.0200,   # %2.00
     "GLOBAL_LONG_CAP": 30,
     "GLOBAL_SHORT_CAP": 30,
     "KC_LONG_CAP": 4,
@@ -52,11 +53,12 @@ PARAM_DEFAULT = {
 PARAM = None
 STATE = None
 
-# ---- TrendLock (duplicate guard)
+# TrendLock (duplicate guard)
 TREND_LOCK = {}
 TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 
+# -------- Utils ----------------------------------------------------------------
 def log(msg):
     print(msg, flush=True)
     try:
@@ -92,14 +94,11 @@ def now_ts_s():  return int(datetime.now(timezone.utc).timestamp())
 def tg_send(t):
     if not BOT_TOKEN or not CHAT_ID: return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id":CHAT_ID,"text":t},
-            timeout=10
-        )
+        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                      data={"chat_id":CHAT_ID,"text":t}, timeout=10)
     except: pass
 
-# ---- Göstergeler
+# -------- Indicators -----------------------------------------------------------
 def ema(vals, n):
     if not vals: return []
     k = 2/(n+1)
@@ -160,7 +159,7 @@ def supertrend_last(highs, lows, closes, period=10, mult=3.0):
     st_val = upper[-1] if dir_up else lower[-1]
     st_dir = "UP" if dir_up else "DOWN"
     return st_val, st_dir
-# ---- Binance yardımcıları
+# -------- Binance helpers ------------------------------------------------------
 def _signed_request(method, path, params):
     q = "&".join([f"{k}={params[k]}" for k in params])
     sig = hmac.new(BINANCE_SECRET.encode(), q.encode(), hashlib.sha256).hexdigest()
@@ -187,8 +186,7 @@ def futures_get_klines(sym, interval, limit):
         r = requests.get(BINANCE_FAPI+"/fapi/v1/klines",
                          params={"symbol":sym,"interval":interval,"limit":limit},
                          timeout=10).json()
-        # Son bar kapansın:
-        if r and int(r[-1][6]) > now_ts_ms():
+        if r and int(r[-1][6]) > now_ts_ms():  # son bar kapanmamışsa at
             r = r[:-1]
         return r
     except:
@@ -255,7 +253,6 @@ def auto_init_symbols():
     symbols.sort()
     return symbols
 
-# ---- Param & State yükle
 def _load_state_and_params():
     global PARAM, STATE
     PARAM = safe_load(PARAM_FILE, PARAM_DEFAULT)
@@ -273,14 +270,40 @@ def _cleanup_trend_lock_expired():
         TREND_LOCK.pop(sym, None); TREND_LOCK_TIME.pop(sym, None)
         log(f"[TRENDLOCK TIMEOUT] {sym}")
 
-# ---- Power & yardımcı metrikler
+# Power hesap & band
 def compute_power(entry, st_val, r_val):
-    # Aynı formül: 60 + uzaklık% + (RSI-50)/2
     dist_pct = abs(entry - st_val) / max(entry, 1e-9) * 100.0
     return 60.0 + dist_pct + (r_val - 50.0) / 2.0
 
 def in_power_band(p):
     return PARAM["POWER_MIN"] <= p <= PARAM["POWER_MAX"]
+
+# Kıvanç 4/4 izleme (gerçek açık poz sayısı)
+def _kiv_load():
+    return safe_load(KIVANC_FILE, [])
+
+def _kiv_save(lst):
+    safe_save(KIVANC_FILE, lst)
+
+def _kiv_refresh_from_positions():
+    """PositionRisk'e bakarak KIVANC_OPEN listesini günceller; kapalıları siler."""
+    kv = _kiv_load()
+    try:
+        acc = _signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
+    except Exception as e:
+        log(f"[KIV REF ERR] {e}")
+        return kv
+    alive = []
+    for item in kv:
+        sym = item["symbol"]; direction = item["dir"]
+        # LONG>0, SHORT<0
+        pr = next((p for p in acc if p.get("symbol")==sym), None)
+        if not pr: continue
+        amt = float(pr.get("positionAmt",0))
+        if direction=="UP" and amt>0: alive.append(item)
+        if direction=="DOWN" and amt<0: alive.append(item)
+    _kiv_save(alive)
+    return alive
 # ===================== Kıvanç Confirm (SuperTrend + EMA Cross) =================
 def ema_cross_dir(closes, fast=9, slow=30):
     if len(closes) < slow+3: return None
@@ -296,21 +319,17 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
     closes = [float(k[4]) for k in kl]
     highs  = [float(k[2]) for k in kl]
     lows   = [float(k[3]) for k in kl]
-
     st_val, st_dir = supertrend_last(highs, lows, closes, period=10, mult=3.0)
     cross_dir = ema_cross_dir(closes, fast=9, slow=30)
     if not cross_dir or not st_dir: return None
     if cross_dir != st_dir: return None
-
     entry = closes[-1]
     r_val = rsi(closes)[-1] if len(closes) >= 16 else 50.0
     power = compute_power(entry, st_val, r_val)
     direction = cross_dir
-    return {
-        "symbol": sym, "dir": direction, "kind":"KIVANC_CONFIRM",
-        "entry": entry, "power": power, "rsi": r_val,
-        "time": now_local_iso(), "born_bar": bar_i
-    }
+    return {"symbol": sym, "dir": direction, "kind":"KIVANC_CONFIRM",
+            "entry": entry, "power": power, "rsi": r_val,
+            "time": now_local_iso(), "born_bar": bar_i}
 
 # ===================== Diğer stratejiler (PEMA devre dışı) =====================
 def build_early_signal(sym, kl, bar_i):
@@ -466,23 +485,20 @@ def mean_reversion_watcher():
             for pos in list(MEAN_REV_POS):
                 sym, direction = pos["symbol"], pos["dir"]
                 dist, _, _, _ = mean_reversion_distance_pct(sym)
-
                 if dist >= MEAN_REV_EXIT_MAX:
                     close_mean_reversion(sym, direction, f"ortalamadan % {dist:.2f} [HARD]")
                     continue
-
                 if dist >= MEAN_REV_EXIT_DIST:
                     pos["confirm"] = pos.get("confirm",0) + 1
                 else:
                     pos["confirm"] = 0
-
                 if pos.get("confirm",0) >= MEAN_REV_CONFIRM:
                     close_mean_reversion(sym, direction, f"ortalamadan % {dist:.2f}")
             _mr_save()
         except Exception as e:
             log(f"[MEAN-REV WATCH ERR] {e}")
         time.sleep(MEAN_REV_INTERVAL)
-# ===================== Emir yardımcıları & yürütücüler =========================
+# ===================== Emir & Yürütücüler =====================================
 def _count_positions_all():
     try:
         acc = _signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
@@ -502,63 +518,63 @@ def open_market(sym, direction, qty):
     })
     return float(res.get("avgPrice") or res.get("price") or futures_get_price(sym) or 0.0)
 
+# ✅ v15.9.51 Stabil TP/SL Bloğu (hedge uyumlu)
 def place_exit_orders(sym, direction, qty, tp_price, sl_price):
-    """TP: TAKE_PROFIT_MARKET, SL: STOP_MARKET — reduceOnly ile"""
     pos_side = "LONG" if direction=="UP" else "SHORT"
+    # TP
     try:
-        # TP
         _signed_request("POST","/fapi/v1/order",{
-            "symbol":sym,
-            "side":"SELL" if direction=="UP" else "BUY",
-            "type":"TAKE_PROFIT_MARKET",
-            "positionSide":pos_side,
-            "reduceOnly":"true",
+            "symbol": sym,
+            "side": "SELL" if direction=="UP" else "BUY",
+            "type": "TAKE_PROFIT_MARKET",
+            "timeInForce": "GTC",
+            "reduceOnly": "true",
+            "positionSide": pos_side,
             "stopPrice": format_price_by_tick(sym, tp_price),
-            "timestamp":now_ts_ms()
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "true",
+            "timestamp": now_ts_ms()
         })
+        log(f"[TP SET] {sym} {direction} {tp_price}")
     except Exception as e:
         log(f"[TP ERR] {sym} {e}")
+    # SL
     try:
-        # SL
         _signed_request("POST","/fapi/v1/order",{
-            "symbol":sym,
-            "side":"SELL" if direction=="UP" else "BUY",
-            "type":"STOP_MARKET",
-            "positionSide":pos_side,
-            "reduceOnly":"true",
+            "symbol": sym,
+            "side": "SELL" if direction=="UP" else "BUY",
+            "type": "STOP_MARKET",
+            "timeInForce": "GTC",
+            "reduceOnly": "true",
+            "positionSide": pos_side,
             "stopPrice": format_price_by_tick(sym, sl_price),
-            "timestamp":now_ts_ms()
+            "workingType": "CONTRACT_PRICE",
+            "priceProtect": "true",
+            "timestamp": now_ts_ms()
         })
+        log(f"[SL SET] {sym} {direction} {sl_price}")
     except Exception as e:
         log(f"[SL ERR] {sym} {e}")
 
 def smart_tp_sl_prices(sym, entry, direction):
-    """1.6–2.0 USD hedef; mikro fiyatlarda % fallback"""
     tp_usd = random.uniform(PARAM["TP_USD_MIN"], PARAM["TP_USD_MAX"])
     usd = PARAM["TRADE_SIZE_USDT"]
-    # entry_price * qty ≈ usd  => qty ≈ usd/entry
-    # 1 USD kâr ≈ (1/qty) fiyat hareketi
     if entry <= 0: return entry, entry
     qty_est = max(usd/entry, 1e-12)
-    delta_for_tp_usd = tp_usd / qty_est
-    # mikro fiyatlarda fallback yüzde
+    delta = tp_usd / qty_est
     min_tick = get_symbol_filters(sym)["tickSize"]
-    if entry < 0.01 or delta_for_tp_usd < float(min_tick):
+    if entry < 0.01 or delta < float(min_tick):
         tp_pct = PARAM["FALLBACK_TP_PCT"]
         sl_pct = PARAM["FALLBACK_SL_PCT"]
         if direction=="UP":
-            tp = entry * (1 + tp_pct)
-            sl = entry * (1 - sl_pct)
+            tp = entry * (1 + tp_pct); sl = entry * (1 - sl_pct)
         else:
-            tp = entry * (1 - tp_pct)
-            sl = entry * (1 + sl_pct)
+            tp = entry * (1 - tp_pct); sl = entry * (1 + sl_pct)
     else:
         if direction=="UP":
-            tp = entry + delta_for_tp_usd
-            sl = entry - delta_for_tp_usd*10*2  # ~20x USD risk (40–50 USD yakın)
+            tp = entry + delta; sl = entry - delta*20
         else:
-            tp = entry - delta_for_tp_usd
-            sl = entry + delta_for_tp_usd*10*2
+            tp = entry - delta; sl = entry + delta*20
     return round_to_tick(sym, tp), round_to_tick(sym, sl)
 
 def _calc_qty(sym, entry_ref):
@@ -566,21 +582,24 @@ def _calc_qty(sym, entry_ref):
     q = calc_order_qty(sym, entry_ref, usd)
     return q if q and q>0 else 0.0
 
-# ---- Kıvanç Confirm: 4 LONG + 4 SHORT, TP/SL KURMAZ (no TP)
+# ---- Kıvanç Confirm: no TP + 4/4 (gerçek açık poz sayımıyla)
 def execute_kivanc_trade(sig):
     sym = sig["symbol"]; direction = sig["dir"]
 
-    # Global cap
+    # Global cap (30/30)
     long_cnt, short_cnt = _count_positions_all()
     if direction == "UP" and long_cnt >= PARAM["GLOBAL_LONG_CAP"]:
         log(f"[GLOBAL CAP] LONG {long_cnt}>= {PARAM['GLOBAL_LONG_CAP']} {sym} skip"); return
     if direction == "DOWN" and short_cnt >= PARAM["GLOBAL_SHORT_CAP"]:
         log(f"[GLOBAL CAP] SHORT {short_cnt}>= {PARAM['GLOBAL_SHORT_CAP']} {sym} skip"); return
 
-    # KC iç limit
-    if direction == "UP" and long_cnt >= PARAM["KC_LONG_CAP"]:
+    # Kıvanç iç limit (gerçek açık pozisyonlardan) — 4/4
+    kv = _kiv_refresh_from_positions()
+    kc_long = sum(1 for x in kv if x["dir"]=="UP")
+    kc_short= sum(1 for x in kv if x["dir"]=="DOWN")
+    if direction=="UP" and kc_long >= PARAM["KC_LONG_CAP"]:
         log(f"[KIVANC LIMIT] 4 LONG dolu, {sym} skip"); return
-    if direction == "DOWN" and short_cnt >= PARAM["KC_SHORT_CAP"]:
+    if direction=="DOWN" and kc_short >= PARAM["KC_SHORT_CAP"]:
         log(f"[KIVANC LIMIT] 4 SHORT dolu, {sym} skip"); return
 
     # Duplicate guard
@@ -594,6 +613,11 @@ def execute_kivanc_trade(sig):
 
     try:
         fill = open_market(sym, direction, qty)
+        # Kıvanç setine ekle
+        kv = _kiv_refresh_from_positions()
+        kv.append({"symbol":sym,"dir":direction})
+        _kiv_save(kv)
+
         TREND_LOCK[sym] = direction; TREND_LOCK_TIME[sym] = now_ts_s()
         tg_send(f"✅ KIVANC OPEN (no TP)\n{sym} {direction} qty:{qty}\nEntry:{format_price_by_tick(sym,fill)}")
         log(f"[KIVANC OPEN] {sym} {direction} entry={fill}")
@@ -601,22 +625,19 @@ def execute_kivanc_trade(sig):
         tg_send(f"❌ KIVANC OPEN ERR {sym}\n{e}")
         log(f"[KIVANC OPEN ERR] {sym} {e}")
 
-# ---- Diğer stratejiler: Power Band + Smart TP/SL + Global cap (30/30)
+# ---- Diğer stratejiler: Power Band + Smart TP/SL + Global 30/30
 def execute_generic_trade(sig):
     sym = sig["symbol"]; direction = sig["dir"]; kind = sig.get("kind","GEN")
-    power = sig.get("power")
-    if power is None: power = 70.0
+    power = sig.get("power", 70.0)
     if not in_power_band(power):
         log(f"[{kind} POWER] {sym} power={power:.2f} band dışı, skip"); return
 
-    # Global cap
     long_cnt, short_cnt = _count_positions_all()
     if direction=="UP" and long_cnt>=PARAM["GLOBAL_LONG_CAP"]:
         log(f"[GLOBAL CAP] LONG {long_cnt}>= {PARAM['GLOBAL_LONG_CAP']} {sym} skip"); return
     if direction=="DOWN" and short_cnt>=PARAM["GLOBAL_SHORT_CAP"]:
         log(f"[GLOBAL CAP] SHORT {short_cnt}>= {PARAM['GLOBAL_SHORT_CAP']} {sym} skip"); return
 
-    # Duplicate guard
     if TREND_LOCK.get(sym) == direction:
         log(f"[{kind} GUARD] {sym} {direction} aktif, atlandı."); return
 
@@ -627,7 +648,6 @@ def execute_generic_trade(sig):
 
     try:
         fill = open_market(sym, direction, qty)
-        # TP/SL kur
         tp, sl = smart_tp_sl_prices(sym, fill, direction)
         place_exit_orders(sym, direction, qty, tp, sl)
 
@@ -638,45 +658,34 @@ def execute_generic_trade(sig):
         tg_send(f"❌ {kind} OPEN ERR {sym}\n{e}")
         log(f"[{kind} OPEN ERR] {sym} {e}")
 
-# ===================== Taramalar ==============================================
+# -------- Sinyal Taraması -----------------------------------------------------
 def scan_symbol(sym, bar_i):
-    kl = futures_get_klines(sym, "1h", 200)  # Tüm stratejiler 1H bazlı
+    kl = futures_get_klines(sym, "1h", 200)
     if len(kl) < 60: return []
-
     res = []
-
-    # Kıvanç Confirm
+    # Kıvanç
     s_kiv = build_kivanc_confirm_signal(sym, kl, bar_i)
     if s_kiv: res.append(s_kiv)
-
-    # PEMA DEVRE DIŞI — çağrı yok
-
-    # Diğer stratejiler (aktif)
+    # PEMA yok
+    # Diğerleri
     s_early = build_early_signal(sym, kl, bar_i)
     if s_early: res.append(s_early)
-
     s_scalp = build_scalp_signal(sym, kl, bar_i)
     if s_scalp: res.append(s_scalp)
-
     s_ut = build_ut_stc_signal(sym, kl, bar_i)
     if s_ut: res.append(s_ut)
-
     s_macd = build_macd_trend_signal(sym, kl, bar_i)
     if s_macd: res.append(s_macd)
-
     s_fvg = build_fvg_break_signal(sym, kl, bar_i)
     if s_fvg: res.append(s_fvg)
-
     return res
 
-# ===================== Main ====================================================
+# -------- Main ----------------------------------------------------------------
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.63 aktif — KC(no TP,4L/4S) + EARLY/SCALP/UT/MACD/FVG(PowerBand+SmartTP) | MR Closer | Global 30/30")
-    log("[START] EMA ULTRA v15.9.63")
+    tg_send("🚀 EMA ULTRA v15.9.64 aktif — KC(no TP,4/4)+Global 30/30 | EARLY/SCALP/UT/MACD/FVG(PowerBand+SmartTP) | MR Closer | PEMA OFF")
+    log("[START] EMA ULTRA v15.9.64")
 
     symbols = auto_init_symbols()
-
-    # MR: sadece kapatıcı izleyici
     threading.Thread(target=mean_reversion_watcher, daemon=True).start()
 
     while True:
@@ -684,32 +693,29 @@ def main():
             STATE["bar_index"] = STATE.get("bar_index", 0) + 1
             bar_i = STATE["bar_index"]
 
+            # Kıvanç setini periyodik temizle (gerçek 4/4)
+            _kiv_refresh_from_positions()
+
             # Sinyal tarama
             sigs = []
             with ThreadPoolExecutor(max_workers=6) as ex:
                 futs = [ex.submit(scan_symbol, s, bar_i) for s in symbols]
                 for f in as_completed(futs):
-                    try:
-                        r = f.result()
+                    try: r = f.result()
                     except Exception as e:
-                        log(f"[SCAN ERR] {e}")
-                        r = []
+                        log(f"[SCAN ERR] {e}"); r = []
                     if r: sigs.extend(r)
 
             # İşlemler
             for sig in sigs:
                 kind = sig.get("kind","GEN")
                 if kind == "KIVANC_CONFIRM":
-                    execute_kivanc_trade(sig)      # 4L/4S – no TP
+                    execute_kivanc_trade(sig)      # no TP + 4/4 + 30/30
                 else:
-                    execute_generic_trade(sig)     # Power band + Smart TP/SL + Global 30/30
+                    execute_generic_trade(sig)     # PowerBand + Smart TP/SL + 30/30
 
-            # Guard timeout
             _cleanup_trend_lock_expired()
-
-            # Persist
             safe_save(STATE_FILE, STATE)
-
             time.sleep(30)
 
         except Exception as e:
