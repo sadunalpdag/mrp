@@ -472,7 +472,7 @@ def check_kivanc_reversal(sym, kl, bar_i):
 
 def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
     """
-    Close all KIVANC_CONFIRM positions for a symbol
+    Close all KIVANC_CONFIRM positions for a symbol on Binance
     """
     try:
         with open(STATE_FILE, "r") as f:
@@ -484,9 +484,47 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
         
         for pos in positions:
             if pos.get("symbol") == sym and pos.get("strategy") == strategy:
-                # Mark position for closing
-                log(f"[CLOSE KIVANC] {sym} {pos.get('side')} strategy={strategy}")
-                closed_count += 1
+                # Close real Binance position
+                side = pos.get("side")
+                qty = pos.get("qty")
+                
+                if qty and qty > 0:
+                    try:
+                        # Cancel all open orders for this symbol first
+                        try:
+                            _signed_request("DELETE", "/fapi/v1/allOpenOrders", {
+                                "symbol": sym,
+                                "timestamp": now_ts_ms()
+                            })
+                            log(f"[KIVANC CANCEL ORDERS] {sym}")
+                        except Exception as cancel_err:
+                            log(f"[KIVANC CANCEL ORDERS WARN] {sym} {cancel_err}")
+                        
+                        # Close position with market order
+                        close_side = "SELL" if side == "BUY" else "BUY"
+                        pos_side = "LONG" if side == "BUY" else "SHORT"
+                        
+                        _signed_request("POST", "/fapi/v1/order", {
+                            "symbol": sym,
+                            "side": close_side,
+                            "type": "MARKET",
+                            "quantity": f"{qty}",
+                            "positionSide": pos_side,
+                            "timestamp": now_ts_ms()
+                        })
+                        
+                        log(f"[CLOSE KIVANC] {sym} {side} qty={qty} strategy={strategy}")
+                        tg_send(f"🔄 KIVANC REVERSAL CLOSE\n{sym} {side}\nQty:{qty}\nReason:SuperTrend Reversal")
+                        closed_count += 1
+                    except Exception as e:
+                        log(f"[CLOSE KIVANC BINANCE ERR] {sym} {e}")
+                        # Don't increment closed_count - position may still be open on Binance
+                        # Keep in state for retry or manual intervention
+                        remaining.append(pos)
+                        continue
+                else:
+                    log(f"[CLOSE KIVANC] {sym} {side} strategy={strategy} (no qty)")
+                    closed_count += 1
             else:
                 remaining.append(pos)
         
@@ -502,34 +540,51 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
 
 def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
     """
-    Open a KIVANC_CONFIRM position and save to STATE_FILE
+    Open a KIVANC_CONFIRM position on Binance (NO TP - only reversal exit)
     """
     try:
         # Convert side to direction for trendlock check
         direction = "UP" if side == "BUY" else "DOWN"
         
-        # Check trendlock
-        if TREND_LOCK.get(sym) == direction:
-            log(f"[KIVANC TRENDLOCK HIT] {sym} {direction}")
+        # Check for duplicate positions and trendlock on Binance
+        if _duplicate_or_locked(sym, direction):
             return False
         
-        # Get current price
+        # Get current price for quantity calculation
         entry_price = futures_get_price(sym)
         if entry_price is None:
             log(f"[KIVANC OPEN ERR] {sym} cannot get price")
+            return False
+        
+        # Calculate order quantity
+        qty = calc_order_qty(sym, entry_price, size_usdt)
+        if not qty or qty <= 0:
+            log(f"[KIVANC QTY ERR] {sym} qty calculation failed")
+            return False
+        
+        # Open real market position on Binance
+        opened = open_market_position(sym, direction, qty)
+        if not opened or not isinstance(opened, dict):
+            log(f"[KIVANC OPEN FAIL] {sym} API call failed, response: {opened}")
+            return False
+        
+        entry_exec = opened.get("entry")
+        if not entry_exec or entry_exec <= 0:
+            log(f"[KIVANC OPEN FAIL] {sym} entry price missing from response: {opened}")
             return False
         
         # Load current state
         with open(STATE_FILE, "r") as f:
             st = json.load(f)
         
-        # Create position record
+        # Create position record (NO TP - only reversal exit)
         position = {
             "symbol": sym,
             "side": side,
             "strategy": strategy,
-            "entry": entry_price,
+            "entry": entry_exec,
             "size_usdt": size_usdt,
+            "qty": qty,
             "time": now_local_iso(),
             "status": "OPEN"
         }
@@ -548,7 +603,20 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         TREND_LOCK_TIME[sym] = now_ts_s()
         log(f"[KIVANC TRENDLOCK SET] {sym} {direction}")
         
-        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
+        # Log success
+        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_exec}")
+        
+        # Format entry price with appropriate decimals
+        entry_str = format_price_by_tick(sym, entry_exec)
+        
+        # Send Telegram notification
+        tg_send(f"🧩 KIVANC {side} {sym}\n"
+                f"Qty:{qty}\n"
+                f"Entry:{entry_str}\n"
+                f"Exit: Reversal Only (no TP)\n"
+                f"Size:{size_usdt} USDT\n"
+                f"Time:{now_local_iso()}")
+        
         return True
     except Exception as e:
         log(f"[KIVANC OPEN ERR] {sym} {e}")
