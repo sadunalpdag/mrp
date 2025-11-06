@@ -490,10 +490,6 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
                 
                 if qty and qty > 0:
                     try:
-                        # Close position with market order
-                        close_side = "SELL" if side == "BUY" else "BUY"
-                        pos_side = "LONG" if side == "BUY" else "SHORT"
-                        
                         # Cancel all open orders for this symbol first
                         try:
                             _signed_request("DELETE", "/fapi/v1/allOpenOrders", {
@@ -501,10 +497,13 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
                                 "timestamp": now_ts_ms()
                             })
                             log(f"[KIVANC CANCEL ORDERS] {sym}")
-                        except:
-                            pass
+                        except Exception as cancel_err:
+                            log(f"[KIVANC CANCEL ORDERS WARN] {sym} {cancel_err}")
                         
                         # Close position with market order
+                        close_side = "SELL" if side == "BUY" else "BUY"
+                        pos_side = "LONG" if side == "BUY" else "SHORT"
+                        
                         _signed_request("POST", "/fapi/v1/order", {
                             "symbol": sym,
                             "side": close_side,
@@ -519,10 +518,12 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
                         closed_count += 1
                     except Exception as e:
                         log(f"[CLOSE KIVANC BINANCE ERR] {sym} {e}")
-                        # Still remove from state even if Binance close fails
-                        closed_count += 1
+                        # Don't increment closed_count - position may still be open on Binance
+                        # Keep in state for retry or manual intervention
+                        remaining.append(pos)
+                        continue
                 else:
-                    log(f"[CLOSE KIVANC] {sym} {side} strategy={strategy}")
+                    log(f"[CLOSE KIVANC] {sym} {side} strategy={strategy} (no qty)")
                     closed_count += 1
             else:
                 remaining.append(pos)
@@ -539,7 +540,7 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
 
 def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
     """
-    Open a KIVANC_CONFIRM position on Binance and save to STATE_FILE
+    Open a KIVANC_CONFIRM position on Binance (NO TP - only reversal exit)
     """
     try:
         # Convert side to direction for trendlock check
@@ -573,16 +574,11 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             log(f"[KIVANC OPEN FAIL] {sym} entry not found")
             return False
         
-        # Set TP (Take Profit) order
-        tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
-            sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0
-        )
-        
         # Load current state
         with open(STATE_FILE, "r") as f:
             st = json.load(f)
         
-        # Create position record
+        # Create position record (NO TP - only reversal exit)
         position = {
             "symbol": sym,
             "side": side,
@@ -591,10 +587,7 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             "size_usdt": size_usdt,
             "qty": qty,
             "time": now_local_iso(),
-            "status": "OPEN",
-            "tp_ok": tp_ok,
-            "tp_usd_used": tp_usd_used,
-            "tp_pct_used": tp_pct_used
+            "status": "OPEN"
         }
         
         # Add to positions list
@@ -611,26 +604,14 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         TREND_LOCK_TIME[sym] = now_ts_s()
         log(f"[KIVANC TRENDLOCK SET] {sym} {direction}")
         
-        # Log success with TP info
+        # Log success
         log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_exec}")
-        if tp_ok:
-            tp_line = (f"TP:{tp_usd_used:.2f}$" if tp_usd_used is not None 
-                      else f"TP:{(tp_pct_used or 0)*100:.2f}%")
-            log(f"[KIVANC TP] {sym} {tp_line}")
         
         # Send Telegram notification
-        tp_info = ""
-        if tp_ok:
-            tp_info = (f"TP:{tp_usd_used:.2f}$ ({(tp_usd_used or 0)/max(size_usdt,1e-12)*100:.2f}%)" 
-                      if tp_usd_used is not None 
-                      else f"TP:{(tp_pct_used or 0)*100:.2f}%")
-        else:
-            tp_info = "TP: YOK"
-        
         tg_send(f"🧩 KIVANC {side} {sym}\n"
                 f"Qty:{qty}\n"
                 f"Entry:{entry_exec:.12f}\n"
-                f"{tp_info}\n"
+                f"Exit: Reversal Only (no TP)\n"
                 f"Size:{size_usdt} USDT\n"
                 f"Time:{now_local_iso()}")
         
