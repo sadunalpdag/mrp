@@ -44,6 +44,12 @@ TRENDLOCK_EXPIRY_SEC = 6 * 3600
 SIM_QUEUE = []
 getcontext().prec = 28
 
+# ===================== Kıvanç Confirm Settings =====================
+KIVANC_MAX_BUY_POS   = 3
+KIVANC_MAX_SELL_POS  = 3
+KIVANC_POS_SIZE_USDT = 250
+KIVANC_TRENDLOCK_HRS = 6
+
 # ===================== UTILITIES =====================
 
 def log(msg):
@@ -74,6 +80,18 @@ def safe_save(p,d):
 
 def now_local_iso():
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
+
+def count_kivanc_positions(side):
+    """
+    Count open KIVANC_CONFIRM positions by side (BUY or SELL)
+    """
+    try:
+        with open(STATE_FILE, "r") as f:
+            st = json.load(f)
+        pos = [p for p in st.get("positions", []) if p.get("strategy")=="KIVANC_CONFIRM" and p.get("side")==side]
+        return len(pos)
+    except:
+        return 0
 
 # ===================== INDICATORS =====================
 
@@ -113,6 +131,67 @@ def atr_like(h,l,c,period=14):
     a=[sum(tr[:period])/period]
     for i in range(period,len(tr)): a.append((a[-1]*(period-1)+tr[i])/period)
     return [0]*(len(h)-len(a))+a
+
+def supertrend(highs, lows, closes, period=10, multiplier=3.0):
+    """
+    Calculate SuperTrend indicator
+    Returns: (supertrend_values, supertrend_direction)
+    direction: "UP" for bullish, "DOWN" for bearish
+    """
+    atr_vals = atr_like(highs, lows, closes, period)
+    
+    basic_ub = []
+    basic_lb = []
+    for i in range(len(closes)):
+        hl_avg = (highs[i] + lows[i]) / 2.0
+        basic_ub.append(hl_avg + multiplier * atr_vals[i])
+        basic_lb.append(hl_avg - multiplier * atr_vals[i])
+    
+    final_ub = [basic_ub[0]]
+    final_lb = [basic_lb[0]]
+    
+    for i in range(1, len(closes)):
+        # Upper band
+        if basic_ub[i] < final_ub[i-1] or closes[i-1] > final_ub[i-1]:
+            final_ub.append(basic_ub[i])
+        else:
+            final_ub.append(final_ub[i-1])
+        
+        # Lower band
+        if basic_lb[i] > final_lb[i-1] or closes[i-1] < final_lb[i-1]:
+            final_lb.append(basic_lb[i])
+        else:
+            final_lb.append(final_lb[i-1])
+    
+    # Determine SuperTrend and direction
+    st_values = []
+    st_direction = []
+    
+    # Initial direction
+    if closes[0] <= final_ub[0]:
+        st_values.append(final_ub[0])
+        st_direction.append("DOWN")
+    else:
+        st_values.append(final_lb[0])
+        st_direction.append("UP")
+    
+    for i in range(1, len(closes)):
+        if st_direction[i-1] == "UP":
+            if closes[i] <= final_lb[i]:
+                st_values.append(final_ub[i])
+                st_direction.append("DOWN")
+            else:
+                st_values.append(final_lb[i])
+                st_direction.append("UP")
+        else:  # DOWN
+            if closes[i] >= final_ub[i]:
+                st_values.append(final_lb[i])
+                st_direction.append("UP")
+            else:
+                st_values.append(final_ub[i])
+                st_direction.append("DOWN")
+    
+    return st_values, st_direction
 
 # ===================== MARKET STATE ANALYZER =====================
 
@@ -300,6 +379,166 @@ def build_ema_pullback_signal(sym, kl, bar_i):
     sig["market_state"] = detect_market_state(closes, highs, lows)
     return sig
 
+def build_kivanc_confirm_signal(sym, kl, bar_i):
+    """
+    Kıvanç Confirm — SuperTrend + EMA Cross trend takip sinyali
+    """
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Calculate SuperTrend
+    st_values, st_direction = supertrend(highs, lows, closes)
+    
+    # Calculate EMAs
+    ema9 = ema(closes, 9)
+    ema30 = ema(closes, 30)
+    
+    # Get current values
+    st_dir = st_direction[-1]
+    ema9_now = ema9[-1]
+    ema30_now = ema30[-1]
+    
+    signal = None
+    if st_dir == "UP" and ema9_now > ema30_now:
+        signal = "BUY"
+    elif st_dir == "DOWN" and ema9_now < ema30_now:
+        signal = "SELL"
+    
+    if signal is None:
+        return None
+    
+    # Calculate additional metrics
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    entry = closes[-1]
+    pwr = 60 + abs(ema9_now - ema30_now) * 120 + (r_val - 50) / 2.0
+    
+    # Set TP and SL
+    if signal == "BUY":
+        tp = entry * 1.006
+        sl = entry * 0.994
+    else:
+        tp = entry * 0.994
+        sl = entry * 1.006
+    
+    return {
+        "symbol": sym,
+        "dir": signal,
+        "tier": "KIVANC",
+        "emoji": "🧩",
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "KIVANC_CONFIRM",
+        "tag": f"🧩 KIVANC {signal}",
+        "supertrend_dir": st_dir,
+        "ema9": ema9_now,
+        "ema30": ema30_now
+    }
+
+def check_kivanc_reversal(sym, kl, bar_i):
+    """
+    Trend reversal uyarısı geldiğinde o yöndeki tüm KIVANC_CONFIRM işlemlerini kapatır
+    """
+    if len(kl) < 60:
+        return
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Calculate SuperTrend
+    st_values, st_direction = supertrend(highs, lows, closes)
+    
+    if len(st_direction) < 2:
+        return
+    
+    st_now = st_direction[-1]
+    st_prev = st_direction[-2]
+    
+    if st_now != st_prev:
+        log(f"[REVERSAL] {sym} | {st_prev} → {st_now}")
+        close_kivanc_positions(sym, strategy="KIVANC_CONFIRM")
+
+def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
+    """
+    Close all KIVANC_CONFIRM positions for a symbol
+    """
+    try:
+        with open(STATE_FILE, "r") as f:
+            st = json.load(f)
+        
+        positions = st.get("positions", [])
+        remaining = []
+        closed_count = 0
+        
+        for pos in positions:
+            if pos.get("symbol") == sym and pos.get("strategy") == strategy:
+                # Mark position for closing
+                log(f"[CLOSE KIVANC] {sym} {pos.get('side')} strategy={strategy}")
+                closed_count += 1
+            else:
+                remaining.append(pos)
+        
+        if closed_count > 0:
+            st["positions"] = remaining
+            with open(STATE_FILE, "w") as f:
+                json.dump(st, f, ensure_ascii=False, indent=2)
+            log(f"[REVERSAL CLOSE] {sym} closed {closed_count} KIVANC_CONFIRM position(s)")
+    except Exception as e:
+        log(f"[CLOSE KIVANC ERR] {sym} {e}")
+
+def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
+    """
+    Open a KIVANC_CONFIRM position and save to STATE_FILE
+    """
+    try:
+        # Get current price
+        entry_price = futures_get_price(sym)
+        if entry_price is None:
+            log(f"[KIVANC OPEN ERR] {sym} cannot get price")
+            return False
+        
+        # Load current state
+        with open(STATE_FILE, "r") as f:
+            st = json.load(f)
+        
+        # Create position record
+        position = {
+            "symbol": sym,
+            "side": side,
+            "strategy": strategy,
+            "entry": entry_price,
+            "size_usdt": size_usdt,
+            "time": now_local_iso(),
+            "status": "OPEN"
+        }
+        
+        # Add to positions list
+        if "positions" not in st:
+            st["positions"] = []
+        st["positions"].append(position)
+        
+        # Save state
+        with open(STATE_FILE, "w") as f:
+            json.dump(st, f, ensure_ascii=False, indent=2)
+        
+        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
+        return True
+    except Exception as e:
+        log(f"[KIVANC OPEN ERR] {sym} {e}")
+        return False
+
 # ===================== SCANNER =====================
 
 def scan_symbol(sym,bar_i):
@@ -311,13 +550,18 @@ def scan_symbol(sym,bar_i):
     s_utstc = build_utstc_signal(sym,kl,bar_i)
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
+    s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i)
 
     # EMA Pullback için 210 bar güvenliği
     kl2 = kl if len(kl)>=210 else futures_get_klines(sym,"1h",210)
     s_pull = build_ema_pullback_signal(sym, kl2, bar_i)
 
-    for s in (s_early, s_utstc, s_macd, s_fvg, s_pull):
+    for s in (s_early, s_utstc, s_macd, s_fvg, s_kivanc, s_pull):
         if s: res.append(s)
+    
+    # Check for Kıvanç reversal
+    check_kivanc_reversal(sym, kl, bar_i)
+    
     return res
 
 def run_parallel(symbols,bar_i):
@@ -951,7 +1195,21 @@ def main():
                 ai_log_signal(sig)
                 queue_sim_variants(sig)
                 update_directional_limits()
-                execute_real_trade(sig)
+                
+                # Handle KIVANC_CONFIRM signals separately
+                if sig.get("kind") == "KIVANC_CONFIRM":
+                    signal_dir = sig.get("dir")
+                    if signal_dir == "BUY":
+                        open_buy = count_kivanc_positions("BUY")
+                        if open_buy < KIVANC_MAX_BUY_POS:
+                            open_kivanc_position(sig["symbol"], "BUY", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                    elif signal_dir == "SELL":
+                        open_sell = count_kivanc_positions("SELL")
+                        if open_sell < KIVANC_MAX_SELL_POS:
+                            open_kivanc_position(sig["symbol"], "SELL", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                else:
+                    # Execute regular trades for other strategies
+                    execute_real_trade(sig)
 
             # 3) SIM open/close
             process_sim_queue_and_open_due()
