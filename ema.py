@@ -13,7 +13,7 @@ import numpy as np
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
-#  - Power band 65–75 sadece EARLY için aktif
+#  - Power filtresi kaldırıldı
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
 
@@ -1081,12 +1081,6 @@ def execute_real_trade(sig):
     if not _can_direction(direction): return
     if _duplicate_or_locked(sym,direction): return
 
-    # ✅ Power filtresi SADECE EARLY için
-    if kind == "EARLY":
-        if not (65 <= pwr < 75):
-            log(f"[POWER FILTER] EARLY {sym} {direction} power={pwr:.2f} skipped")
-            return
-
     qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
     if not qty or qty<=0:
         log(f"[QTY ERR] {sym} qty hesaplanamadı."); return
@@ -1156,7 +1150,7 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.51 aktif (All Strategies + MarketState for EMA Pullback) — Power filter only EARLY")
+    tg_send("🚀 EMA ULTRA v15.9.51 aktif (All Strategies + MarketState for EMA Pullback) — Power filter removed")
     log("[START] EMA ULTRA v15.9.51 FULL")
 
     symbols=auto_init_symbols()
