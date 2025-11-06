@@ -482,8 +482,7 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
             log(f"[CLOSE KIVANC WARN] {STATE_FILE} not found; nothing to close for {sym}")
             return
         
-        with open(STATE_FILE, "r") as f:
-            st = json.load(f)
+        st = safe_load(STATE_FILE, {"positions": []})
         
         positions = st.get("positions", [])
         remaining = []
@@ -499,8 +498,7 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
         
         if closed_count > 0:
             st["positions"] = remaining
-            with open(STATE_FILE, "w") as f:
-                json.dump(st, f, ensure_ascii=False, indent=2)
+            safe_save(STATE_FILE, st)
             log(f"[REVERSAL CLOSE] {sym} closed {closed_count} KIVANC_CONFIRM position(s)")
     except Exception as e:
         log(f"[CLOSE KIVANC ERR] {sym} {e}")
@@ -516,12 +514,8 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             log(f"[KIVANC OPEN ERR] {sym} cannot get price")
             return False
         
-        # Load current state, or create default if file doesn't exist
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r") as f:
-                st = json.load(f)
-        else:
-            st = STATE_DEFAULT.copy()
+        # Load current state, using safe_load for consistency
+        st = safe_load(STATE_FILE, STATE_DEFAULT.copy())
         
         # Create position record
         position = {
@@ -539,9 +533,8 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             st["positions"] = []
         st["positions"].append(position)
         
-        # Save state
-        with open(STATE_FILE, "w") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
+        # Save state using safe_save
+        safe_save(STATE_FILE, st)
         
         log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
         return True
