@@ -352,8 +352,13 @@ def tg_handle_cmd(cmd, args):
             pr = _signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
             lines = ["📗 POSITIONS"]
             for p in pr:
-                amt = float(p.get("positionAmt",0)); if abs(amt) < 1e-12: continue
-                sym = p.get("symbol"); ep = float(p.get("entryPrice",0)); mp = futures_get_price(sym) or 0.0
+                amt = float(p.get("positionAmt", 0))
+                if abs(amt) < 1e-12:
+                    continue
+                sym = p.get("symbol")
+                ep = float(p.get("entryPrice", 0))
+                mp = futures_get_price(sym) or 0.0
+                    
                 pnl = (mp-ep)*amt
                 lines.append(f"{sym} amt:{amt:.6f} EP:{ep:.6f} MP:{mp:.6f} PnL:{pnl:.4f}")
             tg_send("\n".join(lines))
