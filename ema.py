@@ -8,11 +8,12 @@ import numpy as np
 # 📘 EMA ULTRA v15.9.51 — All Strategies + Market State Analyzer (Pullback)
 #  - PEMA tamamen kaldırıldı
 #  - Aktif stratejiler:
-#       ⚡ EARLY (EMA3–EMA7 + ATR spike)
-#       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
-#       📈 MACD (EMA20/200 + MACD crossover)
-#       🟩 FVG (Fair Value Gap Break)
-#       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
+#       ⚡ EARLY (EMA3–EMA7 + ATR spike) — Power field var
+#       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle) — Power field yok
+#       📈 MACD (EMA20/200 + MACD crossover) — Power field yok
+#       🟩 FVG (Fair Value Gap Break) — Power field yok
+#       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState) — Power field yok
+#       🧩 KIVANC (SuperTrend + EMA Cross) — Power field yok
 #  - Power band 65–75 sadece EARLY için aktif
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
