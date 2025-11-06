@@ -509,6 +509,31 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             log(f"[KIVANC OPEN ERR] {sym} cannot get price")
             return False
         
+        # Calculate quantity based on size
+        qty = calc_order_qty(sym, entry_price, size_usdt)
+        if not qty or qty <= 0:
+            log(f"[KIVANC OPEN ERR] {sym} invalid qty calculated")
+            return False
+        
+        # Determine direction and execute market order
+        direction = "UP" if side == "BUY" else "DOWN"
+        opened = open_market_position(sym, direction, qty)
+        entry_exec = opened.get("entry") or futures_get_price(sym)
+        
+        if not entry_exec or entry_exec <= 0:
+            log(f"[KIVANC OPEN ERR] {sym} entry execution failed")
+            return False
+        
+        # Set TP (Take Profit) order
+        tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
+            sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0
+        )
+        
+        # Set TRENDLOCK
+        TREND_LOCK[sym] = direction
+        TREND_LOCK_TIME[sym] = now_ts_s()
+        log(f"[TRENDLOCK SET] {sym} {direction}")
+        
         # Load current state
         with open(STATE_FILE, "r") as f:
             st = json.load(f)
@@ -518,8 +543,9 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             "symbol": sym,
             "side": side,
             "strategy": strategy,
-            "entry": entry_price,
+            "entry": entry_exec,
             "size_usdt": size_usdt,
+            "qty": qty,
             "time": now_local_iso(),
             "status": "OPEN"
         }
@@ -533,7 +559,22 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         with open(STATE_FILE, "w") as f:
             json.dump(st, f, ensure_ascii=False, indent=2)
         
-        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
+        # Send Telegram notification
+        if tp_ok:
+            tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
+                       else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
+            tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(size_usdt, 1e-12))*100
+            tg_send(f"🧩 KIVANC {side} {sym} qty:{qty}\n"
+                    f"Entry:{entry_exec:.12f}\n"
+                    f"{tp_line} ({tp_pct_show:.3f}%)\n"
+                    f"time:{now_local_iso()}")
+        else:
+            tg_send(f"🧩 KIVANC {side} {sym} qty:{qty}\n"
+                    f"Entry:{entry_exec:.12f}\n"
+                    f"TP: YOK (USD/% tarama başarısız)\n"
+                    f"time:{now_local_iso()}")
+        
+        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_exec}")
         return True
     except Exception as e:
         log(f"[KIVANC OPEN ERR] {sym} {e}")
@@ -1199,14 +1240,20 @@ def main():
                 # Handle KIVANC_CONFIRM signals separately
                 if sig.get("kind") == "KIVANC_CONFIRM":
                     signal_dir = sig.get("dir")
+                    sym = sig["symbol"]
+                    
+                    # Check for duplicate or locked positions
+                    if _duplicate_or_locked(sym, signal_dir):
+                        continue
+                    
                     if signal_dir == "BUY":
                         open_buy = count_kivanc_positions("BUY")
                         if open_buy < KIVANC_MAX_BUY_POS:
-                            open_kivanc_position(sig["symbol"], "BUY", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                            open_kivanc_position(sym, "BUY", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
                     elif signal_dir == "SELL":
                         open_sell = count_kivanc_positions("SELL")
                         if open_sell < KIVANC_MAX_SELL_POS:
-                            open_kivanc_position(sig["symbol"], "SELL", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                            open_kivanc_position(sym, "SELL", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
                 else:
                     # Execute regular trades for other strategies
                     execute_real_trade(sig)
