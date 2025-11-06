@@ -228,12 +228,11 @@ def build_utstc_signal(sym, kl, bar_i):
         direction="DOWN"; tag="🔴 UT/STC SELL"
     else: return None
     atr_v=atr_like(highs,lows,closes)[-1]; r_val=rsi(closes)[-1]
-    pwr=55+abs(e13[-1]-e50[-1])*200+(r_val-50)/2
     entry=closes[-1]
     tp=entry*(1.006 if direction=="UP" else 0.994)
     sl=entry*(0.8 if direction=="UP" else 1.2)
     return {"symbol":sym,"dir":direction,"tier":"UTSTC","emoji":"🟢" if direction=="UP" else "🔴",
-            "entry":entry,"tp":tp,"sl":sl,"power":pwr,"rsi":r_val,"atr":atr_v,
+            "entry":entry,"tp":tp,"sl":sl,"rsi":r_val,"atr":atr_v,
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"UTSTC","tag":tag}
 
@@ -248,12 +247,11 @@ def build_macd_trend_signal(sym, kl, bar_i):
         direction="DOWN"; tag="📉 EMA/MACD SELL"
     else: return None
     atr_v=atr_like(highs,lows,closes)[-1]; r_val=rsi(closes)[-1]
-    pwr=60+abs(e20[-1]-e200[-1])*100+(r_val-50)/2
     entry=closes[-1]
     tp=entry*(1.006 if direction=="UP" else 0.994)
     sl=entry*(0.8 if direction=="UP" else 1.2)
     return {"symbol":sym,"dir":direction,"tier":"MACD","emoji":"📈" if direction=="UP" else "📉",
-            "entry":entry,"tp":tp,"sl":sl,"power":pwr,"rsi":r_val,"atr":atr_v,
+            "entry":entry,"tp":tp,"sl":sl,"rsi":r_val,"atr":atr_v,
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"MACD","tag":tag}
 
@@ -267,12 +265,11 @@ def build_fvg_break_signal(sym, kl, bar_i):
     elif dn_gap: direction="DOWN"; tag="🟥 FVG BREAK SELL"
     else: return None
     atr_v=atr_like(highs,lows,closes)[-1]; r_val=rsi(closes)[-1]
-    pwr=58+(atr_v/(closes[-1] or 1))*150
     entry=closes[-1]
     tp=entry*(1.005 if direction=="UP" else 0.995)
     sl=entry*(0.82 if direction=="UP" else 1.18)
     return {"symbol":sym,"dir":direction,"tier":"FVG","emoji":"🟩" if direction=="UP" else "🟥",
-            "entry":entry,"tp":tp,"sl":sl,"power":pwr,"rsi":r_val,"atr":atr_v,
+            "entry":entry,"tp":tp,"sl":sl,"rsi":r_val,"atr":atr_v,
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"FVG","tag":tag}
 
@@ -367,11 +364,10 @@ def build_ema_pullback_signal(sym, kl, bar_i):
         sl_est = sl_ref
 
     atr_v=atr_like(highs,lows,closes)[-1]; r_val=rsi(closes)[-1]
-    pwr=60 + abs(e9[-1]-e30[-1])*120 + (r_val-50)/2.0
 
     sig = {
         "symbol":sym,"dir":direction,"tier":"PULLBACK","emoji":"📘","entry":c_now,
-        "tp":tp_est,"sl":sl_est,"power":pwr,"rsi":r_val,"atr":atr_v,
+        "tp":tp_est,"sl":sl_est,"rsi":r_val,"atr":atr_v,
         "time":now_local_iso(),"born_bar":bar_i,"early":False,
         "kind":"EMA_PULLBACK","tag":tag
     }
@@ -415,7 +411,6 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
     atr_v = atr_like(highs, lows, closes)[-1]
     r_val = rsi(closes)[-1]
     entry = closes[-1]
-    pwr = 60 + abs(ema9_now - ema30_now) * 120 + (r_val - 50) / 2.0
     
     # Set TP and SL
     if signal == "BUY":
@@ -433,7 +428,6 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "entry": entry,
         "tp": tp,
         "sl": sl,
-        "power": pwr,
         "rsi": r_val,
         "atr": atr_v,
         "time": now_local_iso(),
@@ -601,7 +595,7 @@ def queue_sim_variants(sig):
     for secs,label,mins in delays:
         SIM_QUEUE.append({
             "symbol":sig["symbol"],"dir":sig["dir"],"tier":sig["tier"],
-            "entry":sig["entry"],"tp":sig["tp"],"sl":sig["sl"],"power":sig["power"],
+            "entry":sig["entry"],"tp":sig["tp"],"sl":sig["sl"],"power":sig.get("power"),
             "created_ts":now_s,"open_after_ts":now_s+secs,
             "approve_delay_min":mins,"approve_label":label,
             "status":"PENDING","early":bool(sig.get("early",False)),
@@ -850,7 +844,7 @@ def heartbeat_and_status_check(_snapshot):
 def ai_log_signal(sig):
     AI_SIGNALS.append({
         "time":now_local_iso(),"symbol":sig["symbol"],"dir":sig["dir"],"tier":sig["tier"],
-        "chg24h":sig.get("chg24h"),"power":sig["power"],"rsi":sig.get("rsi"),"atr":sig.get("atr"),
+        "chg24h":sig.get("chg24h"),"power":sig.get("power"),"rsi":sig.get("rsi"),"atr":sig.get("atr"),
         "tp":sig["tp"],"sl":sig["sl"],"entry":sig["entry"],"born_bar":sig.get("born_bar"),
         "early":bool(sig.get("early",False)),"kind":sig.get("kind",""),"tag":sig.get("tag",""),
         "market_state":sig.get("market_state","")
@@ -1074,7 +1068,7 @@ def execute_real_trade(sig):
     if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
         return
 
-    sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
+    sym=sig["symbol"]; direction=sig["dir"]; pwr=sig.get("power")
     kind=sig.get("kind","")
 
     # 🔒 Duplicate / Direction limits
@@ -1083,8 +1077,8 @@ def execute_real_trade(sig):
 
     # ✅ Power filtresi SADECE EARLY için
     if kind == "EARLY":
-        if not (65 <= pwr < 75):
-            log(f"[POWER FILTER] EARLY {sym} {direction} power={pwr:.2f} skipped")
+        if pwr is None or not (65 <= pwr < 75):
+            log(f"[POWER FILTER] EARLY {sym} {direction} power={pwr:.2f if pwr else 'N/A'} skipped")
             return
 
     qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
@@ -1107,18 +1101,19 @@ def execute_real_trade(sig):
         prefix = sig.get("tag", f"🟩 {kind}")
         ms = sig.get("market_state","")
         ms_line = f"State:{ms} " if ms else ""
+        power_line = f"Power:{pwr:.2f}\n" if pwr is not None else ""
         if tp_ok:
             tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
                        else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
             tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',250.0),1e-12))*100
             tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
-                    f"{ms_line}Power:{pwr:.2f}\n"
+                    f"{ms_line}{power_line}"
                     f"Entry:{entry_exec:.12f}\n"
                     f"{tp_line} ({tp_pct_show:.3f}%)\n"
                     f"time:{now_local_iso()}")
         else:
             tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
-                    f"{ms_line}Power:{pwr:.2f}\n"
+                    f"{ms_line}{power_line}"
                     f"Entry:{entry_exec:.12f}\n"
                     f"TP: YOK (USD/% tarama başarısız)\n"
                     f"time:{now_local_iso()}")
