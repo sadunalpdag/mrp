@@ -472,7 +472,7 @@ def check_kivanc_reversal(sym, kl, bar_i):
 
 def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
     """
-    Close all KIVANC_CONFIRM positions for a symbol
+    Close all KIVANC_CONFIRM positions for a symbol on Binance
     """
     try:
         with open(STATE_FILE, "r") as f:
@@ -484,9 +484,46 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
         
         for pos in positions:
             if pos.get("symbol") == sym and pos.get("strategy") == strategy:
-                # Mark position for closing
-                log(f"[CLOSE KIVANC] {sym} {pos.get('side')} strategy={strategy}")
-                closed_count += 1
+                # Close real Binance position
+                side = pos.get("side")
+                qty = pos.get("qty")
+                
+                if qty and qty > 0:
+                    try:
+                        # Close position with market order
+                        close_side = "SELL" if side == "BUY" else "BUY"
+                        pos_side = "LONG" if side == "BUY" else "SHORT"
+                        
+                        # Cancel all open orders for this symbol first
+                        try:
+                            _signed_request("DELETE", "/fapi/v1/allOpenOrders", {
+                                "symbol": sym,
+                                "timestamp": now_ts_ms()
+                            })
+                            log(f"[KIVANC CANCEL ORDERS] {sym}")
+                        except:
+                            pass
+                        
+                        # Close position with market order
+                        _signed_request("POST", "/fapi/v1/order", {
+                            "symbol": sym,
+                            "side": close_side,
+                            "type": "MARKET",
+                            "quantity": f"{qty}",
+                            "positionSide": pos_side,
+                            "timestamp": now_ts_ms()
+                        })
+                        
+                        log(f"[CLOSE KIVANC] {sym} {side} qty={qty} strategy={strategy}")
+                        tg_send(f"🔄 KIVANC REVERSAL CLOSE\n{sym} {side}\nQty:{qty}\nReason:SuperTrend Reversal")
+                        closed_count += 1
+                    except Exception as e:
+                        log(f"[CLOSE KIVANC BINANCE ERR] {sym} {e}")
+                        # Still remove from state even if Binance close fails
+                        closed_count += 1
+                else:
+                    log(f"[CLOSE KIVANC] {sym} {side} strategy={strategy}")
+                    closed_count += 1
             else:
                 remaining.append(pos)
         
@@ -502,7 +539,7 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
 
 def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
     """
-    Open a KIVANC_CONFIRM position and save to STATE_FILE
+    Open a KIVANC_CONFIRM position on Binance and save to STATE_FILE
     """
     try:
         # Convert side to direction for trendlock check
@@ -513,11 +550,33 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             log(f"[KIVANC TRENDLOCK HIT] {sym} {direction}")
             return False
         
-        # Get current price
+        # Check for duplicate positions on Binance
+        if _duplicate_or_locked(sym, direction):
+            return False
+        
+        # Get current price for quantity calculation
         entry_price = futures_get_price(sym)
         if entry_price is None:
             log(f"[KIVANC OPEN ERR] {sym} cannot get price")
             return False
+        
+        # Calculate order quantity
+        qty = calc_order_qty(sym, entry_price, size_usdt)
+        if not qty or qty <= 0:
+            log(f"[KIVANC QTY ERR] {sym} qty calculation failed")
+            return False
+        
+        # Open real market position on Binance
+        opened = open_market_position(sym, direction, qty)
+        entry_exec = opened.get("entry") or entry_price
+        if not entry_exec or entry_exec <= 0:
+            log(f"[KIVANC OPEN FAIL] {sym} entry not found")
+            return False
+        
+        # Set TP (Take Profit) order
+        tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
+            sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0
+        )
         
         # Load current state
         with open(STATE_FILE, "r") as f:
@@ -528,10 +587,14 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             "symbol": sym,
             "side": side,
             "strategy": strategy,
-            "entry": entry_price,
+            "entry": entry_exec,
             "size_usdt": size_usdt,
+            "qty": qty,
             "time": now_local_iso(),
-            "status": "OPEN"
+            "status": "OPEN",
+            "tp_ok": tp_ok,
+            "tp_usd_used": tp_usd_used,
+            "tp_pct_used": tp_pct_used
         }
         
         # Add to positions list
@@ -548,7 +611,29 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         TREND_LOCK_TIME[sym] = now_ts_s()
         log(f"[KIVANC TRENDLOCK SET] {sym} {direction}")
         
-        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
+        # Log success with TP info
+        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_exec}")
+        if tp_ok:
+            tp_line = (f"TP:{tp_usd_used:.2f}$" if tp_usd_used is not None 
+                      else f"TP:{(tp_pct_used or 0)*100:.2f}%")
+            log(f"[KIVANC TP] {sym} {tp_line}")
+        
+        # Send Telegram notification
+        tp_info = ""
+        if tp_ok:
+            tp_info = (f"TP:{tp_usd_used:.2f}$ ({(tp_usd_used or 0)/max(size_usdt,1e-12)*100:.2f}%)" 
+                      if tp_usd_used is not None 
+                      else f"TP:{(tp_pct_used or 0)*100:.2f}%")
+        else:
+            tp_info = "TP: YOK"
+        
+        tg_send(f"🧩 KIVANC {side} {sym}\n"
+                f"Qty:{qty}\n"
+                f"Entry:{entry_exec:.12f}\n"
+                f"{tp_info}\n"
+                f"Size:{size_usdt} USDT\n"
+                f"Time:{now_local_iso()}")
+        
         return True
     except Exception as e:
         log(f"[KIVANC OPEN ERR] {sym} {e}")
