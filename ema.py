@@ -565,12 +565,12 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         # Open real market position on Binance
         opened = open_market_position(sym, direction, qty)
         if not opened or not isinstance(opened, dict):
-            log(f"[KIVANC OPEN FAIL] {sym} API call failed")
+            log(f"[KIVANC OPEN FAIL] {sym} API call failed, response: {opened}")
             return False
         
-        entry_exec = opened.get("entry") or entry_price
+        entry_exec = opened.get("entry")
         if not entry_exec or entry_exec <= 0:
-            log(f"[KIVANC OPEN FAIL] {sym} entry price not found")
+            log(f"[KIVANC OPEN FAIL] {sym} entry price missing from response: {opened}")
             return False
         
         # Load current state
