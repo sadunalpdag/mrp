@@ -1129,7 +1129,7 @@ def open_market_position(sym, direction, qty):
     })
     # Try to get fill price from response, handling zero/empty values properly
     fill = None
-    if res.get("avgPrice"):
+    if res.get("avgPrice") is not None:
         try:
             fill = float(res.get("avgPrice"))
             if fill <= 0:
@@ -1137,7 +1137,7 @@ def open_market_position(sym, direction, qty):
         except (ValueError, TypeError):
             fill = None
     
-    if fill is None and res.get("price"):
+    if fill is None and res.get("price") is not None:
         try:
             fill = float(res.get("price"))
             if fill <= 0:
@@ -1146,10 +1146,13 @@ def open_market_position(sym, direction, qty):
             fill = None
     
     # Fallback to fetching current market price
-    if fill is None:
+    if fill is None or fill <= 0:
         fill = futures_get_price(sym)
+        if fill is None or fill <= 0:
+            log(f"[PRICE ERR] {sym} could not get valid entry price")
+            fill = 0.0
     
-    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill) if fill else 0.0,"pos_side":pos_side}
+    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
 
 def _duplicate_or_locked(sym, direction):
     if TREND_LOCK.get(sym)==direction:
@@ -1300,14 +1303,25 @@ def main():
                 # Handle KIVANC_CONFIRM signals separately
                 if sig.get("kind") == "KIVANC_CONFIRM":
                     signal_dir = sig.get("dir")
+                    direction = "UP" if signal_dir == "BUY" else "DOWN"
+                    
+                    # Check global directional limits first
+                    if not _can_direction(direction):
+                        log(f"[KIVANC BLOCKED] {sig['symbol']} {signal_dir} - global limit reached")
+                        continue
+                    
                     if signal_dir == "BUY":
                         open_buy = count_kivanc_positions("BUY")
                         if open_buy < KIVANC_MAX_BUY_POS:
                             open_kivanc_position(sig["symbol"], "BUY", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                        else:
+                            log(f"[KIVANC LIMIT] BUY limit reached ({open_buy}/{KIVANC_MAX_BUY_POS})")
                     elif signal_dir == "SELL":
                         open_sell = count_kivanc_positions("SELL")
                         if open_sell < KIVANC_MAX_SELL_POS:
                             open_kivanc_position(sig["symbol"], "SELL", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                        else:
+                            log(f"[KIVANC LIMIT] SELL limit reached ({open_sell}/{KIVANC_MAX_SELL_POS})")
                 else:
                     # Execute regular trades for other strategies
                     execute_real_trade(sig)
