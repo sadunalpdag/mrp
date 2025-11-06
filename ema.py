@@ -207,12 +207,16 @@ def detect_market_state(closes, highs, lows):
 
 # ===================== EMA-STRUCTURE HELPERS =====================
 
+# Configuration constants for EMA-Structure strategy
+EMA_STRUCTURE_TOUCH_TOLERANCE = 0.005  # 0.5% - Distance to consider EMA "touched"
+EMA_STRUCTURE_STRONG_TREND_THRESHOLD = 0.002  # 0.2% - Extra requirement without confirmation
+
 def detect_higher_high_higher_low(highs, lows, lookback=5):
     """
     Detect Higher High (HH) and Higher Low (HL) pattern
     Returns: (has_hh, has_hl, last_hh_idx, last_hl_idx)
     """
-    if len(highs) < lookback * 2:
+    if len(highs) < lookback + 1:
         return False, False, None, None
     
     # Look for Higher High in recent bars
@@ -240,7 +244,7 @@ def detect_lower_low_lower_high(highs, lows, lookback=5):
     Detect Lower Low (LL) and Lower High (LH) pattern
     Returns: (has_ll, has_lh, last_ll_idx, last_lh_idx)
     """
-    if len(highs) < lookback * 2:
+    if len(highs) < lookback + 1:
         return False, False, None, None
     
     # Look for Lower Low in recent bars
@@ -528,13 +532,25 @@ def build_ema_structure_signal(sym, kl, bar_i):
     # Simplified check: look for recent breakout
     if uptrend_valid:
         # Check if current price broke above recent swing high
-        recent_swing_high = max(highs[-6:-1]) if len(highs) >= 6 else highs[-2]
+        if len(highs) >= 6:
+            recent_swing_high = max(highs[-6:-1])
+        elif len(highs) >= 2:
+            recent_swing_high = highs[-2]
+        else:
+            return None  # Not enough data
+        
         if c_now <= recent_swing_high:
             return None
         direction = "UP"
     else:  # downtrend_valid
         # Check if current price broke below recent swing low
-        recent_swing_low = min(lows[-6:-1]) if len(lows) >= 6 else lows[-2]
+        if len(lows) >= 6:
+            recent_swing_low = min(lows[-6:-1])
+        elif len(lows) >= 2:
+            recent_swing_low = lows[-2]
+        else:
+            return None  # Not enough data
+        
         if c_now >= recent_swing_low:
             return None
         direction = "DOWN"
@@ -548,14 +564,17 @@ def build_ema_structure_signal(sym, kl, bar_i):
         ema50_dist = abs(closes[-i] - e50[-i]) / max(e50[-i], 1e-12)
         ema20_dist = abs(closes[-i] - e20[-i]) / max(e20[-i], 1e-12)
         
-        # Consider "touched" if within 0.5% of EMA
-        if ema50_dist < 0.005 or ema20_dist < 0.005:
+        # Consider "touched" if within configured tolerance
+        if ema50_dist < EMA_STRUCTURE_TOUCH_TOLERANCE or ema20_dist < EMA_STRUCTURE_TOUCH_TOLERANCE:
             touched_ema = True
             break
     
     # Optional: relax this filter if strong breakout
     atr_v = atr_like(highs, lows, closes)[-1]
-    strong_move = abs(c_now - closes[-2]) / max(atr_v, 1e-12) > 0.5
+    if len(closes) >= 2:
+        strong_move = abs(c_now - closes[-2]) / max(atr_v, 1e-12) > 0.5
+    else:
+        strong_move = False
     
     if not touched_ema and not strong_move:
         return None
@@ -567,9 +586,9 @@ def build_ema_structure_signal(sym, kl, bar_i):
     # If no confirmation candle, require stronger structure
     if not has_confirmation:
         # Only proceed if we have very clear structure
-        if direction == "UP" and not (hh_found and hl_found and c_now > e50[-1] * 1.002):
+        if direction == "UP" and not (hh_found and hl_found and c_now > e50[-1] * (1 + EMA_STRUCTURE_STRONG_TREND_THRESHOLD)):
             return None
-        elif direction == "DOWN" and not (ll_found and lh_found and c_now < e50[-1] * 0.998):
+        elif direction == "DOWN" and not (ll_found and lh_found and c_now < e50[-1] * (1 - EMA_STRUCTURE_STRONG_TREND_THRESHOLD)):
             return None
     
     # ========== Position Management ==========
@@ -578,14 +597,26 @@ def build_ema_structure_signal(sym, kl, bar_i):
     
     if direction == "UP":
         # Find last swing low for stop loss
-        swing_low = min(lows[-6:-1]) if len(lows) >= 6 else lows[-2]
+        if len(lows) >= 6:
+            swing_low = min(lows[-6:-1])
+        elif len(lows) >= 2:
+            swing_low = lows[-2]
+        else:
+            swing_low = lows[-1] * 0.99  # Fallback
+        
         sl_est = swing_low - atr_v  # 1 ATR below swing low
         risk = max(1e-12, c_now - sl_est)
         tp_est = c_now + 2.0 * risk  # 1:2 risk-reward
         tag = "📊 EMA-STRUCTURE BUY"
     else:
         # Find last swing high for stop loss
-        swing_high = max(highs[-6:-1]) if len(highs) >= 6 else highs[-2]
+        if len(highs) >= 6:
+            swing_high = max(highs[-6:-1])
+        elif len(highs) >= 2:
+            swing_high = highs[-2]
+        else:
+            swing_high = highs[-1] * 1.01  # Fallback
+        
         sl_est = swing_high + atr_v  # 1 ATR above swing high
         risk = max(1e-12, sl_est - c_now)
         tp_est = c_now - 2.0 * risk  # 1:2 risk-reward
