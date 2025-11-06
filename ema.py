@@ -13,6 +13,7 @@ import numpy as np
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
 #       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
+#       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy)
 #       📊 EMA-STRUCTURE (123 Move + EMA50 + Confirmation Candles - No SL)
 #  - Power filtresi kaldırıldı
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
@@ -318,6 +319,127 @@ def detect_confirmation_candle(opens, highs, lows, closes, direction):
                        curr_open > prev_close)
         
         return is_shooting_star or is_engulfing
+
+# ===================== C.E.S.T. HELPERS =====================
+
+def detect_double_bottom(highs, lows, closes, ma50_values, lookback=10, tolerance=0.015):
+    """
+    Detect Double Bottom formation with MA touch requirement
+    
+    Args:
+        highs, lows, closes: price arrays
+        ma50_values: 50 MA values
+        lookback: how many bars to look back for pattern
+        tolerance: price tolerance for considering two bottoms similar (1.5%)
+    
+    Returns:
+        (found, bottom1_idx, bottom2_idx, touches_ma)
+    """
+    if len(lows) < lookback + 2:
+        return False, None, None, False
+    
+    # Find local minima in recent bars (potential bottoms)
+    bottoms = []
+    for i in range(len(lows) - lookback, len(lows) - 1):
+        # Check if this is a local low
+        is_local_low = True
+        for j in range(max(0, i-2), min(len(lows), i+3)):
+            if j != i and lows[j] < lows[i]:
+                is_local_low = False
+                break
+        if is_local_low:
+            bottoms.append(i)
+    
+    # Need at least 2 bottoms
+    if len(bottoms) < 2:
+        return False, None, None, False
+    
+    # Check the last two bottoms
+    bottom2_idx = bottoms[-1]
+    bottom1_idx = bottoms[-2]
+    
+    bottom1_price = lows[bottom1_idx]
+    bottom2_price = lows[bottom2_idx]
+    
+    # Check if bottoms are similar in price (within tolerance)
+    price_diff = abs(bottom1_price - bottom2_price) / max(abs(bottom1_price), abs(bottom2_price), 1e-12)
+    if price_diff > tolerance:
+        return False, None, None, False
+    
+    # Check if at least one bottom touches MA50
+    # Touch means: low/high/close/open is within small distance of MA
+    touch_tolerance = 0.005  # 0.5% distance to consider a "touch"
+    
+    touches_ma = False
+    for idx in [bottom1_idx, bottom2_idx]:
+        ma50 = ma50_values[idx]
+        # Check if any part of the candle touched MA50
+        if (abs(lows[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(highs[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(closes[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance):
+            touches_ma = True
+            break
+    
+    return True, bottom1_idx, bottom2_idx, touches_ma
+
+def detect_double_top(highs, lows, closes, ma50_values, lookback=10, tolerance=0.015):
+    """
+    Detect Double Top formation with MA touch requirement
+    
+    Args:
+        highs, lows, closes: price arrays
+        ma50_values: 50 MA values
+        lookback: how many bars to look back for pattern
+        tolerance: price tolerance for considering two tops similar (1.5%)
+    
+    Returns:
+        (found, top1_idx, top2_idx, touches_ma)
+    """
+    if len(highs) < lookback + 2:
+        return False, None, None, False
+    
+    # Find local maxima in recent bars (potential tops)
+    tops = []
+    for i in range(len(highs) - lookback, len(highs) - 1):
+        # Check if this is a local high
+        is_local_high = True
+        for j in range(max(0, i-2), min(len(highs), i+3)):
+            if j != i and highs[j] > highs[i]:
+                is_local_high = False
+                break
+        if is_local_high:
+            tops.append(i)
+    
+    # Need at least 2 tops
+    if len(tops) < 2:
+        return False, None, None, False
+    
+    # Check the last two tops
+    top2_idx = tops[-1]
+    top1_idx = tops[-2]
+    
+    top1_price = highs[top1_idx]
+    top2_price = highs[top2_idx]
+    
+    # Check if tops are similar in price (within tolerance)
+    price_diff = abs(top1_price - top2_price) / max(abs(top1_price), abs(top2_price), 1e-12)
+    if price_diff > tolerance:
+        return False, None, None, False
+    
+    # Check if at least one top touches MA50
+    touch_tolerance = 0.005  # 0.5% distance to consider a "touch"
+    
+    touches_ma = False
+    for idx in [top1_idx, top2_idx]:
+        ma50 = ma50_values[idx]
+        # Check if any part of the candle touched MA50
+        if (abs(lows[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(highs[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance or
+            abs(closes[idx] - ma50) / max(abs(ma50), 1e-12) < touch_tolerance):
+            touches_ma = True
+            break
+    
+    return True, top1_idx, top2_idx, touches_ma
 
 # ===================== STRATEGIES =====================
 
@@ -738,6 +860,148 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "crossover": True
     }
 
+def build_cest_signal(sym, kl, bar_i):
+    """
+    C.E.S.T. – 50 MA Double Top/Bottom Strategy
+    
+    Strategy Rules:
+    📈 Long (Alış):
+        - Fiyat 50 MA'nın üstünde olmalı
+        - Double Bottom formasyonu oluşmalı
+        - İki dipten en az biri 50 MA'ya temas etmeli (gövde veya fitil fark etmez)
+        - Entry: Double Bottom sonrası yeşil mum, 50 MA'nın üzerinde kapanmalı
+    
+    📉 Short (Satış):
+        - Fiyat 50 MA'nın altında olmalı
+        - Double Top formasyonu oluşmalı
+        - İki tepeden en az biri 50 MA'ya temas etmeli
+        - Entry: Double Top sonrası kırmızı mum, 50 MA'nın altında kapanmalı
+    
+    🛑 Stop Loss: Swing Low/High ± 1 ATR
+    🎯 Target: Risk:Reward = 1:1.4 (or 1:2)
+    """
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    
+    # Calculate 50 MA
+    ma50 = ema(closes, 50)
+    
+    # Calculate ATR for stop loss
+    atr_vals = atr_like(highs, lows, closes)
+    atr_v = atr_vals[-1]
+    
+    c_now = closes[-1]
+    ma50_now = ma50[-1]
+    
+    # ========== LONG SETUP ==========
+    # Check if price is above 50 MA
+    if c_now > ma50_now:
+        # Detect Double Bottom
+        found, bottom1_idx, bottom2_idx, touches_ma = detect_double_bottom(
+            highs, lows, closes, ma50, lookback=10, tolerance=0.015
+        )
+        
+        if found and touches_ma:
+            # Check for confirmation candle: green candle closing above MA50
+            # Current candle should be green (close > open)
+            is_green = closes[-1] > opens[-1]
+            
+            # Previous candle should have been below or at MA50
+            prev_below_ma = closes[-2] <= ma50[-2]
+            
+            if is_green and prev_below_ma:
+                direction = "UP"
+                
+                # Calculate Stop Loss: Last swing low - 1 ATR
+                swing_low = min(lows[bottom1_idx], lows[bottom2_idx])
+                sl_est = swing_low - atr_v
+                
+                # Calculate Take Profit: Risk:Reward = 1:1.4
+                risk = c_now - sl_est
+                tp_est = c_now + (1.4 * risk)
+                
+                # Calculate power
+                r_val = rsi(closes)[-1]
+                pwr = 60 + abs(c_now - ma50_now) * 100 + (r_val - 50) / 2.0
+                
+                return {
+                    "symbol": sym,
+                    "dir": direction,
+                    "tier": "CEST",
+                    "emoji": "🧩",
+                    "entry": c_now,
+                    "tp": tp_est,
+                    "sl": sl_est,
+                    "power": pwr,
+                    "rsi": r_val,
+                    "atr": atr_v,
+                    "time": now_local_iso(),
+                    "born_bar": bar_i,
+                    "early": False,
+                    "kind": "CEST",
+                    "tag": "🧩 C.E.S.T. BUY",
+                    "ma50": ma50_now,
+                    "swing_low": swing_low
+                }
+    
+    # ========== SHORT SETUP ==========
+    # Check if price is below 50 MA
+    if c_now < ma50_now:
+        # Detect Double Top
+        found, top1_idx, top2_idx, touches_ma = detect_double_top(
+            highs, lows, closes, ma50, lookback=10, tolerance=0.015
+        )
+        
+        if found and touches_ma:
+            # Check for confirmation candle: red candle closing below MA50
+            # Current candle should be red (close < open)
+            is_red = closes[-1] < opens[-1]
+            
+            # Previous candle should have been above or at MA50
+            prev_above_ma = closes[-2] >= ma50[-2]
+            
+            if is_red and prev_above_ma:
+                direction = "DOWN"
+                
+                # Calculate Stop Loss: Last swing high + 1 ATR
+                swing_high = max(highs[top1_idx], highs[top2_idx])
+                sl_est = swing_high + atr_v
+                
+                # Calculate Take Profit: Risk:Reward = 1:1.4
+                risk = sl_est - c_now
+                tp_est = c_now - (1.4 * risk)
+                
+                # Calculate power
+                r_val = rsi(closes)[-1]
+                pwr = 60 + abs(c_now - ma50_now) * 100 + (r_val - 50) / 2.0
+                
+                return {
+                    "symbol": sym,
+                    "dir": direction,
+                    "tier": "CEST",
+                    "emoji": "🧩",
+                    "entry": c_now,
+                    "tp": tp_est,
+                    "sl": sl_est,
+                    "power": pwr,
+                    "rsi": r_val,
+                    "atr": atr_v,
+                    "time": now_local_iso(),
+                    "born_bar": bar_i,
+                    "early": False,
+                    "kind": "CEST",
+                    "tag": "🧩 C.E.S.T. SELL",
+                    "ma50": ma50_now,
+                    "swing_high": swing_high
+                }
+    
+    return None
+
 
 
 
@@ -753,6 +1017,7 @@ def scan_symbol(sym,bar_i):
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
     s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i)
+    s_cest = build_cest_signal(sym,kl,bar_i)
 
     # EMA Pullback için 210 bar güvenliği
     kl2 = kl if len(kl)>=210 else futures_get_klines(sym,"1h",210)
@@ -761,7 +1026,7 @@ def scan_symbol(sym,bar_i):
     # EMA Structure Strategy
     s_structure = build_ema_structure_signal(sym, kl, bar_i)
 
-    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_pull, s_structure):
+    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull, s_structure):
         if s: res.append(s)
     
     return res
@@ -1071,6 +1336,7 @@ def ai_update_analysis_snapshot():
         "fvg_signals_total":   sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG"),
         "pullback_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_PULLBACK"),
         "kivanc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="KIVANC_CONFIRM"),
+        "cest_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="CEST"),
         "ema_structure_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_STRUCTURE"),
         "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
         "sim_closed_count":len(SIM_CLOSED)
