@@ -1127,8 +1127,29 @@ def open_market_position(sym, direction, qty):
         "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
         "positionSide":pos_side,"timestamp":now_ts_ms()
     })
-    fill = res.get("avgPrice") or res.get("price") or futures_get_price(sym)
-    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
+    # Try to get fill price from response, handling zero/empty values properly
+    fill = None
+    if res.get("avgPrice"):
+        try:
+            fill = float(res.get("avgPrice"))
+            if fill <= 0:
+                fill = None
+        except (ValueError, TypeError):
+            fill = None
+    
+    if fill is None and res.get("price"):
+        try:
+            fill = float(res.get("price"))
+            if fill <= 0:
+                fill = None
+        except (ValueError, TypeError):
+            fill = None
+    
+    # Fallback to fetching current market price
+    if fill is None:
+        fill = futures_get_price(sym)
+    
+    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill) if fill else 0.0,"pos_side":pos_side}
 
 def _duplicate_or_locked(sym, direction):
     if TREND_LOCK.get(sym)==direction:
@@ -1170,7 +1191,10 @@ def execute_real_trade(sig):
 
     try:
         opened=open_market_position(sym,direction,qty)
-        entry_exec=opened.get("entry") or futures_get_price(sym)
+        entry_exec=opened.get("entry")
+        if entry_exec is None or entry_exec <= 0:
+            # Try fallback to current price
+            entry_exec = futures_get_price(sym)
         if not entry_exec or entry_exec<=0:
             log(f"[OPEN FAIL] {sym} entry alınamadı."); return
 
