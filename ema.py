@@ -128,15 +128,18 @@ def supertrend_last(highs, lows, closes, period=10, mult=3.0):
     upper = mid + mult * np.array(atr)
     lower = mid - mult * np.array(atr)
     dir_up = True
+
     for i in range(1, len(closes)):
-        if closes[i] > upper[i-1]:
+        if closes[i] > upper[i - 1]:
             dir_up = True
-        elif closes[i] < lower[i-1]:
+        elif closes[i] < lower[i - 1]:
             dir_up = False
+
         if dir_up:
             upper[i] = max(upper[i], closes[i])
         else:
             lower[i] = min(lower[i], closes[i])
+
     st_val = upper[-1] if dir_up else lower[-1]
     st_dir = "UP" if dir_up else "DOWN"
     return st_val, st_dir
