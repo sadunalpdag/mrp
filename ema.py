@@ -5,16 +5,15 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.52 — All Strategies + Market State Analyzer + EMA-Structure
-#  - PEMA tamamen kaldırıldı
+# 📘 EMA ULTRA v15.9.53 — Active Strategies (EARLY removed)
+#  - PEMA ve EARLY tamamen kaldırıldı
 #  - Aktif stratejiler:
-#       ⚡ EARLY (EMA3–EMA7 + ATR spike)
 #       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
 #       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
-#       📊 EMA-STRUCTURE (123 Move + EMA50 + Confirmation Candles)
+#       📊 EMA-STRUCTURE (123 Move + EMA50 + Confirmation Candles - No SL)
 #  - Power filtresi kaldırıldı
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
@@ -210,7 +209,6 @@ def detect_market_state(closes, highs, lows):
 # Configuration constants for EMA-Structure strategy
 EMA_STRUCTURE_TOUCH_TOLERANCE = 0.005  # 0.5% - Distance to consider EMA "touched"
 EMA_STRUCTURE_STRONG_TREND_THRESHOLD = 0.002  # 0.2% - Extra requirement without confirmation
-EMA_STRUCTURE_FALLBACK_SL_PCT = 0.01  # 1% - Fallback stop loss distance if swing not found
 
 def detect_higher_high_higher_low(highs, lows, lookback=5):
     """
@@ -603,36 +601,20 @@ def build_ema_structure_signal(sym, kl, bar_i):
             return None
     
     # ========== Position Management ==========
-    # Stop Loss: Below last swing low (for long) or above last swing high (for short)
-    # Take Profit: Minimum 1:2 or 1:3 risk-reward
+    # No Stop Loss - Only Take Profit based on entry price
+    # Take Profit: Fixed percentage based on entry
     
     if direction == "UP":
-        # Find last swing low for stop loss
-        if len(lows) >= 6:
-            swing_low = min(lows[-6:-1])
-        elif len(lows) >= 2:
-            swing_low = lows[-2]
-        else:
-            # Fallback: use current low minus fallback percentage
-            swing_low = lows[-1] * (1 - EMA_STRUCTURE_FALLBACK_SL_PCT)
-        
-        sl_est = swing_low - atr_v  # 1 ATR below swing low
-        risk = max(1e-12, c_now - sl_est)
-        tp_est = c_now + 2.0 * risk  # 1:2 risk-reward
+        # No stop loss calculation - removed per requirement
+        # TP based on fixed percentage (0.6% like other strategies)
+        tp_est = c_now * 1.006
+        sl_est = c_now * 0.8  # Placeholder for system compatibility (not used)
         tag = "📊 EMA-STRUCTURE BUY"
     else:
-        # Find last swing high for stop loss
-        if len(highs) >= 6:
-            swing_high = max(highs[-6:-1])
-        elif len(highs) >= 2:
-            swing_high = highs[-2]
-        else:
-            # Fallback: use current high plus fallback percentage
-            swing_high = highs[-1] * (1 + EMA_STRUCTURE_FALLBACK_SL_PCT)
-        
-        sl_est = swing_high + atr_v  # 1 ATR above swing high
-        risk = max(1e-12, sl_est - c_now)
-        tp_est = c_now - 2.0 * risk  # 1:2 risk-reward
+        # No stop loss calculation - removed per requirement
+        # TP based on fixed percentage (0.6% like other strategies)
+        tp_est = c_now * 0.994
+        sl_est = c_now * 1.2  # Placeholder for system compatibility (not used)
         tag = "📊 EMA-STRUCTURE SELL"
     
     # Calculate power
@@ -766,7 +748,7 @@ def scan_symbol(sym,bar_i):
     if len(kl)<60: return []
     res=[]
 
-    s_early = build_early_signal(sym,kl,bar_i)
+    # EARLY strategy removed per requirement
     s_utstc = build_utstc_signal(sym,kl,bar_i)
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
@@ -779,7 +761,7 @@ def scan_symbol(sym,bar_i):
     # EMA Structure Strategy
     s_structure = build_ema_structure_signal(sym, kl, bar_i)
 
-    for s in (s_early, s_utstc, s_macd, s_fvg, s_kivanc, s_pull, s_structure):
+    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_pull, s_structure):
         if s: res.append(s)
     
     return res
@@ -1083,7 +1065,7 @@ def ai_update_analysis_snapshot():
         "ultra_signals_total": sum(1 for x in AI_SIGNALS if x.get("tier")=="ULTRA"),
         "real_signals_total":  sum(1 for x in AI_SIGNALS if x.get("tier")=="REAL"),
         "normal_signals_total":sum(1 for x in AI_SIGNALS if x.get("tier")=="NORMAL"),
-        "early_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EARLY"),
+        # EARLY strategy removed
         "utstc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="UTSTC"),
         "macd_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="MACD"),
         "fvg_signals_total":   sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG"),
@@ -1399,8 +1381,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.52 aktif (All Strategies + EMA-Structure 123 Move) — Power filter removed")
-    log("[START] EMA ULTRA v15.9.52 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.53 aktif (EARLY removed, EMA-Structure No SL) — Power filter removed")
+    log("[START] EMA ULTRA v15.9.53 FULL")
 
     symbols=auto_init_symbols()
 
