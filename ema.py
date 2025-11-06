@@ -368,9 +368,11 @@ def build_ema_pullback_signal(sym, kl, bar_i):
 
 def build_kivanc_confirm_signal(sym, kl, bar_i):
     """
-    Kıvanç Confirm — SuperTrend + EMA Cross trend takip sinyali
-    Now uses Smart TP like other strategies
-    Checks: 1) SuperTrend direction, 2) EMA9/EMA30 crossover, 3) Distance from SuperTrend
+    Kıvanç Özbilgıç SuperTrend + EMA Cross Strategy
+    Signal only on the 1st candle AFTER:
+    1) EMA9 crosses EMA30 (crossover just happened)
+    2) SuperTrend direction aligns with crossover
+    3) Price is within 2% of SuperTrend line
     """
     if len(kl) < 60:
         return None
@@ -386,28 +388,36 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
     ema9 = ema(closes, 9)
     ema30 = ema(closes, 30)
     
-    # Get current values
-    st_dir = st_direction[-1]
+    # Get current and previous values
+    st_dir_now = st_direction[-1]
     st_value = st_values[-1]
     ema9_now = ema9[-1]
     ema30_now = ema30[-1]
+    ema9_prev = ema9[-2]
+    ema30_prev = ema30[-2]
     entry = closes[-1]
     
-    # Check 1: SuperTrend direction and EMA crossover alignment
+    # Check for EMA crossover on the CURRENT candle (1st candle after crossover)
+    # Bullish crossover: EMA9 was below/equal EMA30, now EMA9 is above EMA30
+    bullish_cross = (ema9_prev <= ema30_prev) and (ema9_now > ema30_now)
+    
+    # Bearish crossover: EMA9 was above/equal EMA30, now EMA9 is below EMA30
+    bearish_cross = (ema9_prev >= ema30_prev) and (ema9_now < ema30_now)
+    
+    # Determine direction based on crossover + SuperTrend alignment
     direction = None
-    if st_dir == "UP" and ema9_now > ema30_now:
+    if bullish_cross and st_dir_now == "UP":
         direction = "UP"
-    elif st_dir == "DOWN" and ema9_now < ema30_now:
+    elif bearish_cross and st_dir_now == "DOWN":
         direction = "DOWN"
     
     if direction is None:
         return None
     
-    # Check 2: Distance from SuperTrend (price should be close to SuperTrend)
-    # Distance as percentage from SuperTrend line
+    # Check distance from SuperTrend (price should be close to SuperTrend)
     st_distance_pct = abs(entry - st_value) / max(st_value, 1e-12) * 100
     
-    # Maximum allowed distance from SuperTrend (configurable, default 2%)
+    # Maximum allowed distance from SuperTrend (default 2%)
     max_st_distance_pct = 2.0
     
     if st_distance_pct > max_st_distance_pct:
@@ -442,12 +452,13 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "born_bar": bar_i,
         "early": False,
         "kind": "KIVANC_CONFIRM",
-        "tag": f"🧩 KIVANC {direction}",
-        "supertrend_dir": st_dir,
+        "tag": f"🧩 KIVANC {direction} CROSS",
+        "supertrend_dir": st_dir_now,
         "supertrend_value": st_value,
         "st_distance_pct": st_distance_pct,
         "ema9": ema9_now,
-        "ema30": ema30_now
+        "ema30": ema30_now,
+        "crossover": True
     }
 
 def check_kivanc_reversal(sym, kl, bar_i):
