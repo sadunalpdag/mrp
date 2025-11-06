@@ -210,6 +210,7 @@ def detect_market_state(closes, highs, lows):
 # Configuration constants for EMA-Structure strategy
 EMA_STRUCTURE_TOUCH_TOLERANCE = 0.005  # 0.5% - Distance to consider EMA "touched"
 EMA_STRUCTURE_STRONG_TREND_THRESHOLD = 0.002  # 0.2% - Extra requirement without confirmation
+EMA_STRUCTURE_FALLBACK_SL_PCT = 0.01  # 1% - Fallback stop loss distance if swing not found
 
 def detect_higher_high_higher_low(highs, lows, lookback=5):
     """
@@ -220,8 +221,10 @@ def detect_higher_high_higher_low(highs, lows, lookback=5):
         return False, False, None, None
     
     # Look for Higher High in recent bars
+    # Scan backwards from most recent bar, comparing each bar to its lookback window
     hh_found = False
     hh_idx = None
+    # Range: start from second-to-last bar, go back lookback bars, stop at lookback index
     for i in range(len(highs) - 1, max(len(highs) - lookback - 1, lookback), -1):
         if highs[i] > max(highs[max(0, i-lookback):i]):
             hh_found = True
@@ -583,12 +586,20 @@ def build_ema_structure_signal(sym, kl, bar_i):
     # Check for confirmation candle pattern
     has_confirmation = detect_confirmation_candle(opens, highs, lows, closes, direction)
     
-    # If no confirmation candle, require stronger structure
+    # If no confirmation candle, require stronger structure to reduce false signals
     if not has_confirmation:
-        # Only proceed if we have very clear structure
-        if direction == "UP" and not (hh_found and hl_found and c_now > e50[-1] * (1 + EMA_STRUCTURE_STRONG_TREND_THRESHOLD)):
+        # For uptrend: need both HH and HL patterns, plus strong price above EMA
+        has_strong_uptrend = (hh_found and hl_found and 
+                              c_now > e50[-1] * (1 + EMA_STRUCTURE_STRONG_TREND_THRESHOLD))
+        
+        # For downtrend: need both LL and LH patterns, plus strong price below EMA
+        has_strong_downtrend = (ll_found and lh_found and 
+                                c_now < e50[-1] * (1 - EMA_STRUCTURE_STRONG_TREND_THRESHOLD))
+        
+        # Reject signal if structure is not strong enough
+        if direction == "UP" and not has_strong_uptrend:
             return None
-        elif direction == "DOWN" and not (ll_found and lh_found and c_now < e50[-1] * (1 - EMA_STRUCTURE_STRONG_TREND_THRESHOLD)):
+        elif direction == "DOWN" and not has_strong_downtrend:
             return None
     
     # ========== Position Management ==========
@@ -602,7 +613,8 @@ def build_ema_structure_signal(sym, kl, bar_i):
         elif len(lows) >= 2:
             swing_low = lows[-2]
         else:
-            swing_low = lows[-1] * 0.99  # Fallback
+            # Fallback: use current low minus fallback percentage
+            swing_low = lows[-1] * (1 - EMA_STRUCTURE_FALLBACK_SL_PCT)
         
         sl_est = swing_low - atr_v  # 1 ATR below swing low
         risk = max(1e-12, c_now - sl_est)
@@ -615,7 +627,8 @@ def build_ema_structure_signal(sym, kl, bar_i):
         elif len(highs) >= 2:
             swing_high = highs[-2]
         else:
-            swing_high = highs[-1] * 1.01  # Fallback
+            # Fallback: use current high plus fallback percentage
+            swing_high = highs[-1] * (1 + EMA_STRUCTURE_FALLBACK_SL_PCT)
         
         sl_est = swing_high + atr_v  # 1 ATR above swing high
         risk = max(1e-12, sl_est - c_now)
