@@ -546,12 +546,7 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         # Convert side to direction for trendlock check
         direction = "UP" if side == "BUY" else "DOWN"
         
-        # Check trendlock
-        if TREND_LOCK.get(sym) == direction:
-            log(f"[KIVANC TRENDLOCK HIT] {sym} {direction}")
-            return False
-        
-        # Check for duplicate positions on Binance
+        # Check for duplicate positions and trendlock on Binance
         if _duplicate_or_locked(sym, direction):
             return False
         
@@ -569,9 +564,13 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         
         # Open real market position on Binance
         opened = open_market_position(sym, direction, qty)
+        if not opened or not isinstance(opened, dict):
+            log(f"[KIVANC OPEN FAIL] {sym} API call failed")
+            return False
+        
         entry_exec = opened.get("entry") or entry_price
         if not entry_exec or entry_exec <= 0:
-            log(f"[KIVANC OPEN FAIL] {sym} entry not found")
+            log(f"[KIVANC OPEN FAIL] {sym} entry price not found")
             return False
         
         # Load current state
@@ -607,10 +606,13 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         # Log success
         log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_exec}")
         
+        # Format entry price with appropriate decimals
+        entry_str = format_price_by_tick(sym, entry_exec)
+        
         # Send Telegram notification
         tg_send(f"🧩 KIVANC {side} {sym}\n"
                 f"Qty:{qty}\n"
-                f"Entry:{entry_exec:.12f}\n"
+                f"Entry:{entry_str}\n"
                 f"Exit: Reversal Only (no TP)\n"
                 f"Size:{size_usdt} USDT\n"
                 f"Time:{now_local_iso()}")
