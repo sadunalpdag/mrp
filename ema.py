@@ -88,10 +88,26 @@ def count_kivanc_positions(side):
     try:
         with open(STATE_FILE, "r") as f:
             st = json.load(f)
-        pos = [p for p in st.get("positions", []) if p.get("strategy")=="KIVANC_CONFIRM" and p.get("side")==side]
+        pos = [p for p in st.get("positions", []) if p.get("strategy")=="KIVANC_CONFIRM" and p.get("side")==side and p.get("status")=="OPEN"]
         return len(pos)
     except:
         return 0
+
+def has_kivanc_position_for_symbol(sym, side):
+    """
+    Check if there's an open KIVANC_CONFIRM position for the given symbol and side
+    """
+    try:
+        with open(STATE_FILE, "r") as f:
+            st = json.load(f)
+        pos = [p for p in st.get("positions", []) 
+               if p.get("symbol")==sym 
+               and p.get("strategy")=="KIVANC_CONFIRM" 
+               and p.get("side")==side 
+               and p.get("status")=="OPEN"]
+        return len(pos) > 0
+    except:
+        return False
 
 # ===================== INDICATORS =====================
 
@@ -473,6 +489,7 @@ def check_kivanc_reversal(sym, kl, bar_i):
 def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
     """
     Close all KIVANC_CONFIRM positions for a symbol
+    Also unlocks TREND_LOCK with delay
     """
     try:
         with open(STATE_FILE, "r") as f:
@@ -483,10 +500,14 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
         closed_count = 0
         
         for pos in positions:
-            if pos.get("symbol") == sym and pos.get("strategy") == strategy:
-                # Mark position for closing
+            if pos.get("symbol") == sym and pos.get("strategy") == strategy and pos.get("status") == "OPEN":
+                # Mark position as closed
+                pos["status"] = "CLOSED"
+                pos["close_time"] = now_local_iso()
+                pos["close_reason"] = "REVERSAL"
                 log(f"[CLOSE KIVANC] {sym} {pos.get('side')} strategy={strategy}")
                 closed_count += 1
+                remaining.append(pos)
             else:
                 remaining.append(pos)
         
@@ -494,6 +515,10 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
             st["positions"] = remaining
             with open(STATE_FILE, "w") as f:
                 json.dump(st, f, ensure_ascii=False, indent=2)
+            
+            # Unlock trend with delay (6h cooldown)
+            _unlock_trend_for(sym, delay_unlock=True)
+            
             log(f"[REVERSAL CLOSE] {sym} closed {closed_count} KIVANC_CONFIRM position(s)")
     except Exception as e:
         log(f"[CLOSE KIVANC ERR] {sym} {e}")
@@ -501,8 +526,17 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
 def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
     """
     Open a KIVANC_CONFIRM position and save to STATE_FILE
+    Includes TREND_LOCK and duplicate checking
     """
     try:
+        # Convert side to direction for TREND_LOCK
+        direction = "UP" if side == "BUY" else "DOWN"
+        
+        # Check for duplicates or locks (including other strategies)
+        if _duplicate_or_locked(sym, direction, check_kivanc=False):
+            log(f"[KIVANC BLOCKED] {sym} {side} - duplicate or locked")
+            return False
+        
         # Get current price
         entry_price = futures_get_price(sym)
         if entry_price is None:
@@ -532,6 +566,11 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         # Save state
         with open(STATE_FILE, "w") as f:
             json.dump(st, f, ensure_ascii=False, indent=2)
+        
+        # Set TREND_LOCK for KIVANC positions too
+        TREND_LOCK[sym] = direction
+        TREND_LOCK_TIME[sym] = now_ts_s()
+        log(f"[TRENDLOCK SET] {sym} {direction} (KIVANC)")
         
         log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_price}")
         return True
@@ -1047,10 +1086,22 @@ def open_market_position(sym, direction, qty):
     fill = res.get("avgPrice") or res.get("price") or futures_get_price(sym)
     return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
 
-def _duplicate_or_locked(sym, direction):
+def _duplicate_or_locked(sym, direction, check_kivanc=True):
+    """
+    Check if symbol/direction is locked or has duplicate position
+    check_kivanc: If True, also checks KIVANC_CONFIRM positions
+    """
     if TREND_LOCK.get(sym)==direction:
         log(f"[TRENDLOCK HIT] {sym} {direction}")
         return True
+    
+    # Check KIVANC positions if requested
+    if check_kivanc:
+        side = "BUY" if direction=="UP" else "SELL"
+        if has_kivanc_position_for_symbol(sym, side):
+            log(f"[KIVANC-DUP] {sym} {side} already has KIVANC position")
+            return True
+    
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
     except Exception as e:
@@ -1199,14 +1250,25 @@ def main():
                 # Handle KIVANC_CONFIRM signals separately
                 if sig.get("kind") == "KIVANC_CONFIRM":
                     signal_dir = sig.get("dir")
+                    direction = "UP" if signal_dir == "BUY" else "DOWN"
+                    
+                    # Check direction limits
+                    if not _can_direction(direction):
+                        log(f"[KIVANC BLOCKED] Direction blocked for {sig['symbol']} {signal_dir}")
+                        continue
+                    
                     if signal_dir == "BUY":
                         open_buy = count_kivanc_positions("BUY")
                         if open_buy < KIVANC_MAX_BUY_POS:
                             open_kivanc_position(sig["symbol"], "BUY", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                        else:
+                            log(f"[KIVANC LIMIT] Max BUY positions reached ({KIVANC_MAX_BUY_POS})")
                     elif signal_dir == "SELL":
                         open_sell = count_kivanc_positions("SELL")
                         if open_sell < KIVANC_MAX_SELL_POS:
                             open_kivanc_position(sig["symbol"], "SELL", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
+                        else:
+                            log(f"[KIVANC LIMIT] Max SELL positions reached ({KIVANC_MAX_SELL_POS})")
                 else:
                     # Execute regular trades for other strategies
                     execute_real_trade(sig)
