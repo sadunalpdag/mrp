@@ -1198,7 +1198,7 @@ def execute_real_trade(sig):
         if entry_exec is None or entry_exec <= 0:
             # Try fallback to current price
             entry_exec = futures_get_price(sym)
-        if not entry_exec or entry_exec<=0:
+        if entry_exec is None or entry_exec<=0:
             log(f"[OPEN FAIL] {sym} entry alınamadı."); return
 
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
