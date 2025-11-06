@@ -1,13 +1,13 @@
-# ===================== EMA ULTRA v15.9.66 — Trade-Rule Restore =================
+# ===================== EMA ULTRA v15.9.67 — Rollback Edition ==================
 # 📜 TRADE RULE — STABLE TP/SL BLOCK (v15.9.51 — Clean Mode)
 #   1) type = TAKE_PROFIT_MARKET / STOP_MARKET
 #   2) workingType = CONTRACT_PRICE
 #   3) priceProtect = true
 #   4) timeInForce = GTC
-#   5) ❌ reduceOnly KULLANILMAZ (yasak)
+#   5) ❌ reduceOnly kullanılmayacak
 # 📜 TRADE RULE — NO TRUNCATION / NO PARTIAL FILES
-#   Tüm kod eksiksiz paylaşıldı; 4 parça ardışık tek dosyadır.
 # ============================================================================
+
 import os, json, time, requests, hmac, hashlib, threading, math, random, csv
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -157,7 +157,7 @@ def supertrend_last(highs,lows,closes,period=10,mult=3.0):
     st_dir = "UP" if dir_up else "DOWN"
     return st_val, st_dir
 
-# -------------------- Precision & Exchange ------------------------------------
+# -------------------- Precision & Exchange (Rollback) -------------------------
 PRECISION_CACHE = {}
 
 def _decimals_from_tick(tick_str):
@@ -185,7 +185,7 @@ def round_to_tick(sym, price_float):
     return float(q*t)
 
 def get_symbol_filters(sym):
-    """v15.9.51 mantığı: LOT_SIZE.step, PRICE_FILTER.tick + MARKET_LOT_SIZE.minQty dikkate alınır."""
+    """v15.9.51 orijinal: LOT_SIZE.stepSize, PRICE_FILTER.tickSize, MARKET_LOT_SIZE.minQty çekilir."""
     if sym in PRECISION_CACHE: return PRECISION_CACHE[sym]
     try:
         info = requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo", timeout=10).json()
@@ -206,7 +206,7 @@ def get_symbol_filters(sym):
     return PRECISION_CACHE[sym]
 
 def calc_order_qty(sym, entry_price, usd):
-    """v15.9.51 orijinal yaklaşım: usd/price → minQty clamp → step’e yuvarla (reduceOnly yok)."""
+    """v15.9.51 orijinal — Sadece minQty clamp + step yuvarlama. Ek güvenlik yok."""
     f    = get_symbol_filters(sym)
     step = Decimal(str(f["stepSize"]))
     mqty = Decimal(str(f.get("minQty","0")))
@@ -216,10 +216,10 @@ def calc_order_qty(sym, entry_price, usd):
     q   = max(raw, mqty)
     if step > 0:
         q = (q/step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step
-    qf = float(q)
-    if not math.isfinite(qf) or qf <= 0:
+    try:
+        return float(q)
+    except:
         return 0.0
-    return qf
 
 def _signed_request(method, path, params):
     q = "&".join([f"{k}={params[k]}" for k in params])
@@ -248,7 +248,7 @@ def futures_get_klines(sym, interval, limit):
                          params={"symbol":sym,"interval":interval,"limit":limit},
                          timeout=10).json()
         if r and int(r[-1][6]) > now_ts_ms():
-            r = r[:-1]  # son bar kapanmış olsun
+            r = r[:-1]
         return r
     except:
         return []
@@ -356,7 +356,7 @@ def tg_handle_cmd(cmd, args):
         entry = futures_get_price(sym)
         if not entry: tg_send("❌ price err"); return
         qty = calc_order_qty(sym, entry, usd)
-        if not qty or qty <= 0 or math.isnan(qty):
+        if not qty or qty <= 0:
             tg_send("❌ qty err"); return
         try:
             fill = open_market(sym, d, qty)
@@ -609,7 +609,7 @@ def mean_reversion_watcher():
             log(f"[MEAN-REV WATCH ERR] {e}")
         time.sleep(MEAN_REV_INTERVAL)
 
-# -------------- TP/SL — v15.9.51 Clean Mode (reduceOnly YOK) ------------------
+# -------------- TP/SL — v15.9.51 Clean Mode -----------------------------------
 def place_exit_orders(sym, direction, qty, tp_price, sl_price):
     pos_side = "LONG" if direction=="UP" else "SHORT"
     base = {
@@ -618,15 +618,12 @@ def place_exit_orders(sym, direction, qty, tp_price, sl_price):
         "workingType": "CONTRACT_PRICE", "priceProtect": "true",
         "timestamp": now_ts_ms()
     }
-    # TP
     tp = base.copy(); tp.update({"type":"TAKE_PROFIT_MARKET","stopPrice": format_price_by_tick(sym, tp_price)})
     _signed_request("POST","/fapi/v1/order", tp); log(f"[TP SET] {sym} {direction} {tp_price}")
-    # SL
     sl = base.copy(); sl.update({"type":"STOP_MARKET","stopPrice": format_price_by_tick(sym, sl_price)})
     _signed_request("POST","/fapi/v1/order", sl); log(f"[SL SET] {sym} {direction} {sl_price}")
 
 def smart_tp_sl_prices(sym, entry, direction):
-    # USD 1.6–2.0 aralığı + mikro fiyatlarda yüzde fallback (v15.9.51 mantığı)
     tp_pct, sl_pct = PARAM["FALLBACK_TP_PCT"], PARAM["FALLBACK_SL_PCT"]
     if direction=="UP":
         tp = entry * (1 + tp_pct); sl = entry * (1 - sl_pct)
@@ -665,7 +662,7 @@ def execute_kivanc_trade(sig):
     entry_ref = sig.get("entry") or futures_get_price(sym)
     if not entry_ref: return
     qty = calc_order_qty(sym, entry_ref, PARAM["TRADE_SIZE_USDT"])
-    if not qty or qty <= 0 or math.isnan(qty):
+    if not qty or qty <= 0:
         log(f"[QTY ERR KC] {sym} entry={entry_ref} qty={qty}"); return
     try:
         fill = open_market(sym, direction, qty)
@@ -689,7 +686,7 @@ def execute_generic_trade(sig):
     entry_ref = sig.get("entry") or futures_get_price(sym)
     if not entry_ref: return
     qty = calc_order_qty(sym, entry_ref, PARAM["TRADE_SIZE_USDT"])
-    if not qty or qty <= 0 or math.isnan(qty):
+    if not qty or qty <= 0:
         log(f"[QTY ERR {kind}] {sym} entry={entry_ref} qty={qty}"); return
     try:
         fill = open_market(sym, direction, qty)
@@ -743,8 +740,8 @@ def _cleanup_trend_lock_expired():
 # -------------- Main -----------------------------------------------------------
 def main():
     ensure_csv_header()
-    tg_send("🚀 EMA ULTRA v15.9.66 — Trade-Rule Restore | KC(no TP 4/4)+30/30 | EARLY/SCALP/UT/MACD/FVG | MR Exit | PEMA OFF | v15.9.51 TP/SL Clean")
-    log("[START] EMA ULTRA v15.9.66")
+    tg_send("🚀 EMA ULTRA v15.9.67 — Rollback | KC(no TP 4/4)+30/30 | EARLY/SCALP/UT/MACD/FVG | MR Exit | PEMA OFF | v15.9.51 TP/SL")
+    log("[START] EMA ULTRA v15.9.67")
     symbols = auto_init_symbols()
 
     threading.Thread(target=mean_reversion_watcher, daemon=True).start()
