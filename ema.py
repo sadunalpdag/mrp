@@ -317,8 +317,8 @@ MEAN_REV_EXIT_MAX    = 30.0    # güvenlik hard cap
 MEAN_REV_CONFIRM     = 2
 MEAN_REV_INTERVAL    = 120     # watcher aralığı (s)
 MEAN_REV_USD_SIZE    = 250.0
-MEAN_REV_MAX_BUY     = 3
-MEAN_REV_MAX_SELL    = 3
+MEAN_REV_MAX_BUY     = 0  # Devre dışı (mean reversion açmaz)
+MEAN_REV_MAX_SELL    = 0  # Devre dışı (mean reversion açmaz)
 
 def _mr_save(): safe_save(MEAN_REV_FILE, MEAN_REV_POS)
 
@@ -465,6 +465,9 @@ def mean_reversion_loop(symbols):
             time.sleep(60)
 # ===================== Kıvanç Confirm trade (opsiyonel açma) =====================
 
+KIVANC_MAX_LONG  = 4  # Maksimum 4 LONG pozisyon
+KIVANC_MAX_SHORT = 4  # Maksimum 4 SHORT pozisyon
+
 def execute_kivanc_trade(sig):
     """
     Kıvanç Confirm sinyali geldiğinde market pozisyon açar (hedge uyumlu).
@@ -474,6 +477,16 @@ def execute_kivanc_trade(sig):
     if TREND_LOCK.get(sym) == direction:
         log(f"[KIVANC GUARD] {sym} {direction} aktif, atlandı.")
         return
+    
+    # Kıvanç Confirm için pozisyon limiti kontrolü
+    long_cnt, short_cnt = _count_live_positions()
+    if direction == "UP" and long_cnt >= KIVANC_MAX_LONG:
+        log(f"[KIVANC LIMIT] {sym} LONG limit ({KIVANC_MAX_LONG}) doldu, atlandı.")
+        return
+    if direction == "DOWN" and short_cnt >= KIVANC_MAX_SHORT:
+        log(f"[KIVANC LIMIT] {sym} SHORT limit ({KIVANC_MAX_SHORT}) doldu, atlandı.")
+        return
+    
     entry_ref = sig.get("entry") or futures_get_price(sym)
     if not entry_ref: return
     qty = calc_order_qty(sym, entry_ref, PARAM.get("TRADE_SIZE_USDT", 250.0))
