@@ -249,7 +249,7 @@ def _cleanup_trend_lock_expired():
         TREND_LOCK.pop(sym, None); TREND_LOCK_TIME.pop(sym, None)
         log(f"[TRENDLOCK TIMEOUT] {sym}")
 
-        else:
+        
             lower[i] = min(lower[i], closes[i])
     st_val = upper[-1] if dir_up else lower[-1]
     st_dir = "UP" if dir_up else "DOWN"
