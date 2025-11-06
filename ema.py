@@ -86,6 +86,8 @@ def count_kivanc_positions(side):
     Count open KIVANC_CONFIRM positions by side (BUY or SELL)
     """
     try:
+        if not os.path.exists(STATE_FILE):
+            return 0
         with open(STATE_FILE, "r") as f:
             st = json.load(f)
         pos = [p for p in st.get("positions", []) if p.get("strategy")=="KIVANC_CONFIRM" and p.get("side")==side]
@@ -475,6 +477,11 @@ def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
     Close all KIVANC_CONFIRM positions for a symbol
     """
     try:
+        # If the file doesn't exist, there's nothing to close.
+        if not os.path.exists(STATE_FILE):
+            log(f"[CLOSE KIVANC WARN] {STATE_FILE} not found; nothing to close for {sym}")
+            return
+        
         with open(STATE_FILE, "r") as f:
             st = json.load(f)
         
@@ -509,9 +516,12 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
             log(f"[KIVANC OPEN ERR] {sym} cannot get price")
             return False
         
-        # Load current state
-        with open(STATE_FILE, "r") as f:
-            st = json.load(f)
+        # Load current state, or create default if file doesn't exist
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                st = json.load(f)
+        else:
+            st = STATE_DEFAULT.copy()
         
         # Create position record
         position = {
@@ -785,6 +795,7 @@ def tier_from_power(p):
 # ===================== GUARDS / HEARTBEAT / REPORT =====================
 
 STATE_DEFAULT={
+    "positions": [],
     "bar_index":0, "last_report":0, "auto_trade_active":True,
     "last_api_check":0, "long_blocked":False, "short_blocked":False,
     "tg_update_offset":0
@@ -799,6 +810,10 @@ PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
 if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
 STATE=safe_load(STATE_FILE,STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
+
+# Ensure state file is initialized at startup
+if not os.path.exists(STATE_FILE):
+    safe_save(STATE_FILE, STATE)
 
 def update_directional_limits():
     live={"long":{}, "short":{},"long_count":0,"short_count":0}
