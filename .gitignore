@@ -1,3 +1,5 @@
 boring_strategy_backtest.json
 __pycache__/
 *.pyc
+multi_backtest_summary.json
+multi_backtest_results.json
