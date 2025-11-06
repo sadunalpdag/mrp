@@ -135,6 +135,11 @@ def supertrend_last(highs, lows, closes, period=10, mult=3.0):
             dir_up = False
         if dir_up:
             upper[i] = max(upper[i], closes[i])
+        else:
+            lower[i] = min(lower[i], closes[i])
+    st_val = upper[-1] if dir_up else lower[-1]
+    st_dir = "UP" if dir_up else "DOWN"
+    return st_val, st_dir
 # ---- Binance helpers
 def _signed_request(method, path, params):
     q = "&".join([f"{k}={params[k]}" for k in params])
