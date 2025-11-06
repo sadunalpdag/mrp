@@ -518,11 +518,14 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         # Determine direction and execute market order
         direction = "UP" if side == "BUY" else "DOWN"
         opened = open_market_position(sym, direction, qty)
-        entry_exec = opened.get("entry") or futures_get_price(sym)
+        entry_exec = opened.get("entry")
         
+        # If market order didn't return entry price, get current price
         if not entry_exec or entry_exec <= 0:
-            log(f"[KIVANC OPEN ERR] {sym} entry execution failed")
-            return False
+            entry_exec = futures_get_price(sym)
+            if not entry_exec or entry_exec <= 0:
+                log(f"[KIVANC OPEN ERR] {sym} entry execution failed")
+                return False
         
         # Set TP (Take Profit) order
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
@@ -561,16 +564,20 @@ def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
         
         # Send Telegram notification
         if tp_ok:
-            tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
-                       else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
-            tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(size_usdt, 1e-12))*100
+            if tp_usd_used is not None:
+                tp_line = f"TP hedefi:{tp_usd_used:.2f}$"
+                tp_pct_show = (tp_usd_used / max(size_usdt, 1e-12)) * 100
+            else:
+                tp_line = f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}"
+                tp_pct_show = (tp_pct_used or 0) * 100
+            
             tg_send(f"🧩 KIVANC {side} {sym} qty:{qty}\n"
-                    f"Entry:{entry_exec:.12f}\n"
+                    f"Entry:{entry_exec:.8f}\n"
                     f"{tp_line} ({tp_pct_show:.3f}%)\n"
                     f"time:{now_local_iso()}")
         else:
             tg_send(f"🧩 KIVANC {side} {sym} qty:{qty}\n"
-                    f"Entry:{entry_exec:.12f}\n"
+                    f"Entry:{entry_exec:.8f}\n"
                     f"TP: YOK (USD/% tarama başarısız)\n"
                     f"time:{now_local_iso()}")
         
