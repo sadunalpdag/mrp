@@ -45,10 +45,7 @@ SIM_QUEUE = []
 getcontext().prec = 28
 
 # ===================== Kıvanç Confirm Settings =====================
-KIVANC_MAX_BUY_POS   = 3
-KIVANC_MAX_SELL_POS  = 3
-KIVANC_POS_SIZE_USDT = 250
-KIVANC_TRENDLOCK_HRS = 6
+# KIVANC_CONFIRM now uses global PARAM settings (MAX_BUY, MAX_SELL, TRADE_SIZE_USDT)
 
 # ===================== UTILITIES =====================
 
@@ -81,17 +78,7 @@ def safe_save(p,d):
 def now_local_iso():
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
 
-def count_kivanc_positions(side):
-    """
-    Count open KIVANC_CONFIRM positions by side (BUY or SELL)
-    """
-    try:
-        with open(STATE_FILE, "r") as f:
-            st = json.load(f)
-        pos = [p for p in st.get("positions", []) if p.get("strategy")=="KIVANC_CONFIRM" and p.get("side")==side]
-        return len(pos)
-    except:
-        return 0
+
 
 # ===================== INDICATORS =====================
 
@@ -381,7 +368,11 @@ def build_ema_pullback_signal(sym, kl, bar_i):
 
 def build_kivanc_confirm_signal(sym, kl, bar_i):
     """
-    Kıvanç Confirm — SuperTrend + EMA Cross trend takip sinyali
+    Kıvanç Özbilgıç SuperTrend + EMA Cross Strategy
+    Signal only on the 1st candle AFTER:
+    1) EMA9 crosses EMA30 (crossover just happened)
+    2) SuperTrend direction aligns with crossover
+    3) Price is within 2% of SuperTrend line
     """
     if len(kl) < 60:
         return None
@@ -397,28 +388,49 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
     ema9 = ema(closes, 9)
     ema30 = ema(closes, 30)
     
-    # Get current values
-    st_dir = st_direction[-1]
+    # Get current and previous values
+    st_dir_now = st_direction[-1]
+    st_value = st_values[-1]
     ema9_now = ema9[-1]
     ema30_now = ema30[-1]
+    ema9_prev = ema9[-2]
+    ema30_prev = ema30[-2]
+    entry = closes[-1]
     
-    signal = None
-    if st_dir == "UP" and ema9_now > ema30_now:
-        signal = "BUY"
-    elif st_dir == "DOWN" and ema9_now < ema30_now:
-        signal = "SELL"
+    # Check for EMA crossover on the CURRENT candle (1st candle after crossover)
+    # Bullish crossover: EMA9 was below/equal EMA30, now EMA9 is above EMA30
+    bullish_cross = (ema9_prev <= ema30_prev) and (ema9_now > ema30_now)
     
-    if signal is None:
+    # Bearish crossover: EMA9 was above/equal EMA30, now EMA9 is below EMA30
+    bearish_cross = (ema9_prev >= ema30_prev) and (ema9_now < ema30_now)
+    
+    # Determine direction based on crossover + SuperTrend alignment
+    direction = None
+    if bullish_cross and st_dir_now == "UP":
+        direction = "UP"
+    elif bearish_cross and st_dir_now == "DOWN":
+        direction = "DOWN"
+    
+    if direction is None:
+        return None
+    
+    # Check distance from SuperTrend (price should be close to SuperTrend)
+    st_distance_pct = abs(entry - st_value) / max(st_value, 1e-12) * 100
+    
+    # Maximum allowed distance from SuperTrend (default 2%)
+    max_st_distance_pct = 2.0
+    
+    if st_distance_pct > max_st_distance_pct:
+        # Price too far from SuperTrend, skip signal
         return None
     
     # Calculate additional metrics
     atr_v = atr_like(highs, lows, closes)[-1]
     r_val = rsi(closes)[-1]
-    entry = closes[-1]
     pwr = 60 + abs(ema9_now - ema30_now) * 120 + (r_val - 50) / 2.0
     
-    # Set TP and SL
-    if signal == "BUY":
+    # Set TP and SL like other strategies (will use Smart TP in execute_real_trade)
+    if direction == "UP":
         tp = entry * 1.006
         sl = entry * 0.994
     else:
@@ -427,7 +439,7 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
     
     return {
         "symbol": sym,
-        "dir": signal,
+        "dir": direction,
         "tier": "KIVANC",
         "emoji": "🧩",
         "entry": entry,
@@ -440,187 +452,17 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "born_bar": bar_i,
         "early": False,
         "kind": "KIVANC_CONFIRM",
-        "tag": f"🧩 KIVANC {signal}",
-        "supertrend_dir": st_dir,
+        "tag": f"🧩 KIVANC {'BUY' if direction == 'UP' else 'SELL'} CROSS",
+        "supertrend_dir": st_dir_now,
+        "supertrend_value": st_value,
+        "st_distance_pct": st_distance_pct,
         "ema9": ema9_now,
-        "ema30": ema30_now
+        "ema30": ema30_now,
+        "crossover": True
     }
 
-def check_kivanc_reversal(sym, kl, bar_i):
-    """
-    Trend reversal uyarısı geldiğinde o yöndeki tüm KIVANC_CONFIRM işlemlerini kapatır
-    """
-    if len(kl) < 60:
-        return
-    
-    closes = [float(k[4]) for k in kl]
-    highs = [float(k[2]) for k in kl]
-    lows = [float(k[3]) for k in kl]
-    
-    # Calculate SuperTrend
-    st_values, st_direction = supertrend(highs, lows, closes)
-    
-    if len(st_direction) < 2:
-        return
-    
-    st_now = st_direction[-1]
-    st_prev = st_direction[-2]
-    
-    if st_now != st_prev:
-        log(f"[REVERSAL] {sym} | {st_prev} → {st_now}")
-        close_kivanc_positions(sym, strategy="KIVANC_CONFIRM")
 
-def close_kivanc_positions(sym, strategy="KIVANC_CONFIRM"):
-    """
-    Close all KIVANC_CONFIRM positions for a symbol on Binance
-    """
-    try:
-        with open(STATE_FILE, "r") as f:
-            st = json.load(f)
-        
-        positions = st.get("positions", [])
-        remaining = []
-        closed_count = 0
-        
-        for pos in positions:
-            if pos.get("symbol") == sym and pos.get("strategy") == strategy:
-                # Close real Binance position
-                side = pos.get("side")
-                qty = pos.get("qty")
-                
-                if qty and qty > 0:
-                    try:
-                        # Cancel all open orders for this symbol first
-                        try:
-                            _signed_request("DELETE", "/fapi/v1/allOpenOrders", {
-                                "symbol": sym,
-                                "timestamp": now_ts_ms()
-                            })
-                            log(f"[KIVANC CANCEL ORDERS] {sym}")
-                        except Exception as cancel_err:
-                            log(f"[KIVANC CANCEL ORDERS WARN] {sym} {cancel_err}")
-                        
-                        # Close position with market order
-                        close_side = "SELL" if side == "BUY" else "BUY"
-                        pos_side = "LONG" if side == "BUY" else "SHORT"
-                        
-                        _signed_request("POST", "/fapi/v1/order", {
-                            "symbol": sym,
-                            "side": close_side,
-                            "type": "MARKET",
-                            "quantity": f"{qty}",
-                            "positionSide": pos_side,
-                            "timestamp": now_ts_ms()
-                        })
-                        
-                        log(f"[CLOSE KIVANC] {sym} {side} qty={qty} strategy={strategy}")
-                        tg_send(f"🔄 KIVANC REVERSAL CLOSE\n{sym} {side}\nQty:{qty}\nReason:SuperTrend Reversal")
-                        closed_count += 1
-                    except Exception as e:
-                        log(f"[CLOSE KIVANC BINANCE ERR] {sym} {e}")
-                        # Don't increment closed_count - position may still be open on Binance
-                        # Keep in state for retry or manual intervention
-                        remaining.append(pos)
-                        continue
-                else:
-                    log(f"[CLOSE KIVANC] {sym} {side} strategy={strategy} (no qty)")
-                    closed_count += 1
-            else:
-                remaining.append(pos)
-        
-        if closed_count > 0:
-            st["positions"] = remaining
-            with open(STATE_FILE, "w") as f:
-                json.dump(st, f, ensure_ascii=False, indent=2)
-            log(f"[REVERSAL CLOSE] {sym} closed {closed_count} KIVANC_CONFIRM position(s)")
-            # Clear trendlock with delay (6h cooldown)
-            _unlock_trend_for(sym, delay_unlock=True)
-    except Exception as e:
-        log(f"[CLOSE KIVANC ERR] {sym} {e}")
 
-def open_kivanc_position(sym, side, size_usdt, strategy="KIVANC_CONFIRM"):
-    """
-    Open a KIVANC_CONFIRM position on Binance (NO TP - only reversal exit)
-    """
-    try:
-        # Convert side to direction for trendlock check
-        direction = "UP" if side == "BUY" else "DOWN"
-        
-        # Check for duplicate positions and trendlock on Binance
-        if _duplicate_or_locked(sym, direction):
-            return False
-        
-        # Get current price for quantity calculation
-        entry_price = futures_get_price(sym)
-        if entry_price is None:
-            log(f"[KIVANC OPEN ERR] {sym} cannot get price")
-            return False
-        
-        # Calculate order quantity
-        qty = calc_order_qty(sym, entry_price, size_usdt)
-        if not qty or qty <= 0:
-            log(f"[KIVANC QTY ERR] {sym} qty calculation failed")
-            return False
-        
-        # Open real market position on Binance
-        opened = open_market_position(sym, direction, qty)
-        if not opened or not isinstance(opened, dict):
-            log(f"[KIVANC OPEN FAIL] {sym} API call failed, response: {opened}")
-            return False
-        
-        entry_exec = opened.get("entry")
-        if not entry_exec or entry_exec <= 0:
-            log(f"[KIVANC OPEN FAIL] {sym} entry price missing from response: {opened}")
-            return False
-        
-        # Load current state
-        with open(STATE_FILE, "r") as f:
-            st = json.load(f)
-        
-        # Create position record (NO TP - only reversal exit)
-        position = {
-            "symbol": sym,
-            "side": side,
-            "strategy": strategy,
-            "entry": entry_exec,
-            "size_usdt": size_usdt,
-            "qty": qty,
-            "time": now_local_iso(),
-            "status": "OPEN"
-        }
-        
-        # Add to positions list
-        if "positions" not in st:
-            st["positions"] = []
-        st["positions"].append(position)
-        
-        # Save state
-        with open(STATE_FILE, "w") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
-        
-        # Set trendlock
-        TREND_LOCK[sym] = direction
-        TREND_LOCK_TIME[sym] = now_ts_s()
-        log(f"[KIVANC TRENDLOCK SET] {sym} {direction}")
-        
-        # Log success
-        log(f"[KIVANC OPEN] {sym} {side} size={size_usdt} USDT entry={entry_exec}")
-        
-        # Format entry price with appropriate decimals
-        entry_str = format_price_by_tick(sym, entry_exec)
-        
-        # Send Telegram notification
-        tg_send(f"🧩 KIVANC {side} {sym}\n"
-                f"Qty:{qty}\n"
-                f"Entry:{entry_str}\n"
-                f"Exit: Reversal Only (no TP)\n"
-                f"Size:{size_usdt} USDT\n"
-                f"Time:{now_local_iso()}")
-        
-        return True
-    except Exception as e:
-        log(f"[KIVANC OPEN ERR] {sym} {e}")
-        return False
 
 # ===================== SCANNER =====================
 
@@ -641,9 +483,6 @@ def scan_symbol(sym,bar_i):
 
     for s in (s_early, s_utstc, s_macd, s_fvg, s_kivanc, s_pull):
         if s: res.append(s)
-    
-    # Check for Kıvanç reversal
-    check_kivanc_reversal(sym, kl, bar_i)
     
     return res
 
@@ -1300,31 +1139,8 @@ def main():
                 queue_sim_variants(sig)
                 update_directional_limits()
                 
-                # Handle KIVANC_CONFIRM signals separately
-                if sig.get("kind") == "KIVANC_CONFIRM":
-                    signal_dir = sig.get("dir")
-                    direction = "UP" if signal_dir == "BUY" else "DOWN"
-                    
-                    # Check global directional limits first
-                    if not _can_direction(direction):
-                        log(f"[KIVANC BLOCKED] {sig['symbol']} {signal_dir} - global limit reached")
-                        continue
-                    
-                    if signal_dir == "BUY":
-                        open_buy = count_kivanc_positions("BUY")
-                        if open_buy < KIVANC_MAX_BUY_POS:
-                            open_kivanc_position(sig["symbol"], "BUY", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
-                        else:
-                            log(f"[KIVANC LIMIT] BUY limit reached ({open_buy}/{KIVANC_MAX_BUY_POS})")
-                    elif signal_dir == "SELL":
-                        open_sell = count_kivanc_positions("SELL")
-                        if open_sell < KIVANC_MAX_SELL_POS:
-                            open_kivanc_position(sig["symbol"], "SELL", KIVANC_POS_SIZE_USDT, strategy="KIVANC_CONFIRM")
-                        else:
-                            log(f"[KIVANC LIMIT] SELL limit reached ({open_sell}/{KIVANC_MAX_SELL_POS})")
-                else:
-                    # Execute regular trades for other strategies
-                    execute_real_trade(sig)
+                # Execute real trade for all strategies (including KIVANC_CONFIRM)
+                execute_real_trade(sig)
 
             # 3) SIM open/close
             process_sim_queue_and_open_due()
