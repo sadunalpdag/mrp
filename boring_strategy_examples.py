@@ -154,7 +154,8 @@ def example_live_scanning():
     while True:
         now = datetime.now(eastern)
         
-        if 9.45 <= now.hour + now.minute/60 < 12:
+        # Check if within trading hours (9:45 AM to 12:00 PM)
+        if (now.hour == 9 and now.minute >= 45) or (10 <= now.hour < 12):
             # Get data
             candles_15min = get_range_candle()
             candles_5min = get_5min_candles()

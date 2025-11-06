@@ -40,6 +40,21 @@ class BoringStrategy:
     
     def __init__(self):
         self.eastern = pytz.timezone('US/Eastern')
+    
+    def _timestamp_to_datetime(self, timestamp_ms: int) -> Optional[datetime]:
+        """
+        Convert millisecond timestamp to datetime in Eastern timezone.
+        
+        Args:
+            timestamp_ms: Timestamp in milliseconds
+            
+        Returns:
+            datetime object in Eastern timezone or None if conversion fails
+        """
+        try:
+            return datetime.fromtimestamp(timestamp_ms / 1000, tz=self.eastern)
+        except (ValueError, OSError, OverflowError):
+            return None
         
     def get_first_15min_range(self, candles_15min: List[Dict]) -> Optional[Tuple[float, float]]:
         """
@@ -61,13 +76,9 @@ class BoringStrategy:
         for candle in candles_15min:
             timestamp = candle.get('timestamp')
             if timestamp:
-                try:
-                    dt = datetime.fromtimestamp(timestamp / 1000, tz=self.eastern)
-                    # Check if this is the 9:30-9:45 candle
-                    if dt.hour == 9 and dt.minute == 30:
-                        return (float(candle['high']), float(candle['low']))
-                except:
-                    pass
+                dt = self._timestamp_to_datetime(timestamp)
+                if dt and dt.hour == 9 and dt.minute == 30:
+                    return (float(candle['high']), float(candle['low']))
         return None
     
     def detect_fair_value_gap(self, candles_5min: List[Dict], 
@@ -140,24 +151,37 @@ class BoringStrategy:
         """
         Check if the FVG breaks through the 15-minute range.
         
+        Validation ensures that:
+        1. At least one of the 3 FVG candles closes outside the range
+        2. The FVG pattern actually interacts with the range
+        
         Args:
             fvg: FVG dictionary from detect_fair_value_gap
             range_high: High of the 15-min range
             range_low: Low of the 15-min range
             
         Returns:
-            True if FVG breaks the range
+            True if FVG breaks the range properly
         """
         if not fvg:
             return False
             
         if fvg['direction'] == 'UP':
             # For bullish, need to break above range_high
-            # At least one of the 3 candles should close outside range
-            return fvg['candle3_close'] > range_high
+            # Candle 3 should close outside (above) range
+            closes_outside = fvg['candle3_close'] > range_high
+            # FVG should touch or interact with the range
+            # (FVG bottom should be at or below range high)
+            touches_range = fvg['fvg_bottom'] <= range_high
+            return closes_outside and touches_range
         else:
             # For bearish, need to break below range_low
-            return fvg['candle3_close'] < range_low
+            # Candle 3 should close outside (below) range
+            closes_outside = fvg['candle3_close'] < range_low
+            # FVG should touch or interact with the range
+            # (FVG top should be at or above range low)
+            touches_range = fvg['fvg_top'] >= range_low
+            return closes_outside and touches_range
     
     def calculate_trade_params(self, fvg: Dict) -> Dict:
         """
@@ -228,8 +252,8 @@ class BoringStrategy:
                 # Check time constraint (before 12 PM EST)
                 timestamp = potential_fvg.get('timestamp')
                 if timestamp:
-                    dt = datetime.fromtimestamp(timestamp / 1000, tz=self.eastern)
-                    if dt.hour < entry_before_hour:
+                    dt = self._timestamp_to_datetime(timestamp)
+                    if dt and dt.hour < entry_before_hour:
                         fvg = potential_fvg
                         break
                 else:
