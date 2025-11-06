@@ -452,7 +452,7 @@ def build_kivanc_confirm_signal(sym, kl, bar_i):
         "born_bar": bar_i,
         "early": False,
         "kind": "KIVANC_CONFIRM",
-        "tag": f"🧩 KIVANC {direction} CROSS",
+        "tag": f"🧩 KIVANC {'BUY' if direction == 'UP' else 'SELL'} CROSS",
         "supertrend_dir": st_dir_now,
         "supertrend_value": st_value,
         "st_distance_pct": st_distance_pct,
