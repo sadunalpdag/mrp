@@ -29,6 +29,9 @@ BINANCE_FAPI = "https://fapi.binance.com"
 RESULTS_FILE = "backtest_results_new_strategies.json"
 TRADES_FILE = "backtest_trades_new_strategies.json"
 
+# Configuration
+RATE_LIMIT_DELAY = 0.1  # Delay between API calls to avoid rate limiting
+
 def log(msg):
     """Print and log messages"""
     print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -95,7 +98,7 @@ def get_historical_klines(symbol, interval="1h", days=90):
             current_start = int(klines[-1][0]) + 1
             
             # Rate limiting
-            time.sleep(0.1)
+            time.sleep(RATE_LIMIT_DELAY)
             
             if len(klines) < 1500:
                 break

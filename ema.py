@@ -214,6 +214,26 @@ def detect_market_state(closes, highs, lows):
 EMA_STRUCTURE_TOUCH_TOLERANCE = 0.005  # 0.5% - Distance to consider EMA "touched"
 EMA_STRUCTURE_STRONG_TREND_THRESHOLD = 0.002  # 0.2% - Extra requirement without confirmation
 
+# ===================== NEW STRATEGIES CONFIGURATION =====================
+
+# Common constants
+EPSILON = 1e-12  # Small value to avoid division by zero
+
+# London Breakout (LO_ORB) Configuration
+LO_ORB_TP_PCT = 0.006  # 0.6% take profit
+LO_ORB_SL_PCT = 0.006  # 0.6% stop loss (placeholder)
+
+# New York Reversal (NYR) Configuration
+NYR_SWEEP_TOLERANCE = 0.002  # 0.2% tolerance for liquidity sweep detection
+NYR_TP_PCT = 0.006  # 0.6% take profit
+NYR_SL_PCT = 0.006  # 0.6% stop loss (placeholder)
+
+# ICT Power of 3 Configuration
+ICT_P3_ACCUMULATION_ATR_MULTIPLIER = 1.5  # Range tightness threshold
+ICT_P3_TP_PCT = 0.006  # 0.6% take profit
+ICT_P3_SL_PCT = 0.006  # 0.6% stop loss (placeholder)
+EMA_STRUCTURE_STRONG_TREND_THRESHOLD = 0.002  # 0.2% - Extra requirement without confirmation
+
 def detect_higher_high_higher_low(highs, lows, lookback=5):
     """
     Detect Higher High (HH) and Higher Low (HL) pattern
@@ -1112,7 +1132,7 @@ def build_lo_orb_signal(sym, kl, bar_i):
     
     # Power calculation
     range_size = range_high - range_low
-    breakout_strength = abs(c_now - (range_high if direction == "UP" else range_low)) / max(range_size, 1e-12)
+    breakout_strength = abs(c_now - (range_high if direction == "UP" else range_low)) / max(range_size, EPSILON)
     pwr = 60 + breakout_strength * 20 + (r_val - 50) / 2.0
     if has_fvg:
         pwr += 5  # Bonus for FVG confirmation
@@ -1120,11 +1140,11 @@ def build_lo_orb_signal(sym, kl, bar_i):
     # Entry, TP, SL
     entry = c_now
     if direction == "UP":
-        tp = entry * 1.006
-        sl = entry * 0.994
+        tp = entry * (1 + LO_ORB_TP_PCT)
+        sl = entry * (1 - LO_ORB_SL_PCT)
     else:
-        tp = entry * 0.994
-        sl = entry * 1.006
+        tp = entry * (1 - LO_ORB_TP_PCT)
+        sl = entry * (1 + LO_ORB_SL_PCT)
     
     return {
         "symbol": sym,
@@ -1187,8 +1207,6 @@ def build_ny_reversal_signal(sym, kl, bar_i):
     # Upper sweep: high wicks above recent high, but closes back below
     # Lower sweep: low wicks below recent low, but closes back above
     
-    sweep_tolerance = 0.002  # 0.2% tolerance for sweep
-    
     # Check last 2 bars for sweep pattern
     sweep_up = False
     sweep_down = False
@@ -1196,10 +1214,10 @@ def build_ny_reversal_signal(sym, kl, bar_i):
     for i in range(-2, 0):
         if i >= -len(highs):
             # Upper liquidity sweep
-            if highs[i] > recent_high * (1 + sweep_tolerance) and closes[i] < recent_high:
+            if highs[i] > recent_high * (1 + NYR_SWEEP_TOLERANCE) and closes[i] < recent_high:
                 sweep_up = True
             # Lower liquidity sweep
-            if lows[i] < recent_low * (1 - sweep_tolerance) and closes[i] > recent_low:
+            if lows[i] < recent_low * (1 - NYR_SWEEP_TOLERANCE) and closes[i] > recent_low:
                 sweep_down = True
     
     if not (sweep_up or sweep_down):
@@ -1237,17 +1255,17 @@ def build_ny_reversal_signal(sym, kl, bar_i):
     atr_v = atr_like(highs, lows, closes)[-1]
     
     # Power calculation
-    reversal_strength = abs(c_now - (recent_low if direction == "UP" else recent_high)) / max(atr_v, 1e-12)
+    reversal_strength = abs(c_now - (recent_low if direction == "UP" else recent_high)) / max(atr_v, EPSILON)
     pwr = 60 + reversal_strength * 15 + abs(r_val - 50) / 2.0
     
     # Entry, TP, SL
     entry = c_now
     if direction == "UP":
-        tp = entry * 1.006
-        sl = entry * 0.994
+        tp = entry * (1 + NYR_TP_PCT)
+        sl = entry * (1 - NYR_SL_PCT)
     else:
-        tp = entry * 0.994
-        sl = entry * 1.006
+        tp = entry * (1 - NYR_TP_PCT)
+        sl = entry * (1 + NYR_SL_PCT)
     
     return {
         "symbol": sym,
@@ -1314,7 +1332,7 @@ def build_ict_power3_signal(sym, kl, bar_i):
     avg_atr = np.mean(atr_vals[-20:]) if len(atr_vals) >= 20 else atr_vals[-1]
     
     # Accumulation: range should be relatively tight (< 1.5 * ATR)
-    is_accumulation = acc_range < (avg_atr * 1.5)
+    is_accumulation = acc_range < (avg_atr * ICT_P3_ACCUMULATION_ATR_MULTIPLIER)
     
     if not is_accumulation:
         return None
@@ -1384,7 +1402,7 @@ def build_ict_power3_signal(sym, kl, bar_i):
     r_val = rsi(closes)[-1]
     
     # Power calculation
-    distribution_strength = abs(c_now - (acc_low if direction == "UP" else acc_high)) / max(acc_range, 1e-12)
+    distribution_strength = abs(c_now - (acc_low if direction == "UP" else acc_high)) / max(acc_range, EPSILON)
     pwr = 62 + distribution_strength * 18 + (r_val - 50) / 2.0
     if has_fvg:
         pwr += 8  # Strong bonus for FVG confirmation in ICT
@@ -1392,11 +1410,11 @@ def build_ict_power3_signal(sym, kl, bar_i):
     # Entry, TP, SL
     entry = c_now
     if direction == "UP":
-        tp = entry * 1.006
-        sl = entry * 0.994
+        tp = entry * (1 + ICT_P3_TP_PCT)
+        sl = entry * (1 - ICT_P3_SL_PCT)
     else:
-        tp = entry * 0.994
-        sl = entry * 1.006
+        tp = entry * (1 - ICT_P3_TP_PCT)
+        sl = entry * (1 + ICT_P3_SL_PCT)
     
     return {
         "symbol": sym,
