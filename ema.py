@@ -7,8 +7,8 @@ import numpy as np
 # ==============================================================================
 # 📘 EMA ULTRA v15.9.54 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
+#  - UT/STC devre dışı bırakıldı
 #  - Aktif stratejiler:
-#       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
@@ -33,6 +33,7 @@ PARAM_FILE       = os.path.join(DATA_DIR,"params.json")
 AI_SIGNALS_FILE  = os.path.join(DATA_DIR,"ai_signals.json")
 AI_ANALYSIS_FILE = os.path.join(DATA_DIR,"ai_analysis.json")
 AI_RL_FILE       = os.path.join(DATA_DIR,"ai_rl_log.json")
+REAL_CLOSED_FILE = os.path.join(DATA_DIR,"real_closed.json")
 SIM_POS_FILE     = os.path.join(DATA_DIR,"sim_positions.json")
 SIM_CLOSED_FILE  = os.path.join(DATA_DIR,"sim_closed.json")
 LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
@@ -49,6 +50,8 @@ TREND_LOCK = {}
 TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 SIM_QUEUE = []
+REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
+LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 getcontext().prec = 28
 
 # ===================== Kıvanç Confirm Settings =====================
@@ -1428,7 +1431,8 @@ def scan_symbol(sym,bar_i):
     res=[]
 
     # EARLY strategy removed per requirement
-    s_utstc = build_utstc_signal(sym,kl,bar_i)
+    # UT/STC strategy disabled per requirement
+    s_utstc = None  # Disabled - was: build_utstc_signal(sym,kl,bar_i)
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
     s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i)
@@ -1467,6 +1471,7 @@ def run_parallel(symbols,bar_i):
 AI_SIGNALS    = safe_load(AI_SIGNALS_FILE,[])
 AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
 AI_RL         = safe_load(AI_RL_FILE,[])
+REAL_CLOSED   = safe_load(REAL_CLOSED_FILE,[])
 SIM_POSITIONS = safe_load(SIM_POS_FILE,[])
 SIM_CLOSED    = safe_load(SIM_CLOSED_FILE,[])
 
@@ -1555,6 +1560,103 @@ def process_sim_closes():
     if changed:
         safe_save(SIM_POS_FILE,SIM_POSITIONS)
         safe_save(SIM_CLOSED_FILE,SIM_CLOSED)
+
+def check_and_log_real_closed_trades():
+    """
+    Check for closed real positions and log them with strategy information.
+    This runs periodically to track which strategies resulted in closed trades.
+    Throttled to run max once per minute to avoid excessive API calls.
+    """
+    global REAL_CLOSED, REAL_POSITIONS_TRACKER, LAST_REAL_CLOSE_CHECK
+    
+    # Throttle: only check once per minute
+    now = now_ts_s()
+    if now - LAST_REAL_CLOSE_CHECK < 60:
+        return
+    LAST_REAL_CLOSE_CHECK = now
+    
+    try:
+        # Get current positions from Binance
+        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
+        current_positions = {}
+        
+        for p in acc:
+            amt = float(p["positionAmt"])
+            if amt != 0:  # Position is still open
+                sym = p["symbol"]
+                current_positions[sym] = {
+                    "symbol": sym,
+                    "amount": amt,
+                    "entry_price": float(p["entryPrice"]),
+                    "unrealized_pnl": float(p["unRealizedProfit"])
+                }
+        
+        # Check if any tracked positions have closed
+        closed_symbols = []
+        for sym, pos_info in REAL_POSITIONS_TRACKER.items():
+            if sym not in current_positions:
+                # Position has closed
+                closed_symbols.append(sym)
+                
+                # Try to get the last trade to find exit price
+                exit_price = None
+                pnl = None
+                try:
+                    trades = _signed_request("GET", "/fapi/v3/userTrades", {
+                        "symbol": sym,
+                        "limit": 10,
+                        "timestamp": now_ts_ms()
+                    })
+                    # Find the closing trade (most recent opposite direction trade)
+                    for trade in reversed(trades):
+                        if trade["symbol"] == sym:
+                            exit_price = float(trade["price"])
+                            break
+                except:
+                    pass
+                
+                # Calculate PnL percentage if we have exit price
+                entry_price = pos_info.get("entry_price", 0)
+                direction = pos_info.get("direction")
+                if exit_price and entry_price > 0:
+                    if direction == "UP":
+                        pnl_pct = ((exit_price / entry_price) - 1) * 100
+                    else:  # SHORT
+                        pnl_pct = ((entry_price - exit_price) / entry_price) * 100
+                else:
+                    pnl_pct = None
+                
+                # Log the closed trade with strategy information
+                closed_trade = {
+                    "symbol": sym,
+                    "direction": direction,
+                    "strategy": pos_info.get("kind", "UNKNOWN"),
+                    "tag": pos_info.get("tag", ""),
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "pnl_pct": pnl_pct,
+                    "power": pos_info.get("power"),
+                    "open_time": pos_info.get("open_time"),
+                    "close_time": now_local_iso(),
+                    "tp_target": pos_info.get("tp_target"),
+                    "market_state": pos_info.get("market_state", "")
+                }
+                
+                REAL_CLOSED.append(closed_trade)
+                safe_save(REAL_CLOSED_FILE, REAL_CLOSED)
+                
+                pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
+                exit_str = f"{exit_price}" if exit_price is not None else "N/A"
+                log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
+                    f"PnL:{pnl_str}% Exit:{exit_str}")
+        
+        # Remove closed positions from tracker
+        for sym in closed_symbols:
+            REAL_POSITIONS_TRACKER.pop(sym, None)
+            
+    except Exception as e:
+        log(f"[CHECK REAL CLOSED ERR] {e}")
+
 # ===================== TELEGRAM HELPERS =====================
 
 def tg_send(t):
@@ -1775,7 +1877,7 @@ def auto_report_if_due():
     if now_now-STATE.get("last_report",0) < 14400:
         return
     ai_update_analysis_snapshot()
-    for fpath in [AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,SIM_POS_FILE,SIM_CLOSED_FILE,PARAM_FILE,STATE_FILE]:
+    for fpath in [AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,REAL_CLOSED_FILE,SIM_POS_FILE,SIM_CLOSED_FILE,PARAM_FILE,STATE_FILE]:
         try:
             if os.path.exists(fpath) and os.path.getsize(fpath)>20*1024*1024:
                 with open(fpath,"r",encoding="utf-8") as f: raw=f.read()
@@ -1807,6 +1909,7 @@ def _cmd_status():
         f"📊 /status bar:{STATE.get('bar_index')} "
         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'} "
         f"long:{live.get('long_count',0)} short:{live.get('short_count',0)} "
+        f"real_closed:{len(REAL_CLOSED)} "
         f"sim_open:{len([p for p in SIM_POSITIONS if p.get('status')=='OPEN'])} "
         f"sim_closed:{len(SIM_CLOSED)}"
     )
@@ -1816,6 +1919,7 @@ def _cmd_report():
     tg_send_file(AI_SIGNALS_FILE,"📄 ai_signals.json")
     tg_send_file(AI_ANALYSIS_FILE,"📄 ai_analysis.json")
     tg_send_file(AI_RL_FILE,"📄 ai_rl_log.json")
+    tg_send_file(REAL_CLOSED_FILE,"📄 real_closed.json")
     tg_send_file(SIM_POS_FILE,"📄 sim_positions.json")
     tg_send_file(SIM_CLOSED_FILE,"📄 sim_closed.json")
 
@@ -1837,7 +1941,7 @@ def _cmd_set(args):
         tg_send(f"❌ /set hata: {e}")
 
 def _cmd_export():
-    for fpath in [PARAM_FILE,STATE_FILE,AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,SIM_POS_FILE,SIM_CLOSED_FILE,LOG_FILE]:
+    for fpath in [PARAM_FILE,STATE_FILE,AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,REAL_CLOSED_FILE,SIM_POS_FILE,SIM_CLOSED_FILE,LOG_FILE]:
         tg_send_file(fpath, f"📦 {os.path.basename(fpath)}")
 
 def check_telegram_commands():
@@ -2049,6 +2153,19 @@ def execute_real_trade(sig):
             "market_state":sig.get("market_state","")
         })
         safe_save(AI_RL_FILE,AI_RL)
+        
+        # Track this position for later closure detection
+        REAL_POSITIONS_TRACKER[sym] = {
+            "symbol": sym,
+            "direction": direction,
+            "entry_price": entry_exec,
+            "kind": kind,
+            "tag": sig.get("tag", ""),
+            "power": pwr,
+            "open_time": now_local_iso(),
+            "tp_target": tp_usd_used or tp_pct_used,
+            "market_state": sig.get("market_state", "")
+        }
 
     except Exception as e:
         log(f"[OPEN ERR]{sym}{e}")
@@ -2074,8 +2191,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.54 aktif (6 new strategies added) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.54 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.54 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.54 FULL (UT/STC disabled)")
 
     symbols=auto_init_symbols()
 
@@ -2120,6 +2237,9 @@ def main():
             # 3) SIM open/close
             process_sim_queue_and_open_due()
             process_sim_closes()
+            
+            # 3.1) Check and log real closed trades
+            check_and_log_real_closed_trades()
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
