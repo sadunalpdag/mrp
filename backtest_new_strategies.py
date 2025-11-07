@@ -178,12 +178,12 @@ def simulate_trade(signal, klines, signal_index):
     # Trade not completed within data range
     return None
 
-def backtest_symbol(symbol, strategies_to_test):
+def backtest_symbol(symbol, strategies_to_test, days=90):
     """
     Backtest a single symbol with new strategies
     Returns list of completed trades
     """
-    klines = get_historical_klines(symbol, interval="1h", days=90)
+    klines = get_historical_klines(symbol, interval="1h", days=days)
     
     if len(klines) < 100:
         return []
@@ -371,7 +371,7 @@ def main():
     # Process symbols in parallel
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
-            executor.submit(backtest_symbol, symbol, strategies_to_test): symbol
+            executor.submit(backtest_symbol, symbol, strategies_to_test, args.days): symbol
             for symbol in symbols
         }
         

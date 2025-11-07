@@ -232,7 +232,6 @@ NYR_SL_PCT = 0.006  # 0.6% stop loss (placeholder)
 ICT_P3_ACCUMULATION_ATR_MULTIPLIER = 1.5  # Range tightness threshold
 ICT_P3_TP_PCT = 0.006  # 0.6% take profit
 ICT_P3_SL_PCT = 0.006  # 0.6% stop loss (placeholder)
-EMA_STRUCTURE_STRONG_TREND_THRESHOLD = 0.002  # 0.2% - Extra requirement without confirmation
 
 def detect_higher_high_higher_low(highs, lows, lookback=5):
     """
@@ -1211,14 +1210,16 @@ def build_ny_reversal_signal(sym, kl, bar_i):
     sweep_up = False
     sweep_down = False
     
-    for i in range(-2, 0):
-        if i >= -len(highs):
-            # Upper liquidity sweep
-            if highs[i] > recent_high * (1 + NYR_SWEEP_TOLERANCE) and closes[i] < recent_high:
-                sweep_up = True
-            # Lower liquidity sweep
-            if lows[i] < recent_low * (1 - NYR_SWEEP_TOLERANCE) and closes[i] > recent_low:
-                sweep_down = True
+    # Only check bars that exist
+    check_range = min(2, len(highs))
+    for idx in range(1, check_range + 1):
+        i = -idx  # Access from end: -1, -2
+        # Upper liquidity sweep
+        if highs[i] > recent_high * (1 + NYR_SWEEP_TOLERANCE) and closes[i] < recent_high:
+            sweep_up = True
+        # Lower liquidity sweep
+        if lows[i] < recent_low * (1 - NYR_SWEEP_TOLERANCE) and closes[i] > recent_low:
+            sweep_down = True
     
     if not (sweep_up or sweep_down):
         return None
