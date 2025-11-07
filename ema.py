@@ -1647,7 +1647,7 @@ def check_and_log_real_closed_trades():
                 
                 pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
                 exit_str = f"{exit_price}" if exit_price is not None else "N/A"
-                log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind')} "
+                log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
                     f"PnL:{pnl_str}% Exit:{exit_str}")
         
         # Remove closed positions from tracker
