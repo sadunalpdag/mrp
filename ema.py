@@ -7,8 +7,8 @@ import numpy as np
 # ==============================================================================
 # 📘 EMA ULTRA v15.9.54 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
+#  - UT/STC devre dışı bırakıldı
 #  - Aktif stratejiler:
-#       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
@@ -1428,7 +1428,8 @@ def scan_symbol(sym,bar_i):
     res=[]
 
     # EARLY strategy removed per requirement
-    s_utstc = build_utstc_signal(sym,kl,bar_i)
+    # UT/STC strategy disabled per requirement
+    # s_utstc = build_utstc_signal(sym,kl,bar_i)
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
     s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i)
@@ -1446,7 +1447,7 @@ def scan_symbol(sym,bar_i):
     s_asian_bo = build_asian_range_breakout_signal(sym, kl, bar_i)
     s_fvg_breaker = build_fvg_breaker_block_signal(sym, kl, bar_i)
 
-    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull,
+    for s in (s_macd, s_fvg, s_kivanc, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker):
         if s: res.append(s)
     
@@ -2074,8 +2075,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.54 aktif (6 new strategies added) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.54 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.54 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.54 FULL (UT/STC disabled)")
 
     symbols=auto_init_symbols()
 
