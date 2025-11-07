@@ -1429,7 +1429,7 @@ def scan_symbol(sym,bar_i):
 
     # EARLY strategy removed per requirement
     # UT/STC strategy disabled per requirement
-    # s_utstc = build_utstc_signal(sym,kl,bar_i)
+    s_utstc = None  # Disabled - was: build_utstc_signal(sym,kl,bar_i)
     s_macd  = build_macd_trend_signal(sym,kl,bar_i)
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
     s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i)
@@ -1447,7 +1447,7 @@ def scan_symbol(sym,bar_i):
     s_asian_bo = build_asian_range_breakout_signal(sym, kl, bar_i)
     s_fvg_breaker = build_fvg_breaker_block_signal(sym, kl, bar_i)
 
-    for s in (s_macd, s_fvg, s_kivanc, s_cest, s_pull,
+    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker):
         if s: res.append(s)
     
