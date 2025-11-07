@@ -1226,12 +1226,13 @@ def build_orb_fvg_confirm_signal(sym, kl, bar_i):
     ORB + FVG Confirm Strategy
     
     Opening Range Breakout combined with Fair Value Gap confirmation.
-    Active: 09:45-12:00 EST (14:45-17:00 UTC)
+    Active: 09:45-12:00 EST (14:45-17:00 UTC) - approximate with hourly candles
     Entry: FVG breakout after range breakout
     TP/SL: 2:1 Risk/Reward
     """
-    # Time window: 09:45-12:00 EST = 14:45-17:00 UTC
-    if not is_in_time_window(est_to_utc(9), est_to_utc(12)):
+    # Time window: 09:45-12:00 EST ≈ 14:00-17:00 UTC (hour-level approximation)
+    # Since we work with hourly candles, we use 14:00-17:00 UTC
+    if not is_in_time_window(14, 17):
         return None
     
     if len(kl) < 10:
@@ -1392,8 +1393,9 @@ def build_ny_reversal_signal(sym, kl, bar_i):
     Entry: Liquidity sweep followed by reversal
     TP/SL: 1.5:1 Risk/Reward
     """
-    # Time window: 09:30-11:00 EST = 14:30-16:00 UTC
-    if not is_in_time_window(est_to_utc(9) + 1, est_to_utc(11)):  # 14:30-16:00 UTC
+    # Time window: 09:30-11:00 EST ≈ 14:00-16:00 UTC (hour-level approximation)
+    # Since we work with hourly candles, we use 14:00-16:00 UTC
+    if not is_in_time_window(14, 16):
         return None
     
     if len(kl) < 15:
@@ -1467,8 +1469,9 @@ def build_ict_power_of_3_signal(sym, kl, bar_i):
     Entry: Distribution phase after manipulation
     TP/SL: 2:1 Risk/Reward
     """
-    # Time window: 08:30-12:00 EST = 13:30-17:00 UTC
-    if not is_in_time_window(est_to_utc(8) + 1, est_to_utc(12)):  # 13:30-17:00 UTC
+    # Time window: 08:30-12:00 EST ≈ 13:00-17:00 UTC (hour-level approximation)
+    # Since we work with hourly candles, we use 13:00-17:00 UTC
+    if not is_in_time_window(13, 17):
         return None
     
     if len(kl) < 20:
