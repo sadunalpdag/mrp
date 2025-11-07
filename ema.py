@@ -51,6 +51,7 @@ TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 SIM_QUEUE = []
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
+LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 getcontext().prec = 28
 
 # ===================== Kıvanç Confirm Settings =====================
@@ -1564,8 +1565,15 @@ def check_and_log_real_closed_trades():
     """
     Check for closed real positions and log them with strategy information.
     This runs periodically to track which strategies resulted in closed trades.
+    Throttled to run max once per minute to avoid excessive API calls.
     """
-    global REAL_CLOSED, REAL_POSITIONS_TRACKER
+    global REAL_CLOSED, REAL_POSITIONS_TRACKER, LAST_REAL_CLOSE_CHECK
+    
+    # Throttle: only check once per minute
+    now = now_ts_s()
+    if now - LAST_REAL_CLOSE_CHECK < 60:
+        return
+    LAST_REAL_CLOSE_CHECK = now
     
     try:
         # Get current positions from Binance
@@ -1613,8 +1621,8 @@ def check_and_log_real_closed_trades():
                 if exit_price and entry_price > 0:
                     if direction == "UP":
                         pnl_pct = ((exit_price / entry_price) - 1) * 100
-                    else:
-                        pnl_pct = ((entry_price / exit_price) - 1) * 100
+                    else:  # SHORT
+                        pnl_pct = ((entry_price - exit_price) / entry_price) * 100
                 else:
                     pnl_pct = None
                 
@@ -1637,8 +1645,10 @@ def check_and_log_real_closed_trades():
                 REAL_CLOSED.append(closed_trade)
                 safe_save(REAL_CLOSED_FILE, REAL_CLOSED)
                 
+                pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
+                exit_str = f"{exit_price}" if exit_price is not None else "N/A"
                 log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind')} "
-                    f"PnL:{pnl_pct:.2f}% Exit:{exit_price}")
+                    f"PnL:{pnl_str}% Exit:{exit_str}")
         
         # Remove closed positions from tracker
         for sym in closed_symbols:
