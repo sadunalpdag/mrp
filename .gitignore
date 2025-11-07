@@ -38,6 +38,10 @@ data/
 !requirements.txt
 !render.yaml
 
+# Backtest results
+backtest_results*.json
+backtest_trades*.json
+
 # Logs
 *.log
 log.txt
