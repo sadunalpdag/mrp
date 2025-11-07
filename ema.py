@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.53 — Active Strategies (EARLY removed)
+# 📘 EMA ULTRA v15.9.54 — Active Strategies (EARLY removed + 3 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
 #  - Aktif stratejiler:
 #       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
@@ -15,6 +15,9 @@ import numpy as np
 #       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
 #       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy)
 #       📊 EMA-STRUCTURE (123 Move + EMA50 + Confirmation Candles - No SL)
+#       🟢 LO_ORB (London Breakout - Opening Range Breakout 08:00-08:30 GMT)
+#       🔴 NYR (New York Reversal - Liquidity Sweep + Reversal)
+#       📊 ICT_P3 (ICT Power of 3 - Accumulation/Manipulation/Distribution)
 #  - Power filtresi kaldırıldı
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
@@ -1002,6 +1005,420 @@ def build_cest_signal(sym, kl, bar_i):
     
     return None
 
+# ===================== SESSION TIME HELPERS =====================
+
+def get_current_hour_gmt(kline_time_ms):
+    """
+    Get GMT hour from kline timestamp
+    """
+    from datetime import datetime, timezone
+    dt = datetime.fromtimestamp(kline_time_ms / 1000, tz=timezone.utc)
+    return dt.hour
+
+def is_london_session(kline_time_ms):
+    """
+    Check if current time is London session (08:00-08:30 GMT)
+    """
+    hour = get_current_hour_gmt(kline_time_ms)
+    return hour == 8
+
+def is_ny_session(kline_time_ms):
+    """
+    Check if current time is NY session (09:30-10:00 EST = 14:30-15:00 GMT)
+    Adjusted to 13:30-14:30 GMT for market opening
+    """
+    hour = get_current_hour_gmt(kline_time_ms)
+    return 13 <= hour <= 14
+
+# ===================== NEW STRATEGIES =====================
+
+def build_lo_orb_signal(sym, kl, bar_i):
+    """
+    1️⃣ London Breakout (LO Session ORB)
+    
+    Logic:
+    - Mark first 30-minute range at London opening (08:00-08:30 GMT)
+    - When range is broken, trade in breakout direction
+    - Additional filter: FVG or EMA20 trend confirmation
+    
+    Advantage:
+    - Same time every day - high volatility
+    - Easily added to EMA ULTRA as "LO_ORB"
+    """
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    times = [int(k[0]) for k in kl]
+    
+    # Calculate EMA20 for trend confirmation
+    e20 = ema(closes, 20)
+    
+    # Find London session bars (08:00-08:30 GMT)
+    # Look back up to 10 bars for London session range
+    london_highs = []
+    london_lows = []
+    
+    for i in range(max(0, len(kl) - 10), len(kl) - 1):
+        if is_london_session(times[i]):
+            london_highs.append(highs[i])
+            london_lows.append(lows[i])
+    
+    # Need at least 1 London session bar to establish range
+    if len(london_highs) == 0:
+        return None
+    
+    # Opening Range: high and low of London session
+    range_high = max(london_highs)
+    range_low = min(london_lows)
+    
+    c_now = closes[-1]
+    
+    # Check for breakout
+    breakout_up = c_now > range_high
+    breakout_down = c_now < range_low
+    
+    if not (breakout_up or breakout_down):
+        return None
+    
+    # Determine direction
+    if breakout_up:
+        direction = "UP"
+        # Confirm with EMA20 trend (price should be above EMA20)
+        if c_now < e20[-1]:
+            return None  # Weak signal without trend confirmation
+        tag = "🟢 LO_ORB BUY"
+    else:
+        direction = "DOWN"
+        # Confirm with EMA20 trend (price should be below EMA20)
+        if c_now > e20[-1]:
+            return None  # Weak signal without trend confirmation
+        tag = "🔴 LO_ORB SELL"
+    
+    # Check for FVG confirmation (optional additional filter)
+    has_fvg = False
+    if len(highs) >= 3 and len(lows) >= 3:
+        h1, h2, h3 = highs[-3:]
+        l1, l2, l3 = lows[-3:]
+        up_gap = l2 > h1 and c_now > l2
+        dn_gap = h2 < l1 and c_now < h2
+        has_fvg = up_gap or dn_gap
+    
+    # Calculate metrics
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    # Power calculation
+    range_size = range_high - range_low
+    breakout_strength = abs(c_now - (range_high if direction == "UP" else range_low)) / max(range_size, 1e-12)
+    pwr = 60 + breakout_strength * 20 + (r_val - 50) / 2.0
+    if has_fvg:
+        pwr += 5  # Bonus for FVG confirmation
+    
+    # Entry, TP, SL
+    entry = c_now
+    if direction == "UP":
+        tp = entry * 1.006
+        sl = entry * 0.994
+    else:
+        tp = entry * 0.994
+        sl = entry * 1.006
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "LO_ORB",
+        "emoji": "🟢" if direction == "UP" else "🔴",
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "LO_ORB",
+        "tag": tag,
+        "range_high": range_high,
+        "range_low": range_low,
+        "has_fvg": has_fvg
+    }
+
+def build_ny_reversal_signal(sym, kl, bar_i):
+    """
+    2️⃣ New York Reversal (NY Reversal + Liquidity Sweep)
+    
+    Logic:
+    - At NY opening, morning liquidity is taken (09:30-10:00) → then reverses
+    - Fake breakout → reversal
+    - "Liquidity sweep": wick just outside previous high/low then reverses
+    
+    Similarity:
+    - Opposite of ORB - rejection trade instead of breakout
+    - Can be added to EMA ULTRA as "NYR" module (TrendLock + RSI confirm)
+    """
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    times = [int(k[0]) for k in kl]
+    
+    # Find recent high/low (last 10 bars before NY session)
+    lookback_start = max(0, len(kl) - 15)
+    lookback_end = len(kl) - 1
+    
+    recent_high = max(highs[lookback_start:lookback_end])
+    recent_low = min(lows[lookback_start:lookback_end])
+    
+    # Check if we're in or just after NY session
+    current_is_ny = is_ny_session(times[-1])
+    prev_was_ny = is_ny_session(times[-2]) if len(times) >= 2 else False
+    
+    if not (current_is_ny or prev_was_ny):
+        return None
+    
+    # Liquidity sweep detection
+    # Upper sweep: high wicks above recent high, but closes back below
+    # Lower sweep: low wicks below recent low, but closes back above
+    
+    sweep_tolerance = 0.002  # 0.2% tolerance for sweep
+    
+    # Check last 2 bars for sweep pattern
+    sweep_up = False
+    sweep_down = False
+    
+    for i in range(-2, 0):
+        if i >= -len(highs):
+            # Upper liquidity sweep
+            if highs[i] > recent_high * (1 + sweep_tolerance) and closes[i] < recent_high:
+                sweep_up = True
+            # Lower liquidity sweep
+            if lows[i] < recent_low * (1 - sweep_tolerance) and closes[i] > recent_low:
+                sweep_down = True
+    
+    if not (sweep_up or sweep_down):
+        return None
+    
+    # Determine reversal direction
+    c_now = closes[-1]
+    
+    if sweep_up:
+        # Swept high, now reversing down
+        # Confirm: current close should be below recent high
+        if c_now >= recent_high:
+            return None
+        direction = "DOWN"
+        tag = "🔴 NYR SELL"
+    else:  # sweep_down
+        # Swept low, now reversing up
+        # Confirm: current close should be above recent low
+        if c_now <= recent_low:
+            return None
+        direction = "UP"
+        tag = "🟢 NYR BUY"
+    
+    # RSI confirmation
+    r_val = rsi(closes)[-1]
+    
+    # For reversal up: RSI should not be too high
+    # For reversal down: RSI should not be too low
+    if direction == "UP" and r_val > 70:
+        return None
+    if direction == "DOWN" and r_val < 30:
+        return None
+    
+    # Calculate metrics
+    atr_v = atr_like(highs, lows, closes)[-1]
+    
+    # Power calculation
+    reversal_strength = abs(c_now - (recent_low if direction == "UP" else recent_high)) / max(atr_v, 1e-12)
+    pwr = 60 + reversal_strength * 15 + abs(r_val - 50) / 2.0
+    
+    # Entry, TP, SL
+    entry = c_now
+    if direction == "UP":
+        tp = entry * 1.006
+        sl = entry * 0.994
+    else:
+        tp = entry * 0.994
+        sl = entry * 1.006
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "NYR",
+        "emoji": "🟢" if direction == "UP" else "🔴",
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "NYR",
+        "tag": tag,
+        "sweep_level": recent_high if sweep_up else recent_low,
+        "sweep_type": "high" if sweep_up else "low"
+    }
+
+def build_ict_power3_signal(sym, kl, bar_i):
+    """
+    3️⃣ ICT Power of 3 (Accumulation – Manipulation – Distribution)
+    
+    Logic:
+    1️⃣ Morning "accumulation" (consolidation)
+    2️⃣ "Manipulation" (fake breakout)
+    3️⃣ "Distribution" (real direction)
+    Generally combines with FVG and session timing
+    
+    Similarity:
+    - Based on FVG and session timing
+    - Advanced version of ORB + FVG Confirm
+    
+    Advantage:
+    - Produces trend-following swing and intraday setups
+    - Can be scripted as "ICT_P3" in EMA ULTRA
+    """
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    times = [int(k[0]) for k in kl]
+    
+    # Step 1: Detect Accumulation (consolidation/range)
+    # Look at last 5-10 bars for low volatility / tight range
+    accumulation_window = 10
+    if len(kl) < accumulation_window + 5:
+        return None
+    
+    # Calculate range in accumulation window
+    acc_start = -(accumulation_window + 5)
+    acc_end = -5
+    
+    acc_highs = highs[acc_start:acc_end]
+    acc_lows = lows[acc_start:acc_end]
+    acc_range = max(acc_highs) - min(acc_lows)
+    
+    # Calculate average ATR for comparison
+    atr_vals = atr_like(highs, lows, closes)
+    avg_atr = np.mean(atr_vals[-20:]) if len(atr_vals) >= 20 else atr_vals[-1]
+    
+    # Accumulation: range should be relatively tight (< 1.5 * ATR)
+    is_accumulation = acc_range < (avg_atr * 1.5)
+    
+    if not is_accumulation:
+        return None
+    
+    # Step 2: Detect Manipulation (fake breakout in recent bars)
+    # Look at bars -4 to -2 for a breakout that was rejected
+    
+    manip_highs = highs[-5:-1]
+    manip_lows = lows[-5:-1]
+    manip_closes = closes[-5:-1]
+    
+    acc_high = max(acc_highs)
+    acc_low = min(acc_lows)
+    
+    # Check for fake breakout up (manipulation to upside)
+    fake_breakout_up = False
+    fake_breakout_down = False
+    
+    for i in range(len(manip_highs)):
+        # Fake breakout up: high breaks above accumulation high, but closes back inside
+        if manip_highs[i] > acc_high and manip_closes[i] < acc_high:
+            fake_breakout_up = True
+        # Fake breakout down: low breaks below accumulation low, but closes back inside
+        if manip_lows[i] < acc_low and manip_closes[i] > acc_low:
+            fake_breakout_down = True
+    
+    if not (fake_breakout_up or fake_breakout_down):
+        return None
+    
+    # Step 3: Detect Distribution (real direction move)
+    # Current price should be breaking in opposite direction of fake breakout
+    
+    c_now = closes[-1]
+    
+    if fake_breakout_up:
+        # Fake breakout was up, real move should be down
+        # Check if price is now breaking below accumulation low
+        if c_now > acc_low:
+            return None
+        direction = "DOWN"
+        tag = "📊 ICT_P3 SELL"
+    elif fake_breakout_down:
+        # Fake breakout was down, real move should be up
+        # Check if price is now breaking above accumulation high
+        if c_now < acc_high:
+            return None
+        direction = "UP"
+        tag = "📊 ICT_P3 BUY"
+    else:
+        return None
+    
+    # Check for FVG confirmation (ICT heavily uses FVG)
+    has_fvg = False
+    if len(highs) >= 3 and len(lows) >= 3:
+        h1, h2, h3 = highs[-3:]
+        l1, l2, l3 = lows[-3:]
+        up_gap = l2 > h1 and c_now > l2
+        dn_gap = h2 < l1 and c_now < h2
+        
+        if direction == "UP" and up_gap:
+            has_fvg = True
+        elif direction == "DOWN" and dn_gap:
+            has_fvg = True
+    
+    # Calculate metrics
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    # Power calculation
+    distribution_strength = abs(c_now - (acc_low if direction == "UP" else acc_high)) / max(acc_range, 1e-12)
+    pwr = 62 + distribution_strength * 18 + (r_val - 50) / 2.0
+    if has_fvg:
+        pwr += 8  # Strong bonus for FVG confirmation in ICT
+    
+    # Entry, TP, SL
+    entry = c_now
+    if direction == "UP":
+        tp = entry * 1.006
+        sl = entry * 0.994
+    else:
+        tp = entry * 0.994
+        sl = entry * 1.006
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "ICT_P3",
+        "emoji": "📊",
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "ICT_P3",
+        "tag": tag,
+        "accumulation_range": acc_range,
+        "manipulation_type": "up" if fake_breakout_up else "down",
+        "has_fvg": has_fvg
+    }
+
 
 
 
@@ -1025,8 +1442,13 @@ def scan_symbol(sym,bar_i):
     
     # EMA Structure Strategy
     s_structure = build_ema_structure_signal(sym, kl, bar_i)
+    
+    # New Strategies: London Breakout, NY Reversal, ICT Power of 3
+    s_lo_orb = build_lo_orb_signal(sym, kl, bar_i)
+    s_nyr = build_ny_reversal_signal(sym, kl, bar_i)
+    s_ict_p3 = build_ict_power3_signal(sym, kl, bar_i)
 
-    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull, s_structure):
+    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull, s_structure, s_lo_orb, s_nyr, s_ict_p3):
         if s: res.append(s)
     
     return res
@@ -1338,6 +1760,9 @@ def ai_update_analysis_snapshot():
         "kivanc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="KIVANC_CONFIRM"),
         "cest_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="CEST"),
         "ema_structure_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_STRUCTURE"),
+        "lo_orb_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="LO_ORB"),
+        "nyr_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="NYR"),
+        "ict_p3_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ICT_P3"),
         "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
         "sim_closed_count":len(SIM_CLOSED)
     }
@@ -1647,8 +2072,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.53 aktif (EARLY removed, EMA-Structure No SL) — Power filter removed")
-    log("[START] EMA ULTRA v15.9.53 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.54 aktif (3 New Strategies: LO_ORB, NYR, ICT_P3)")
+    log("[START] EMA ULTRA v15.9.54 FULL")
 
     symbols=auto_init_symbols()
 
