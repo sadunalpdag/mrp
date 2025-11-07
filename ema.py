@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.53 — Active Strategies (EARLY removed)
+# 📘 EMA ULTRA v15.9.54 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
 #  - Aktif stratejiler:
 #       🟢 UT/STC (Ultimate Trend + Schaff Trend Cycle)
@@ -15,6 +15,12 @@ import numpy as np
 #       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
 #       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy)
 #       📊 EMA-STRUCTURE (123 Move + EMA50 + Confirmation Candles - No SL)
+#       🔥 ORB + FVG CONFIRM (Opening Range Breakout + FVG - 09:45-12:00 EST)
+#       🌍 LONDON BREAKOUT (LO Session ORB - 08:00-10:00 GMT)
+#       🔄 NY REVERSAL (Liquidity Sweep + Reversal - 09:30-11:00 EST)
+#       ⚡ ICT POWER OF 3 (Accumulation-Manipulation-Distribution - 08:30-12:00 EST)
+#       🌏 ASIAN RANGE BREAKOUT (ARB - 03:00-08:00 GMT)
+#       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
 #  - Power filtresi kaldırıldı
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
@@ -80,6 +86,41 @@ def safe_save(p,d):
 def now_local_iso():
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
 
+# ===================== TIME-BASED UTILITIES =====================
+
+def get_current_utc_hour():
+    """Get current UTC hour (0-23)"""
+    return datetime.now(timezone.utc).hour
+
+def is_in_time_window(start_hour, end_hour):
+    """
+    Check if current UTC time is within the specified hour window.
+    Handles wrap-around for windows that cross midnight.
+    
+    Args:
+        start_hour: Start hour in UTC (0-23)
+        end_hour: End hour in UTC (0-23)
+    
+    Returns:
+        bool: True if current time is within window
+    """
+    current_hour = get_current_utc_hour()
+    
+    if start_hour <= end_hour:
+        # Normal window (e.g., 8-10)
+        return start_hour <= current_hour < end_hour
+    else:
+        # Wrap-around window (e.g., 23-2)
+        return current_hour >= start_hour or current_hour < end_hour
+
+def gmt_to_utc(gmt_hour):
+    """Convert GMT hour to UTC hour (they're the same, but kept for clarity)"""
+    return gmt_hour
+
+def est_to_utc(est_hour):
+    """Convert EST hour to UTC hour (EST = UTC-5)"""
+    utc_hour = est_hour + 5
+    return utc_hour % 24
 
 
 # ===================== INDICATORS =====================
@@ -441,7 +482,184 @@ def detect_double_top(highs, lows, closes, ma50_values, lookback=10, tolerance=0
     
     return True, top1_idx, top2_idx, touches_ma
 
-# ===================== STRATEGIES =====================
+# ===================== NEW STRATEGIES HELPERS =====================
+
+def get_session_range(klines, start_hour_utc, end_hour_utc):
+    """
+    Get high and low of a specific session range from klines.
+    
+    Args:
+        klines: List of kline data [[time, open, high, low, close, ...], ...]
+        start_hour_utc: Session start hour in UTC
+        end_hour_utc: Session end hour in UTC
+    
+    Returns:
+        (range_high, range_low) or (None, None) if not enough data
+    """
+    if len(klines) < 2:
+        return None, None
+    
+    # Get recent candles within the time window
+    session_candles = []
+    for k in klines[-30:]:  # Check last 30 candles (30 hours)
+        candle_time = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
+        candle_hour = candle_time.hour
+        
+        # Check if candle is in session
+        if start_hour_utc <= end_hour_utc:
+            in_session = start_hour_utc <= candle_hour < end_hour_utc
+        else:
+            in_session = candle_hour >= start_hour_utc or candle_hour < end_hour_utc
+        
+        if in_session:
+            session_candles.append(k)
+    
+    if len(session_candles) < 1:
+        return None, None
+    
+    # Get high and low of session
+    highs = [float(k[2]) for k in session_candles]
+    lows = [float(k[3]) for k in session_candles]
+    
+    return max(highs), min(lows)
+
+def detect_liquidity_sweep(highs, lows, closes, lookback=10):
+    """
+    Detect liquidity sweep pattern:
+    - Price briefly breaks above previous high or below previous low
+    - Then reverses direction (fake breakout)
+    
+    Returns:
+        ("UP", sweep_level) for bullish sweep (broke below then reversed up)
+        ("DOWN", sweep_level) for bearish sweep (broke above then reversed down)
+        (None, None) if no sweep detected
+    """
+    if len(closes) < lookback + 2:
+        return None, None
+    
+    # Get recent swing high and low
+    recent_high = max(highs[-(lookback+1):-1])
+    recent_low = min(lows[-(lookback+1):-1])
+    
+    current_high = highs[-1]
+    current_low = lows[-1]
+    current_close = closes[-1]
+    prev_close = closes[-2]
+    
+    # Bullish sweep: broke below recent low but closed back above
+    if current_low < recent_low and current_close > recent_low:
+        return "UP", recent_low
+    
+    # Bearish sweep: broke above recent high but closed back below
+    if current_high > recent_high and current_close < recent_high:
+        return "DOWN", recent_high
+    
+    return None, None
+
+def detect_breaker_block(highs, lows, closes, direction, lookback=20):
+    """
+    Detect breaker block: a previous support that became resistance (or vice versa).
+    
+    Args:
+        direction: "UP" or "DOWN" - the intended trade direction
+        lookback: how many bars to look back
+    
+    Returns:
+        (found, breaker_level) - True and price level if breaker block found
+    """
+    if len(closes) < lookback + 5:
+        return False, None
+    
+    # For UP direction: look for old resistance that was broken and is now support
+    if direction == "UP":
+        # Find a previous high that was broken
+        for i in range(len(highs) - lookback, len(highs) - 3):
+            level = highs[i]
+            
+            # Check if this level was broken upward
+            broken = False
+            for j in range(i + 1, len(closes)):
+                if closes[j] > level:
+                    broken = True
+                    break
+            
+            if broken:
+                # Check if price is now near this level (within 1%)
+                current_price = closes[-1]
+                distance = abs(current_price - level) / max(level, 1e-12)
+                if distance < 0.01 and current_price >= level * 0.995:
+                    return True, level
+    
+    # For DOWN direction: look for old support that was broken and is now resistance
+    else:
+        # Find a previous low that was broken
+        for i in range(len(lows) - lookback, len(lows) - 3):
+            level = lows[i]
+            
+            # Check if this level was broken downward
+            broken = False
+            for j in range(i + 1, len(closes)):
+                if closes[j] < level:
+                    broken = True
+                    break
+            
+            if broken:
+                # Check if price is now near this level (within 1%)
+                current_price = closes[-1]
+                distance = abs(current_price - level) / max(level, 1e-12)
+                if distance < 0.01 and current_price <= level * 1.005:
+                    return True, level
+    
+    return False, None
+
+def detect_ict_power_of_3(highs, lows, closes, opens):
+    """
+    Detect ICT Power of 3 pattern:
+    1. Accumulation - price consolidates in narrow range
+    2. Manipulation - fake breakout (liquidity grab)
+    3. Distribution - real move in opposite direction
+    
+    Returns:
+        ("UP", manipulation_level) for bullish setup
+        ("DOWN", manipulation_level) for bearish setup
+        (None, None) if no pattern
+    """
+    if len(closes) < 15:
+        return None, None
+    
+    # Phase 1: Check for accumulation (narrow range in bars -10 to -5)
+    accumulation_highs = highs[-10:-5]
+    accumulation_lows = lows[-10:-5]
+    accumulation_range = max(accumulation_highs) - min(accumulation_lows)
+    avg_price = sum(closes[-10:-5]) / 5
+    
+    # Range should be tight (< 1% of price)
+    if accumulation_range / max(avg_price, 1e-12) > 0.01:
+        return None, None
+    
+    # Phase 2: Check for manipulation (spike in bars -5 to -2)
+    manipulation_high = max(highs[-5:-1])
+    manipulation_low = min(lows[-5:-1])
+    
+    # Phase 3: Check for distribution (current bar shows reversal)
+    current_close = closes[-1]
+    prev_close = closes[-2]
+    
+    # Bullish P3: fake breakdown followed by rally
+    if manipulation_low < min(accumulation_lows):
+        # Check if current price is back above accumulation range
+        if current_close > max(accumulation_highs):
+            return "UP", manipulation_low
+    
+    # Bearish P3: fake breakout followed by drop
+    if manipulation_high > max(accumulation_highs):
+        # Check if current price is back below accumulation range
+        if current_close < min(accumulation_lows):
+            return "DOWN", manipulation_high
+    
+    return None, None
+
+
 
 def build_utstc_signal(sym, kl, bar_i):
     if len(kl)<60: return None
@@ -1003,9 +1221,478 @@ def build_cest_signal(sym, kl, bar_i):
     return None
 
 
+def build_orb_fvg_confirm_signal(sym, kl, bar_i):
+    """
+    ORB + FVG Confirm Strategy
+    
+    Opening Range Breakout combined with Fair Value Gap confirmation.
+    Active: 09:45-12:00 EST (14:45-17:00 UTC) - approximate with hourly candles
+    Entry: FVG breakout after range breakout
+    TP/SL: 2:1 Risk/Reward
+    """
+    # Time window: 09:45-12:00 EST ≈ 14:00-17:00 UTC (hour-level approximation)
+    # Since we work with hourly candles, we use 14:00-17:00 UTC
+    if not is_in_time_window(14, 17):
+        return None
+    
+    if len(kl) < 10:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Get opening range (first 30-60 min of trading, approximate with recent session)
+    # Use last 3-5 bars as "opening range"
+    or_high = max(highs[-5:-1])
+    or_low = min(lows[-5:-1])
+    
+    c_now = closes[-1]
+    
+    # Check for range breakout
+    broke_high = c_now > or_high
+    broke_low = c_now < or_low
+    
+    if not (broke_high or broke_low):
+        return None
+    
+    # Check for FVG confirmation
+    h1, h2, h3 = highs[-3:]
+    l1, l2, l3 = lows[-3:]
+    
+    # FVG patterns
+    up_gap = l2 > h1 and c_now > l2
+    dn_gap = h2 < l1 and c_now < h2
+    
+    # Combine: range breakout + FVG
+    if broke_high and up_gap:
+        direction = "UP"
+        tag = "🔥 ORB+FVG BUY"
+    elif broke_low and dn_gap:
+        direction = "DOWN"
+        tag = "🔥 ORB+FVG SELL"
+    else:
+        return None
+    
+    # Calculate TP/SL with 2:1 RR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    if direction == "UP":
+        sl_est = or_low
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+    else:
+        sl_est = or_high
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+    
+    pwr = 62 + (atr_v / c_now) * 150 + (r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "ORB_FVG",
+        "emoji": "🔥",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "ORB_FVG_CONFIRM",
+        "tag": tag,
+        "or_high": or_high,
+        "or_low": or_low
+    }
 
 
-# ===================== SCANNER =====================
+def build_london_breakout_signal(sym, kl, bar_i):
+    """
+    London Breakout (LO) Strategy
+    
+    London session opening range breakout (08:00-10:00 GMT).
+    Entry: Breakout of 30-minute London open range
+    TP/SL: 2:1 Risk/Reward
+    """
+    # Time window: 08:00-10:00 GMT = 08:00-10:00 UTC
+    if not is_in_time_window(8, 10):
+        return None
+    
+    if len(kl) < 10:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Get London opening range (approx first 30 min)
+    # Use bars from 08:00-08:30 (first 1-2 bars)
+    lo_range_high, lo_range_low = get_session_range(kl, 8, 9)
+    
+    if lo_range_high is None:
+        # Fallback: use recent range
+        lo_range_high = max(highs[-3:-1])
+        lo_range_low = min(lows[-3:-1])
+    
+    c_now = closes[-1]
+    
+    # Check for breakout with EMA20 trend confirmation
+    e20 = ema(closes, 20)
+    
+    # Bullish breakout: price breaks above range + above EMA20
+    if c_now > lo_range_high and c_now > e20[-1]:
+        direction = "UP"
+        tag = "🌍 LONDON BO BUY"
+        sl_est = lo_range_low
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+    # Bearish breakout: price breaks below range + below EMA20
+    elif c_now < lo_range_low and c_now < e20[-1]:
+        direction = "DOWN"
+        tag = "🌍 LONDON BO SELL"
+        sl_est = lo_range_high
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+    else:
+        return None
+    
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    pwr = 63 + (atr_v / c_now) * 140 + (r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "LONDON_BO",
+        "emoji": "🌍",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "LONDON_BREAKOUT",
+        "tag": tag,
+        "lo_range_high": lo_range_high,
+        "lo_range_low": lo_range_low
+    }
+
+
+def build_ny_reversal_signal(sym, kl, bar_i):
+    """
+    NY Reversal Strategy
+    
+    New York reversal with liquidity sweep (09:30-11:00 EST).
+    Entry: Liquidity sweep followed by reversal
+    TP/SL: 1.5:1 Risk/Reward
+    """
+    # Time window: 09:30-11:00 EST ≈ 14:00-16:00 UTC (hour-level approximation)
+    # Since we work with hourly candles, we use 14:00-16:00 UTC
+    if not is_in_time_window(14, 16):
+        return None
+    
+    if len(kl) < 15:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Detect liquidity sweep
+    sweep_dir, sweep_level = detect_liquidity_sweep(highs, lows, closes, lookback=10)
+    
+    if sweep_dir is None:
+        return None
+    
+    c_now = closes[-1]
+    direction = sweep_dir
+    
+    # Confirm with TrendLock-style logic (RSI)
+    r_val = rsi(closes)[-1]
+    
+    # For UP reversal: RSI should show recovery
+    if direction == "UP" and r_val < 40:
+        return None
+    
+    # For DOWN reversal: RSI should show weakness
+    if direction == "DOWN" and r_val > 60:
+        return None
+    
+    # Calculate TP/SL with 1.5:1 RR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    
+    if direction == "UP":
+        sl_est = sweep_level - atr_v
+        risk = c_now - sl_est
+        tp_est = c_now + 1.5 * risk
+        tag = "🔄 NY REV BUY"
+    else:
+        sl_est = sweep_level + atr_v
+        risk = sl_est - c_now
+        tp_est = c_now - 1.5 * risk
+        tag = "🔄 NY REV SELL"
+    
+    pwr = 61 + (atr_v / c_now) * 130 + abs(r_val - 50)
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "NY_REVERSAL",
+        "emoji": "🔄",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "NY_REVERSAL",
+        "tag": tag,
+        "sweep_level": sweep_level
+    }
+
+
+def build_ict_power_of_3_signal(sym, kl, bar_i):
+    """
+    ICT Power of 3 Strategy
+    
+    Accumulation -> Manipulation -> Distribution pattern (08:30-12:00 EST).
+    Entry: Distribution phase after manipulation
+    TP/SL: 2:1 Risk/Reward
+    """
+    # Time window: 08:30-12:00 EST ≈ 13:00-17:00 UTC (hour-level approximation)
+    # Since we work with hourly candles, we use 13:00-17:00 UTC
+    if not is_in_time_window(13, 17):
+        return None
+    
+    if len(kl) < 20:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    
+    # Detect P3 pattern
+    p3_dir, manipulation_level = detect_ict_power_of_3(highs, lows, closes, opens)
+    
+    if p3_dir is None:
+        return None
+    
+    c_now = closes[-1]
+    direction = p3_dir
+    
+    # Check FVG for additional confirmation
+    h1, h2, h3 = highs[-3:]
+    l1, l2, l3 = lows[-3:]
+    
+    up_gap = l2 > h1 and c_now > l2
+    dn_gap = h2 < l1 and c_now < h2
+    
+    # Require FVG alignment
+    if direction == "UP" and not up_gap:
+        return None
+    if direction == "DOWN" and not dn_gap:
+        return None
+    
+    # Calculate TP/SL with 2:1 RR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    if direction == "UP":
+        sl_est = manipulation_level
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+        tag = "⚡ ICT P3 BUY"
+    else:
+        sl_est = manipulation_level
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+        tag = "⚡ ICT P3 SELL"
+    
+    pwr = 64 + (atr_v / c_now) * 145 + (r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "ICT_P3",
+        "emoji": "⚡",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "ICT_POWER_OF_3",
+        "tag": tag,
+        "manipulation_level": manipulation_level
+    }
+
+
+def build_asian_range_breakout_signal(sym, kl, bar_i):
+    """
+    Asian Range Breakout (ARB) Strategy
+    
+    Asian session range breakout (03:00-08:00 GMT).
+    Entry: Breakout of Asian range during London/NY session
+    TP/SL: 2:1 Risk/Reward
+    """
+    # Active during Asian session breakout time: 03:00-08:00 GMT = 03:00-08:00 UTC
+    # But we also allow signals shortly after (08:00-09:00) for breakout confirmation
+    if not is_in_time_window(3, 9):
+        return None
+    
+    if len(kl) < 10:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Get Asian session range (03:00-08:00 GMT)
+    asian_high, asian_low = get_session_range(kl, 3, 8)
+    
+    if asian_high is None:
+        # Fallback: use recent tight range
+        asian_high = max(highs[-6:-1])
+        asian_low = min(lows[-6:-1])
+    
+    c_now = closes[-1]
+    
+    # Check for breakout
+    broke_high = c_now > asian_high
+    broke_low = c_now < asian_low
+    
+    if not (broke_high or broke_low):
+        return None
+    
+    # Calculate TP/SL with 2:1 RR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    if broke_high:
+        direction = "UP"
+        tag = "🌏 ASIA BO BUY"
+        sl_est = asian_low
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+    else:
+        direction = "DOWN"
+        tag = "🌏 ASIA BO SELL"
+        sl_est = asian_high
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+    
+    pwr = 62 + (atr_v / c_now) * 135 + (r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "ASIAN_BO",
+        "emoji": "🌏",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "ASIAN_RANGE_BREAKOUT",
+        "tag": tag,
+        "asian_high": asian_high,
+        "asian_low": asian_low
+    }
+
+
+def build_fvg_breaker_block_signal(sym, kl, bar_i):
+    """
+    FVG + Breaker Block Strategy
+    
+    Fair Value Gap with Breaker Block confirmation (session independent).
+    Entry: FVG breakout at breaker block level
+    TP/SL: 2:1 Risk/Reward
+    """
+    # Session independent - no time filter
+    
+    if len(kl) < 25:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Check for FVG first
+    h1, h2, h3 = highs[-3:]
+    l1, l2, l3 = lows[-3:]
+    c_now = closes[-1]
+    
+    up_gap = l2 > h1 and c_now > l2
+    dn_gap = h2 < l1 and c_now < h2
+    
+    if not (up_gap or dn_gap):
+        return None
+    
+    # Determine direction
+    direction = "UP" if up_gap else "DOWN"
+    
+    # Check for breaker block confirmation
+    has_breaker, breaker_level = detect_breaker_block(highs, lows, closes, direction, lookback=20)
+    
+    if not has_breaker:
+        return None
+    
+    # Calculate TP/SL with 2:1 RR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    if direction == "UP":
+        sl_est = breaker_level - atr_v
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+        tag = "🧱 FVG+BREAKER BUY"
+    else:
+        sl_est = breaker_level + atr_v
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+        tag = "🧱 FVG+BREAKER SELL"
+    
+    pwr = 65 + (atr_v / c_now) * 140 + (r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "FVG_BREAKER",
+        "emoji": "🧱",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "FVG_BREAKER_BLOCK",
+        "tag": tag,
+        "breaker_level": breaker_level
+    }
+
+
+
 
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
@@ -1025,8 +1712,17 @@ def scan_symbol(sym,bar_i):
     
     # EMA Structure Strategy
     s_structure = build_ema_structure_signal(sym, kl, bar_i)
+    
+    # New strategies (6 new ones)
+    s_orb_fvg = build_orb_fvg_confirm_signal(sym, kl, bar_i)
+    s_london_bo = build_london_breakout_signal(sym, kl, bar_i)
+    s_ny_rev = build_ny_reversal_signal(sym, kl, bar_i)
+    s_ict_p3 = build_ict_power_of_3_signal(sym, kl, bar_i)
+    s_asian_bo = build_asian_range_breakout_signal(sym, kl, bar_i)
+    s_fvg_breaker = build_fvg_breaker_block_signal(sym, kl, bar_i)
 
-    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull, s_structure):
+    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull, s_structure,
+              s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker):
         if s: res.append(s)
     
     return res
@@ -1338,6 +2034,13 @@ def ai_update_analysis_snapshot():
         "kivanc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="KIVANC_CONFIRM"),
         "cest_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="CEST"),
         "ema_structure_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_STRUCTURE"),
+        # New strategies tracking
+        "orb_fvg_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ORB_FVG_CONFIRM"),
+        "london_bo_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="LONDON_BREAKOUT"),
+        "ny_reversal_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="NY_REVERSAL"),
+        "ict_p3_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ICT_POWER_OF_3"),
+        "asian_bo_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ASIAN_RANGE_BREAKOUT"),
+        "fvg_breaker_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_BREAKER_BLOCK"),
         "sim_open_count":len([p for p in SIM_POSITIONS if p.get("status")=="OPEN"]),
         "sim_closed_count":len(SIM_CLOSED)
     }
@@ -1647,8 +2350,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.53 aktif (EARLY removed, EMA-Structure No SL) — Power filter removed")
-    log("[START] EMA ULTRA v15.9.53 FULL")
+    tg_send("🚀 EMA ULTRA v15.9.54 aktif (6 new strategies added) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.54 FULL")
 
     symbols=auto_init_symbols()
 
