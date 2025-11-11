@@ -1829,8 +1829,8 @@ def get_account_balance():
     """Fetch current futures account balance (margin balance)"""
     try:
         acc = _signed_request("GET", "/fapi/v2/account", {"timestamp": now_ts_ms()})
-        # Get total wallet balance (margin balance)
-        balance = float(acc.get("totalWalletBalance", 0))
+        # Get total margin balance (includes unrealized PnL)
+        balance = float(acc.get("totalMarginBalance", 0))
         return balance
     except Exception as e:
         log(f"[GET BALANCE ERR] {e}")
