@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.55 — Active Strategies (EARLY removed + 6 New Strategies)
+# 📘 EMA ULTRA v15.9.56 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
 #  - UT/STC devre dışı bırakıldı
 #  - Aktif stratejiler:
@@ -1829,8 +1829,8 @@ def get_account_balance():
     """Fetch current futures account balance (margin balance)"""
     try:
         acc = _signed_request("GET", "/fapi/v2/account", {"timestamp": now_ts_ms()})
-        # Get total wallet balance (margin balance)
-        balance = float(acc.get("totalWalletBalance", 0))
+        # Get total margin balance (includes unrealized PnL)
+        balance = float(acc.get("totalMarginBalance", 0))
         return balance
     except Exception as e:
         log(f"[GET BALANCE ERR] {e}")
@@ -2525,8 +2525,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.55 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.55 FULL (UT/STC disabled)")
+    tg_send("🚀 EMA ULTRA v15.9.56 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.56 FULL (UT/STC disabled)")
 
     symbols=auto_init_symbols()
 
