@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.57 — Active Strategies (EARLY removed + 6 New Strategies)
+# 📘 EMA ULTRA v15.9.58 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
 #  - UT/STC devre dışı bırakıldı
 #  - Aktif stratejiler:
@@ -1684,6 +1684,15 @@ def futures_get_price(sym):
     except:
         return None
 
+def futures_get_mark_price(sym):
+    """Get mark price from Binance Futures premiumIndex endpoint"""
+    try:
+        r=requests.get(BINANCE_FAPI+"/fapi/v1/premiumIndex",
+                       params={"symbol":sym},timeout=5).json()
+        return float(r["markPrice"])
+    except:
+        return None
+
 def futures_get_klines(sym,it,lim):
     try:
         r=requests.get(BINANCE_FAPI+"/fapi/v1/klines",
@@ -1832,15 +1841,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Log to closed trades with exit reason
                 entry_price = float(p.get("entryPrice", 0))
                 # Get mark price as exit price
-                try:
-                    mark_resp = requests.get(
-                        BINANCE_FAPI + "/fapi/v1/premiumIndex",
-                        params={"symbol": sym},
-                        timeout=5
-                    ).json()
-                    exit_price = float(mark_resp.get("markPrice", 0))
-                except:
-                    exit_price = None
+                exit_price = futures_get_mark_price(sym)
                 
                 # Get position info from tracker if available
                 pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
@@ -2480,7 +2481,7 @@ def open_market_position(sym, direction, qty):
         except (ValueError, TypeError):
             fill = None
     
-    # Fallback to fetching current market price
+    # Fallback to fetching current market price (last traded price)
     if fill is None or fill <= 0:
         fill = futures_get_price(sym)
         if fill is None or fill <= 0:
@@ -2618,8 +2619,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.57 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.57 FULL (UT/STC disabled)")
+    tg_send("🚀 EMA ULTRA v15.9.58 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.58 FULL (UT/STC disabled)")
 
     symbols=auto_init_symbols()
 
