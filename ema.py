@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.56 — Active Strategies (EARLY removed + 6 New Strategies)
+# 📘 EMA ULTRA v15.9.57 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
 #  - UT/STC devre dışı bırakıldı
 #  - Aktif stratejiler:
@@ -2618,8 +2618,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.56 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.56 FULL (UT/STC disabled)")
+    tg_send("🚀 EMA ULTRA v15.9.57 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.57 FULL (UT/STC disabled)")
 
     symbols=auto_init_symbols()
 
