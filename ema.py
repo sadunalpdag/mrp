@@ -2481,11 +2481,11 @@ def open_market_position(sym, direction, qty):
         except (ValueError, TypeError):
             fill = None
     
-    # Fallback to fetching mark price (instead of last traded price)
+    # Fallback to fetching current market price (last traded price)
     if fill is None or fill <= 0:
-        fill = futures_get_mark_price(sym)
+        fill = futures_get_price(sym)
         if fill is None or fill <= 0:
-            log(f"[PRICE ERR] {sym} could not get valid entry price from mark price")
+            log(f"[PRICE ERR] {sym} could not get valid entry price")
             fill = 0.0
     
     return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
@@ -2542,8 +2542,8 @@ def execute_real_trade(sig):
         opened=open_market_position(sym,direction,qty)
         entry_exec=opened.get("entry")
         if entry_exec is None or entry_exec <= 0:
-            # Try fallback to mark price
-            entry_exec = futures_get_mark_price(sym)
+            # Try fallback to current price
+            entry_exec = futures_get_price(sym)
         if entry_exec is None or entry_exec<=0:
             log(f"[OPEN FAIL] {sym} entry alınamadı."); return
 
