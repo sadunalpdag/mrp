@@ -1684,6 +1684,15 @@ def futures_get_price(sym):
     except:
         return None
 
+def futures_get_mark_price(sym):
+    """Get mark price from Binance Futures premiumIndex endpoint"""
+    try:
+        r=requests.get(BINANCE_FAPI+"/fapi/v1/premiumIndex",
+                       params={"symbol":sym},timeout=5).json()
+        return float(r["markPrice"])
+    except:
+        return None
+
 def futures_get_klines(sym,it,lim):
     try:
         r=requests.get(BINANCE_FAPI+"/fapi/v1/klines",
@@ -1832,15 +1841,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Log to closed trades with exit reason
                 entry_price = float(p.get("entryPrice", 0))
                 # Get mark price as exit price
-                try:
-                    mark_resp = requests.get(
-                        BINANCE_FAPI + "/fapi/v1/premiumIndex",
-                        params={"symbol": sym},
-                        timeout=5
-                    ).json()
-                    exit_price = float(mark_resp.get("markPrice", 0))
-                except:
-                    exit_price = None
+                exit_price = futures_get_mark_price(sym)
                 
                 # Get position info from tracker if available
                 pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
@@ -2480,11 +2481,11 @@ def open_market_position(sym, direction, qty):
         except (ValueError, TypeError):
             fill = None
     
-    # Fallback to fetching current market price
+    # Fallback to fetching mark price (instead of last traded price)
     if fill is None or fill <= 0:
-        fill = futures_get_price(sym)
+        fill = futures_get_mark_price(sym)
         if fill is None or fill <= 0:
-            log(f"[PRICE ERR] {sym} could not get valid entry price")
+            log(f"[PRICE ERR] {sym} could not get valid entry price from mark price")
             fill = 0.0
     
     return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
@@ -2541,8 +2542,8 @@ def execute_real_trade(sig):
         opened=open_market_position(sym,direction,qty)
         entry_exec=opened.get("entry")
         if entry_exec is None or entry_exec <= 0:
-            # Try fallback to current price
-            entry_exec = futures_get_price(sym)
+            # Try fallback to mark price
+            entry_exec = futures_get_mark_price(sym)
         if entry_exec is None or entry_exec<=0:
             log(f"[OPEN FAIL] {sym} entry alınamadı."); return
 
