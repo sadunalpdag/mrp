@@ -1826,8 +1826,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "symbol": sym,
                     "side": side,
                     "type": "MARKET",
+                    "quantity": f"{amt}",
                     "positionSide": pos_side,
-                    "closePosition": "true",
+                    "reduceOnly": "true",
                     "timestamp": now_ts_ms()
                 }
                 res = _signed_request("POST", "/fapi/v1/order", payload)
