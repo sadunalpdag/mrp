@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.59 — Active Strategies (EARLY removed + 6 New Strategies)
+# 📘 EMA ULTRA v15.9.60 — Active Strategies (EARLY removed + 6 New Strategies)
 #  - PEMA ve EARLY tamamen kaldırıldı
 #  - UT/STC devre dışı bırakıldı
 #  - Aktif stratejiler:
@@ -1842,9 +1842,31 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "positionSide": pos_side,
                     "timestamp": now_ts_ms()
                 }
-                res = _signed_request("POST", "/fapi/v1/order", payload)
-                closed_symbols.append(sym)
-                log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
+                
+                try:
+                    res = _signed_request("POST", "/fapi/v1/order", payload)
+                    closed_symbols.append(sym)
+                    log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
+                except Exception as tp_err:
+                    # Check if error is -2021 "Order would immediately trigger"
+                    err_str = str(tp_err)
+                    if "-2021" in err_str or "would immediately trigger" in err_str.lower():
+                        # Fallback: close position directly with MARKET order
+                        log(f"[CLOSE ALL] {sym} TP failed (would immediately trigger), using MARKET order")
+                        market_payload = {
+                            "symbol": sym,
+                            "side": side,
+                            "type": "MARKET",
+                            "quantity": f"{amt}",
+                            "positionSide": pos_side,
+                            "timestamp": now_ts_ms()
+                        }
+                        res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                        closed_symbols.append(sym)
+                        log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (direct close)")
+                    else:
+                        # Re-raise if it's a different error
+                        raise
                 
                 # Remove from trend lock
                 TREND_LOCK.pop(sym, None)
@@ -2631,8 +2653,8 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.59 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.59 FULL (UT/STC disabled)")
+    tg_send("🚀 EMA ULTRA v15.9.60 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
+    log("[START] EMA ULTRA v15.9.60 FULL (UT/STC disabled)")
 
     symbols=auto_init_symbols()
 
