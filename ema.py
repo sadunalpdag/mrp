@@ -1820,19 +1820,31 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 pos_side = "SHORT"
                 amt = abs(amt)
             
-            # Place market close order
+            # Place take profit order at mark price
             try:
+                # Get current mark price
+                mark_price = futures_get_mark_price(sym)
+                if not mark_price:
+                    log(f"[CLOSE ALL SKIP] {sym} - unable to get mark price")
+                    continue
+                
+                # Format stop price according to symbol's tick size
+                stop_price_str = format_price_by_tick(sym, mark_price)
+                
                 payload = {
                     "symbol": sym,
                     "side": side,
-                    "type": "MARKET",
-                    "positionSide": pos_side,
+                    "type": "TAKE_PROFIT_MARKET",
+                    "stopPrice": stop_price_str,
+                    "quantity": f"{amt}",
+                    "workingType": "MARK_PRICE",
                     "closePosition": "true",
+                    "positionSide": pos_side,
                     "timestamp": now_ts_ms()
                 }
                 res = _signed_request("POST", "/fapi/v1/order", payload)
                 closed_symbols.append(sym)
-                log(f"[CLOSE ALL] {sym} {pos_side} closed at market")
+                log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 
                 # Remove from trend lock
                 TREND_LOCK.pop(sym, None)
