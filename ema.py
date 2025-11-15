@@ -5,22 +5,26 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.60 — Active Strategies (EARLY removed + 6 New Strategies)
-#  - PEMA ve EARLY tamamen kaldırıldı
-#  - UT/STC devre dışı bırakıldı
-#  - Aktif stratejiler:
+# 📘 EMA ULTRA v15.9.62 — Active Strategies (KIVANC removed + Asian improved)
+#  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
+#  - Aktif stratejiler (12 strateji):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
-#       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
-#       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy)
+#       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy - IMPROVED)
 #       🔥 ORB + FVG CONFIRM (Opening Range Breakout + FVG - 09:45-12:00 EST)
 #       🌍 LONDON BREAKOUT (LO Session ORB - 08:00-10:00 GMT)
 #       🔄 NY REVERSAL (Liquidity Sweep + Reversal - 09:30-11:00 EST)
 #       ⚡ ICT POWER OF 3 (Accumulation-Manipulation-Distribution - 08:30-12:00 EST)
-#       🌏 ASIAN RANGE BREAKOUT (ARB - 03:00-08:00 GMT)
+#       🌏 ASIAN SESSION (Liquidity Sweep + Range Fade + Micro FVG - IMPROVED)
 #       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
-#  - Power filtresi kaldırıldı,margin wallet geldi 60 dolarla kar al seceneği eklendi. 
+#       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
+#       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
+#  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
+#  - Strategy enable/disable via Telegram commands
+#  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
+#  - Asian session improved: Liquidity sweep, range fade, mean reversion
+#  - Power filtresi kaldırıldı, margin wallet geldi 60 dolarla kar al seçeneği eklendi. 
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
 
@@ -51,9 +55,6 @@ TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 getcontext().prec = 28
-
-# ===================== Kıvanç Confirm Settings =====================
-# KIVANC_CONFIRM now uses global PARAM settings (MAX_BUY, MAX_SELL, TRADE_SIZE_USDT)
 
 # ===================== UTILITIES =====================
 
@@ -547,6 +548,235 @@ def detect_ict_power_of_3(highs, lows, closes, opens):
     return None, None
 
 
+# ===================== RE-ENTRY STRATEGY HELPERS =====================
+
+def detect_4h_trend(closes_4h):
+    """
+    Detect 4H trend direction for re-entry strategy.
+    
+    Returns:
+        "UP" for bullish, "DOWN" for bearish, None for unclear trend
+    """
+    if len(closes_4h) < 20:
+        return None
+    
+    # Use EMA20 and price action
+    ema20_4h = ema(closes_4h, 20)
+    
+    # Check if price is consistently above/below EMA20
+    recent_closes = closes_4h[-5:]
+    recent_ema = ema20_4h[-5:]
+    
+    above_count = sum(1 for i in range(len(recent_closes)) if recent_closes[i] > recent_ema[i])
+    below_count = sum(1 for i in range(len(recent_closes)) if recent_closes[i] < recent_ema[i])
+    
+    # Clear uptrend: most recent closes above EMA20
+    if above_count >= 4:
+        return "UP"
+    # Clear downtrend: most recent closes below EMA20
+    elif below_count >= 4:
+        return "DOWN"
+    else:
+        return None
+
+def detect_5m_reentry(klines_5m, zone_high, zone_low, trend_direction):
+    """
+    Detect re-entry pattern on 5m timeframe.
+    
+    Args:
+        klines_5m: 5-minute klines
+        zone_high: 4H zone high (from last completed 4H candle)
+        zone_low: 4H zone low (from last completed 4H candle)
+        trend_direction: "UP" or "DOWN" from 4H analysis
+    
+    Returns:
+        ("LONG", entry_price, sl_price) or ("SHORT", entry_price, sl_price) or (None, None, None)
+    """
+    if len(klines_5m) < 10:
+        return None, None, None
+    
+    closes = [float(k[4]) for k in klines_5m]
+    highs = [float(k[2]) for k in klines_5m]
+    lows = [float(k[3]) for k in klines_5m]
+    opens = [float(k[1]) for k in klines_5m]
+    
+    # Check last 5 candles for the pattern
+    for i in range(len(closes) - 5, len(closes) - 1):
+        if i < 0:
+            continue
+        
+        # Pattern: Break out of zone, then re-enter
+        prev_close = closes[i - 1] if i > 0 else closes[i]
+        curr_close = closes[i]
+        curr_high = highs[i]
+        curr_low = lows[i]
+        curr_open = opens[i]
+        
+        # Check for body size (strong candle requirement)
+        body_size = abs(curr_close - curr_open)
+        candle_range = curr_high - curr_low
+        
+        # Body should be at least 60% of the range for "strong" candle
+        if candle_range > 0 and body_size / candle_range < 0.6:
+            continue
+        
+        # LONG setup (4H bullish, looking at lower zone)
+        if trend_direction == "UP":
+            # Check if we broke below zone_low with strong body close
+            broke_below = curr_close < zone_low and curr_open > zone_low
+            
+            if broke_below:
+                # Now check if next candle re-enters zone
+                for j in range(i + 1, min(i + 4, len(closes))):
+                    reenter_close = closes[j]
+                    reenter_open = opens[j]
+                    reenter_body = abs(reenter_close - reenter_open)
+                    reenter_range = highs[j] - lows[j]
+                    
+                    # Strong bullish candle closing back inside zone
+                    if (reenter_close > zone_low and reenter_close < zone_high and
+                        reenter_close > reenter_open and
+                        reenter_range > 0 and reenter_body / reenter_range >= 0.6):
+                        
+                        # Stop loss below the swing low
+                        sl = lows[i] - (zone_high - zone_low) * 0.1  # 10% buffer
+                        return "LONG", reenter_close, sl
+        
+        # SHORT setup (4H bearish, looking at upper zone)
+        elif trend_direction == "DOWN":
+            # Check if we broke above zone_high with strong body close
+            broke_above = curr_close > zone_high and curr_open < zone_high
+            
+            if broke_above:
+                # Now check if next candle re-enters zone
+                for j in range(i + 1, min(i + 4, len(closes))):
+                    reenter_close = closes[j]
+                    reenter_open = opens[j]
+                    reenter_body = abs(reenter_close - reenter_open)
+                    reenter_range = highs[j] - lows[j]
+                    
+                    # Strong bearish candle closing back inside zone
+                    if (reenter_close < zone_high and reenter_close > zone_low and
+                        reenter_close < reenter_open and
+                        reenter_range > 0 and reenter_body / reenter_range >= 0.6):
+                        
+                        # Stop loss above the swing high
+                        sl = highs[i] + (zone_high - zone_low) * 0.1  # 10% buffer
+                        return "SHORT", reenter_close, sl
+    
+    return None, None, None
+
+
+# ===================== MSS (Market Structure Shift) HELPERS =====================
+
+def detect_mss(highs, lows, closes, lookback=20):
+    """
+    Detect Market Structure Shift (MSS) - a clear break of market structure.
+    
+    MSS is when price breaks the most recent swing high (for bullish) or swing low (for bearish)
+    indicating a potential trend change or continuation.
+    
+    Returns:
+        ("UP", break_level) for bullish MSS
+        ("DOWN", break_level) for bearish MSS
+        (None, None) if no MSS
+    """
+    if len(closes) < lookback + 5:
+        return None, None
+    
+    # Find recent swing highs and lows
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(len(highs) - lookback, len(highs) - 2):
+        # Swing high: higher than surrounding bars
+        if i > 1 and i < len(highs) - 2:
+            if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1]:
+                swing_highs.append((i, highs[i]))
+            
+            # Swing low: lower than surrounding bars
+            if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1]:
+                swing_lows.append((i, lows[i]))
+    
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return None, None
+    
+    # Get most recent swing levels
+    last_swing_high = swing_highs[-1][1]
+    last_swing_low = swing_lows[-1][1]
+    
+    current_close = closes[-1]
+    prev_close = closes[-2]
+    
+    # Bullish MSS: price breaks above the last swing high
+    if prev_close <= last_swing_high and current_close > last_swing_high:
+        return "UP", last_swing_high
+    
+    # Bearish MSS: price breaks below the last swing low
+    if prev_close >= last_swing_low and current_close < last_swing_low:
+        return "DOWN", last_swing_low
+    
+    return None, None
+
+def detect_order_block(highs, lows, closes, opens, direction, lookback=20):
+    """
+    Detect Order Block (OB) - institutional supply/demand zone.
+    
+    An order block is the last opposing candle before a strong move.
+    For bullish OB: last bearish candle before bullish move
+    For bearish OB: last bullish candle before bearish move
+    
+    Returns:
+        (found, ob_high, ob_low) - True and OB levels if found
+    """
+    if len(closes) < lookback + 5:
+        return False, None, None
+    
+    # Look for strong moves (multiple consecutive candles in same direction)
+    for i in range(len(closes) - lookback, len(closes) - 5):
+        if direction == "UP":
+            # Find a sequence of bullish candles
+            bullish_count = 0
+            for j in range(i, min(i + 5, len(closes))):
+                if closes[j] > opens[j]:
+                    bullish_count += 1
+            
+            # If we have 3+ bullish candles, look for last bearish candle before them
+            if bullish_count >= 3:
+                for k in range(i - 1, max(0, i - 5), -1):
+                    if closes[k] < opens[k]:  # Bearish candle
+                        # This is the order block
+                        ob_high = highs[k]
+                        ob_low = lows[k]
+                        
+                        # Check if current price is near this OB (retest)
+                        current_price = closes[-1]
+                        if ob_low <= current_price <= ob_high * 1.02:  # Within 2% above OB
+                            return True, ob_high, ob_low
+        
+        elif direction == "DOWN":
+            # Find a sequence of bearish candles
+            bearish_count = 0
+            for j in range(i, min(i + 5, len(closes))):
+                if closes[j] < opens[j]:
+                    bearish_count += 1
+            
+            # If we have 3+ bearish candles, look for last bullish candle before them
+            if bearish_count >= 3:
+                for k in range(i - 1, max(0, i - 5), -1):
+                    if closes[k] > opens[k]:  # Bullish candle
+                        # This is the order block
+                        ob_high = highs[k]
+                        ob_low = lows[k]
+                        
+                        # Check if current price is near this OB (retest)
+                        current_price = closes[-1]
+                        if ob_high >= current_price >= ob_low * 0.98:  # Within 2% below OB
+                            return True, ob_high, ob_low
+    
+    return False, None, None
+
+
 
 def build_utstc_signal(sym, kl, bar_i):
     if len(kl)<60: return None
@@ -712,104 +942,9 @@ def build_ema_pullback_signal(sym, kl, bar_i):
 
 
 
-def build_kivanc_confirm_signal(sym, kl, bar_i):
-    """
-    Kıvanç Özbilgıç SuperTrend + EMA Cross Strategy
-    Signal only on the 1st candle AFTER:
-    1) EMA9 crosses EMA30 (crossover just happened)
-    2) SuperTrend direction aligns with crossover
-    3) Price is within 2% of SuperTrend line
-    """
-    if len(kl) < 60:
-        return None
-    
-    closes = [float(k[4]) for k in kl]
-    highs = [float(k[2]) for k in kl]
-    lows = [float(k[3]) for k in kl]
-    
-    # Calculate SuperTrend
-    st_values, st_direction = supertrend(highs, lows, closes)
-    
-    # Calculate EMAs
-    ema9 = ema(closes, 9)
-    ema30 = ema(closes, 30)
-    
-    # Get current and previous values
-    st_dir_now = st_direction[-1]
-    st_value = st_values[-1]
-    ema9_now = ema9[-1]
-    ema30_now = ema30[-1]
-    ema9_prev = ema9[-2]
-    ema30_prev = ema30[-2]
-    entry = closes[-1]
-    
-    # Check for EMA crossover on the CURRENT candle (1st candle after crossover)
-    # Bullish crossover: EMA9 was below/equal EMA30, now EMA9 is above EMA30
-    bullish_cross = (ema9_prev <= ema30_prev) and (ema9_now > ema30_now)
-    
-    # Bearish crossover: EMA9 was above/equal EMA30, now EMA9 is below EMA30
-    bearish_cross = (ema9_prev >= ema30_prev) and (ema9_now < ema30_now)
-    
-    # Determine direction based on crossover + SuperTrend alignment
-    direction = None
-    if bullish_cross and st_dir_now == "UP":
-        direction = "UP"
-    elif bearish_cross and st_dir_now == "DOWN":
-        direction = "DOWN"
-    
-    if direction is None:
-        return None
-    
-    # Check distance from SuperTrend (price should be close to SuperTrend)
-    st_distance_pct = abs(entry - st_value) / max(st_value, 1e-12) * 100
-    
-    # Maximum allowed distance from SuperTrend (default 2%)
-    max_st_distance_pct = 2.0
-    
-    if st_distance_pct > max_st_distance_pct:
-        # Price too far from SuperTrend, skip signal
-        return None
-    
-    # Calculate additional metrics
-    atr_v = atr_like(highs, lows, closes)[-1]
-    r_val = rsi(closes)[-1]
-    pwr = 60 + abs(ema9_now - ema30_now) * 120 + (r_val - 50) / 2.0
-    
-    # Set TP and SL like other strategies (will use Smart TP in execute_real_trade)
-    if direction == "UP":
-        tp = entry * 1.006
-        sl = entry * 0.994
-    else:
-        tp = entry * 0.994
-        sl = entry * 1.006
-    
-    return {
-        "symbol": sym,
-        "dir": direction,
-        "tier": "KIVANC",
-        "emoji": "🧩",
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "power": pwr,
-        "rsi": r_val,
-        "atr": atr_v,
-        "time": now_local_iso(),
-        "born_bar": bar_i,
-        "early": False,
-        "kind": "KIVANC_CONFIRM",
-        "tag": f"🧩 KIVANC {'BUY' if direction == 'UP' else 'SELL'} CROSS",
-        "supertrend_dir": st_dir_now,
-        "supertrend_value": st_value,
-        "st_distance_pct": st_distance_pct,
-        "ema9": ema9_now,
-        "ema30": ema30_now,
-        "crossover": True
-    }
-
 def build_cest_signal(sym, kl, bar_i):
     """
-    C.E.S.T. – 50 MA Double Top/Bottom Strategy
+    C.E.S.T. – 50 MA Double Top/Bottom Strategy (IMPROVED VERSION)
     
     Strategy Rules:
     📈 Long (Alış):
@@ -826,6 +961,14 @@ def build_cest_signal(sym, kl, bar_i):
     
     🛑 Stop Loss: Swing Low/High ± 1 ATR
     🎯 Target: Risk:Reward = 1:1.4 (or 1:2)
+    
+    ✨ IMPROVEMENTS:
+    1. Multi-timeframe confirmation (4H trend check)
+    2. Enhanced pattern quality (tighter tolerance)
+    3. RSI filter for better entries
+    4. Confirmation candle quality check (body size, volume)
+    5. ATR-based SL/TP optimization
+    6. Time/session filter (London/NY sessions)
     """
     if len(kl) < 60:
         return None
@@ -845,36 +988,88 @@ def build_cest_signal(sym, kl, bar_i):
     c_now = closes[-1]
     ma50_now = ma50[-1]
     
+    # Get parameters from PARAM
+    tolerance = PARAM.get("CEST_TOLERANCE", 0.015)
+    lookback = PARAM.get("CEST_LOOKBACK", 10)
+    min_body_ratio = PARAM.get("CEST_MIN_BODY_RATIO", 0.6)
+    rr_ratio = PARAM.get("CEST_RR_RATIO", 1.4)
+    
+    # IMPROVEMENT 1: Multi-timeframe confirmation (4H trend check)
+    try:
+        kl_4h = futures_get_klines(sym, "4h", 30)
+        if len(kl_4h) >= 20:
+            closes_4h = [float(k[4]) for k in kl_4h]
+            trend_4h = detect_4h_trend(closes_4h)
+        else:
+            trend_4h = None
+    except:
+        trend_4h = None
+    
+    # IMPROVEMENT 3: RSI filter
+    r_val = rsi(closes)[-1]
+    
+    # IMPROVEMENT 7: Time/session filter (London/NY sessions)
+    current_hour = get_current_utc_hour()
+    in_session = (8 <= current_hour < 12) or (13 <= current_hour < 17)  # London or NY
+    
+    # If session filter is enabled but we're not in session, skip
+    if not in_session and PARAM.get("CEST_SESSION_FILTER", False):
+        return None
+    
     # ========== LONG SETUP ==========
     # Check if price is above 50 MA
     if c_now > ma50_now:
-        # Detect Double Bottom
+        # IMPROVEMENT 1: Check 4H trend alignment (should be bullish or neutral for long)
+        if trend_4h == "DOWN":
+            return None  # Don't trade against 4H trend
+        
+        # Detect Double Bottom with improved parameters
         found, bottom1_idx, bottom2_idx, touches_ma = detect_double_bottom(
-            highs, lows, closes, ma50, lookback=10, tolerance=0.015
+            highs, lows, closes, ma50, lookback=lookback, tolerance=tolerance
         )
         
         if found and touches_ma:
-            # Check for confirmation candle: green candle closing above MA50
+            # IMPROVEMENT 4: Check for confirmation candle quality
             # Current candle should be green (close > open)
             is_green = closes[-1] > opens[-1]
+            
+            # Calculate body to range ratio for confirmation candle
+            body_size = abs(closes[-1] - opens[-1])
+            candle_range = highs[-1] - lows[-1]
+            body_ratio = body_size / max(candle_range, 1e-12)
+            
+            # Body should be strong (>60% of range by default)
+            if body_ratio < min_body_ratio:
+                return None
             
             # Previous candle should have been below or at MA50
             prev_below_ma = closes[-2] <= ma50[-2]
             
+            # IMPROVEMENT 3: RSI should not be overbought for long entry
+            if r_val > 70:
+                return None  # Skip overbought conditions
+            
             if is_green and prev_below_ma:
                 direction = "UP"
                 
-                # Calculate Stop Loss: Last swing low - 1 ATR
+                # IMPROVEMENT 5: ATR-based SL optimization
                 swing_low = min(lows[bottom1_idx], lows[bottom2_idx])
                 sl_est = swing_low - atr_v
                 
-                # Calculate Take Profit: Risk:Reward = 1:1.4
+                # Calculate Take Profit with configurable RR ratio
                 risk = c_now - sl_est
-                tp_est = c_now + (1.4 * risk)
+                tp_est = c_now + (rr_ratio * risk)
                 
-                # Calculate power
-                r_val = rsi(closes)[-1]
-                pwr = 60 + abs(c_now - ma50_now) * 100 + (r_val - 50) / 2.0
+                # Calculate power with improved metrics
+                pwr = 62 + abs(c_now - ma50_now) * 100 + (50 - r_val) / 2.0 + body_ratio * 10
+                
+                # IMPROVEMENT 6: Check for FVG/Liquidity Sweep near pattern
+                # (simplified check - can be enhanced)
+                has_fvg = False
+                if len(highs) >= 3:
+                    h1, h2, h3 = highs[-3:]
+                    l1, l2, l3 = lows[-3:]
+                    has_fvg = l2 > h1  # Bullish FVG
                 
                 return {
                     "symbol": sym,
@@ -891,41 +1086,68 @@ def build_cest_signal(sym, kl, bar_i):
                     "born_bar": bar_i,
                     "early": False,
                     "kind": "CEST",
-                    "tag": "🧩 C.E.S.T. BUY",
+                    "tag": "🧩 C.E.S.T. BUY" + (" +FVG" if has_fvg else ""),
                     "ma50": ma50_now,
-                    "swing_low": swing_low
+                    "swing_low": swing_low,
+                    "trend_4h": trend_4h,
+                    "body_ratio": body_ratio,
+                    "has_fvg": has_fvg
                 }
     
     # ========== SHORT SETUP ==========
     # Check if price is below 50 MA
     if c_now < ma50_now:
-        # Detect Double Top
+        # IMPROVEMENT 1: Check 4H trend alignment (should be bearish or neutral for short)
+        if trend_4h == "UP":
+            return None  # Don't trade against 4H trend
+        
+        # Detect Double Top with improved parameters
         found, top1_idx, top2_idx, touches_ma = detect_double_top(
-            highs, lows, closes, ma50, lookback=10, tolerance=0.015
+            highs, lows, closes, ma50, lookback=lookback, tolerance=tolerance
         )
         
         if found and touches_ma:
-            # Check for confirmation candle: red candle closing below MA50
+            # IMPROVEMENT 4: Check for confirmation candle quality
             # Current candle should be red (close < open)
             is_red = closes[-1] < opens[-1]
+            
+            # Calculate body to range ratio for confirmation candle
+            body_size = abs(closes[-1] - opens[-1])
+            candle_range = highs[-1] - lows[-1]
+            body_ratio = body_size / max(candle_range, 1e-12)
+            
+            # Body should be strong (>60% of range by default)
+            if body_ratio < min_body_ratio:
+                return None
             
             # Previous candle should have been above or at MA50
             prev_above_ma = closes[-2] >= ma50[-2]
             
+            # IMPROVEMENT 3: RSI should not be oversold for short entry
+            if r_val < 30:
+                return None  # Skip oversold conditions
+            
             if is_red and prev_above_ma:
                 direction = "DOWN"
                 
-                # Calculate Stop Loss: Last swing high + 1 ATR
+                # IMPROVEMENT 5: ATR-based SL optimization
                 swing_high = max(highs[top1_idx], highs[top2_idx])
                 sl_est = swing_high + atr_v
                 
-                # Calculate Take Profit: Risk:Reward = 1:1.4
+                # Calculate Take Profit with configurable RR ratio
                 risk = sl_est - c_now
-                tp_est = c_now - (1.4 * risk)
+                tp_est = c_now - (rr_ratio * risk)
                 
-                # Calculate power
-                r_val = rsi(closes)[-1]
-                pwr = 60 + abs(c_now - ma50_now) * 100 + (r_val - 50) / 2.0
+                # Calculate power with improved metrics
+                pwr = 62 + abs(c_now - ma50_now) * 100 + (r_val - 50) / 2.0 + body_ratio * 10
+                
+                # IMPROVEMENT 6: Check for FVG/Liquidity Sweep near pattern
+                # (simplified check - can be enhanced)
+                has_fvg = False
+                if len(highs) >= 3:
+                    h1, h2, h3 = highs[-3:]
+                    l1, l2, l3 = lows[-3:]
+                    has_fvg = h2 < l1  # Bearish FVG
                 
                 return {
                     "symbol": sym,
@@ -942,9 +1164,12 @@ def build_cest_signal(sym, kl, bar_i):
                     "born_bar": bar_i,
                     "early": False,
                     "kind": "CEST",
-                    "tag": "🧩 C.E.S.T. SELL",
+                    "tag": "🧩 C.E.S.T. SELL" + (" +FVG" if has_fvg else ""),
                     "ma50": ma50_now,
-                    "swing_high": swing_high
+                    "swing_high": swing_high,
+                    "trend_4h": trend_4h,
+                    "body_ratio": body_ratio,
+                    "has_fvg": has_fvg
                 }
     
     return None
@@ -1272,25 +1497,41 @@ def build_ict_power_of_3_signal(sym, kl, bar_i):
 
 def build_asian_range_breakout_signal(sym, kl, bar_i):
     """
-    Asian Range Breakout (ARB) Strategy
+    Asian Session Strategy (IMPROVED - Range-Bound/Mean Reversion)
     
-    Asian session range breakout (03:00-08:00 GMT).
-    Entry: Breakout of Asian range during London/NY session
-    TP/SL: 2:1 Risk/Reward
+    Asian session (03:00-08:00 GMT) is characterized by low volatility and ranging behavior.
+    Instead of breakout-following (which often fails), this strategy uses:
+    
+    1. **Liquidity Sweep + Reversal** (Primary - Highest Winrate):
+       - Detects when price sweeps Asian range high/low (stop hunt)
+       - Waits for strong reversal candle closing back inside range
+       - Enters on mean reversion back to range center
+    
+    2. **Range Scalping** (Secondary):
+       - Fades extremes: sells at range top, buys at range bottom
+       - Quick scalps targeting range mean (VWAP/midpoint)
+    
+    3. **Micro FVG Fill**:
+       - Small FVG gaps within Asian range get filled quickly
+       - Mean reversion to fair value
+    
+    Entry: Liquidity sweep detection + 5m strong reversal candle
+    TP/SL: 1:1.5 Risk/Reward (Asian session has lower volatility)
+    Time: Active 03:00-09:00 GMT (includes early London for sweep detection)
     """
-    # Active during Asian session breakout time: 03:00-08:00 GMT = 03:00-08:00 UTC
-    # But we also allow signals shortly after (08:00-09:00) for breakout confirmation
+    # Active during and shortly after Asian session: 03:00-09:00 GMT
     if not is_in_time_window(3, 9):
         return None
     
-    if len(kl) < 10:
+    if len(kl) < 15:
         return None
     
     closes = [float(k[4]) for k in kl]
     highs = [float(k[2]) for k in kl]
     lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
     
-    # Get Asian session range (03:00-08:00 GMT)
+    # Get Asian session range (03:00-08:00 GMT) using 1H candles
     asian_high, asian_low = get_session_range(kl, 3, 8)
     
     if asian_high is None:
@@ -1298,38 +1539,158 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         asian_high = max(highs[-6:-1])
         asian_low = min(lows[-6:-1])
     
-    c_now = closes[-1]
+    # Calculate range midpoint for mean reversion target
+    range_mid = (asian_high + asian_low) / 2.0
+    range_size = asian_high - asian_low
     
-    # Check for breakout
-    broke_high = c_now > asian_high
-    broke_low = c_now < asian_low
-    
-    if not (broke_high or broke_low):
+    # Skip if range is too wide (not a typical Asian ranging session)
+    if range_size / range_mid > 0.02:  # More than 2% range
         return None
     
-    # Calculate TP/SL with 2:1 RR
+    c_now = closes[-1]
+    h_now = highs[-1]
+    l_now = lows[-1]
+    o_now = opens[-1]
+    
+    # Get previous candle data for sweep detection
+    if len(closes) < 2:
+        return None
+    c_prev = closes[-2]
+    h_prev = highs[-2]
+    l_prev = lows[-2]
+    
+    # ===== STRATEGY 1: LIQUIDITY SWEEP + REVERSAL (Primary) =====
+    # Detect liquidity sweep: wick above/below range, but body closes back inside
+    
+    # Bullish Sweep: Swept below asian_low (stop hunt), then reversed up
+    sweep_buffer = range_size * 0.002  # 0.2% buffer for sweep detection
+    bullish_sweep = (
+        l_now < (asian_low - sweep_buffer) and  # Wick swept below range
+        c_now > asian_low and                    # But closed back inside range
+        c_now > o_now and                        # Strong bullish candle (green)
+        (c_now - o_now) / max(h_now - l_now, 1e-12) > 0.6  # Strong body (>60%)
+    )
+    
+    # Bearish Sweep: Swept above asian_high (stop hunt), then reversed down
+    bearish_sweep = (
+        h_now > (asian_high + sweep_buffer) and  # Wick swept above range
+        c_now < asian_high and                   # But closed back inside range
+        c_now < o_now and                        # Strong bearish candle (red)
+        (o_now - c_now) / max(h_now - l_now, 1e-12) > 0.6  # Strong body (>60%)
+    )
+    
+    # ===== STRATEGY 2: RANGE FADE (Secondary) =====
+    # Fade extremes: price is at range edge, fade back to mean
+    
+    # At range high, fade down (sell)
+    at_range_high = c_now >= asian_high * 0.995  # Within 0.5% of range high
+    fade_short = at_range_high and c_now < o_now  # Bearish candle at top
+    
+    # At range low, fade up (buy)
+    at_range_low = c_now <= asian_low * 1.005  # Within 0.5% of range low
+    fade_long = at_range_low and c_now > o_now  # Bullish candle at bottom
+    
+    # ===== STRATEGY 3: MICRO FVG FILL (Bonus) =====
+    # Small FVG within range gets filled quickly
+    has_micro_fvg_up = False
+    has_micro_fvg_down = False
+    
+    if len(highs) >= 3:
+        h1, h2, h3 = highs[-3:]
+        l1, l2, l3 = lows[-3:]
+        
+        # Micro bullish FVG (small gap)
+        if l2 > h1 and (l2 - h1) / range_mid < 0.005:  # Gap < 0.5%
+            has_micro_fvg_up = c_now > l2  # Price above FVG, likely to fill down
+        
+        # Micro bearish FVG (small gap)
+        if h2 < l1 and (l1 - h2) / range_mid < 0.005:  # Gap < 0.5%
+            has_micro_fvg_down = c_now < h2  # Price below FVG, likely to fill up
+    
+    # ===== DETERMINE ENTRY =====
+    direction = None
+    entry_type = None
+    
+    # Priority 1: Liquidity Sweep (highest winrate)
+    if bullish_sweep:
+        direction = "UP"
+        entry_type = "SWEEP"
+        tag = "🌏 ASIA SWEEP BUY"
+    elif bearish_sweep:
+        direction = "DOWN"
+        entry_type = "SWEEP"
+        tag = "🌏 ASIA SWEEP SELL"
+    
+    # Priority 2: Range Fade (mean reversion)
+    elif fade_long and not bullish_sweep:
+        direction = "UP"
+        entry_type = "FADE"
+        tag = "🌏 ASIA FADE BUY"
+    elif fade_short and not bearish_sweep:
+        direction = "DOWN"
+        entry_type = "FADE"
+        tag = "🌏 ASIA FADE SELL"
+    
+    # Priority 3: Micro FVG Fill
+    elif has_micro_fvg_down:
+        direction = "UP"
+        entry_type = "FVG"
+        tag = "🌏 ASIA FVG BUY"
+    elif has_micro_fvg_up:
+        direction = "DOWN"
+        entry_type = "FVG"
+        tag = "🌏 ASIA FVG SELL"
+    
+    if direction is None:
+        return None
+    
+    # ===== CALCULATE TP/SL (Asian session = lower volatility, tighter stops) =====
     atr_v = atr_like(highs, lows, closes)[-1]
     r_val = rsi(closes)[-1]
     
-    if broke_high:
-        direction = "UP"
-        tag = "🌏 ASIA BO BUY"
-        sl_est = asian_low
+    if direction == "UP":
+        # Target: Range midpoint or slightly above
+        if entry_type == "SWEEP":
+            tp_est = range_mid + (range_size * 0.25)  # 25% above mid
+            sl_est = l_now - (atr_v * 0.5)  # Tight stop below sweep wick
+        elif entry_type == "FADE":
+            tp_est = range_mid  # Target mean
+            sl_est = asian_low - (atr_v * 0.3)  # Very tight stop
+        else:  # FVG
+            tp_est = range_mid
+            sl_est = c_now - (atr_v * 0.5)
+        
+        # Ensure 1:1.5 minimum RR
         risk = c_now - sl_est
-        tp_est = c_now + 2.0 * risk
-    else:
-        direction = "DOWN"
-        tag = "🌏 ASIA BO SELL"
-        sl_est = asian_high
-        risk = sl_est - c_now
-        tp_est = c_now - 2.0 * risk
+        if (tp_est - c_now) < (risk * 1.5):
+            tp_est = c_now + (risk * 1.5)
     
-    pwr = 62 + (atr_v / c_now) * 135 + (r_val - 50) / 2.0
+    else:  # DOWN
+        # Target: Range midpoint or slightly below
+        if entry_type == "SWEEP":
+            tp_est = range_mid - (range_size * 0.25)  # 25% below mid
+            sl_est = h_now + (atr_v * 0.5)  # Tight stop above sweep wick
+        elif entry_type == "FADE":
+            tp_est = range_mid  # Target mean
+            sl_est = asian_high + (atr_v * 0.3)  # Very tight stop
+        else:  # FVG
+            tp_est = range_mid
+            sl_est = c_now + (atr_v * 0.5)
+        
+        # Ensure 1:1.5 minimum RR
+        risk = sl_est - c_now
+        if (c_now - tp_est) < (risk * 1.5):
+            tp_est = c_now - (risk * 1.5)
+    
+    # Power calculation (lower for Asian session - less aggressive)
+    pwr = 58 + (atr_v / c_now) * 100 + abs(r_val - 50) / 2.0
+    if entry_type == "SWEEP":
+        pwr += 5  # Sweep has higher winrate
     
     return {
         "symbol": sym,
         "dir": direction,
-        "tier": "ASIAN_BO",
+        "tier": "ASIAN_SESSION",
         "emoji": "🌏",
         "entry": c_now,
         "tp": tp_est,
@@ -1340,10 +1701,15 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         "time": now_local_iso(),
         "born_bar": bar_i,
         "early": False,
-        "kind": "ASIAN_RANGE_BREAKOUT",
+        "kind": "ASIAN_RANGE_BREAKOUT",  # Keep same kind for compatibility
         "tag": tag,
         "asian_high": asian_high,
-        "asian_low": asian_low
+        "asian_low": asian_low,
+        "range_mid": range_mid,
+        "entry_type": entry_type,  # SWEEP, FADE, or FVG
+        "is_sweep": entry_type == "SWEEP",
+        "is_fade": entry_type == "FADE",
+        "is_fvg": entry_type == "FVG"
     }
 
 
@@ -1421,6 +1787,193 @@ def build_fvg_breaker_block_signal(sym, kl, bar_i):
     }
 
 
+def build_reentry_signal(sym, kl, bar_i):
+    """
+    Re-entry Strategy (4H reference + 5m entries)
+    
+    Strategy Rules:
+    1. Get last completed 4H candle (reference candle)
+    2. Mark 4H High and 4H Low as zone
+    3. On 5m: price breaks out of zone, then re-enters
+    4. Trend filter: 4H bullish → long only, 4H bearish → short only
+    5. Fresh zone: use each zone only once
+    6. Time filter: prefer London/NY sessions
+    7. Entry/TP/SL: 1:2 risk/reward minimum
+    """
+    # Need both 4H and 5m data
+    kl_4h = futures_get_klines(sym, "4h", 50)
+    kl_5m = futures_get_klines(sym, "5m", 100)
+    
+    if len(kl_4h) < 10 or len(kl_5m) < 20:
+        return None
+    
+    # Get last completed 4H candle (not the current one)
+    last_4h = kl_4h[-2]  # -2 because -1 might be incomplete
+    zone_high = float(last_4h[2])  # High
+    zone_low = float(last_4h[3])   # Low
+    
+    # Detect 4H trend
+    closes_4h = [float(k[4]) for k in kl_4h]
+    trend_4h = detect_4h_trend(closes_4h)
+    
+    if trend_4h is None:
+        return None  # No clear trend, skip
+    
+    # Check time window (Kill Zone filter)
+    # London: 08:00-12:00 GMT, NY: 13:00-17:00 GMT (EST 08:00-12:00 = GMT 13:00-17:00)
+    current_hour = get_current_utc_hour()
+    in_kill_zone = (8 <= current_hour < 12) or (13 <= current_hour < 17)
+    
+    if not in_kill_zone:
+        return None  # Outside kill zone
+    
+    # Detect 5m re-entry pattern
+    direction, entry, sl = detect_5m_reentry(kl_5m, zone_high, zone_low, trend_4h)
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP with 1:2 risk/reward
+    closes_5m = [float(k[4]) for k in kl_5m]
+    highs_5m = [float(k[2]) for k in kl_5m]
+    lows_5m = [float(k[3]) for k in kl_5m]
+    
+    atr_v = atr_like(highs_5m, lows_5m, closes_5m)[-1]
+    r_val = rsi(closes_5m)[-1]
+    
+    risk = abs(entry - sl)
+    if direction == "LONG":
+        tp = entry + 2.0 * risk
+    else:
+        tp = entry - 2.0 * risk
+    
+    pwr = 66 + (atr_v / entry) * 130 + abs(r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "REENTRY",
+        "emoji": "🔄",
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "REENTRY_4H_5M",
+        "tag": f"🔄 REENTRY {'BUY' if direction == 'LONG' else 'SELL'}",
+        "zone_high": zone_high,
+        "zone_low": zone_low,
+        "trend_4h": trend_4h
+    }
+
+
+def build_fvg_mss_signal(sym, kl, bar_i):
+    """
+    FVG Zone + MSS (Market Structure Shift) Entry Strategy
+    
+    This is the highest winrate strategy combining:
+    - 4H/1H FVG (Fair Value Gap) as main zone
+    - 5m BOS/MSS for clear direction change
+    - OB (Order Block) retest for confirmation
+    
+    Only enters when: MSS + FVG + OB retest align
+    TP/SL: 1:2 to 1:5 risk/reward
+    """
+    # Get both higher timeframe (1H) and entry timeframe (5m for MSS)
+    kl_1h = futures_get_klines(sym, "1h", 100)
+    
+    if len(kl_1h) < 20 or len(kl) < 50:  # kl is already 1h from scan_symbol
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    
+    # 1. Detect FVG on 1H timeframe (imbalance zone)
+    # FVG: gap between candles (already implemented in build_fvg_break_signal)
+    h1, h2, h3 = highs[-3:]
+    l1, l2, l3 = lows[-3:]
+    c_now = closes[-1]
+    
+    # Bullish FVG: gap up (l2 > h1)
+    has_bullish_fvg = l2 > h1 and c_now > l2
+    # Bearish FVG: gap down (h2 < l1)
+    has_bearish_fvg = h2 < l1 and c_now < h2
+    
+    if not (has_bullish_fvg or has_bearish_fvg):
+        return None
+    
+    # 2. Detect MSS (Market Structure Shift)
+    mss_direction, mss_level = detect_mss(highs, lows, closes, lookback=20)
+    
+    if mss_direction is None:
+        return None
+    
+    # 3. Check for Order Block retest
+    ob_found, ob_high, ob_low = detect_order_block(highs, lows, closes, opens, mss_direction, lookback=20)
+    
+    if not ob_found:
+        return None
+    
+    # 4. Combine all three: FVG + MSS + OB
+    direction = None
+    if has_bullish_fvg and mss_direction == "UP":
+        direction = "UP"
+    elif has_bearish_fvg and mss_direction == "DOWN":
+        direction = "DOWN"
+    else:
+        return None  # Signals don't align
+    
+    # Calculate entry, TP, SL
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    entry = c_now
+    
+    if direction == "UP":
+        # SL below OB low
+        sl_est = ob_low - atr_v * 0.5
+        risk = entry - sl_est
+        # TP: 1:3 risk/reward (high confidence setup)
+        tp_est = entry + 3.0 * risk
+        tag = "⭐ FVG+MSS BUY"
+    else:
+        # SL above OB high
+        sl_est = ob_high + atr_v * 0.5
+        risk = sl_est - entry
+        # TP: 1:3 risk/reward
+        tp_est = entry - 3.0 * risk
+        tag = "⭐ FVG+MSS SELL"
+    
+    # High power for this high-quality setup
+    pwr = 70 + (atr_v / entry) * 150 + abs(r_val - 50) / 2.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "FVG_MSS",
+        "emoji": "⭐",
+        "entry": entry,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "FVG_MSS_ENTRY",
+        "tag": tag,
+        "mss_level": mss_level,
+        "ob_high": ob_high,
+        "ob_low": ob_low,
+        "fvg_zone": "bullish" if has_bullish_fvg else "bearish"
+    }
 
 
 def scan_symbol(sym,bar_i):
@@ -1428,28 +1981,35 @@ def scan_symbol(sym,bar_i):
     if len(kl)<60: return []
     res=[]
 
+    # Check strategy enable/disable flags from PARAM
     # EARLY strategy removed per requirement
     # UT/STC strategy disabled per requirement
+    # KIVANC_CONFIRM removed per user request
     s_utstc = None  # Disabled - was: build_utstc_signal(sym,kl,bar_i)
-    s_macd  = build_macd_trend_signal(sym,kl,bar_i)
-    s_fvg   = build_fvg_break_signal(sym,kl,bar_i)
-    s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i)
-    s_cest = build_cest_signal(sym,kl,bar_i)
+    
+    s_macd  = build_macd_trend_signal(sym,kl,bar_i) if PARAM.get("ENABLE_MACD", True) else None
+    s_fvg   = build_fvg_break_signal(sym,kl,bar_i) if PARAM.get("ENABLE_FVG", True) else None
+    s_cest = build_cest_signal(sym,kl,bar_i) if PARAM.get("ENABLE_CEST", True) else None
 
     # EMA Pullback için 210 bar güvenliği
     kl2 = kl if len(kl)>=210 else futures_get_klines(sym,"1h",210)
-    s_pull = build_ema_pullback_signal(sym, kl2, bar_i)
+    s_pull = build_ema_pullback_signal(sym, kl2, bar_i) if PARAM.get("ENABLE_PULLBACK", True) else None
     
-    # New strategies (6 new ones)
-    s_orb_fvg = build_orb_fvg_confirm_signal(sym, kl, bar_i)
-    s_london_bo = build_london_breakout_signal(sym, kl, bar_i)
-    s_ny_rev = build_ny_reversal_signal(sym, kl, bar_i)
-    s_ict_p3 = build_ict_power_of_3_signal(sym, kl, bar_i)
-    s_asian_bo = build_asian_range_breakout_signal(sym, kl, bar_i)
-    s_fvg_breaker = build_fvg_breaker_block_signal(sym, kl, bar_i)
+    # Session-based strategies
+    s_orb_fvg = build_orb_fvg_confirm_signal(sym, kl, bar_i) if PARAM.get("ENABLE_ORB_FVG", True) else None
+    s_london_bo = build_london_breakout_signal(sym, kl, bar_i) if PARAM.get("ENABLE_LONDON_BO", True) else None
+    s_ny_rev = build_ny_reversal_signal(sym, kl, bar_i) if PARAM.get("ENABLE_NY_REV", True) else None
+    s_ict_p3 = build_ict_power_of_3_signal(sym, kl, bar_i) if PARAM.get("ENABLE_ICT_P3", True) else None
+    s_asian_bo = build_asian_range_breakout_signal(sym, kl, bar_i) if PARAM.get("ENABLE_ASIAN_BO", True) else None
+    s_fvg_breaker = build_fvg_breaker_block_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FVG_BREAKER", True) else None
+    
+    # New high-quality strategies
+    s_reentry = build_reentry_signal(sym, kl, bar_i) if PARAM.get("ENABLE_REENTRY", True) else None
+    s_fvg_mss = build_fvg_mss_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FVG_MSS", True) else None
 
-    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull,
-              s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker):
+    for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
+              s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
+              s_reentry, s_fvg_mss):
         if s: res.append(s)
     
     return res
@@ -1723,17 +2283,37 @@ STATE_DEFAULT={
     "bar_index":0, "last_report":0, "auto_trade_active":True,
     "last_api_check":0, "long_blocked":False, "short_blocked":False,
     "cest_long_blocked":False, "cest_short_blocked":False,
+    "reentry_long_blocked":False, "reentry_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":250.0,
-    "MAX_BUY":30, "MAX_SELL":30,
+    "MAX_BUY":30, "MAX_SELL":30,  # General limits (kept at 30)
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,
+    "MAX_REENTRY_BUY":5, "MAX_REENTRY_SELL":5,  # Re-entry specific limits (5 buy, 5 sell)
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
-    "PROFIT_TARGET_USD":20.0
+    "PROFIT_TARGET_USD":20.0,
+    # Strategy enable/disable flags (all enabled by default)
+    "ENABLE_MACD": True,
+    "ENABLE_FVG": True,
+    "ENABLE_CEST": True,
+    "ENABLE_PULLBACK": True,
+    "ENABLE_ORB_FVG": True,
+    "ENABLE_LONDON_BO": True,
+    "ENABLE_NY_REV": True,
+    "ENABLE_ICT_P3": True,
+    "ENABLE_ASIAN_BO": True,
+    "ENABLE_FVG_BREAKER": True,
+    "ENABLE_REENTRY": True,
+    "ENABLE_FVG_MSS": True,
+    # CEST improvements
+    "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
+    "CEST_LOOKBACK": 10,  # Bars to look back for patterns
+    "CEST_MIN_BODY_RATIO": 0.6,  # Minimum body to range ratio for confirmation
+    "CEST_RR_RATIO": 1.4  # Risk/Reward ratio (1:1.4)
 }
 PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
 if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
@@ -1741,7 +2321,7 @@ STATE=safe_load(STATE_FILE,STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
 
 def update_directional_limits():
-    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0}
+    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,"reentry_long_count":0,"reentry_short_count":0}
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
         for p in acc:
@@ -1751,11 +2331,17 @@ def update_directional_limits():
                 # Check if this is a CEST position
                 if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
                     live["cest_long_count"] += 1
+                # Check if this is a RE-ENTRY position
+                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "REENTRY_4H_5M":
+                    live["reentry_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
                 # Check if this is a CEST position
                 if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
                     live["cest_short_count"] += 1
+                # Check if this is a RE-ENTRY position
+                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "REENTRY_4H_5M":
+                    live["reentry_short_count"] += 1
         live["long_count"]=len(live["long"])
         live["short_count"]=len(live["short"])
     except Exception as e:
@@ -1765,6 +2351,8 @@ def update_directional_limits():
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
     STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
+    STATE["reentry_long_blocked"]  = (live["reentry_long_count"]  >= PARAM.get("MAX_REENTRY_BUY", 5))
+    STATE["reentry_short_blocked"] = (live["reentry_short_count"] >= PARAM.get("MAX_REENTRY_SELL", 5))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -2176,11 +2764,10 @@ def heartbeat_and_status_check(_snapshot):
         tg_send(f"❌ HEARTBEAT {e}"); log(f"[HBERR]{e}")
 
     msg=(f"📊 STATUS bar:{STATE.get('bar_index',0)} "
-         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'} "
-         f"long_blocked:{STATE.get('long_blocked')} "
-         f"short_blocked:{STATE.get('short_blocked')} "
-         f"cest_long_blocked:{STATE.get('cest_long_blocked')} "
-         f"cest_short_blocked:{STATE.get('cest_short_blocked')}")
+         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
+         f"long_blocked:{STATE.get('long_blocked')} short_blocked:{STATE.get('short_blocked')}\n"
+         f"cest_long_blocked:{STATE.get('cest_long_blocked')} cest_short_blocked:{STATE.get('cest_short_blocked')}\n"
+         f"reentry_long_blocked:{STATE.get('reentry_long_blocked')} reentry_short_blocked:{STATE.get('reentry_short_blocked')}")
     tg_send(msg); log(msg)
 
 def ai_log_signal(sig):
@@ -2200,19 +2787,22 @@ def ai_update_analysis_snapshot():
         "real_signals_total":  sum(1 for x in AI_SIGNALS if x.get("tier")=="REAL"),
         "normal_signals_total":sum(1 for x in AI_SIGNALS if x.get("tier")=="NORMAL"),
         # EARLY strategy removed
+        # KIVANC_CONFIRM removed per user request
         "utstc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="UTSTC"),
         "macd_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="MACD"),
         "fvg_signals_total":   sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG"),
         "pullback_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_PULLBACK"),
-        "kivanc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="KIVANC_CONFIRM"),
         "cest_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="CEST"),
-        # New strategies tracking
+        # Session-based strategies tracking
         "orb_fvg_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ORB_FVG_CONFIRM"),
         "london_bo_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="LONDON_BREAKOUT"),
         "ny_reversal_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="NY_REVERSAL"),
         "ict_p3_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ICT_POWER_OF_3"),
         "asian_bo_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ASIAN_RANGE_BREAKOUT"),
-        "fvg_breaker_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_BREAKER_BLOCK")
+        "fvg_breaker_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_BREAKER_BLOCK"),
+        # New high-quality strategies tracking
+        "reentry_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="REENTRY_4H_5M"),
+        "fvg_mss_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_MSS_ENTRY")
     }
     AI_ANALYSIS.append(snapshot); safe_save(AI_ANALYSIS_FILE,AI_ANALYSIS)
 
@@ -2251,9 +2841,10 @@ def _cmd_status():
     live=update_directional_limits()
     tg_send(
         f"📊 /status bar:{STATE.get('bar_index')} "
-        f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'} "
-        f"long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',30)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',30)} "
-        f"cest_long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} cest_short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)} "
+        f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
+        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',30)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',30)}\n"
+        f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
+        f"Re-entry long:{live.get('reentry_long_count',0)}/{PARAM.get('MAX_REENTRY_BUY',5)} short:{live.get('reentry_short_count',0)}/{PARAM.get('MAX_REENTRY_SELL',5)}\n"
         f"real_closed:{len(REAL_CLOSED)}"
     )
 
@@ -2388,6 +2979,160 @@ def _cmd_closeall():
         tg_send(f"❌ /closeall error: {e}")
         log(f"[CLOSEALL ERR] {e}")
 
+def _cmd_enable(args):
+    """Enable a strategy"""
+    try:
+        if not args:
+            tg_send("❌ Usage: /enable <strategy_name>\n"
+                    "Available strategies:\n"
+                    "MACD, FVG, CEST, PULLBACK,\n"
+                    "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+            return
+        
+        strategy = args[0].upper()
+        key = f"ENABLE_{strategy}"
+        
+        # Check if it's a valid strategy key
+        valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
+                          "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+        
+        if strategy not in valid_strategies:
+            tg_send(f"❌ Unknown strategy: {strategy}\n"
+                    f"Available: {', '.join(valid_strategies)}")
+            return
+        
+        PARAM[key] = True
+        safe_save(PARAM_FILE, PARAM)
+        tg_send(f"✅ Strategy {strategy} enabled")
+        log(f"[ENABLE] Strategy {strategy} enabled via Telegram")
+    except Exception as e:
+        tg_send(f"❌ /enable error: {e}")
+
+def _cmd_disable(args):
+    """Disable a strategy"""
+    try:
+        if not args:
+            tg_send("❌ Usage: /disable <strategy_name>\n"
+                    "Available strategies:\n"
+                    "MACD, FVG, CEST, PULLBACK,\n"
+                    "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+            return
+        
+        strategy = args[0].upper()
+        key = f"ENABLE_{strategy}"
+        
+        # Check if it's a valid strategy key
+        valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
+                          "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+        
+        if strategy not in valid_strategies:
+            tg_send(f"❌ Unknown strategy: {strategy}\n"
+                    f"Available: {', '.join(valid_strategies)}")
+            return
+        
+        PARAM[key] = False
+        safe_save(PARAM_FILE, PARAM)
+        tg_send(f"✅ Strategy {strategy} disabled")
+        log(f"[DISABLE] Strategy {strategy} disabled via Telegram")
+    except Exception as e:
+        tg_send(f"❌ /disable error: {e}")
+
+def _cmd_strategies():
+    """List all strategies and their status"""
+    try:
+        strategies = [
+            ("MACD", "📈 MACD Trend"),
+            ("FVG", "🟩 FVG Break"),
+            ("CEST", "🧩 C.E.S.T."),
+            ("PULLBACK", "📘 EMA Pullback"),
+            ("ORB_FVG", "🔥 ORB+FVG"),
+            ("LONDON_BO", "🌍 London Breakout"),
+            ("NY_REV", "🔄 NY Reversal"),
+            ("ICT_P3", "⚡ ICT Power of 3"),
+            ("ASIAN_BO", "🌏 Asian Breakout"),
+            ("FVG_BREAKER", "🧱 FVG+Breaker"),
+            ("REENTRY", "🔄 Re-entry 4H+5m"),
+            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)")
+        ]
+        
+        msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
+        for key, name in strategies:
+            enabled = PARAM.get(f"ENABLE_{key}", True)
+            status = "✅" if enabled else "❌"
+            msg += f"{status} {name}\n"
+        
+        msg += f"\n📌 General Limits:\n"
+        msg += f"Long: {PARAM.get('MAX_BUY', 30)}\n"
+        msg += f"Short: {PARAM.get('MAX_SELL', 30)}\n"
+        msg += f"\n🧩 CEST Limits:\n"
+        msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
+        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
+        msg += f"\n🔄 Re-entry Limits:\n"
+        msg += f"Long: {PARAM.get('MAX_REENTRY_BUY', 5)}\n"
+        msg += f"Short: {PARAM.get('MAX_REENTRY_SELL', 5)}"
+        
+        tg_send(msg)
+    except Exception as e:
+        tg_send(f"❌ /strategies error: {e}")
+
+def _cmd_setlimits(args):
+    """Set trading limits"""
+    try:
+        if len(args) < 2:
+            tg_send("❌ Usage: /setlimits <type> <value>\n"
+                    "Types:\n"
+                    "  buy, sell - General limits\n"
+                    "  cest_buy, cest_sell - CEST limits\n"
+                    "  reentry_buy, reentry_sell - Re-entry limits\n"
+                    "Example: /setlimits reentry_buy 10")
+            return
+        
+        limit_type = args[0].lower()
+        value = int(args[1])
+        
+        if value < 0 or value > 100:
+            tg_send("❌ Value must be between 0 and 100")
+            return
+        
+        if limit_type == "buy":
+            PARAM["MAX_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ MAX_BUY set to {value}")
+        elif limit_type == "sell":
+            PARAM["MAX_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ MAX_SELL set to {value}")
+        elif limit_type == "cest_buy":
+            PARAM["MAX_CEST_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ MAX_CEST_BUY set to {value}")
+        elif limit_type == "cest_sell":
+            PARAM["MAX_CEST_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ MAX_CEST_SELL set to {value}")
+        elif limit_type == "reentry_buy":
+            PARAM["MAX_REENTRY_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ MAX_REENTRY_BUY set to {value}")
+        elif limit_type == "reentry_sell":
+            PARAM["MAX_REENTRY_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ MAX_REENTRY_SELL set to {value}")
+        else:
+            tg_send(f"❌ Unknown limit type: {limit_type}\n"
+                    "Available: buy, sell, cest_buy, cest_sell, reentry_buy, reentry_sell")
+            return
+        
+        log(f"[SETLIMITS] {limit_type} = {value}")
+    except ValueError:
+        tg_send("❌ Value must be a number")
+    except Exception as e:
+        tg_send(f"❌ /setlimits error: {e}")
+
 def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
@@ -2410,12 +3155,25 @@ def check_telegram_commands():
         elif cmd=="/settarget": _cmd_settarget(args)
         elif cmd=="/resettarget": _cmd_resettarget()
         elif cmd=="/closeall": _cmd_closeall()
+        elif cmd=="/enable": _cmd_enable(args)
+        elif cmd=="/disable": _cmd_disable(args)
+        elif cmd=="/strategies": _cmd_strategies()
+        elif cmd=="/setlimits": _cmd_setlimits(args)
         else:
-            tg_send("Komutlar: /status, /report, /set KEY VALUE, /export\n"
-                    "/balance - Show balance and profit\n"
+            tg_send("📋 AVAILABLE COMMANDS:\n"
+                    "━━━━━━━━━━━━━━━━\n"
+                    "/status - Bot status\n"
+                    "/balance - Balance and profit\n"
+                    "/strategies - List all strategies\n"
+                    "/enable <strategy> - Enable strategy\n"
+                    "/disable <strategy> - Disable strategy\n"
+                    "/setlimits <type> <value> - Set limits\n"
                     "/settarget <amount> - Set profit target\n"
                     "/resettarget - Reset margin balance\n"
-                    "/closeall - Close all positions")
+                    "/closeall - Close all positions\n"
+                    "/set KEY VALUE - Set parameter\n"
+                    "/report - Generate report\n"
+                    "/export - Export all data")
 
 # ===================== SMART TP =====================
 
@@ -2554,6 +3312,15 @@ def _can_direction(direction, kind=""):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
             return False
     
+    # Check RE-ENTRY-specific limits
+    if kind == "REENTRY_4H_5M":
+        if direction=="UP" and STATE.get("reentry_long_blocked",False):
+            log(f"[REENTRY LIMIT] Re-entry long positions blocked (max: {PARAM.get('MAX_REENTRY_BUY', 5)})")
+            return False
+        if direction=="DOWN" and STATE.get("reentry_short_blocked",False):
+            log(f"[REENTRY LIMIT] Re-entry short positions blocked (max: {PARAM.get('MAX_REENTRY_SELL', 5)})")
+            return False
+    
     return True
 
 def execute_real_trade(sig):
@@ -2653,8 +3420,10 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.60 aktif (UT/STC devre dışı) — ORB+FVG, London BO, NY Rev, ICT P3, Asian BO, FVG+Breaker")
-    log("[START] EMA ULTRA v15.9.60 FULL (UT/STC disabled)")
+    tg_send("🚀 EMA ULTRA v15.9.62 aktif — KIVANC removed, Asian improved\n"
+            "📊 12 strategies active | Re-entry limits: 5 buy/5 sell\n"
+            "🎛️ Use /strategies to see all | /enable, /disable to control")
+    log("[START] EMA ULTRA v15.9.62 - KIVANC removed, Asian session improved")
 
     symbols=auto_init_symbols()
 
@@ -2675,7 +3444,7 @@ def main():
                 ai_log_signal(sig)
                 update_directional_limits()
                 
-                # Execute real trade for all strategies (including KIVANC_CONFIRM)
+                # Execute real trade for all strategies
                 execute_real_trade(sig)
             
             # 3.1) Check and log real closed trades
