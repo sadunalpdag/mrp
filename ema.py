@@ -5,26 +5,25 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.61 — Active Strategies (NEW: Re-entry + FVG+MSS + CEST Improvements)
-#  - PEMA ve EARLY tamamen kaldırıldı
-#  - UT/STC devre dışı bırakıldı
-#  - Aktif stratejiler (13 strateji):
+# 📘 EMA ULTRA v15.9.62 — Active Strategies (KIVANC removed + Asian improved)
+#  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
+#  - Aktif stratejiler (12 strateji):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
-#       🧩 KIVANC CONFIRM (SuperTrend + EMA9/30 crossover)
 #       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy - IMPROVED)
 #       🔥 ORB + FVG CONFIRM (Opening Range Breakout + FVG - 09:45-12:00 EST)
 #       🌍 LONDON BREAKOUT (LO Session ORB - 08:00-10:00 GMT)
 #       🔄 NY REVERSAL (Liquidity Sweep + Reversal - 09:30-11:00 EST)
 #       ⚡ ICT POWER OF 3 (Accumulation-Manipulation-Distribution - 08:30-12:00 EST)
-#       🌏 ASIAN RANGE BREAKOUT (ARB - 03:00-08:00 GMT)
+#       🌏 ASIAN SESSION (Liquidity Sweep + Range Fade + Micro FVG - IMPROVED)
 #       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
 #       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
 #       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
-#  - Default limits changed to 5 buy / 5 sell (adjustable via Telegram)
+#  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
+#  - Asian session improved: Liquidity sweep, range fade, mean reversion
 #  - Power filtresi kaldırıldı, margin wallet geldi 60 dolarla kar al seçeneği eklendi. 
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
@@ -56,9 +55,6 @@ TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 getcontext().prec = 28
-
-# ===================== Kıvanç Confirm Settings =====================
-# KIVANC_CONFIRM now uses global PARAM settings (MAX_BUY, MAX_SELL, TRADE_SIZE_USDT)
 
 # ===================== UTILITIES =====================
 
@@ -945,101 +941,6 @@ def build_ema_pullback_signal(sym, kl, bar_i):
     return sig
 
 
-
-def build_kivanc_confirm_signal(sym, kl, bar_i):
-    """
-    Kıvanç Özbilgıç SuperTrend + EMA Cross Strategy
-    Signal only on the 1st candle AFTER:
-    1) EMA9 crosses EMA30 (crossover just happened)
-    2) SuperTrend direction aligns with crossover
-    3) Price is within 2% of SuperTrend line
-    """
-    if len(kl) < 60:
-        return None
-    
-    closes = [float(k[4]) for k in kl]
-    highs = [float(k[2]) for k in kl]
-    lows = [float(k[3]) for k in kl]
-    
-    # Calculate SuperTrend
-    st_values, st_direction = supertrend(highs, lows, closes)
-    
-    # Calculate EMAs
-    ema9 = ema(closes, 9)
-    ema30 = ema(closes, 30)
-    
-    # Get current and previous values
-    st_dir_now = st_direction[-1]
-    st_value = st_values[-1]
-    ema9_now = ema9[-1]
-    ema30_now = ema30[-1]
-    ema9_prev = ema9[-2]
-    ema30_prev = ema30[-2]
-    entry = closes[-1]
-    
-    # Check for EMA crossover on the CURRENT candle (1st candle after crossover)
-    # Bullish crossover: EMA9 was below/equal EMA30, now EMA9 is above EMA30
-    bullish_cross = (ema9_prev <= ema30_prev) and (ema9_now > ema30_now)
-    
-    # Bearish crossover: EMA9 was above/equal EMA30, now EMA9 is below EMA30
-    bearish_cross = (ema9_prev >= ema30_prev) and (ema9_now < ema30_now)
-    
-    # Determine direction based on crossover + SuperTrend alignment
-    direction = None
-    if bullish_cross and st_dir_now == "UP":
-        direction = "UP"
-    elif bearish_cross and st_dir_now == "DOWN":
-        direction = "DOWN"
-    
-    if direction is None:
-        return None
-    
-    # Check distance from SuperTrend (price should be close to SuperTrend)
-    st_distance_pct = abs(entry - st_value) / max(st_value, 1e-12) * 100
-    
-    # Maximum allowed distance from SuperTrend (default 2%)
-    max_st_distance_pct = 2.0
-    
-    if st_distance_pct > max_st_distance_pct:
-        # Price too far from SuperTrend, skip signal
-        return None
-    
-    # Calculate additional metrics
-    atr_v = atr_like(highs, lows, closes)[-1]
-    r_val = rsi(closes)[-1]
-    pwr = 60 + abs(ema9_now - ema30_now) * 120 + (r_val - 50) / 2.0
-    
-    # Set TP and SL like other strategies (will use Smart TP in execute_real_trade)
-    if direction == "UP":
-        tp = entry * 1.006
-        sl = entry * 0.994
-    else:
-        tp = entry * 0.994
-        sl = entry * 1.006
-    
-    return {
-        "symbol": sym,
-        "dir": direction,
-        "tier": "KIVANC",
-        "emoji": "🧩",
-        "entry": entry,
-        "tp": tp,
-        "sl": sl,
-        "power": pwr,
-        "rsi": r_val,
-        "atr": atr_v,
-        "time": now_local_iso(),
-        "born_bar": bar_i,
-        "early": False,
-        "kind": "KIVANC_CONFIRM",
-        "tag": f"🧩 KIVANC {'BUY' if direction == 'UP' else 'SELL'} CROSS",
-        "supertrend_dir": st_dir_now,
-        "supertrend_value": st_value,
-        "st_distance_pct": st_distance_pct,
-        "ema9": ema9_now,
-        "ema30": ema30_now,
-        "crossover": True
-    }
 
 def build_cest_signal(sym, kl, bar_i):
     """
@@ -2083,11 +1984,11 @@ def scan_symbol(sym,bar_i):
     # Check strategy enable/disable flags from PARAM
     # EARLY strategy removed per requirement
     # UT/STC strategy disabled per requirement
+    # KIVANC_CONFIRM removed per user request
     s_utstc = None  # Disabled - was: build_utstc_signal(sym,kl,bar_i)
     
     s_macd  = build_macd_trend_signal(sym,kl,bar_i) if PARAM.get("ENABLE_MACD", True) else None
     s_fvg   = build_fvg_break_signal(sym,kl,bar_i) if PARAM.get("ENABLE_FVG", True) else None
-    s_kivanc = build_kivanc_confirm_signal(sym,kl,bar_i) if PARAM.get("ENABLE_KIVANC", True) else None
     s_cest = build_cest_signal(sym,kl,bar_i) if PARAM.get("ENABLE_CEST", True) else None
 
     # EMA Pullback için 210 bar güvenliği
@@ -2106,7 +2007,7 @@ def scan_symbol(sym,bar_i):
     s_reentry = build_reentry_signal(sym, kl, bar_i) if PARAM.get("ENABLE_REENTRY", True) else None
     s_fvg_mss = build_fvg_mss_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FVG_MSS", True) else None
 
-    for s in (s_utstc, s_macd, s_fvg, s_kivanc, s_cest, s_pull,
+    for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
               s_reentry, s_fvg_mss):
         if s: res.append(s)
@@ -2398,7 +2299,6 @@ PARAM_DEFAULT={
     # Strategy enable/disable flags (all enabled by default)
     "ENABLE_MACD": True,
     "ENABLE_FVG": True,
-    "ENABLE_KIVANC": True,
     "ENABLE_CEST": True,
     "ENABLE_PULLBACK": True,
     "ENABLE_ORB_FVG": True,
@@ -2887,11 +2787,11 @@ def ai_update_analysis_snapshot():
         "real_signals_total":  sum(1 for x in AI_SIGNALS if x.get("tier")=="REAL"),
         "normal_signals_total":sum(1 for x in AI_SIGNALS if x.get("tier")=="NORMAL"),
         # EARLY strategy removed
+        # KIVANC_CONFIRM removed per user request
         "utstc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="UTSTC"),
         "macd_signals_total":  sum(1 for x in AI_SIGNALS if x.get("kind")=="MACD"),
         "fvg_signals_total":   sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG"),
         "pullback_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="EMA_PULLBACK"),
-        "kivanc_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="KIVANC_CONFIRM"),
         "cest_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="CEST"),
         # Session-based strategies tracking
         "orb_fvg_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="ORB_FVG_CONFIRM"),
@@ -3085,7 +2985,7 @@ def _cmd_enable(args):
         if not args:
             tg_send("❌ Usage: /enable <strategy_name>\n"
                     "Available strategies:\n"
-                    "MACD, FVG, KIVANC, CEST, PULLBACK,\n"
+                    "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
                     "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
             return
@@ -3094,7 +2994,7 @@ def _cmd_enable(args):
         key = f"ENABLE_{strategy}"
         
         # Check if it's a valid strategy key
-        valid_strategies = ["MACD", "FVG", "KIVANC", "CEST", "PULLBACK", 
+        valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
                           "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
         
@@ -3116,7 +3016,7 @@ def _cmd_disable(args):
         if not args:
             tg_send("❌ Usage: /disable <strategy_name>\n"
                     "Available strategies:\n"
-                    "MACD, FVG, KIVANC, CEST, PULLBACK,\n"
+                    "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
                     "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
             return
@@ -3125,7 +3025,7 @@ def _cmd_disable(args):
         key = f"ENABLE_{strategy}"
         
         # Check if it's a valid strategy key
-        valid_strategies = ["MACD", "FVG", "KIVANC", "CEST", "PULLBACK", 
+        valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
                           "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
         
@@ -3147,7 +3047,6 @@ def _cmd_strategies():
         strategies = [
             ("MACD", "📈 MACD Trend"),
             ("FVG", "🟩 FVG Break"),
-            ("KIVANC", "🧩 Kıvanç Confirm"),
             ("CEST", "🧩 C.E.S.T."),
             ("PULLBACK", "📘 EMA Pullback"),
             ("ORB_FVG", "🔥 ORB+FVG"),
@@ -3521,10 +3420,10 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.61 aktif — NEW: Re-entry (4H+5m), FVG+MSS, CEST Improved\n"
-            "📊 13 strategies active | Re-entry limits: 5 buy/5 sell\n"
+    tg_send("🚀 EMA ULTRA v15.9.62 aktif — KIVANC removed, Asian improved\n"
+            "📊 12 strategies active | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control")
-    log("[START] EMA ULTRA v15.9.61 FULL - Re-entry + FVG+MSS + CEST Improvements")
+    log("[START] EMA ULTRA v15.9.62 - KIVANC removed, Asian session improved")
 
     symbols=auto_init_symbols()
 
@@ -3545,7 +3444,7 @@ def main():
                 ai_log_signal(sig)
                 update_directional_limits()
                 
-                # Execute real trade for all strategies (including KIVANC_CONFIRM)
+                # Execute real trade for all strategies
                 execute_real_trade(sig)
             
             # 3.1) Check and log real closed trades
