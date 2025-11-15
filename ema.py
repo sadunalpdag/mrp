@@ -1596,25 +1596,41 @@ def build_ict_power_of_3_signal(sym, kl, bar_i):
 
 def build_asian_range_breakout_signal(sym, kl, bar_i):
     """
-    Asian Range Breakout (ARB) Strategy
+    Asian Session Strategy (IMPROVED - Range-Bound/Mean Reversion)
     
-    Asian session range breakout (03:00-08:00 GMT).
-    Entry: Breakout of Asian range during London/NY session
-    TP/SL: 2:1 Risk/Reward
+    Asian session (03:00-08:00 GMT) is characterized by low volatility and ranging behavior.
+    Instead of breakout-following (which often fails), this strategy uses:
+    
+    1. **Liquidity Sweep + Reversal** (Primary - Highest Winrate):
+       - Detects when price sweeps Asian range high/low (stop hunt)
+       - Waits for strong reversal candle closing back inside range
+       - Enters on mean reversion back to range center
+    
+    2. **Range Scalping** (Secondary):
+       - Fades extremes: sells at range top, buys at range bottom
+       - Quick scalps targeting range mean (VWAP/midpoint)
+    
+    3. **Micro FVG Fill**:
+       - Small FVG gaps within Asian range get filled quickly
+       - Mean reversion to fair value
+    
+    Entry: Liquidity sweep detection + 5m strong reversal candle
+    TP/SL: 1:1.5 Risk/Reward (Asian session has lower volatility)
+    Time: Active 03:00-09:00 GMT (includes early London for sweep detection)
     """
-    # Active during Asian session breakout time: 03:00-08:00 GMT = 03:00-08:00 UTC
-    # But we also allow signals shortly after (08:00-09:00) for breakout confirmation
+    # Active during and shortly after Asian session: 03:00-09:00 GMT
     if not is_in_time_window(3, 9):
         return None
     
-    if len(kl) < 10:
+    if len(kl) < 15:
         return None
     
     closes = [float(k[4]) for k in kl]
     highs = [float(k[2]) for k in kl]
     lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
     
-    # Get Asian session range (03:00-08:00 GMT)
+    # Get Asian session range (03:00-08:00 GMT) using 1H candles
     asian_high, asian_low = get_session_range(kl, 3, 8)
     
     if asian_high is None:
@@ -1622,38 +1638,158 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         asian_high = max(highs[-6:-1])
         asian_low = min(lows[-6:-1])
     
-    c_now = closes[-1]
+    # Calculate range midpoint for mean reversion target
+    range_mid = (asian_high + asian_low) / 2.0
+    range_size = asian_high - asian_low
     
-    # Check for breakout
-    broke_high = c_now > asian_high
-    broke_low = c_now < asian_low
-    
-    if not (broke_high or broke_low):
+    # Skip if range is too wide (not a typical Asian ranging session)
+    if range_size / range_mid > 0.02:  # More than 2% range
         return None
     
-    # Calculate TP/SL with 2:1 RR
+    c_now = closes[-1]
+    h_now = highs[-1]
+    l_now = lows[-1]
+    o_now = opens[-1]
+    
+    # Get previous candle data for sweep detection
+    if len(closes) < 2:
+        return None
+    c_prev = closes[-2]
+    h_prev = highs[-2]
+    l_prev = lows[-2]
+    
+    # ===== STRATEGY 1: LIQUIDITY SWEEP + REVERSAL (Primary) =====
+    # Detect liquidity sweep: wick above/below range, but body closes back inside
+    
+    # Bullish Sweep: Swept below asian_low (stop hunt), then reversed up
+    sweep_buffer = range_size * 0.002  # 0.2% buffer for sweep detection
+    bullish_sweep = (
+        l_now < (asian_low - sweep_buffer) and  # Wick swept below range
+        c_now > asian_low and                    # But closed back inside range
+        c_now > o_now and                        # Strong bullish candle (green)
+        (c_now - o_now) / max(h_now - l_now, 1e-12) > 0.6  # Strong body (>60%)
+    )
+    
+    # Bearish Sweep: Swept above asian_high (stop hunt), then reversed down
+    bearish_sweep = (
+        h_now > (asian_high + sweep_buffer) and  # Wick swept above range
+        c_now < asian_high and                   # But closed back inside range
+        c_now < o_now and                        # Strong bearish candle (red)
+        (o_now - c_now) / max(h_now - l_now, 1e-12) > 0.6  # Strong body (>60%)
+    )
+    
+    # ===== STRATEGY 2: RANGE FADE (Secondary) =====
+    # Fade extremes: price is at range edge, fade back to mean
+    
+    # At range high, fade down (sell)
+    at_range_high = c_now >= asian_high * 0.995  # Within 0.5% of range high
+    fade_short = at_range_high and c_now < o_now  # Bearish candle at top
+    
+    # At range low, fade up (buy)
+    at_range_low = c_now <= asian_low * 1.005  # Within 0.5% of range low
+    fade_long = at_range_low and c_now > o_now  # Bullish candle at bottom
+    
+    # ===== STRATEGY 3: MICRO FVG FILL (Bonus) =====
+    # Small FVG within range gets filled quickly
+    has_micro_fvg_up = False
+    has_micro_fvg_down = False
+    
+    if len(highs) >= 3:
+        h1, h2, h3 = highs[-3:]
+        l1, l2, l3 = lows[-3:]
+        
+        # Micro bullish FVG (small gap)
+        if l2 > h1 and (l2 - h1) / range_mid < 0.005:  # Gap < 0.5%
+            has_micro_fvg_up = c_now > l2  # Price above FVG, likely to fill down
+        
+        # Micro bearish FVG (small gap)
+        if h2 < l1 and (l1 - h2) / range_mid < 0.005:  # Gap < 0.5%
+            has_micro_fvg_down = c_now < h2  # Price below FVG, likely to fill up
+    
+    # ===== DETERMINE ENTRY =====
+    direction = None
+    entry_type = None
+    
+    # Priority 1: Liquidity Sweep (highest winrate)
+    if bullish_sweep:
+        direction = "UP"
+        entry_type = "SWEEP"
+        tag = "🌏 ASIA SWEEP BUY"
+    elif bearish_sweep:
+        direction = "DOWN"
+        entry_type = "SWEEP"
+        tag = "🌏 ASIA SWEEP SELL"
+    
+    # Priority 2: Range Fade (mean reversion)
+    elif fade_long and not bullish_sweep:
+        direction = "UP"
+        entry_type = "FADE"
+        tag = "🌏 ASIA FADE BUY"
+    elif fade_short and not bearish_sweep:
+        direction = "DOWN"
+        entry_type = "FADE"
+        tag = "🌏 ASIA FADE SELL"
+    
+    # Priority 3: Micro FVG Fill
+    elif has_micro_fvg_down:
+        direction = "UP"
+        entry_type = "FVG"
+        tag = "🌏 ASIA FVG BUY"
+    elif has_micro_fvg_up:
+        direction = "DOWN"
+        entry_type = "FVG"
+        tag = "🌏 ASIA FVG SELL"
+    
+    if direction is None:
+        return None
+    
+    # ===== CALCULATE TP/SL (Asian session = lower volatility, tighter stops) =====
     atr_v = atr_like(highs, lows, closes)[-1]
     r_val = rsi(closes)[-1]
     
-    if broke_high:
-        direction = "UP"
-        tag = "🌏 ASIA BO BUY"
-        sl_est = asian_low
+    if direction == "UP":
+        # Target: Range midpoint or slightly above
+        if entry_type == "SWEEP":
+            tp_est = range_mid + (range_size * 0.25)  # 25% above mid
+            sl_est = l_now - (atr_v * 0.5)  # Tight stop below sweep wick
+        elif entry_type == "FADE":
+            tp_est = range_mid  # Target mean
+            sl_est = asian_low - (atr_v * 0.3)  # Very tight stop
+        else:  # FVG
+            tp_est = range_mid
+            sl_est = c_now - (atr_v * 0.5)
+        
+        # Ensure 1:1.5 minimum RR
         risk = c_now - sl_est
-        tp_est = c_now + 2.0 * risk
-    else:
-        direction = "DOWN"
-        tag = "🌏 ASIA BO SELL"
-        sl_est = asian_high
-        risk = sl_est - c_now
-        tp_est = c_now - 2.0 * risk
+        if (tp_est - c_now) < (risk * 1.5):
+            tp_est = c_now + (risk * 1.5)
     
-    pwr = 62 + (atr_v / c_now) * 135 + (r_val - 50) / 2.0
+    else:  # DOWN
+        # Target: Range midpoint or slightly below
+        if entry_type == "SWEEP":
+            tp_est = range_mid - (range_size * 0.25)  # 25% below mid
+            sl_est = h_now + (atr_v * 0.5)  # Tight stop above sweep wick
+        elif entry_type == "FADE":
+            tp_est = range_mid  # Target mean
+            sl_est = asian_high + (atr_v * 0.3)  # Very tight stop
+        else:  # FVG
+            tp_est = range_mid
+            sl_est = c_now + (atr_v * 0.5)
+        
+        # Ensure 1:1.5 minimum RR
+        risk = sl_est - c_now
+        if (c_now - tp_est) < (risk * 1.5):
+            tp_est = c_now - (risk * 1.5)
+    
+    # Power calculation (lower for Asian session - less aggressive)
+    pwr = 58 + (atr_v / c_now) * 100 + abs(r_val - 50) / 2.0
+    if entry_type == "SWEEP":
+        pwr += 5  # Sweep has higher winrate
     
     return {
         "symbol": sym,
         "dir": direction,
-        "tier": "ASIAN_BO",
+        "tier": "ASIAN_SESSION",
         "emoji": "🌏",
         "entry": c_now,
         "tp": tp_est,
@@ -1664,10 +1800,15 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         "time": now_local_iso(),
         "born_bar": bar_i,
         "early": False,
-        "kind": "ASIAN_RANGE_BREAKOUT",
+        "kind": "ASIAN_RANGE_BREAKOUT",  # Keep same kind for compatibility
         "tag": tag,
         "asian_high": asian_high,
-        "asian_low": asian_low
+        "asian_low": asian_low,
+        "range_mid": range_mid,
+        "entry_type": entry_type,  # SWEEP, FADE, or FVG
+        "is_sweep": entry_type == "SWEEP",
+        "is_fade": entry_type == "FADE",
+        "is_fvg": entry_type == "FVG"
     }
 
 
