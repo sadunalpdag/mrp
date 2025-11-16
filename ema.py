@@ -3446,12 +3446,17 @@ def main():
             sigs=run_parallel(symbols,bar_i)
 
             # 2) Sinyal kayıt + Gerçek trade
+            # Update limits once before processing batch
+            update_directional_limits()
+            
             for sig in sigs:
                 ai_log_signal(sig)
-                update_directional_limits()
                 
                 # Execute real trade for all strategies
                 execute_real_trade(sig)
+                
+                # Update limits after each trade to prevent race conditions in same batch
+                update_directional_limits()
             
             # 3.1) Check and log real closed trades
             check_and_log_real_closed_trades()
