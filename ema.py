@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.63 — Active Strategies (KIVANC removed + Asian improved)
+# 📘 EMA ULTRA v15.9.64 — Active Strategies (KIVANC removed + Asian improved)
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
 #  - Aktif stratejiler (12 strateji):
 #       📈 MACD (EMA20/200 + MACD crossover)
@@ -3859,10 +3859,10 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.63 aktif — KIVANC removed, Asian improved\n"
+    tg_send("🚀 EMA ULTRA v15.9.64 aktif — KIVANC removed, Asian improved\n"
             "📊 12 strategies active | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control")
-    log("[START] EMA ULTRA v15.9.63 - KIVANC removed, Asian session improved")
+    log("[START] EMA ULTRA v15.9.64 - KIVANC removed, Asian session improved")
 
     symbols=auto_init_symbols()
 
