@@ -1,0 +1,4 @@
+symbol,strategy,direction,entry_price,exit_price,pnl_pct,power,exit_reason,market_state,open_time,close_time,cond_ma50,cond_swing_low,cond_body_ratio,cond_has_fvg,cond_trend_4h,cond_tolerance,cond_rr_ratio,cond_mss_level,cond_mss_direction,cond_ob_high,cond_ob_low,cond_fvg_gap_size,cond_risk,cond_zone_high,cond_zone_low,cond_zone_range,cond_in_kill_zone
+BTCUSDT,CEST,UP,45000.0,45300.0,0.67,68.5,TP,PULLBACK,2024-11-16T10:00:00,2024-11-16T12:30:00,44800.0,44500.0,0.72,True,UP,0.015,1.4,,,,,,,,,,
+ETHUSDT,FVG_MSS_ENTRY,DOWN,2500.0,2550.0,-2.0,72.3,SL,BREAKOUT,2024-11-16T08:00:00,2024-11-16T09:15:00,,,,,,,3.0,2520.0,DOWN,2540.0,2510.0,25.0,50.0,,,,
+SOLUSDT,REENTRY_4H_5M,UP,100.0,103.5,3.5,70.1,TP,NORMAL,2024-11-16T14:00:00,2024-11-16T16:45:00,,,,,UP,,2.0,,,,,,1.5,102.0,99.5,2.5,True
