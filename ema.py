@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.62 — Active Strategies (KIVANC removed + Asian improved)
+# 📘 EMA ULTRA v15.9.63 — Active Strategies (KIVANC removed + Asian improved)
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
 #  - Aktif stratejiler (12 strateji):
 #       📈 MACD (EMA20/200 + MACD crossover)
@@ -1509,7 +1509,7 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
     
     2. **Range Scalping** (Secondary):
        - Fades extremes: sells at range top, buys at range bottom
-       - Quick scalps targeting range mean (VWAP/midpoint)
+       - Quick scalps ing range mean (VWAP/midpoint)
     
     3. **Micro FVG Fill**:
        - Small FVG gaps within Asian range get filled quickly
@@ -1539,7 +1539,7 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         asian_high = max(highs[-6:-1])
         asian_low = min(lows[-6:-1])
     
-    # Calculate range midpoint for mean reversion target
+    # Calculate range midpoint for mean reversion 
     range_mid = (asian_high + asian_low) / 2.0
     range_size = asian_high - asian_low
     
@@ -2295,7 +2295,7 @@ PARAM_DEFAULT={
     "MAX_REENTRY_BUY":5, "MAX_REENTRY_SELL":5,  # Re-entry specific limits (5 buy, 5 sell)
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
-    "PROFIT_TARGET_USD":20.0,
+    "PROFIT_TARGET_USD":220.0,
     # Strategy enable/disable flags (all enabled by default)
     "ENABLE_MACD": True,
     "ENABLE_FVG": True,
@@ -2456,9 +2456,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         # Re-raise if it's a different error
                         raise
                 
-                # Remove from trend lock
-                TREND_LOCK.pop(sym, None)
-                TREND_LOCK_TIME.pop(sym, None)
+                # Note: TRENDLOCK is intentionally NOT removed during cashout
+                # This prevents reopening positions for same symbols immediately after cashout
                 
                 # Log to closed trades with exit reason
                 entry_price = float(p.get("entryPrice", 0))
@@ -3300,10 +3299,16 @@ def _duplicate_or_locked(sym, direction):
 
 def _can_direction(direction, kind=""):
     if not STATE.get("auto_trade_active", True): return False
-    if direction=="UP" and STATE.get("long_blocked",False):  return False
-    if direction=="DOWN" and STATE.get("short_blocked",False): return False
     
-    # Check CEST-specific limits
+    # Check global limits first - these apply to ALL strategies including REENTRY and CEST
+    if direction=="UP" and STATE.get("long_blocked",False):
+        log(f"[GLOBAL LIMIT] Long positions blocked (max: {PARAM['MAX_BUY']})")
+        return False
+    if direction=="DOWN" and STATE.get("short_blocked",False):
+        log(f"[GLOBAL LIMIT] Short positions blocked (max: {PARAM['MAX_SELL']})")
+        return False
+    
+    # Check CEST-specific limits (in addition to global limits)
     if kind == "CEST":
         if direction=="UP" and STATE.get("cest_long_blocked",False):
             log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 15)})")
@@ -3312,7 +3317,7 @@ def _can_direction(direction, kind=""):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
             return False
     
-    # Check RE-ENTRY-specific limits
+    # Check RE-ENTRY-specific limits (in addition to global limits)
     if kind == "REENTRY_4H_5M":
         if direction=="UP" and STATE.get("reentry_long_blocked",False):
             log(f"[REENTRY LIMIT] Re-entry long positions blocked (max: {PARAM.get('MAX_REENTRY_BUY', 5)})")
@@ -3326,18 +3331,18 @@ def _can_direction(direction, kind=""):
 def execute_real_trade(sig):
     approve_bars = int(PARAM.get("SCALP_APPROVE_BARS",0))
     if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
-        return
+        return False
 
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
 
     # 🔒 Duplicate / Direction limits
-    if not _can_direction(direction, kind): return
-    if _duplicate_or_locked(sym,direction): return
+    if not _can_direction(direction, kind): return False
+    if _duplicate_or_locked(sym,direction): return False
 
     qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
     if not qty or qty<=0:
-        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return
+        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return False
 
     try:
         opened=open_market_position(sym,direction,qty)
@@ -3346,7 +3351,7 @@ def execute_real_trade(sig):
             # Try fallback to current price
             entry_exec = futures_get_price(sym)
         if entry_exec is None or entry_exec<=0:
-            log(f"[OPEN FAIL] {sym} entry alınamadı."); return
+            log(f"[OPEN FAIL] {sym} entry alınamadı."); return False
 
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
             sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
@@ -3395,9 +3400,12 @@ def execute_real_trade(sig):
             "tp_target": tp_usd_used or tp_pct_used,
             "market_state": sig.get("market_state", "")
         }
+        
+        return True  # Successfully opened position
 
     except Exception as e:
         log(f"[OPEN ERR]{sym}{e}")
+        return False
 
 # ===================== TRENDLOCK TEMİZLİK =====================
 
@@ -3420,10 +3428,10 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
-    tg_send("🚀 EMA ULTRA v15.9.62 aktif — KIVANC removed, Asian improved\n"
+    tg_send("🚀 EMA ULTRA v15.9.63 aktif — KIVANC removed, Asian improved\n"
             "📊 12 strategies active | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control")
-    log("[START] EMA ULTRA v15.9.62 - KIVANC removed, Asian session improved")
+    log("[START] EMA ULTRA v15.9.63 - KIVANC removed, Asian session improved")
 
     symbols=auto_init_symbols()
 
@@ -3440,12 +3448,46 @@ def main():
             sigs=run_parallel(symbols,bar_i)
 
             # 2) Sinyal kayıt + Gerçek trade
+            # Update limits once before processing batch
+            update_directional_limits()
+            
+            # Track positions opened in this batch to update local counts
+            batch_opened = {"reentry_long": 0, "reentry_short": 0, "cest_long": 0, "cest_short": 0, "general_long": 0, "general_short": 0}
+            
             for sig in sigs:
                 ai_log_signal(sig)
-                update_directional_limits()
                 
                 # Execute real trade for all strategies
-                execute_real_trade(sig)
+                trade_opened = execute_real_trade(sig)
+                
+                # If trade was opened, update local counts and STATE to prevent race conditions
+                if trade_opened:
+                    kind = sig.get("kind", "")
+                    direction = sig["dir"]
+                    
+                    if kind == "REENTRY_4H_5M":
+                        if direction == "UP":
+                            batch_opened["reentry_long"] += 1
+                            # Update STATE immediately so next signal sees the updated count
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
+                            STATE["reentry_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_BUY", 5))
+                        else:
+                            batch_opened["reentry_short"] += 1
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "DOWN"])
+                            STATE["reentry_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_SELL", 5))
+                    elif kind == "CEST":
+                        if direction == "UP":
+                            batch_opened["cest_long"] += 1
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
+                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 15))
+                        else:
+                            batch_opened["cest_short"] += 1
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
+                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
+            
+            # Update limits once after batch to sync with exchange state
+            if any(batch_opened.values()):
+                update_directional_limits()
             
             # 3.1) Check and log real closed trades
             check_and_log_real_closed_trades()
