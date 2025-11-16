@@ -2456,9 +2456,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         # Re-raise if it's a different error
                         raise
                 
-                # Remove from trend lock
-                TREND_LOCK.pop(sym, None)
-                TREND_LOCK_TIME.pop(sym, None)
+                # Note: TRENDLOCK is intentionally NOT removed during cashout
+                # This prevents reopening positions for same symbols immediately after cashout
                 
                 # Log to closed trades with exit reason
                 entry_price = float(p.get("entryPrice", 0))
