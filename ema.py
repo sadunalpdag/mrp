@@ -813,10 +813,23 @@ def build_macd_trend_signal(sym, kl, bar_i):
     entry=closes[-1]
     tp=entry*(1.006 if direction=="UP" else 0.994)
     sl=entry*(0.8 if direction=="UP" else 1.2)
-    return {"symbol":sym,"dir":direction,"tier":"MACD","emoji":"📈" if direction=="UP" else "📉",
+    sig = {"symbol":sym,"dir":direction,"tier":"MACD","emoji":"📈" if direction=="UP" else "📉",
             "entry":entry,"tp":tp,"sl":sl,"power":pwr,"rsi":r_val,"atr":atr_v,
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"MACD","tag":tag}
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "ema20": e20[-1],
+        "ema200": e200[-1],
+        "macd_line": macd_line[-1],
+        "macd_signal": sig_line[-1],
+        "macd_prev": macd_line[-2],
+        "signal_prev": sig_line[-2],
+        "ema_spread": abs(e20[-1] - e200[-1])
+    }
+    
+    return sig
 
 def build_fvg_break_signal(sym, kl, bar_i):
     if len(kl)<5: return None
@@ -824,18 +837,30 @@ def build_fvg_break_signal(sym, kl, bar_i):
     h1,h2,h3=highs[-3:]; l1,l2,l3=lows[-3:]; c_now=closes[-1]
     up_gap = l2>h1 and c_now>l2
     dn_gap = h2<l1 and c_now< h2
-    if up_gap: direction="UP"; tag="🟩 FVG BREAK BUY"
-    elif dn_gap: direction="DOWN"; tag="🟥 FVG BREAK SELL"
+    if up_gap: direction="UP"; tag="🟩 FVG BREAK BUY"; gap_size = l2 - h1
+    elif dn_gap: direction="DOWN"; tag="🟥 FVG BREAK SELL"; gap_size = l1 - h2
     else: return None
     atr_v=atr_like(highs,lows,closes)[-1]; r_val=rsi(closes)[-1]
     pwr=58+(atr_v/(closes[-1] or 1))*150
     entry=closes[-1]
     tp=entry*(1.005 if direction=="UP" else 0.995)
     sl=entry*(0.82 if direction=="UP" else 1.18)
-    return {"symbol":sym,"dir":direction,"tier":"FVG","emoji":"🟩" if direction=="UP" else "🟥",
+    sig = {"symbol":sym,"dir":direction,"tier":"FVG","emoji":"🟩" if direction=="UP" else "🟥",
             "entry":entry,"tp":tp,"sl":sl,"power":pwr,"rsi":r_val,"atr":atr_v,
             "time":now_local_iso(),"born_bar":bar_i,"early":False,
             "kind":"FVG","tag":tag}
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "gap_size": gap_size,
+        "gap_size_pct": (gap_size / entry) * 100,
+        "h1": h1, "h2": h2, "h3": h3,
+        "l1": l1, "l2": l2, "l3": l3,
+        "up_gap": up_gap,
+        "dn_gap": dn_gap
+    }
+    
+    return sig
 
 def build_early_signal(sym, kl, bar_i):
     if len(kl)<60: return None
@@ -938,6 +963,18 @@ def build_ema_pullback_signal(sym, kl, bar_i):
     }
     # 🔹 Sadece EMA Pullback için Market State etiketi
     sig["market_state"] = detect_market_state(closes, highs, lows)
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "ema9": e9[-1],
+        "ema30": e30[-1],
+        "ema200": e200[-1],
+        "swing_high": swing_h,
+        "swing_low": swing_l,
+        "uptrend": uptrend,
+        "downtrend": downtrend
+    }
+    
     return sig
 
 
@@ -1071,7 +1108,7 @@ def build_cest_signal(sym, kl, bar_i):
                     l1, l2, l3 = lows[-3:]
                     has_fvg = l2 > h1  # Bullish FVG
                 
-                return {
+                sig = {
                     "symbol": sym,
                     "dir": direction,
                     "tier": "CEST",
@@ -1093,6 +1130,22 @@ def build_cest_signal(sym, kl, bar_i):
                     "body_ratio": body_ratio,
                     "has_fvg": has_fvg
                 }
+                
+                # 📊 Strategy condition parameters for analysis
+                sig["conditions"] = {
+                    "ma50": ma50_now,
+                    "swing_low": swing_low,
+                    "body_ratio": body_ratio,
+                    "has_fvg": has_fvg,
+                    "trend_4h": trend_4h,
+                    "bottom1_idx": bottom1_idx,
+                    "bottom2_idx": bottom2_idx,
+                    "touches_ma": touches_ma,
+                    "tolerance": tolerance,
+                    "rr_ratio": rr_ratio
+                }
+                
+                return sig
     
     # ========== SHORT SETUP ==========
     # Check if price is below 50 MA
@@ -1149,7 +1202,7 @@ def build_cest_signal(sym, kl, bar_i):
                     l1, l2, l3 = lows[-3:]
                     has_fvg = h2 < l1  # Bearish FVG
                 
-                return {
+                sig = {
                     "symbol": sym,
                     "dir": direction,
                     "tier": "CEST",
@@ -1171,6 +1224,22 @@ def build_cest_signal(sym, kl, bar_i):
                     "body_ratio": body_ratio,
                     "has_fvg": has_fvg
                 }
+                
+                # 📊 Strategy condition parameters for analysis
+                sig["conditions"] = {
+                    "ma50": ma50_now,
+                    "swing_high": swing_high,
+                    "body_ratio": body_ratio,
+                    "has_fvg": has_fvg,
+                    "trend_4h": trend_4h,
+                    "top1_idx": top1_idx,
+                    "top2_idx": top2_idx,
+                    "touches_ma": touches_ma,
+                    "tolerance": tolerance,
+                    "rr_ratio": rr_ratio
+                }
+                
+                return sig
     
     return None
 
@@ -1243,7 +1312,7 @@ def build_orb_fvg_confirm_signal(sym, kl, bar_i):
     
     pwr = 62 + (atr_v / c_now) * 150 + (r_val - 50) / 2.0
     
-    return {
+    sig = {
         "symbol": sym,
         "dir": direction,
         "tier": "ORB_FVG",
@@ -1262,6 +1331,23 @@ def build_orb_fvg_confirm_signal(sym, kl, bar_i):
         "or_high": or_high,
         "or_low": or_low
     }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "or_high": or_high,
+        "or_low": or_low,
+        "or_range": or_high - or_low,
+        "or_range_pct": ((or_high - or_low) / c_now) * 100,
+        "fvg_gap_size": (l2 - h1) if direction == "UP" else (l1 - h2),
+        "broke_high": broke_high,
+        "broke_low": broke_low,
+        "up_gap": up_gap,
+        "dn_gap": dn_gap,
+        "risk": risk,
+        "rr_ratio": 2.0
+    }
+    
+    return sig
 
 
 def build_london_breakout_signal(sym, kl, bar_i):
@@ -1318,7 +1404,7 @@ def build_london_breakout_signal(sym, kl, bar_i):
     r_val = rsi(closes)[-1]
     pwr = 63 + (atr_v / c_now) * 140 + (r_val - 50) / 2.0
     
-    return {
+    sig = {
         "symbol": sym,
         "dir": direction,
         "tier": "LONDON_BO",
@@ -1337,6 +1423,20 @@ def build_london_breakout_signal(sym, kl, bar_i):
         "lo_range_high": lo_range_high,
         "lo_range_low": lo_range_low
     }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "lo_range_high": lo_range_high,
+        "lo_range_low": lo_range_low,
+        "lo_range": lo_range_high - lo_range_low,
+        "lo_range_pct": ((lo_range_high - lo_range_low) / c_now) * 100,
+        "ema20": e20[-1],
+        "above_ema20": c_now > e20[-1],
+        "risk": risk,
+        "rr_ratio": 2.0
+    }
+    
+    return sig
 
 
 def build_ny_reversal_signal(sym, kl, bar_i):
@@ -1395,7 +1495,7 @@ def build_ny_reversal_signal(sym, kl, bar_i):
     
     pwr = 61 + (atr_v / c_now) * 130 + abs(r_val - 50)
     
-    return {
+    sig = {
         "symbol": sym,
         "dir": direction,
         "tier": "NY_REVERSAL",
@@ -1413,6 +1513,16 @@ def build_ny_reversal_signal(sym, kl, bar_i):
         "tag": tag,
         "sweep_level": sweep_level
     }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "sweep_level": sweep_level,
+        "sweep_direction": direction,
+        "risk": risk,
+        "rr_ratio": 1.5
+    }
+    
+    return sig
 
 
 def build_ict_power_of_3_signal(sym, kl, bar_i):
@@ -1849,7 +1959,7 @@ def build_reentry_signal(sym, kl, bar_i):
     
     pwr = 66 + (atr_v / entry) * 130 + abs(r_val - 50) / 2.0
     
-    return {
+    sig = {
         "symbol": sym,
         "dir": direction,
         "tier": "REENTRY",
@@ -1869,6 +1979,21 @@ def build_reentry_signal(sym, kl, bar_i):
         "zone_low": zone_low,
         "trend_4h": trend_4h
     }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "zone_high": zone_high,
+        "zone_low": zone_low,
+        "zone_range": zone_high - zone_low,
+        "zone_range_pct": ((zone_high - zone_low) / entry) * 100,
+        "trend_4h": trend_4h,
+        "risk": risk,
+        "rr_ratio": 2.0,
+        "in_kill_zone": in_kill_zone,
+        "current_hour": current_hour
+    }
+    
+    return sig
 
 
 def build_fvg_mss_signal(sym, kl, bar_i):
@@ -1953,7 +2078,7 @@ def build_fvg_mss_signal(sym, kl, bar_i):
     # High power for this high-quality setup
     pwr = 70 + (atr_v / entry) * 150 + abs(r_val - 50) / 2.0
     
-    return {
+    sig = {
         "symbol": sym,
         "dir": direction,
         "tier": "FVG_MSS",
@@ -1974,6 +2099,23 @@ def build_fvg_mss_signal(sym, kl, bar_i):
         "ob_low": ob_low,
         "fvg_zone": "bullish" if has_bullish_fvg else "bearish"
     }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "mss_level": mss_level,
+        "mss_direction": mss_direction,
+        "ob_high": ob_high,
+        "ob_low": ob_low,
+        "ob_range": ob_high - ob_low,
+        "fvg_gap_size": (l2 - h1) if has_bullish_fvg else (l1 - h2),
+        "fvg_zone": "bullish" if has_bullish_fvg else "bearish",
+        "has_bullish_fvg": has_bullish_fvg,
+        "has_bearish_fvg": has_bearish_fvg,
+        "risk": risk,
+        "rr_ratio": 3.0
+    }
+    
+    return sig
 
 
 def scan_symbol(sym,bar_i):
@@ -2135,7 +2277,8 @@ def check_and_log_real_closed_trades():
                     "open_time": pos_info.get("open_time"),
                     "close_time": now_local_iso(),
                     "tp_target": pos_info.get("tp_target"),
-                    "market_state": pos_info.get("market_state", "")
+                    "market_state": pos_info.get("market_state", ""),
+                    "conditions": pos_info.get("conditions", {})  # 📊 Include strategy condition parameters
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -2490,7 +2633,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "close_time": now_local_iso(),
                     "exit_reason": exit_reason,
                     "market_state": pos_info.get("market_state", ""),
-                    "closed_by_profit_target": (exit_reason == "PROFIT_TARGET")
+                    "closed_by_profit_target": (exit_reason == "PROFIT_TARGET"),
+                    "conditions": pos_info.get("conditions", {})  # 📊 Include strategy condition parameters
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -3398,7 +3542,8 @@ def execute_real_trade(sig):
             "power": pwr,
             "open_time": now_local_iso(),
             "tp_target": tp_usd_used or tp_pct_used,
-            "market_state": sig.get("market_state", "")
+            "market_state": sig.get("market_state", ""),
+            "conditions": sig.get("conditions", {})  # 📊 Store strategy condition parameters
         }
         
         return True  # Successfully opened position
