@@ -3332,18 +3332,18 @@ def _can_direction(direction, kind=""):
 def execute_real_trade(sig):
     approve_bars = int(PARAM.get("SCALP_APPROVE_BARS",0))
     if approve_bars>0 and (STATE.get("bar_index",0) - sig.get("born_bar",0) < approve_bars):
-        return
+        return False
 
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
 
     # 🔒 Duplicate / Direction limits
-    if not _can_direction(direction, kind): return
-    if _duplicate_or_locked(sym,direction): return
+    if not _can_direction(direction, kind): return False
+    if _duplicate_or_locked(sym,direction): return False
 
     qty=calc_order_qty(sym,sig["entry"],PARAM["TRADE_SIZE_USDT"])
     if not qty or qty<=0:
-        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return
+        log(f"[QTY ERR] {sym} qty hesaplanamadı."); return False
 
     try:
         opened=open_market_position(sym,direction,qty)
@@ -3352,7 +3352,7 @@ def execute_real_trade(sig):
             # Try fallback to current price
             entry_exec = futures_get_price(sym)
         if entry_exec is None or entry_exec<=0:
-            log(f"[OPEN FAIL] {sym} entry alınamadı."); return
+            log(f"[OPEN FAIL] {sym} entry alınamadı."); return False
 
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
             sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
@@ -3401,9 +3401,12 @@ def execute_real_trade(sig):
             "tp_target": tp_usd_used or tp_pct_used,
             "market_state": sig.get("market_state", "")
         }
+        
+        return True  # Successfully opened position
 
     except Exception as e:
         log(f"[OPEN ERR]{sym}{e}")
+        return False
 
 # ===================== TRENDLOCK TEMİZLİK =====================
 
@@ -3449,13 +3452,42 @@ def main():
             # Update limits once before processing batch
             update_directional_limits()
             
+            # Track positions opened in this batch to update local counts
+            batch_opened = {"reentry_long": 0, "reentry_short": 0, "cest_long": 0, "cest_short": 0, "general_long": 0, "general_short": 0}
+            
             for sig in sigs:
                 ai_log_signal(sig)
                 
                 # Execute real trade for all strategies
-                execute_real_trade(sig)
+                trade_opened = execute_real_trade(sig)
                 
-                # Update limits after each trade to prevent race conditions in same batch
+                # If trade was opened, update local counts and STATE to prevent race conditions
+                if trade_opened:
+                    kind = sig.get("kind", "")
+                    direction = sig["dir"]
+                    
+                    if kind == "REENTRY_4H_5M":
+                        if direction == "UP":
+                            batch_opened["reentry_long"] += 1
+                            # Update STATE immediately so next signal sees the updated count
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
+                            STATE["reentry_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_BUY", 5))
+                        else:
+                            batch_opened["reentry_short"] += 1
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "DOWN"])
+                            STATE["reentry_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_SELL", 5))
+                    elif kind == "CEST":
+                        if direction == "UP":
+                            batch_opened["cest_long"] += 1
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
+                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 15))
+                        else:
+                            batch_opened["cest_short"] += 1
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
+                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
+            
+            # Update limits once after batch to sync with exchange state
+            if any(batch_opened.values()):
                 update_directional_limits()
             
             # 3.1) Check and log real closed trades
