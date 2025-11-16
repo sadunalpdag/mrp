@@ -3300,10 +3300,16 @@ def _duplicate_or_locked(sym, direction):
 
 def _can_direction(direction, kind=""):
     if not STATE.get("auto_trade_active", True): return False
-    if direction=="UP" and STATE.get("long_blocked",False):  return False
-    if direction=="DOWN" and STATE.get("short_blocked",False): return False
     
-    # Check CEST-specific limits
+    # Check global limits first - these apply to ALL strategies including REENTRY and CEST
+    if direction=="UP" and STATE.get("long_blocked",False):
+        log(f"[GLOBAL LIMIT] Long positions blocked (max: {PARAM['MAX_BUY']})")
+        return False
+    if direction=="DOWN" and STATE.get("short_blocked",False):
+        log(f"[GLOBAL LIMIT] Short positions blocked (max: {PARAM['MAX_SELL']})")
+        return False
+    
+    # Check CEST-specific limits (in addition to global limits)
     if kind == "CEST":
         if direction=="UP" and STATE.get("cest_long_blocked",False):
             log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 15)})")
@@ -3312,7 +3318,7 @@ def _can_direction(direction, kind=""):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
             return False
     
-    # Check RE-ENTRY-specific limits
+    # Check RE-ENTRY-specific limits (in addition to global limits)
     if kind == "REENTRY_4H_5M":
         if direction=="UP" and STATE.get("reentry_long_blocked",False):
             log(f"[REENTRY LIMIT] Re-entry long positions blocked (max: {PARAM.get('MAX_REENTRY_BUY', 5)})")
