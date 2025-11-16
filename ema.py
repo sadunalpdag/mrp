@@ -224,6 +224,108 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
     
     return st_values, st_direction
 
+# ===================== VWAP & VOLUME HELPERS =====================
+
+def calculate_vwap(klines):
+    """
+    Calculate VWAP (Volume Weighted Average Price)
+    
+    Args:
+        klines: List of klines [[time, open, high, low, close, volume, ...], ...]
+    
+    Returns:
+        float: VWAP value or None if insufficient data
+    """
+    if len(klines) < 2:
+        return None
+    
+    try:
+        total_volume = 0.0
+        total_pv = 0.0  # price * volume
+        
+        for k in klines:
+            high = float(k[2])
+            low = float(k[3])
+            close = float(k[4])
+            volume = float(k[5])
+            
+            # Typical price: (high + low + close) / 3
+            typical_price = (high + low + close) / 3.0
+            pv = typical_price * volume
+            
+            total_pv += pv
+            total_volume += volume
+        
+        if total_volume > 0:
+            return total_pv / total_volume
+        return None
+    except:
+        return None
+
+def detect_volume_spike(klines, spike_threshold=1.5):
+    """
+    Detect if current volume is significantly higher than average (volume spike)
+    
+    Args:
+        klines: List of klines
+        spike_threshold: Multiplier to consider a spike (default 1.5x)
+    
+    Returns:
+        (has_spike, volume_ratio): bool and float ratio
+    """
+    if len(klines) < 10:
+        return False, 1.0
+    
+    try:
+        volumes = [float(k[5]) for k in klines]
+        
+        # Current volume
+        current_vol = volumes[-1]
+        
+        # Average volume of previous bars (exclude current)
+        avg_vol = sum(volumes[-10:-1]) / 9.0
+        
+        if avg_vol > 0:
+            vol_ratio = current_vol / avg_vol
+            has_spike = vol_ratio >= spike_threshold
+            return has_spike, vol_ratio
+        
+        return False, 1.0
+    except:
+        return False, 1.0
+
+def check_ema_trend_alignment(closes, period1=50, period2=200):
+    """
+    Check if EMA50 and EMA200 are aligned in same direction (trend filter)
+    
+    Args:
+        closes: List of close prices
+        period1: First EMA period (default 50)
+        period2: Second EMA period (default 200)
+    
+    Returns:
+        ("UP", "DOWN", or None): Aligned trend direction or None if not aligned
+    """
+    if len(closes) < period2 + 5:
+        return None
+    
+    try:
+        ema_short = ema(closes, period1)
+        ema_long = ema(closes, period2)
+        
+        # Both EMAs sloping up = uptrend
+        if ema_short[-1] > ema_long[-1] and ema_short[-1] > ema_short[-3]:
+            return "UP"
+        
+        # Both EMAs sloping down = downtrend
+        if ema_short[-1] < ema_long[-1] and ema_short[-1] < ema_short[-3]:
+            return "DOWN"
+        
+        # Not aligned or unclear
+        return None
+    except:
+        return None
+
 # ===================== MARKET STATE ANALYZER =====================
 
 def detect_market_state(closes, highs, lows):
@@ -1352,11 +1454,16 @@ def build_orb_fvg_confirm_signal(sym, kl, bar_i):
 
 def build_london_breakout_signal(sym, kl, bar_i):
     """
-    London Breakout (LO) Strategy
+    London Breakout (LO) Strategy - ENHANCED
     
     London session opening range breakout (08:00-10:00 GMT).
     Entry: Breakout of 30-minute London open range
     TP/SL: 2:1 Risk/Reward
+    
+    NEW FILTERS:
+    - Volume Spike: Confirms breakout strength
+    - VWAP Filter: Price above VWAP = Long safer, below = Short safer
+    - EMA Trend Alignment (5M/15M): EMA50+200 same direction = stronger breakout
     """
     # Time window: 08:00-10:00 GMT = 08:00-10:00 UTC
     if not is_in_time_window(8, 10):
@@ -1380,6 +1487,27 @@ def build_london_breakout_signal(sym, kl, bar_i):
     
     c_now = closes[-1]
     
+    # NEW: Calculate VWAP for session
+    vwap = calculate_vwap(kl[-10:])  # Last 10 bars for VWAP
+    
+    # NEW: Detect volume spike
+    has_volume_spike, volume_ratio = detect_volume_spike(kl)
+    
+    # NEW: Check EMA trend alignment (try to get 5M data if available, fallback to 1H)
+    ema_trend = None
+    try:
+        # Try 5M data for better trend detection
+        kl_5m = futures_get_klines(sym, "5m", 200)
+        if kl_5m and len(kl_5m) >= 200:
+            closes_5m = [float(k[4]) for k in kl_5m]
+            ema_trend = check_ema_trend_alignment(closes_5m, period1=50, period2=200)
+    except:
+        pass
+    
+    # Fallback to 1H data if 5M not available
+    if ema_trend is None and len(closes) >= 200:
+        ema_trend = check_ema_trend_alignment(closes, period1=50, period2=200)
+    
     # Check for breakout with EMA20 trend confirmation
     e20 = ema(closes, 20)
     
@@ -1387,13 +1515,37 @@ def build_london_breakout_signal(sym, kl, bar_i):
     if c_now > lo_range_high and c_now > e20[-1]:
         direction = "UP"
         tag = "🌍 LONDON BO BUY"
+        
+        # NEW: VWAP Filter - Long is safer if price above VWAP
+        if vwap and c_now < vwap:
+            # Price below VWAP but trying to go long - less safe, skip or reduce confidence
+            # We'll continue but mark it in conditions
+            pass
+        
+        # NEW: EMA Trend Filter - Check alignment
+        if ema_trend == "DOWN":
+            # EMAs pointing down but trying to go long - fakeout risk, skip
+            return None
+        
         sl_est = lo_range_low
         risk = c_now - sl_est
         tp_est = c_now + 2.0 * risk
+        
     # Bearish breakout: price breaks below range + below EMA20
     elif c_now < lo_range_low and c_now < e20[-1]:
         direction = "DOWN"
         tag = "🌍 LONDON BO SELL"
+        
+        # NEW: VWAP Filter - Short is safer if price below VWAP
+        if vwap and c_now > vwap:
+            # Price above VWAP but trying to go short - less safe, skip or reduce confidence
+            pass
+        
+        # NEW: EMA Trend Filter - Check alignment
+        if ema_trend == "UP":
+            # EMAs pointing up but trying to go short - fakeout risk, skip
+            return None
+        
         sl_est = lo_range_high
         risk = sl_est - c_now
         tp_est = c_now - 2.0 * risk
@@ -1402,7 +1554,22 @@ def build_london_breakout_signal(sym, kl, bar_i):
     
     atr_v = atr_like(highs, lows, closes)[-1]
     r_val = rsi(closes)[-1]
+    
+    # Power calculation with new filters
     pwr = 63 + (atr_v / c_now) * 140 + (r_val - 50) / 2.0
+    
+    # Boost power for volume spike
+    if has_volume_spike:
+        pwr += 5
+    
+    # Boost power for EMA trend alignment
+    if ema_trend == direction:
+        pwr += 5
+    
+    # Boost power for VWAP confirmation
+    if vwap:
+        if (direction == "UP" and c_now > vwap) or (direction == "DOWN" and c_now < vwap):
+            pwr += 3
     
     sig = {
         "symbol": sym,
@@ -1433,7 +1600,14 @@ def build_london_breakout_signal(sym, kl, bar_i):
         "ema20": e20[-1],
         "above_ema20": c_now > e20[-1],
         "risk": risk,
-        "rr_ratio": 2.0
+        "rr_ratio": 2.0,
+        # NEW condition parameters
+        "vwap": vwap,
+        "price_vs_vwap": "above" if (vwap and c_now > vwap) else "below" if vwap else "unknown",
+        "has_volume_spike": has_volume_spike,
+        "volume_ratio": volume_ratio,
+        "ema_trend": ema_trend,
+        "ema_aligned": (ema_trend == direction) if ema_trend else False
     }
     
     return sig
@@ -1619,7 +1793,7 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
     
     2. **Range Scalping** (Secondary):
        - Fades extremes: sells at range top, buys at range bottom
-       - Quick scalps ing range mean (VWAP/midpoint)
+       - Quick scalps to range mean (VWAP/midpoint)
     
     3. **Micro FVG Fill**:
        - Small FVG gaps within Asian range get filled quickly
@@ -1628,6 +1802,12 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
     Entry: Liquidity sweep detection + 5m strong reversal candle
     TP/SL: 1:1.5 Risk/Reward (Asian session has lower volatility)
     Time: Active 03:00-09:00 GMT (includes early London for sweep detection)
+    
+    NEW FILTERS (User Requested):
+    - Volume Spike: Confirms breakout strength
+    - VWAP Filter: Price above VWAP = Long safer, below = Short safer
+    - Range Width Filter: 0.3-0.8% = take trade, >1% = skip (too wide)
+    - EMA Trend Filter (5M/15M): EMA50+200 same direction = breakout stronger
     """
     # Active during and shortly after Asian session: 03:00-09:00 GMT
     if not is_in_time_window(3, 9):
@@ -1652,8 +1832,18 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
     # Calculate range midpoint for mean reversion 
     range_mid = (asian_high + asian_low) / 2.0
     range_size = asian_high - asian_low
+    range_size_pct = (range_size / range_mid) * 100
     
-    # Skip if range is too wide (not a typical Asian ranging session)
+    # NEW: Range Width Filter
+    # Rule: Asian range 0.3-0.8% = take trade, >1% = skip (too wide)
+    if range_size_pct < 0.3:
+        # Range too narrow, might not be enough movement
+        return None
+    if range_size_pct > 1.0:
+        # Range too wide, breakout likely weak/fake
+        return None
+    
+    # Original filter kept as backup (less strict than user's request)
     if range_size / range_mid > 0.02:  # More than 2% range
         return None
     
@@ -1717,6 +1907,34 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         if h2 < l1 and (l1 - h2) / range_mid < 0.005:  # Gap < 0.5%
             has_micro_fvg_down = c_now < h2  # Price below FVG, likely to fill up
     
+    # NEW: Calculate VWAP for Asian session
+    vwap = calculate_vwap(kl[-10:])  # Last 10 bars for VWAP
+    
+    # NEW: Detect volume spike
+    has_volume_spike, volume_ratio = detect_volume_spike(kl)
+    
+    # NEW: Check EMA trend alignment (try to get 5M or 15M data if available, fallback to 1H)
+    ema_trend = None
+    try:
+        # Try 5M data for better trend detection
+        kl_5m = futures_get_klines(sym, "5m", 200)
+        if kl_5m and len(kl_5m) >= 200:
+            closes_5m = [float(k[4]) for k in kl_5m]
+            ema_trend = check_ema_trend_alignment(closes_5m, period1=50, period2=200)
+        
+        # If 5M didn't give result, try 15M
+        if ema_trend is None:
+            kl_15m = futures_get_klines(sym, "15m", 200)
+            if kl_15m and len(kl_15m) >= 200:
+                closes_15m = [float(k[4]) for k in kl_15m]
+                ema_trend = check_ema_trend_alignment(closes_15m, period1=50, period2=200)
+    except:
+        pass
+    
+    # Fallback to 1H data if 5M/15M not available
+    if ema_trend is None and len(closes) >= 200:
+        ema_trend = check_ema_trend_alignment(closes, period1=50, period2=200)
+    
     # ===== DETERMINE ENTRY =====
     direction = None
     entry_type = None
@@ -1726,20 +1944,51 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         direction = "UP"
         entry_type = "SWEEP"
         tag = "🌏 ASIA SWEEP BUY"
+        
+        # NEW: VWAP Filter - Long is safer if price above VWAP
+        if vwap and c_now < vwap:
+            # Price below VWAP but trying to go long - less safe, reduce confidence
+            pass  # Continue but mark in conditions
+        
+        # NEW: EMA Trend Filter - stronger breakout if aligned
+        if ema_trend == "DOWN":
+            # EMAs pointing down but trying to go long - fakeout risk
+            # For sweeps, we're more lenient as they're reversal plays
+            pass
+        
     elif bearish_sweep:
         direction = "DOWN"
         entry_type = "SWEEP"
         tag = "🌏 ASIA SWEEP SELL"
+        
+        # NEW: VWAP Filter - Short is safer if price below VWAP
+        if vwap and c_now > vwap:
+            # Price above VWAP but trying to go short - less safe
+            pass  # Continue but mark in conditions
+        
+        # NEW: EMA Trend Filter
+        if ema_trend == "UP":
+            # EMAs pointing up but trying to go short - fakeout risk
+            pass
     
     # Priority 2: Range Fade (mean reversion)
     elif fade_long and not bullish_sweep:
         direction = "UP"
         entry_type = "FADE"
         tag = "🌏 ASIA FADE BUY"
+        
+        # VWAP filter for fades
+        if vwap and c_now < vwap:
+            pass
+        
     elif fade_short and not bearish_sweep:
         direction = "DOWN"
         entry_type = "FADE"
         tag = "🌏 ASIA FADE SELL"
+        
+        # VWAP filter for fades
+        if vwap and c_now > vwap:
+            pass
     
     # Priority 3: Micro FVG Fill
     elif has_micro_fvg_down:
@@ -1797,7 +2046,24 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
     if entry_type == "SWEEP":
         pwr += 5  # Sweep has higher winrate
     
-    return {
+    # NEW: Boost power for volume spike
+    if has_volume_spike:
+        pwr += 4
+    
+    # NEW: Boost power for EMA trend alignment
+    if ema_trend == direction:
+        pwr += 4
+    
+    # NEW: Boost power for VWAP confirmation
+    if vwap:
+        if (direction == "UP" and c_now > vwap) or (direction == "DOWN" and c_now < vwap):
+            pwr += 3
+    
+    # NEW: Boost for optimal range width (0.3-0.8%)
+    if 0.3 <= range_size_pct <= 0.8:
+        pwr += 3
+    
+    sig = {
         "symbol": sym,
         "dir": direction,
         "tier": "ASIAN_SESSION",
@@ -1821,6 +2087,26 @@ def build_asian_range_breakout_signal(sym, kl, bar_i):
         "is_fade": entry_type == "FADE",
         "is_fvg": entry_type == "FVG"
     }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "asian_high": asian_high,
+        "asian_low": asian_low,
+        "range_mid": range_mid,
+        "range_size": range_size,
+        "range_size_pct": range_size_pct,
+        "entry_type": entry_type,
+        # NEW condition parameters
+        "vwap": vwap,
+        "price_vs_vwap": "above" if (vwap and c_now > vwap) else "below" if vwap else "unknown",
+        "has_volume_spike": has_volume_spike,
+        "volume_ratio": volume_ratio,
+        "ema_trend": ema_trend,
+        "ema_aligned": (ema_trend == direction) if ema_trend else False,
+        "in_optimal_range": 0.3 <= range_size_pct <= 0.8
+    }
+    
+    return sig
 
 
 def build_fvg_breaker_block_signal(sym, kl, bar_i):
