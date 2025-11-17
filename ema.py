@@ -3896,6 +3896,12 @@ def main():
                     kind = sig.get("kind", "")
                     direction = sig["dir"]
                     
+                    # Update global position counts immediately to prevent exceeding limits in same batch
+                    total_long_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("direction") == "UP"])
+                    total_short_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("direction") == "DOWN"])
+                    STATE["long_blocked"] = (total_long_count >= PARAM["MAX_BUY"])
+                    STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
+                    
                     if kind == "REENTRY_4H_5M":
                         if direction == "UP":
                             batch_opened["reentry_long"] += 1
