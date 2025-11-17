@@ -2718,7 +2718,6 @@ STATE_DEFAULT={
     "bar_index":0, "last_report":0, "auto_trade_active":True,
     "last_api_check":0, "long_blocked":False, "short_blocked":False,
     "cest_long_blocked":False, "cest_short_blocked":False,
-    "reentry_long_blocked":False, "reentry_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0
@@ -2727,7 +2726,6 @@ PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":250.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
-    "MAX_REENTRY_BUY":5, "MAX_REENTRY_SELL":5,  # Re-entry specific limits (within global limit)
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":220.0,
@@ -2974,7 +2972,7 @@ def is_hour_blocked_for_trading():
     return blocked
 
 def update_directional_limits():
-    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,"reentry_long_count":0,"reentry_short_count":0}
+    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0}
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
         for p in acc:
@@ -2984,17 +2982,11 @@ def update_directional_limits():
                 # Check if this is a CEST position
                 if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
                     live["cest_long_count"] += 1
-                # Check if this is a RE-ENTRY position
-                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "REENTRY_4H_5M":
-                    live["reentry_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
                 # Check if this is a CEST position
                 if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
                     live["cest_short_count"] += 1
-                # Check if this is a RE-ENTRY position
-                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "REENTRY_4H_5M":
-                    live["reentry_short_count"] += 1
         live["long_count"]=len(live["long"])
         live["short_count"]=len(live["short"])
     except Exception as e:
@@ -3004,8 +2996,6 @@ def update_directional_limits():
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
     STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
-    STATE["reentry_long_blocked"]  = (live["reentry_long_count"]  >= PARAM.get("MAX_REENTRY_BUY", 5))
-    STATE["reentry_short_blocked"] = (live["reentry_short_count"] >= PARAM.get("MAX_REENTRY_SELL", 5))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -3422,8 +3412,7 @@ def heartbeat_and_status_check(_snapshot):
     msg=(f"📊 STATUS bar:{STATE.get('bar_index',0)} "
          f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
          f"long_blocked:{STATE.get('long_blocked')} short_blocked:{STATE.get('short_blocked')}\n"
-         f"cest_long_blocked:{STATE.get('cest_long_blocked')} cest_short_blocked:{STATE.get('cest_short_blocked')}\n"
-         f"reentry_long_blocked:{STATE.get('reentry_long_blocked')} reentry_short_blocked:{STATE.get('reentry_short_blocked')}")
+         f"cest_long_blocked:{STATE.get('cest_long_blocked')} cest_short_blocked:{STATE.get('cest_short_blocked')}")
     tg_send(msg); log(msg)
 
 def ai_log_signal(sig):
@@ -3598,9 +3587,8 @@ def _cmd_status():
         f"📊 STATUS bar:{STATE.get('bar_index')} "
         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',30)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',30)}\n"
+        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',45)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',45)}\n"
         f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
-        f"Re-entry long:{live.get('reentry_long_count',0)}/{PARAM.get('MAX_REENTRY_BUY',5)} short:{live.get('reentry_short_count',0)}/{PARAM.get('MAX_REENTRY_SELL',5)}\n"
         f"Closed trades:{len(REAL_CLOSED)}\n"
         f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
         f"{strategy_msg}"
@@ -3824,15 +3812,12 @@ def _cmd_strategies():
             status = "✅" if enabled else "❌"
             msg += f"{status} {name}\n"
         
-        msg += f"\n📌 General Limits:\n"
-        msg += f"Long: {PARAM.get('MAX_BUY', 30)}\n"
-        msg += f"Short: {PARAM.get('MAX_SELL', 30)}\n"
-        msg += f"\n🧩 CEST Limits:\n"
+        msg += f"\n📌 Global Limits (All Strategies):\n"
+        msg += f"Long: {PARAM.get('MAX_BUY', 45)}\n"
+        msg += f"Short: {PARAM.get('MAX_SELL', 45)}\n"
+        msg += f"\n🧩 CEST Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
-        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
-        msg += f"\n🔄 Re-entry Limits:\n"
-        msg += f"Long: {PARAM.get('MAX_REENTRY_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_REENTRY_SELL', 5)}"
+        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}"
         
         tg_send(msg)
     except Exception as e:
@@ -3844,49 +3829,44 @@ def _cmd_setlimits(args):
         if len(args) < 2:
             tg_send("❌ Usage: /setlimits <type> <value>\n"
                     "Types:\n"
-                    "  buy, sell - General limits\n"
-                    "  cest_buy, cest_sell - CEST limits\n"
-                    "  reentry_buy, reentry_sell - Re-entry limits\n"
-                    "Example: /setlimits reentry_buy 10")
+                    "  buy, sell - Global limits (all strategies)\n"
+                    "  cest_buy, cest_sell - CEST sub-limits\n"
+                    "Example: /setlimits buy 50\n"
+                    "Example: /setlimits cest_buy 20")
             return
         
         limit_type = args[0].lower()
         value = int(args[1])
         
-        if value < 0 or value > 100:
-            tg_send("❌ Value must be between 0 and 100")
+        if value < 0 or value > 150:
+            tg_send("❌ Value must be between 0 and 150")
             return
         
         if limit_type == "buy":
             PARAM["MAX_BUY"] = value
             safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ MAX_BUY set to {value}")
+            tg_send(f"✅ Global MAX_BUY limit set to {value}")
+            log(f"[SETLIMITS] MAX_BUY = {value}")
         elif limit_type == "sell":
             PARAM["MAX_SELL"] = value
             safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ MAX_SELL set to {value}")
+            tg_send(f"✅ Global MAX_SELL limit set to {value}")
+            log(f"[SETLIMITS] MAX_SELL = {value}")
         elif limit_type == "cest_buy":
             PARAM["MAX_CEST_BUY"] = value
             safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ MAX_CEST_BUY set to {value}")
+            tg_send(f"✅ CEST MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_CEST_BUY = {value}")
         elif limit_type == "cest_sell":
             PARAM["MAX_CEST_SELL"] = value
             safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ MAX_CEST_SELL set to {value}")
-        elif limit_type == "reentry_buy":
-            PARAM["MAX_REENTRY_BUY"] = value
-            safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ MAX_REENTRY_BUY set to {value}")
-        elif limit_type == "reentry_sell":
-            PARAM["MAX_REENTRY_SELL"] = value
-            safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ MAX_REENTRY_SELL set to {value}")
+            tg_send(f"✅ CEST MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_CEST_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell, reentry_buy, reentry_sell")
+                    "Available: buy, sell, cest_buy, cest_sell")
             return
         
-        log(f"[SETLIMITS] {limit_type} = {value}")
     except ValueError:
         tg_send("❌ Value must be a number")
     except Exception as e:
@@ -4245,15 +4225,6 @@ def _can_direction(direction, kind=""):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
             return False
     
-    # Check RE-ENTRY-specific limits (in addition to global limits)
-    if kind == "REENTRY_4H_5M":
-        if direction=="UP" and STATE.get("reentry_long_blocked",False):
-            log(f"[REENTRY LIMIT] Re-entry long positions blocked (max: {PARAM.get('MAX_REENTRY_BUY', 5)})")
-            return False
-        if direction=="DOWN" and STATE.get("reentry_short_blocked",False):
-            log(f"[REENTRY LIMIT] Re-entry short positions blocked (max: {PARAM.get('MAX_REENTRY_SELL', 5)})")
-            return False
-    
     return True
 
 def execute_real_trade(sig):
@@ -4389,7 +4360,7 @@ def main():
             update_directional_limits()
             
             # Track positions opened in this batch to update local counts
-            batch_opened = {"reentry_long": 0, "reentry_short": 0, "cest_long": 0, "cest_short": 0, "general_long": 0, "general_short": 0}
+            batch_opened = {"cest_long": 0, "cest_short": 0, "general_long": 0, "general_short": 0}
             
             for sig in sigs:
                 ai_log_signal(sig)
@@ -4408,17 +4379,8 @@ def main():
                     STATE["long_blocked"] = (total_long_count >= PARAM["MAX_BUY"])
                     STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
                     
-                    # Update strategy-specific counts
-                    if kind == "REENTRY_4H_5M":
-                        if direction == "UP":
-                            batch_opened["reentry_long"] += 1
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
-                            STATE["reentry_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_BUY", 5))
-                        else:
-                            batch_opened["reentry_short"] += 1
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "DOWN"])
-                            STATE["reentry_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_SELL", 5))
-                    elif kind == "CEST":
+                    # Update CEST-specific counts (only CEST has sub-limits)
+                    if kind == "CEST":
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
