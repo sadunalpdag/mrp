@@ -40,6 +40,7 @@ AI_RL_FILE       = os.path.join(DATA_DIR,"ai_rl_log.json")
 REAL_CLOSED_FILE = os.path.join(DATA_DIR,"real_closed.json")
 LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
 BALANCE_HISTORY_FILE = os.path.join(DATA_DIR,"balance_history.json")
+HOURLY_STATS_FILE = os.path.join(DATA_DIR,"hourly_stats.json")
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -54,6 +55,7 @@ TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
+HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
 # ===================== UTILITIES =====================
@@ -2459,6 +2461,7 @@ AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
 AI_RL         = safe_load(AI_RL_FILE,[])
 REAL_CLOSED   = safe_load(REAL_CLOSED_FILE,[])
 BALANCE_HISTORY = safe_load(BALANCE_HISTORY_FILE,[])
+HOURLY_STATS  = safe_load(HOURLY_STATS_FILE,{})
 
 def enrich_with_ai_context(pos):
     best=None
@@ -2569,6 +2572,9 @@ def check_and_log_real_closed_trades():
                 
                 REAL_CLOSED.append(closed_trade)
                 safe_save(REAL_CLOSED_FILE, REAL_CLOSED)
+                
+                # Update hourly performance statistics
+                update_hourly_stats_from_closed_trade(closed_trade)
                 
                 pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
                 exit_str = f"{exit_price}" if exit_price is not None else "N/A"
@@ -2742,12 +2748,230 @@ PARAM_DEFAULT={
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
     "CEST_MIN_BODY_RATIO": 0.6,  # Minimum body to range ratio for confirmation
-    "CEST_RR_RATIO": 1.4  # Risk/Reward ratio (1:1.4)
+    "CEST_RR_RATIO": 1.4,  # Risk/Reward ratio (1:1.4)
+    # Hourly performance analysis thresholds
+    "HOURLY_MIN_TRADES": 20,  # Minimum trades to consider an hour for blocking
+    "HOURLY_MIN_WIN_RATE": 40.0,  # Minimum win rate % (below this = block)
+    "HOURLY_MIN_AVG_PNL": -0.5  # Minimum average PnL % (below this = block)
 }
 PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
 if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
 STATE=safe_load(STATE_FILE,STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
+
+# ===================== HOURLY PERFORMANCE TRACKING =====================
+
+def initialize_hourly_stats():
+    """Initialize hourly statistics structure"""
+    global HOURLY_STATS
+    
+    if not HOURLY_STATS:
+        HOURLY_STATS = {
+            "start_date": None,  # Start date for 2-week data collection
+            "analysis_active": False,  # Whether to use hourly filtering
+            "blocked_hours": [],  # List of hours where trading is blocked
+            "hours": {}  # Statistics per hour (0-23)
+        }
+        
+        # Initialize each hour with empty stats
+        for hour in range(24):
+            HOURLY_STATS["hours"][str(hour)] = {
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl_pct": 0.0,
+                "avg_pnl_pct": 0.0,
+                "win_rate": 0.0,
+                "strategies": {}  # Per-strategy stats
+            }
+        
+        safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+
+def update_hourly_stats_from_closed_trade(closed_trade):
+    """
+    Update hourly statistics when a trade closes.
+    
+    Args:
+        closed_trade: Dict with trade information including open_time, pnl_pct, strategy, etc.
+    """
+    global HOURLY_STATS
+    
+    try:
+        # Parse open time to get hour (UTC)
+        open_time_str = closed_trade.get("open_time")
+        if not open_time_str:
+            return
+        
+        # Parse ISO format timestamp
+        from datetime import datetime
+        open_time = datetime.fromisoformat(open_time_str.replace('Z', '+00:00'))
+        hour = str(open_time.hour)  # 0-23
+        
+        # Get trade metrics
+        pnl_pct = closed_trade.get("pnl_pct", 0.0)
+        strategy = closed_trade.get("strategy", "UNKNOWN")
+        exit_reason = closed_trade.get("exit_reason", "UNKNOWN")
+        
+        # Determine if win or loss
+        is_win = (exit_reason == "TP" or (pnl_pct and pnl_pct > 0))
+        
+        # Update hour stats
+        hour_stats = HOURLY_STATS["hours"][hour]
+        hour_stats["total_trades"] += 1
+        
+        if is_win:
+            hour_stats["wins"] += 1
+        else:
+            hour_stats["losses"] += 1
+        
+        if pnl_pct:
+            hour_stats["total_pnl_pct"] += pnl_pct
+            hour_stats["avg_pnl_pct"] = hour_stats["total_pnl_pct"] / hour_stats["total_trades"]
+        
+        # Calculate win rate
+        if hour_stats["total_trades"] > 0:
+            hour_stats["win_rate"] = (hour_stats["wins"] / hour_stats["total_trades"]) * 100
+        
+        # Update strategy-specific stats for this hour
+        if strategy not in hour_stats["strategies"]:
+            hour_stats["strategies"][strategy] = {
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl_pct": 0.0,
+                "avg_pnl_pct": 0.0,
+                "win_rate": 0.0
+            }
+        
+        strat_stats = hour_stats["strategies"][strategy]
+        strat_stats["total_trades"] += 1
+        if is_win:
+            strat_stats["wins"] += 1
+        else:
+            strat_stats["losses"] += 1
+        
+        if pnl_pct:
+            strat_stats["total_pnl_pct"] += pnl_pct
+            strat_stats["avg_pnl_pct"] = strat_stats["total_pnl_pct"] / strat_stats["total_trades"]
+        
+        if strat_stats["total_trades"] > 0:
+            strat_stats["win_rate"] = (strat_stats["wins"] / strat_stats["total_trades"]) * 100
+        
+        # Save updated stats
+        safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+        
+        log(f"[HOURLY STATS] Updated for hour {hour}: {hour_stats['total_trades']} trades, {hour_stats['win_rate']:.1f}% WR")
+        
+    except Exception as e:
+        log(f"[HOURLY STATS ERR] {e}")
+
+def check_and_activate_hourly_analysis():
+    """
+    Check if 2 weeks have passed since start_date.
+    If yes, activate hourly analysis and block poor-performing hours.
+    """
+    global HOURLY_STATS
+    
+    # If analysis is already active, skip
+    if HOURLY_STATS.get("analysis_active", False):
+        return
+    
+    # If no start date, set it now
+    if not HOURLY_STATS.get("start_date"):
+        HOURLY_STATS["start_date"] = now_local_iso()
+        safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+        log(f"[HOURLY ANALYSIS] Data collection started. Will activate analysis after 2 weeks.")
+        tg_send(f"📊 Hourly performance tracking started!\n"
+                f"Collecting data for 2 weeks before activating hour-based filtering.\n"
+                f"Start: {HOURLY_STATS['start_date']}")
+        return
+    
+    # Check if 2 weeks have passed
+    try:
+        from datetime import datetime, timedelta
+        start_date = datetime.fromisoformat(HOURLY_STATS["start_date"].replace('Z', '+00:00'))
+        now_date = datetime.now(timezone.utc)
+        days_passed = (now_date - start_date).days
+        
+        # Activate after 14 days (2 weeks)
+        if days_passed >= 14:
+            HOURLY_STATS["analysis_active"] = True
+            
+            # Calculate which hours to block based on performance
+            update_blocked_hours()
+            
+            safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+            
+            log(f"[HOURLY ANALYSIS] Activated after {days_passed} days of data collection")
+            tg_send(f"✅ Hourly analysis ACTIVATED!\n"
+                    f"Data collection period: {days_passed} days\n"
+                    f"Blocked hours: {HOURLY_STATS.get('blocked_hours', [])}\n"
+                    f"System will now avoid trading in poor-performing hours.")
+        else:
+            # Log remaining days (once per day)
+            remaining = 14 - days_passed
+            log(f"[HOURLY ANALYSIS] Data collection: {days_passed}/14 days. {remaining} days remaining.")
+    
+    except Exception as e:
+        log(f"[HOURLY ANALYSIS CHECK ERR] {e}")
+
+def update_blocked_hours():
+    """
+    Analyze hourly performance and update blocked hours list.
+    Blocks hours with poor performance based on configurable thresholds.
+    """
+    global HOURLY_STATS
+    
+    # Get thresholds from PARAM (configurable via Telegram)
+    min_trades_threshold = PARAM.get("HOURLY_MIN_TRADES", 20)  # Minimum trades to consider
+    min_win_rate_threshold = PARAM.get("HOURLY_MIN_WIN_RATE", 40.0)  # Minimum win rate %
+    min_avg_pnl_threshold = PARAM.get("HOURLY_MIN_AVG_PNL", -0.5)  # Minimum average PnL %
+    
+    blocked_hours = []
+    
+    for hour in range(24):
+        hour_str = str(hour)
+        hour_stats = HOURLY_STATS["hours"][hour_str]
+        
+        total_trades = hour_stats.get("total_trades", 0)
+        win_rate = hour_stats.get("win_rate", 0.0)
+        avg_pnl = hour_stats.get("avg_pnl_pct", 0.0)
+        
+        # Only consider hours with enough data
+        if total_trades < min_trades_threshold:
+            continue
+        
+        # Block hour if performance is poor
+        if win_rate < min_win_rate_threshold or avg_pnl < min_avg_pnl_threshold:
+            blocked_hours.append(hour)
+            log(f"[HOURLY BLOCK] Hour {hour}: WR={win_rate:.1f}%, AvgPnL={avg_pnl:.2f}% (blocked)")
+    
+    HOURLY_STATS["blocked_hours"] = blocked_hours
+    safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+    
+    return blocked_hours
+
+def is_hour_blocked_for_trading():
+    """
+    Check if current hour is blocked for trading based on performance analysis.
+    
+    Returns:
+        bool: True if current hour is blocked, False otherwise
+    """
+    # If analysis is not active, don't block any hours
+    if not HOURLY_STATS.get("analysis_active", False):
+        return False
+    
+    # Get current UTC hour
+    current_hour = get_current_utc_hour()
+    
+    # Check if current hour is in blocked list
+    blocked = current_hour in HOURLY_STATS.get("blocked_hours", [])
+    
+    if blocked:
+        log(f"[HOUR BLOCKED] Trading blocked for hour {current_hour} due to poor performance")
+    
+    return blocked
 
 def update_directional_limits():
     live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,"reentry_long_count":0,"reentry_short_count":0}
@@ -2924,6 +3148,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 }
                 
                 REAL_CLOSED.append(closed_trade)
+                
+                # Update hourly performance statistics
+                update_hourly_stats_from_closed_trade(closed_trade)
                 
                 # Remove from tracker
                 REAL_POSITIONS_TRACKER.pop(sym, None)
@@ -3268,13 +3495,116 @@ def _tg_set_offset(new_off):
 
 def _cmd_status():
     live=update_directional_limits()
+    
+    # Calculate strategy-specific position counts and distances to TP
+    try:
+        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
+        
+        # Count positions by strategy
+        strategy_counts = {}
+        tp_distances = []
+        total_unrealized_pnl = 0.0
+        
+        for p in acc:
+            amt = float(p["positionAmt"])
+            if amt == 0:
+                continue
+            
+            sym = p["symbol"]
+            entry_price = float(p.get("entryPrice", 0))
+            mark_price = float(p.get("markPrice", 0))
+            unrealized_pnl = float(p.get("unRealizedProfit", 0))
+            total_unrealized_pnl += unrealized_pnl
+            
+            # Get strategy info from tracker
+            pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
+            strategy = pos_info.get("kind", "UNKNOWN")
+            direction = "LONG" if amt > 0 else "SHORT"
+            
+            # Count by strategy
+            strategy_key = f"{strategy}_{direction}"
+            strategy_counts[strategy_key] = strategy_counts.get(strategy_key, 0) + 1
+            
+            # Calculate distance to TP if we have target info
+            tp_target = pos_info.get("tp_target")
+            if tp_target and entry_price > 0 and mark_price > 0:
+                # Calculate current PnL%
+                if direction == "LONG":
+                    current_pnl_pct = ((mark_price / entry_price) - 1) * 100
+                else:
+                    current_pnl_pct = ((entry_price - mark_price) / entry_price) * 100
+                
+                # If tp_target is a percentage
+                if isinstance(tp_target, float) and 0 < tp_target < 1:
+                    tp_pct = tp_target * 100
+                    distance_pct = tp_pct - current_pnl_pct
+                else:
+                    # tp_target is in USD, estimate percentage
+                    trade_size = PARAM.get("TRADE_SIZE_USDT", 250.0)
+                    tp_pct = (tp_target / trade_size) * 100
+                    distance_pct = tp_pct - current_pnl_pct
+                
+                tp_distances.append({
+                    "symbol": sym,
+                    "strategy": strategy,
+                    "direction": direction,
+                    "current_pnl": current_pnl_pct,
+                    "tp_target": tp_pct,
+                    "distance": distance_pct
+                })
+        
+        # Build strategy breakdown message
+        strategy_msg = "\n━━━━━ STRATEGY BREAKDOWN ━━━━━\n"
+        for strat_key, count in sorted(strategy_counts.items()):
+            strategy_msg += f"{strat_key}: {count}\n"
+        
+        # Add top 5 closest to TP
+        if tp_distances:
+            tp_distances.sort(key=lambda x: x["distance"])
+            strategy_msg += "\n━━━ CLOSEST TO TP (Top 5) ━━━\n"
+            for i, td in enumerate(tp_distances[:5]):
+                strategy_msg += (f"{i+1}. {td['symbol']} ({td['strategy']} {td['direction']})\n"
+                               f"   Current: {td['current_pnl']:.2f}%, Target: {td['tp_target']:.2f}%\n"
+                               f"   Distance: {td['distance']:.2f}%\n")
+        
+        # Check hourly analysis status
+        hourly_msg = "\n━━━━━ HOURLY ANALYSIS ━━━━━\n"
+        if HOURLY_STATS.get("analysis_active", False):
+            blocked_hours = HOURLY_STATS.get("blocked_hours", [])
+            current_hour = get_current_utc_hour()
+            hourly_msg += f"✅ Active (Current hour: {current_hour} UTC)\n"
+            if blocked_hours:
+                hourly_msg += f"🚫 Blocked hours: {blocked_hours}\n"
+            else:
+                hourly_msg += "✅ No hours blocked\n"
+        else:
+            start_date = HOURLY_STATS.get("start_date")
+            if start_date:
+                from datetime import datetime
+                start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
+                now_dt = datetime.now(timezone.utc)
+                days_passed = (now_dt - start_dt).days
+                remaining = max(0, 14 - days_passed)
+                hourly_msg += f"📊 Collecting data: {days_passed}/14 days\n"
+                hourly_msg += f"⏳ {remaining} days until activation\n"
+            else:
+                hourly_msg += "⏳ Not started\n"
+        
+    except Exception as e:
+        strategy_msg = f"\n⚠️ Error getting strategy breakdown: {e}\n"
+        hourly_msg = ""
+    
     tg_send(
-        f"📊 /status bar:{STATE.get('bar_index')} "
+        f"📊 STATUS bar:{STATE.get('bar_index')} "
         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
+        f"━━━━━━━━━━━━━━━━\n"
         f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',30)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',30)}\n"
         f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
         f"Re-entry long:{live.get('reentry_long_count',0)}/{PARAM.get('MAX_REENTRY_BUY',5)} short:{live.get('reentry_short_count',0)}/{PARAM.get('MAX_REENTRY_SELL',5)}\n"
-        f"real_closed:{len(REAL_CLOSED)}"
+        f"Closed trades:{len(REAL_CLOSED)}\n"
+        f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
+        f"{strategy_msg}"
+        f"{hourly_msg}"
     )
 
 def _cmd_report():
@@ -3562,6 +3892,166 @@ def _cmd_setlimits(args):
     except Exception as e:
         tg_send(f"❌ /setlimits error: {e}")
 
+def _cmd_hourlystats():
+    """Show hourly performance statistics"""
+    try:
+        if not HOURLY_STATS.get("hours"):
+            tg_send("📊 No hourly statistics available yet")
+            return
+        
+        # Check if analysis is active
+        analysis_status = "✅ Active" if HOURLY_STATS.get("analysis_active", False) else "⏳ Collecting data"
+        start_date = HOURLY_STATS.get("start_date", "Not set")
+        blocked_hours = HOURLY_STATS.get("blocked_hours", [])
+        
+        msg = f"📊 HOURLY PERFORMANCE STATS\n"
+        msg += f"━━━━━━━━━━━━━━━━\n"
+        msg += f"Status: {analysis_status}\n"
+        msg += f"Start date: {start_date}\n"
+        if blocked_hours:
+            msg += f"🚫 Blocked hours: {blocked_hours}\n"
+        msg += f"\n━━━━━━━━━━━━━━━━\n"
+        
+        # Show stats for hours with trades
+        hours_with_trades = []
+        for hour in range(24):
+            hour_stats = HOURLY_STATS["hours"][str(hour)]
+            if hour_stats.get("total_trades", 0) > 0:
+                hours_with_trades.append((hour, hour_stats))
+        
+        if not hours_with_trades:
+            msg += "No trades recorded yet\n"
+        else:
+            # Sort by total trades descending
+            hours_with_trades.sort(key=lambda x: x[1]["total_trades"], reverse=True)
+            
+            msg += "Top 10 active hours:\n\n"
+            for i, (hour, stats) in enumerate(hours_with_trades[:10]):
+                total = stats["total_trades"]
+                wins = stats["wins"]
+                wr = stats["win_rate"]
+                avg_pnl = stats["avg_pnl_pct"]
+                blocked_mark = "🚫" if hour in blocked_hours else "✅"
+                
+                msg += f"{blocked_mark} Hour {hour:02d}: {total} trades, WR {wr:.1f}%, Avg {avg_pnl:.2f}%\n"
+        
+        tg_send(msg)
+        
+    except Exception as e:
+        tg_send(f"❌ /hourlystats error: {e}")
+        log(f"[HOURLYSTATS ERR] {e}")
+
+def _cmd_blockhour(args):
+    """Manually block or unblock an hour"""
+    try:
+        if not args:
+            tg_send("❌ Usage: /blockhour <hour> [block|unblock]\n"
+                   "Example: /blockhour 3 block\n"
+                   "Example: /blockhour 14 unblock")
+            return
+        
+        hour = int(args[0])
+        if hour < 0 or hour > 23:
+            tg_send("❌ Hour must be between 0 and 23")
+            return
+        
+        action = args[1].lower() if len(args) > 1 else "block"
+        
+        if action not in ["block", "unblock"]:
+            tg_send("❌ Action must be 'block' or 'unblock'")
+            return
+        
+        blocked_hours = HOURLY_STATS.get("blocked_hours", [])
+        
+        if action == "block":
+            if hour not in blocked_hours:
+                blocked_hours.append(hour)
+                blocked_hours.sort()
+                HOURLY_STATS["blocked_hours"] = blocked_hours
+                safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+                tg_send(f"✅ Hour {hour} blocked for trading")
+                log(f"[BLOCKHOUR] Hour {hour} manually blocked")
+            else:
+                tg_send(f"ℹ️ Hour {hour} is already blocked")
+        else:  # unblock
+            if hour in blocked_hours:
+                blocked_hours.remove(hour)
+                HOURLY_STATS["blocked_hours"] = blocked_hours
+                safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+                tg_send(f"✅ Hour {hour} unblocked for trading")
+                log(f"[BLOCKHOUR] Hour {hour} manually unblocked")
+            else:
+                tg_send(f"ℹ️ Hour {hour} is not blocked")
+        
+    except ValueError:
+        tg_send("❌ Invalid hour value")
+    except Exception as e:
+        tg_send(f"❌ /blockhour error: {e}")
+        log(f"[BLOCKHOUR ERR] {e}")
+
+def _cmd_resethourlystats():
+    """Reset hourly statistics and restart data collection"""
+    try:
+        global HOURLY_STATS
+        
+        # Reset to empty state
+        HOURLY_STATS = {
+            "start_date": None,
+            "analysis_active": False,
+            "blocked_hours": [],
+            "hours": {}
+        }
+        
+        # Initialize each hour
+        for hour in range(24):
+            HOURLY_STATS["hours"][str(hour)] = {
+                "total_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "total_pnl_pct": 0.0,
+                "avg_pnl_pct": 0.0,
+                "win_rate": 0.0,
+                "strategies": {}
+            }
+        
+        safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+        
+        tg_send("✅ Hourly statistics reset!\n"
+               "Data collection will restart on next trade.\n"
+               "Analysis will activate after 2 weeks.")
+        log("[RESETHOURLYSTATS] Hourly statistics reset")
+        
+    except Exception as e:
+        tg_send(f"❌ /resethourlystats error: {e}")
+        log(f"[RESETHOURLYSTATS ERR] {e}")
+
+def _cmd_forcehourlyanalysis():
+    """Force activate hourly analysis (bypass 2-week wait)"""
+    try:
+        global HOURLY_STATS
+        
+        if HOURLY_STATS.get("analysis_active", False):
+            tg_send("ℹ️ Hourly analysis is already active")
+            return
+        
+        # Activate analysis
+        HOURLY_STATS["analysis_active"] = True
+        
+        # Calculate blocked hours
+        update_blocked_hours()
+        
+        safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
+        
+        blocked_hours = HOURLY_STATS.get("blocked_hours", [])
+        tg_send(f"✅ Hourly analysis FORCE ACTIVATED!\n"
+               f"Blocked hours: {blocked_hours}\n"
+               f"System will now avoid trading in poor-performing hours.")
+        log("[FORCEHOURLYANALYSIS] Hourly analysis force activated")
+        
+    except Exception as e:
+        tg_send(f"❌ /forcehourlyanalysis error: {e}")
+        log(f"[FORCEHOURLYANALYSIS ERR] {e}")
+
 def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
@@ -3588,6 +4078,10 @@ def check_telegram_commands():
         elif cmd=="/disable": _cmd_disable(args)
         elif cmd=="/strategies": _cmd_strategies()
         elif cmd=="/setlimits": _cmd_setlimits(args)
+        elif cmd=="/hourlystats": _cmd_hourlystats()
+        elif cmd=="/blockhour": _cmd_blockhour(args)
+        elif cmd=="/resethourlystats": _cmd_resethourlystats()
+        elif cmd=="/forcehourlyanalysis": _cmd_forcehourlyanalysis()
         else:
             tg_send("📋 AVAILABLE COMMANDS:\n"
                     "━━━━━━━━━━━━━━━━\n"
@@ -3600,6 +4094,10 @@ def check_telegram_commands():
                     "/settarget <amount> - Set profit target\n"
                     "/resettarget - Reset margin balance\n"
                     "/closeall - Close all positions\n"
+                    "/hourlystats - View hourly performance\n"
+                    "/blockhour <hour> [block|unblock] - Block/unblock hour\n"
+                    "/resethourlystats - Reset hourly data\n"
+                    "/forcehourlyanalysis - Force activate analysis\n"
                     "/set KEY VALUE - Set parameter\n"
                     "/report - Generate report\n"
                     "/export - Export all data")
@@ -3766,6 +4264,10 @@ def execute_real_trade(sig):
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
 
+    # 🔒 Check if current hour is blocked for trading
+    if is_hour_blocked_for_trading():
+        return False
+
     # 🔒 Duplicate / Direction limits
     if not _can_direction(direction, kind): return False
     if _duplicate_or_locked(sym,direction): return False
@@ -3859,9 +4361,13 @@ def auto_init_symbols():
     symbols.sort(); return symbols
 
 def main():
+    # Initialize hourly statistics tracking
+    initialize_hourly_stats()
+    
     tg_send("🚀 EMA ULTRA v15.9.64 aktif — KIVANC removed, Asian improved\n"
             "📊 12 strategies active | Re-entry limits: 5 buy/5 sell\n"
-            "🎛️ Use /strategies to see all | /enable, /disable to control")
+            "🎛️ Use /strategies to see all | /enable, /disable to control\n"
+            "⏱️ Hourly performance tracking enabled")
     log("[START] EMA ULTRA v15.9.64 - KIVANC removed, Asian session improved")
 
     symbols=auto_init_symbols()
@@ -3928,6 +4434,9 @@ def main():
             
             # 3.3) Send hourly margin progress log
             send_hourly_margin_log()
+            
+            # 3.4) Check and activate hourly analysis if 2 weeks have passed
+            check_and_activate_hourly_analysis()
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
