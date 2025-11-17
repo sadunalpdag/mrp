@@ -2725,9 +2725,9 @@ STATE_DEFAULT={
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":250.0,
-    "MAX_BUY":30, "MAX_SELL":30,  # General limits (kept at 30)
-    "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,
-    "MAX_REENTRY_BUY":5, "MAX_REENTRY_SELL":5,  # Re-entry specific limits (5 buy, 5 sell)
+    "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
+    "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
+    "MAX_REENTRY_BUY":5, "MAX_REENTRY_SELL":5,  # Re-entry specific limits (within global limit)
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":220.0,
@@ -4397,15 +4397,21 @@ def main():
                 # Execute real trade for all strategies
                 trade_opened = execute_real_trade(sig)
                 
-                # If trade was opened, update local counts and STATE to prevent race conditions
+                # If trade was opened, update ALL counts immediately to prevent exceeding limits
                 if trade_opened:
                     kind = sig.get("kind", "")
                     direction = sig["dir"]
                     
+                    # Update GLOBAL counts first (counts ALL open positions regardless of strategy)
+                    total_long_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("direction") == "UP"])
+                    total_short_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("direction") == "DOWN"])
+                    STATE["long_blocked"] = (total_long_count >= PARAM["MAX_BUY"])
+                    STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
+                    
+                    # Update strategy-specific counts
                     if kind == "REENTRY_4H_5M":
                         if direction == "UP":
                             batch_opened["reentry_long"] += 1
-                            # Update STATE immediately so next signal sees the updated count
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
                             STATE["reentry_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_BUY", 5))
                         else:
@@ -4421,6 +4427,9 @@ def main():
                             batch_opened["cest_short"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
                             STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
+                    
+                    # Log the current counts for monitoring
+                    log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']}")
             
             # Update limits once after batch to sync with exchange state
             if any(batch_opened.values()):
