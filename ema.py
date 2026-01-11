@@ -22,7 +22,7 @@ import numpy as np
 #  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
-#  - TAKE_PROFIT order type used instead of TAKE_PROFIT_MARKET to avoid API error -4120
+#  - TAKE_PROFIT_MARKET order type used with closePosition=true to fix API errors -4136 and -4120
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
 
@@ -55,11 +55,6 @@ REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
-
-# TP Order Configuration - for TAKE_PROFIT limit price adjustments
-# These factors ensure better fill rates by setting limit price slightly better than stop
-TP_LIMIT_PRICE_FACTOR_LONG_EXIT = 0.9995   # 0.05% below stop for long exits (sell)
-TP_LIMIT_PRICE_FACTOR_SHORT_EXIT = 1.0005  # 0.05% above stop for short exits (buy)
 
 # Trading Signal Quality Filter
 DEFAULT_MIN_POWER_THRESHOLD = 70.0  # Minimum power score to execute trades (scale: ~50-100)
@@ -3069,23 +3064,13 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Format stop price according to symbol's tick size
                 stop_price_str = format_price_by_tick(sym, mark_price)
                 
-                # Use TAKE_PROFIT (limit order) instead of TAKE_PROFIT_MARKET
-                # to avoid API error -4120. Set limit price slightly better to ensure fill.
-                if amt > 0:
-                    # For long exit (sell), use slightly lower price
-                    limit_price = round_to_tick(sym, mark_price * TP_LIMIT_PRICE_FACTOR_LONG_EXIT)
-                else:
-                    # For short exit (buy), use slightly higher price
-                    limit_price = round_to_tick(sym, mark_price * TP_LIMIT_PRICE_FACTOR_SHORT_EXIT)
-                limit_price_str = format_price_by_tick(sym, limit_price)
-                
+                # Use TAKE_PROFIT_MARKET which is compatible with closePosition=true
+                # This is a market order that triggers when stopPrice is reached
                 payload = {
                     "symbol": sym,
                     "side": side,
-                    "type": "TAKE_PROFIT",
+                    "type": "TAKE_PROFIT_MARKET",
                     "stopPrice": stop_price_str,
-                    "price": limit_price_str,  # Limit price slightly better for guaranteed fill
-                    "quantity": f"{amt}",
                     "workingType": "MARK_PRICE",
                     "closePosition": "true",
                     "positionSide": pos_side,
@@ -4124,7 +4109,7 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         trade_usd=PARAM.get("TRADE_SIZE_USDT",250.0)
         usd_based = entry_exec>0.2
 
-        def try_once(tp_price_candidate, order_type, tp_usd_used=None, tp_pct_used=None):
+        def try_once(tp_price_candidate, tp_usd_used=None, tp_pct_used=None):
             price=round_to_tick(sym,tp_price_candidate)
             if price<minp: price=round_to_tick(sym,minp)
             if price>maxp: price=round_to_tick(sym,maxp)
@@ -4136,56 +4121,35 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                     log(f"[TP GUARD] {sym} stop=0 minp jump failed")
                     return False,None,None
             
-            # Build payload based on order type
-            payload={"symbol":sym,"side":side,"type":order_type,"stopPrice":stop_str,
-                     "quantity":f"{qty}","workingType":"MARK_PRICE","closePosition":"true",
+            # Use TAKE_PROFIT_MARKET which is compatible with closePosition=true
+            # This is a market order that triggers when stopPrice is reached
+            payload={"symbol":sym,"side":side,"type":"TAKE_PROFIT_MARKET","stopPrice":stop_str,
+                     "workingType":"MARK_PRICE","closePosition":"true",
                      "positionSide":pos_side,"timestamp":now_ts_ms()}
-            
-            # For TAKE_PROFIT, we need a limit price parameter
-            # Set it slightly better than stop price to ensure fill (0.05% better)
-            if order_type == "TAKE_PROFIT":
-                if direction == "UP":
-                    # For long exits (sell), use slightly lower price for better fill
-                    limit_price = round_to_tick(sym, price * TP_LIMIT_PRICE_FACTOR_LONG_EXIT)
-                else:
-                    # For short exits (buy), use slightly higher price for better fill
-                    limit_price = round_to_tick(sym, price * TP_LIMIT_PRICE_FACTOR_SHORT_EXIT)
-                limit_str = format_price_by_tick(sym, limit_price)
-                payload["price"] = limit_str
             
             try:
                 _signed_request("POST","/fapi/v1/order",payload)
-                log(f"[TP OK] {sym} {order_type} stop={stop_str} qty={qty}")
+                log(f"[TP OK] {sym} TAKE_PROFIT_MARKET stop={stop_str}")
                 return True,tp_usd_used,tp_pct_used
             except Exception as e:
-                log(f"[TP FAIL] {sym} {order_type} stop={stop_str} err={e}")
+                log(f"[TP FAIL] {sym} TAKE_PROFIT_MARKET stop={stop_str} err={e}")
                 return False,None,None
 
         if usd_based:
-            # Try TAKE_PROFIT (limit) first - it's more reliable than TAKE_PROFIT_MARKET
+            # Try TAKE_PROFIT_MARKET with different TP targets
             for tp_usd in [round(x,1) for x in np.arange(tp_low_usd, tp_high_usd+0.001, 0.1)]:
                 tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT",tp_usd,tp_pct)
+                ok,u,p=try_once(tp_price,tp_usd,tp_pct)
                 if ok: return True,u,p
             for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
                 tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT",tp_usd,tp_pct)
-                if ok: return True,u,p
-            # Fallback to STOP_MARKET if TAKE_PROFIT doesn't work
-            for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
-                tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"STOP_MARKET",tp_usd,tp_pct)
+                ok,u,p=try_once(tp_price,tp_usd,tp_pct)
                 if ok: return True,u,p
         else:
             # Percentage-based path (for low-priced assets)
             for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
                 tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT",None,tp_pct)
-                if ok: return True,u,p
-            # Fallback to STOP_MARKET if TAKE_PROFIT doesn't work
-            for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
-                tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
-                ok,u,p=try_once(tp_price,"STOP_MARKET",None,tp_pct)
+                ok,u,p=try_once(tp_price,None,tp_pct)
                 if ok: return True,u,p
 
         log(f"[NO TP] {sym} uygun TP bulunamadı.")
