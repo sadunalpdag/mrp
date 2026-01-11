@@ -2732,6 +2732,7 @@ PARAM_DEFAULT={
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":220.0,
+    "MIN_POWER_THRESHOLD":70.0,  # Minimum power required to execute trades
     # Strategy enable/disable flags (all enabled by default)
     "ENABLE_MACD": True,
     "ENABLE_FVG": True,
@@ -4271,6 +4272,12 @@ def execute_real_trade(sig):
 
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
+
+    # 🔒 Check minimum power threshold
+    min_power = PARAM.get("MIN_POWER_THRESHOLD", 70.0)
+    if pwr < min_power:
+        log(f"[LOW POWER] {sym} {kind} power={pwr:.2f} < {min_power:.2f}, skipping trade")
+        return False
 
     # 🔒 Check if current hour is blocked for trading
     if is_hour_blocked_for_trading():
