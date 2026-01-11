@@ -6,9 +6,8 @@
 #  - ZIP yedekleme
 # ==============================================================
 
-import os
+import os, json, time, requests, hmac, hashlib, threading, math
 import zipfile
-import requests
 from datetime import datetime, timezone, timedelta
 
 # ============ Telegram Ayarları ============

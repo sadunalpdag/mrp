@@ -2,6 +2,7 @@
 # 📘 UT BOT + STC Backtest (15 Günlük, Binance 5m)
 # ============================================================
 
+import os, json, time, requests, hmac, hashlib, threading, math
 import ccxt
 import pandas as pd
 import numpy as np
