@@ -5,26 +5,24 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.65 — Active Strategies (KIVANC removed + Asian improved)
+# 📘 EMA ULTRA v15.9.66 — Active Strategies (Asian & London disabled)
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (12 strateji):
+#  - Aktif stratejiler (10 strateji - Asian & London disabled):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
 #       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy - IMPROVED)
 #       🔥 ORB + FVG CONFIRM (Opening Range Breakout + FVG - 09:45-12:00 EST)
-#       🌍 LONDON BREAKOUT (LO Session ORB - 08:00-10:00 GMT)
 #       🔄 NY REVERSAL (Liquidity Sweep + Reversal - 09:30-11:00 EST)
 #       ⚡ ICT POWER OF 3 (Accumulation-Manipulation-Distribution - 08:30-12:00 EST)
-#       🌏 ASIAN SESSION (Liquidity Sweep + Range Fade + Micro FVG - IMPROVED)
 #       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
 #       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
 #       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
+#  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
-#  - Asian session improved: Liquidity sweep, range fade, mean reversion
-#  - Power filtresi kaldırıldı, margin wallet geldi 60 dolarla kar al seçeneği eklendi. 
+#  - TAKE_PROFIT order type used instead of TAKE_PROFIT_MARKET to avoid API error -4120
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
 
@@ -2735,10 +2733,10 @@ PARAM_DEFAULT={
     "ENABLE_CEST": True,
     "ENABLE_PULLBACK": True,
     "ENABLE_ORB_FVG": True,
-    "ENABLE_LONDON_BO": True,
+    "ENABLE_LONDON_BO": False,  # Disabled per user request
     "ENABLE_NY_REV": True,
     "ENABLE_ICT_P3": True,
-    "ENABLE_ASIAN_BO": True,
+    "ENABLE_ASIAN_BO": False,  # Disabled per user request
     "ENABLE_FVG_BREAKER": True,
     "ENABLE_REENTRY": True,
     "ENABLE_FVG_MSS": True,
@@ -3062,11 +3060,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Format stop price according to symbol's tick size
                 stop_price_str = format_price_by_tick(sym, mark_price)
                 
+                # Use TAKE_PROFIT (limit order) instead of TAKE_PROFIT_MARKET
+                # to avoid API error -4120
                 payload = {
                     "symbol": sym,
                     "side": side,
-                    "type": "TAKE_PROFIT_MARKET",
+                    "type": "TAKE_PROFIT",
                     "stopPrice": stop_price_str,
+                    "price": stop_price_str,  # Limit price = stop price for immediate execution
                     "quantity": f"{amt}",
                     "workingType": "MARK_PRICE",
                     "closePosition": "true",
@@ -4117,9 +4118,13 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                 if float(stop_str)<=0:
                     log(f"[TP GUARD] {sym} stop=0 minp jump failed")
                     return False,None,None
+            
+            # For TAKE_PROFIT, we need both stopPrice and price (limit price)
+            # Using the same value for both to ensure immediate execution when stop is hit
             payload={"symbol":sym,"side":side,"type":order_type,"stopPrice":stop_str,
-                     "quantity":f"{qty}","workingType":"MARK_PRICE","closePosition":"true",
-                     "positionSide":pos_side,"timestamp":now_ts_ms()}
+                     "price":stop_str,"quantity":f"{qty}","workingType":"MARK_PRICE",
+                     "closePosition":"true","positionSide":pos_side,"timestamp":now_ts_ms()}
+            
             try:
                 _signed_request("POST","/fapi/v1/order",payload)
                 log(f"[TP OK] {sym} {order_type} stop={stop_str} qty={qty}")
@@ -4129,14 +4134,16 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                 return False,None,None
 
         if usd_based:
+            # Try TAKE_PROFIT (limit) first - it's more reliable than TAKE_PROFIT_MARKET
             for tp_usd in [round(x,1) for x in np.arange(tp_low_usd, tp_high_usd+0.001, 0.1)]:
                 tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",tp_usd,tp_pct)
+                ok,u,p=try_once(tp_price,"TAKE_PROFIT",tp_usd,tp_pct)
                 if ok: return True,u,p
             for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
                 tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",tp_usd,tp_pct)
+                ok,u,p=try_once(tp_price,"TAKE_PROFIT",tp_usd,tp_pct)
                 if ok: return True,u,p
+            # Fallback to STOP_MARKET if TAKE_PROFIT doesn't work
             for tp_usd in [round(x,2) for x in np.arange(tp_low_usd, tp_high_usd+0.0001, 0.01)]:
                 tp_price,tp_pct=_tp_price_from_usd(direction,entry_exec,tp_usd,trade_usd)
                 ok,u,p=try_once(tp_price,"STOP_MARKET",tp_usd,tp_pct)
@@ -4144,7 +4151,7 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         else:
             for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
                 tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
-                ok,u,p=try_once(tp_price,"TAKE_PROFIT_MARKET",None,tp_pct)
+                ok,u,p=try_once(tp_price,"TAKE_PROFIT",None,tp_pct)
                 if ok: return True,u,p
 
         log(f"[NO TP] {sym} uygun TP bulunamadı.")
@@ -4335,11 +4342,11 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.65 aktif — KIVANC removed, Asian improved\n"
-            "📊 12 strategies active | Re-entry limits: 5 buy/5 sell\n"
+    tg_send("🚀 EMA ULTRA v15.9.65 aktif — KIVANC removed, Asian/London disabled\n"
+            "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.65 - KIVANC removed, Asian session improved")
+    log("[START] EMA ULTRA v15.9.65 - KIVANC removed, Asian & London disabled")
 
     symbols=auto_init_symbols()
 
