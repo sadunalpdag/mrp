@@ -2735,10 +2735,10 @@ PARAM_DEFAULT={
     "ENABLE_CEST": True,
     "ENABLE_PULLBACK": True,
     "ENABLE_ORB_FVG": True,
-    "ENABLE_LONDON_BO": True,
+    "ENABLE_LONDON_BO": False,
     "ENABLE_NY_REV": True,
     "ENABLE_ICT_P3": True,
-    "ENABLE_ASIAN_BO": True,
+    "ENABLE_ASIAN_BO": False,
     "ENABLE_FVG_BREAKER": True,
     "ENABLE_REENTRY": True,
     "ENABLE_FVG_MSS": True,
@@ -4117,12 +4117,25 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                 if float(stop_str)<=0:
                     log(f"[TP GUARD] {sym} stop=0 minp jump failed")
                     return False,None,None
-            payload={"symbol":sym,"side":side,"type":order_type,"stopPrice":stop_str,
-                     "quantity":f"{qty}","workingType":"MARK_PRICE","closePosition":"true",
-                     "positionSide":pos_side,"timestamp":now_ts_ms()}
+            
+            # Use Algo Order API for TAKE_PROFIT_MARKET and STOP_MARKET with closePosition
+            # Binance requires these to use /fapi/v1/algo/futures/newOrderVp endpoint
+            payload={
+                "symbol": sym,
+                "side": side,
+                "type": order_type,
+                "stopPrice": stop_str,
+                "quantity": f"{qty}",
+                "workingType": "MARK_PRICE",
+                "closePosition": "true",
+                "positionSide": pos_side,
+                "timestamp": now_ts_ms()
+            }
+            
             try:
-                _signed_request("POST","/fapi/v1/order",payload)
-                log(f"[TP OK] {sym} {order_type} stop={stop_str} qty={qty}")
+                # Try Algo Order API endpoint first (required for TAKE_PROFIT_MARKET/STOP_MARKET with closePosition)
+                _signed_request("POST", "/fapi/v1/algo/futures/newOrderVp", payload)
+                log(f"[TP OK ALGO] {sym} {order_type} stop={stop_str} qty={qty}")
                 return True,tp_usd_used,tp_pct_used
             except Exception as e:
                 log(f"[TP FAIL] {sym} {order_type} stop={stop_str} err={e}")
