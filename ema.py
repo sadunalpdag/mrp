@@ -61,6 +61,9 @@ getcontext().prec = 28
 TP_LIMIT_PRICE_FACTOR_LONG_EXIT = 0.9995   # 0.05% below stop for long exits (sell)
 TP_LIMIT_PRICE_FACTOR_SHORT_EXIT = 1.0005  # 0.05% above stop for short exits (buy)
 
+# Trading Signal Quality Filter
+DEFAULT_MIN_POWER_THRESHOLD = 70.0  # Minimum power score to execute trades (scale: ~50-100)
+
 # ===================== UTILITIES =====================
 
 def log(msg):
@@ -2732,7 +2735,7 @@ PARAM_DEFAULT={
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":220.0,
-    "MIN_POWER_THRESHOLD":70.0,  # Minimum power required to execute trades
+    "MIN_POWER_THRESHOLD":DEFAULT_MIN_POWER_THRESHOLD,  # Minimum power score to execute trades (power scale: ~50-100, higher = stronger signal)
     # Strategy enable/disable flags (all enabled by default)
     "ENABLE_MACD": True,
     "ENABLE_FVG": True,
@@ -4274,7 +4277,7 @@ def execute_real_trade(sig):
     kind=sig.get("kind","")
 
     # 🔒 Check minimum power threshold
-    min_power = PARAM.get("MIN_POWER_THRESHOLD", 70.0)
+    min_power = PARAM.get("MIN_POWER_THRESHOLD", DEFAULT_MIN_POWER_THRESHOLD)
     if pwr < min_power:
         log(f"[LOW POWER] {sym} {kind} power={pwr:.2f} < {min_power:.2f}, skipping trade")
         return False
