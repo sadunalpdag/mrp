@@ -56,6 +56,11 @@ LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
+# TP Order Configuration - for TAKE_PROFIT limit price adjustments
+# These factors ensure better fill rates by setting limit price slightly better than stop
+TP_LIMIT_PRICE_FACTOR_LONG_EXIT = 0.9995   # 0.05% below stop for long exits (sell)
+TP_LIMIT_PRICE_FACTOR_SHORT_EXIT = 1.0005  # 0.05% above stop for short exits (buy)
+
 # ===================== UTILITIES =====================
 
 def log(msg):
@@ -3064,10 +3069,10 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # to avoid API error -4120. Set limit price slightly better to ensure fill.
                 if amt > 0:
                     # For long exit (sell), use slightly lower price
-                    limit_price = round_to_tick(sym, mark_price * 0.9995)
+                    limit_price = round_to_tick(sym, mark_price * TP_LIMIT_PRICE_FACTOR_LONG_EXIT)
                 else:
                     # For short exit (buy), use slightly higher price
-                    limit_price = round_to_tick(sym, mark_price * 1.0005)
+                    limit_price = round_to_tick(sym, mark_price * TP_LIMIT_PRICE_FACTOR_SHORT_EXIT)
                 limit_price_str = format_price_by_tick(sym, limit_price)
                 
                 payload = {
@@ -4137,10 +4142,10 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
             if order_type == "TAKE_PROFIT":
                 if direction == "UP":
                     # For long exits (sell), use slightly lower price for better fill
-                    limit_price = round_to_tick(sym, price * 0.9995)
+                    limit_price = round_to_tick(sym, price * TP_LIMIT_PRICE_FACTOR_LONG_EXIT)
                 else:
                     # For short exits (buy), use slightly higher price for better fill
-                    limit_price = round_to_tick(sym, price * 1.0005)
+                    limit_price = round_to_tick(sym, price * TP_LIMIT_PRICE_FACTOR_SHORT_EXIT)
                 limit_str = format_price_by_tick(sym, limit_price)
                 payload["price"] = limit_str
             
@@ -4168,9 +4173,15 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                 ok,u,p=try_once(tp_price,"STOP_MARKET",tp_usd,tp_pct)
                 if ok: return True,u,p
         else:
+            # Percentage-based path (for low-priced assets)
             for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
                 tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
                 ok,u,p=try_once(tp_price,"TAKE_PROFIT",None,tp_pct)
+                if ok: return True,u,p
+            # Fallback to STOP_MARKET if TAKE_PROFIT doesn't work
+            for tp_pct in [round(x,4) for x in np.arange(0.0050, 0.0100+0.0001, 0.0005)]:
+                tp_price = entry_exec*(1+tp_pct if direction=="UP" else 1-tp_pct)
+                ok,u,p=try_once(tp_price,"STOP_MARKET",None,tp_pct)
                 if ok: return True,u,p
 
         log(f"[NO TP] {sym} uygun TP bulunamadı.")
