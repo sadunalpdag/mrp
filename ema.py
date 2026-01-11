@@ -3075,7 +3075,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 }
                 
                 try:
-                    res = _signed_request("POST", "/fapi/v1/order", payload)
+                    # Use Algo Order API endpoint for TAKE_PROFIT_MARKET with closePosition
+                    res = _signed_request("POST", "/fapi/v1/algo/futures/newOrderVp", payload)
                     closed_symbols.append(sym)
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
