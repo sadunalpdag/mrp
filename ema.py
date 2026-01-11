@@ -3061,13 +3061,21 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 stop_price_str = format_price_by_tick(sym, mark_price)
                 
                 # Use TAKE_PROFIT (limit order) instead of TAKE_PROFIT_MARKET
-                # to avoid API error -4120
+                # to avoid API error -4120. Set limit price slightly better to ensure fill.
+                if amt > 0:
+                    # For long exit (sell), use slightly lower price
+                    limit_price = round_to_tick(sym, mark_price * 0.9995)
+                else:
+                    # For short exit (buy), use slightly higher price
+                    limit_price = round_to_tick(sym, mark_price * 1.0005)
+                limit_price_str = format_price_by_tick(sym, limit_price)
+                
                 payload = {
                     "symbol": sym,
                     "side": side,
                     "type": "TAKE_PROFIT",
                     "stopPrice": stop_price_str,
-                    "price": stop_price_str,  # Limit price = stop price for immediate execution
+                    "price": limit_price_str,  # Limit price slightly better for guaranteed fill
                     "quantity": f"{amt}",
                     "workingType": "MARK_PRICE",
                     "closePosition": "true",
@@ -4119,11 +4127,22 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                     log(f"[TP GUARD] {sym} stop=0 minp jump failed")
                     return False,None,None
             
-            # For TAKE_PROFIT, we need both stopPrice and price (limit price)
-            # Using the same value for both to ensure immediate execution when stop is hit
+            # Build payload based on order type
             payload={"symbol":sym,"side":side,"type":order_type,"stopPrice":stop_str,
-                     "price":stop_str,"quantity":f"{qty}","workingType":"MARK_PRICE",
-                     "closePosition":"true","positionSide":pos_side,"timestamp":now_ts_ms()}
+                     "quantity":f"{qty}","workingType":"MARK_PRICE","closePosition":"true",
+                     "positionSide":pos_side,"timestamp":now_ts_ms()}
+            
+            # For TAKE_PROFIT, we need a limit price parameter
+            # Set it slightly better than stop price to ensure fill (0.05% better)
+            if order_type == "TAKE_PROFIT":
+                if direction == "UP":
+                    # For long exits (sell), use slightly lower price for better fill
+                    limit_price = round_to_tick(sym, price * 0.9995)
+                else:
+                    # For short exits (buy), use slightly higher price for better fill
+                    limit_price = round_to_tick(sym, price * 1.0005)
+                limit_str = format_price_by_tick(sym, limit_price)
+                payload["price"] = limit_str
             
             try:
                 _signed_request("POST","/fapi/v1/order",payload)
