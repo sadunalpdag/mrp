@@ -4342,11 +4342,11 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.65 aktif — KIVANC removed, Asian/London disabled\n"
+    tg_send("🚀 EMA ULTRA v15.9.66 aktif — KIVANC removed, Asian/London disabled\n"
             "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.65 - KIVANC removed, Asian & London disabled")
+    log("[START] EMA ULTRA v15.9.66 - KIVANC removed, Asian & London disabled")
 
     symbols=auto_init_symbols()
 
