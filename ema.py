@@ -53,6 +53,7 @@ TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
+LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
@@ -2596,8 +2597,17 @@ def update_max_profit_tracking():
     Update max profit tracking for all open positions.
     Tracks the maximum profit value reached by each unclosed trade.
     Returns the average of all max profits.
+    Throttled to run max once per 30 seconds to avoid rate limiting.
     """
-    global REAL_POSITIONS_TRACKER
+    global REAL_POSITIONS_TRACKER, LAST_MAX_PROFIT_UPDATE
+    
+    # Throttle: only check every 30 seconds
+    now = now_ts_s()
+    if now - LAST_MAX_PROFIT_UPDATE < 30:
+        # Return last known average from STATE if available
+        return STATE.get("avg_max_profit", 0.0)
+    
+    LAST_MAX_PROFIT_UPDATE = now
     
     try:
         # Get current positions from Binance
@@ -2619,8 +2629,6 @@ def update_max_profit_tracking():
             
             # Get position info
             pos_info = REAL_POSITIONS_TRACKER[sym]
-            entry_price = pos_info.get("entry_price", 0)
-            direction = pos_info.get("direction", "")
             
             # Get current unrealized profit
             unrealized_pnl = float(p.get("unRealizedProfit", 0))
