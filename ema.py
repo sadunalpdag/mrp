@@ -2568,7 +2568,8 @@ def check_and_log_real_closed_trades():
                     "close_time": now_local_iso(),
                     "tp_target": pos_info.get("tp_target"),
                     "market_state": pos_info.get("market_state", ""),
-                    "conditions": pos_info.get("conditions", {})  # 📊 Include strategy condition parameters
+                    "conditions": pos_info.get("conditions", {}),  # 📊 Include strategy condition parameters
+                    "max_profit": pos_info.get("max_profit", 0.0)  # Include maximum profit reached
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -2579,8 +2580,9 @@ def check_and_log_real_closed_trades():
                 
                 pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
                 exit_str = f"{exit_price}" if exit_price is not None else "N/A"
+                max_profit_str = f"{pos_info.get('max_profit', 0.0):.2f}"
                 log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
-                    f"PnL:{pnl_str}% Exit:{exit_str}")
+                    f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str}")
         
         # Remove closed positions from tracker
         for sym in closed_symbols:
@@ -2588,6 +2590,63 @@ def check_and_log_real_closed_trades():
             
     except Exception as e:
         log(f"[CHECK REAL CLOSED ERR] {e}")
+
+def update_max_profit_tracking():
+    """
+    Update max profit tracking for all open positions.
+    Tracks the maximum profit value reached by each unclosed trade.
+    Returns the average of all max profits.
+    """
+    global REAL_POSITIONS_TRACKER
+    
+    try:
+        # Get current positions from Binance
+        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
+        if not acc:
+            return 0.0
+        
+        total_max_profit = 0.0
+        position_count = 0
+        
+        for p in acc:
+            amt = float(p["positionAmt"])
+            if amt == 0:
+                continue
+            
+            sym = p["symbol"]
+            if sym not in REAL_POSITIONS_TRACKER:
+                continue
+            
+            # Get position info
+            pos_info = REAL_POSITIONS_TRACKER[sym]
+            entry_price = pos_info.get("entry_price", 0)
+            direction = pos_info.get("direction", "")
+            
+            # Get current unrealized profit
+            unrealized_pnl = float(p.get("unRealizedProfit", 0))
+            
+            # Update max profit if current profit is higher
+            current_max_profit = pos_info.get("max_profit", 0.0)
+            if unrealized_pnl > current_max_profit:
+                REAL_POSITIONS_TRACKER[sym]["max_profit"] = unrealized_pnl
+                current_max_profit = unrealized_pnl
+            
+            # Add to total for average calculation
+            total_max_profit += current_max_profit
+            position_count += 1
+        
+        # Calculate average max profit
+        avg_max_profit = total_max_profit / position_count if position_count > 0 else 0.0
+        
+        # Log the average if there are open positions
+        if position_count > 0:
+            log(f"[MAX PROFIT] Open positions: {position_count}, Avg max profit: ${avg_max_profit:.2f}")
+        
+        return avg_max_profit
+        
+    except Exception as e:
+        log(f"[UPDATE MAX PROFIT ERR] {e}")
+        return 0.0
 
 # ===================== TELEGRAM HELPERS =====================
 
@@ -3137,7 +3196,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "exit_reason": exit_reason,
                     "market_state": pos_info.get("market_state", ""),
                     "closed_by_profit_target": (exit_reason == "PROFIT_TARGET"),
-                    "conditions": pos_info.get("conditions", {})  # 📊 Include strategy condition parameters
+                    "conditions": pos_info.get("conditions", {}),  # 📊 Include strategy condition parameters
+                    "max_profit": pos_info.get("max_profit", 0.0)  # Include maximum profit reached
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -4313,7 +4373,8 @@ def execute_real_trade(sig):
             "open_time": now_local_iso(),
             "tp_target": tp_usd_used or tp_pct_used,
             "market_state": sig.get("market_state", ""),
-            "conditions": sig.get("conditions", {})  # 📊 Store strategy condition parameters
+            "conditions": sig.get("conditions", {}),  # 📊 Store strategy condition parameters
+            "max_profit": 0.0  # Track maximum profit reached
         }
         
         return True  # Successfully opened position
@@ -4411,13 +4472,17 @@ def main():
             # 3.1) Check and log real closed trades
             check_and_log_real_closed_trades()
             
-            # 3.2) Check profit target (cash out feature)
+            # 3.2) Update max profit tracking for open positions
+            avg_max_profit = update_max_profit_tracking()
+            STATE["avg_max_profit"] = avg_max_profit
+            
+            # 3.3) Check profit target (cash out feature)
             check_profit_target()
             
-            # 3.3) Send hourly margin progress log
+            # 3.4) Send hourly margin progress log
             send_hourly_margin_log()
             
-            # 3.4) Check and activate hourly analysis if 2 weeks have passed
+            # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
 
             # 4) 4 saatlik auto-backup
