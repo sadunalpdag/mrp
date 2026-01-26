@@ -2613,7 +2613,8 @@ def update_max_profit_tracking():
         # Get current positions from Binance
         acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
         if not acc:
-            return 0.0
+            # Return cached value on API error
+            return STATE.get("avg_max_profit", 0.0)
         
         total_max_profit = 0.0
         position_count = 0
@@ -2654,7 +2655,8 @@ def update_max_profit_tracking():
         
     except Exception as e:
         log(f"[UPDATE MAX PROFIT ERR] {e}")
-        return 0.0
+        # Return cached value on exception
+        return STATE.get("avg_max_profit", 0.0)
 
 # ===================== TELEGRAM HELPERS =====================
 
@@ -4483,7 +4485,8 @@ def main():
             
             # 3.2) Update max profit tracking for open positions
             avg_max_profit = update_max_profit_tracking()
-            if avg_max_profit != STATE.get("avg_max_profit", 0.0):
+            # Use rounded comparison to avoid unnecessary saves due to floating point precision
+            if round(avg_max_profit, 2) != round(STATE.get("avg_max_profit", 0.0), 2):
                 STATE["avg_max_profit"] = avg_max_profit
                 safe_save(STATE_FILE, STATE)
             
