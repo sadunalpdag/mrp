@@ -3395,7 +3395,7 @@ def send_hourly_margin_log():
                 # Estimate hours to reach target
                 estimated_hours = remaining / profit_per_hour
         
-        # Get average max profit
+        # Get average max profit (updated by main loop's update_max_profit_tracking())
         avg_max_profit = STATE.get("avg_max_profit", 0.0)
         
         # Record this balance change in history
