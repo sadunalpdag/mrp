@@ -2613,7 +2613,8 @@ def update_max_profit_tracking():
         # Get current positions from Binance
         acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
         if not acc:
-            return 0.0
+            # Return cached value on API error
+            return STATE.get("avg_max_profit", 0.0)
         
         total_max_profit = 0.0
         position_count = 0
@@ -2654,7 +2655,8 @@ def update_max_profit_tracking():
         
     except Exception as e:
         log(f"[UPDATE MAX PROFIT ERR] {e}")
-        return 0.0
+        # Return cached value on exception
+        return STATE.get("avg_max_profit", 0.0)
 
 # ===================== TELEGRAM HELPERS =====================
 
@@ -2788,7 +2790,8 @@ STATE_DEFAULT={
     "cest_long_blocked":False, "cest_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
-    "last_hourly_margin_log":0
+    "last_hourly_margin_log":0,
+    "avg_max_profit":0.0  # Average of max profits from open positions
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":250.0,
@@ -3392,6 +3395,9 @@ def send_hourly_margin_log():
                 # Estimate hours to reach target
                 estimated_hours = remaining / profit_per_hour
         
+        # Get average max profit (updated by main loop's update_max_profit_tracking())
+        avg_max_profit = STATE.get("avg_max_profit", 0.0)
+        
         # Record this balance change in history
         balance_record = {
             "timestamp": now,
@@ -3407,7 +3413,8 @@ def send_hourly_margin_log():
             "cest_long_count": cest_long_count,
             "cest_short_count": cest_short_count,
             "profit_per_hour": profit_per_hour,
-            "estimated_hours_to_target": estimated_hours
+            "estimated_hours_to_target": estimated_hours,
+            "avg_max_profit": avg_max_profit
         }
         
         BALANCE_HISTORY.append(balance_record)
@@ -3429,7 +3436,8 @@ def send_hourly_margin_log():
                    f"💵 Unrealized PnL: ${unrealized_pnl:.2f}\n"
                    f"📌 Open Positions: {open_positions}\n"
                    f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
-                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}")
+                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🔝 Avg Max Profit: ${avg_max_profit:.2f}")
             
             # Add estimated time to target if available
             if estimated_hours is not None:
@@ -3452,6 +3460,7 @@ def send_hourly_margin_log():
                    f"📌 Open Positions: {open_positions}\n"
                    f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
                    f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🔝 Avg Max Profit: ${avg_max_profit:.2f}\n"
                    f"🕐 {now_local_iso()}")
         
         tg_send(msg)
@@ -4415,7 +4424,7 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.66 aktif — KIVANC removed, Asian/London disabled\n"
+    tg_send("🚀 EMA ULTRA v15.9.67 aktif — KIVANC removed, Asian/London disabled\n"
             "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
@@ -4482,7 +4491,10 @@ def main():
             
             # 3.2) Update max profit tracking for open positions
             avg_max_profit = update_max_profit_tracking()
-            STATE["avg_max_profit"] = avg_max_profit
+            # Use rounded comparison to avoid unnecessary saves due to floating point precision
+            if round(avg_max_profit, 2) != round(STATE.get("avg_max_profit", 0.0), 2):
+                STATE["avg_max_profit"] = avg_max_profit
+                safe_save(STATE_FILE, STATE)
             
             # 3.3) Check profit target (cash out feature)
             check_profit_target()
