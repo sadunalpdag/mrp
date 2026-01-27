@@ -3395,6 +3395,9 @@ def send_hourly_margin_log():
                 # Estimate hours to reach target
                 estimated_hours = remaining / profit_per_hour
         
+        # Get average max profit
+        avg_max_profit = STATE.get("avg_max_profit", 0.0)
+        
         # Record this balance change in history
         balance_record = {
             "timestamp": now,
@@ -3410,7 +3413,8 @@ def send_hourly_margin_log():
             "cest_long_count": cest_long_count,
             "cest_short_count": cest_short_count,
             "profit_per_hour": profit_per_hour,
-            "estimated_hours_to_target": estimated_hours
+            "estimated_hours_to_target": estimated_hours,
+            "avg_max_profit": avg_max_profit
         }
         
         BALANCE_HISTORY.append(balance_record)
@@ -3432,7 +3436,8 @@ def send_hourly_margin_log():
                    f"💵 Unrealized PnL: ${unrealized_pnl:.2f}\n"
                    f"📌 Open Positions: {open_positions}\n"
                    f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
-                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}")
+                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🔝 Avg Max Profit: ${avg_max_profit:.2f}")
             
             # Add estimated time to target if available
             if estimated_hours is not None:
@@ -3455,6 +3460,7 @@ def send_hourly_margin_log():
                    f"📌 Open Positions: {open_positions}\n"
                    f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
                    f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🔝 Avg Max Profit: ${avg_max_profit:.2f}\n"
                    f"🕐 {now_local_iso()}")
         
         tg_send(msg)
