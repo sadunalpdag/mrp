@@ -62,11 +62,11 @@ def main():
         log(f"View your data at: https://docs.google.com/spreadsheets/d/{spreadsheet_id}")
         log("=" * 60)
         return 0
-    else:
-        log("\n" + "=" * 60)
-        log("❌ FAILED: Could not export data")
-        log("=" * 60)
-        return 1
+    
+    log("\n" + "=" * 60)
+    log("❌ FAILED: Could not export data")
+    log("=" * 60)
+    return 1
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,5 +1,5 @@
 # mrp
-pyton ile mrp yazımı
+Python ile mrp yazımı
 
 ## Google Sheets Entegrasyonu
 

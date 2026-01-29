@@ -1,8 +1,7 @@
 # Google Sheets credentials
 credentials.json
-*.json
-!package.json
-!package-lock.json
+*credentials*.json
+service-account*.json
 
 # Python
 __pycache__/

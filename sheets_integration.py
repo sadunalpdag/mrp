@@ -52,7 +52,17 @@ def get_sheets_client():
 
 # ============ Export Functions ============
 def export_trades_to_sheet(client, spreadsheet_id, trades_file):
-    """Export trades from JSON file to Google Sheets"""
+    """
+    Export trades from JSON file to Google Sheets
+    
+    Args:
+        client: Authorized gspread client
+        spreadsheet_id: Google Sheets spreadsheet ID
+        trades_file: Path to trades JSON file
+        
+    Returns:
+        bool: True if export successful, False otherwise
+    """
     try:
         if not os.path.exists(trades_file):
             log(f"Trades file not found: {trades_file}")
@@ -93,7 +103,17 @@ def export_trades_to_sheet(client, spreadsheet_id, trades_file):
         return False
 
 def export_performance_report(client, spreadsheet_id, trades_file):
-    """Export performance analysis to Google Sheets"""
+    """
+    Export performance analysis to Google Sheets
+    
+    Args:
+        client: Authorized gspread client
+        spreadsheet_id: Google Sheets spreadsheet ID
+        trades_file: Path to trades JSON file
+        
+    Returns:
+        bool: True if export successful, False otherwise
+    """
     try:
         if not os.path.exists(trades_file):
             log(f"Trades file not found: {trades_file}")
@@ -114,19 +134,24 @@ def export_performance_report(client, spreadsheet_id, trades_file):
         available_cols = [c for c in required_cols if c in df.columns]
         df = df[available_cols]
         
+        # Check if power column exists before creating power bands
+        if "power" not in df.columns:
+            log("Warning: 'power' column not found, skipping power band analysis")
+            return False
+        
         # Power band analysis
-        bins = [0, 60, 70, 80, 90, 100]
+        power_bins = [0, 60, 70, 80, 90, 100]
         labels = ["<60", "60-70", "70-80", "80-90", ">90"]
-        df["power_band"] = pd.cut(df["power"], bins=bins, labels=labels, include_lowest=True)
+        df["power_band"] = pd.cut(df["power"], bins=power_bins, labels=labels, include_lowest=True)
         
         # Calculate summary statistics
         summary = df.groupby(["power_band", "exit_reason"]).agg(
             trade_count=("exit_reason", "count"),
             avg_gain_pct=("gain_pct", "mean"),
-            avg_duration_min=("duration_sec", lambda x: (x.mean()/60) if len(x) > 0 else 0)
+            avg_duration_min=("duration_sec", lambda x: x.mean() / 60)
         ).reset_index()
         
-        # TP Rate calculation
+        # TP Rate calculation with explicit zero check
         pivot = df.pivot_table(
             index="power_band",
             columns="exit_reason",
@@ -135,7 +160,8 @@ def export_performance_report(client, spreadsheet_id, trades_file):
             fill_value=0
         )
         if "TP" in pivot.columns and "SL" in pivot.columns:
-            pivot["TP_Rate(%)"] = (pivot["TP"] / (pivot["TP"] + pivot["SL"] + 1e-6)) * 100
+            total = pivot["TP"] + pivot["SL"]
+            pivot["TP_Rate(%)"] = pivot["TP"].where(total > 0, 0) / total.where(total > 0, 1) * 100
         pivot = pivot.reset_index()
         
         # Open spreadsheet
@@ -172,7 +198,17 @@ def export_performance_report(client, spreadsheet_id, trades_file):
         return False
 
 def export_balance_history(client, spreadsheet_id, balance_file):
-    """Export balance history to Google Sheets"""
+    """
+    Export balance history to Google Sheets
+    
+    Args:
+        client: Authorized gspread client
+        spreadsheet_id: Google Sheets spreadsheet ID
+        balance_file: Path to balance history JSON file
+        
+    Returns:
+        bool: True if export successful, False otherwise
+    """
     try:
         if not os.path.exists(balance_file):
             log(f"Balance file not found: {balance_file}")
