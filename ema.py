@@ -5,9 +5,9 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.66 — Active Strategies (Asian & London disabled)
+# 📘 EMA ULTRA v15.9.70 — Donchian Breakout Strategy Added
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (10 strateji - Asian & London disabled):
+#  - Aktif stratejiler (11 strateji):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
@@ -18,8 +18,9 @@ import numpy as np
 #       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
 #       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
 #       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
+#       📈 DONCHIAN BREAKOUT (15m EMA20/50 trend + 5m Donchian Channel breakout)
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
-#  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
+#  - Donchian-specific limits: 3 buy / 3 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
 #  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
@@ -2408,6 +2409,118 @@ def build_fvg_mss_signal(sym, kl, bar_i):
     return sig
 
 
+def build_donchian_breakout_signal(sym, kl, bar_i):
+    """
+    Donchian Breakout Strategy
+    
+    📈 Trend: 15m EMA20/50
+    📊 Entry: 5m Donchian Channel breakout (Period: 20)
+    🎯 TP/SL: 2:1 Risk/Reward
+    🔒 Limits: Max 3 buy / 3 sell    
+    
+    Rules:
+    - 15m EMA20 > EMA50 → Only LONG entries
+    - 15m EMA20 < EMA50 → Only SHORT entries
+    - 5m close breaks Donchian high/low → Entry signal
+    """
+    # 15m trend check (EMA20/50)
+    kl_15m = futures_get_klines(sym, "15m", 200)
+    if len(kl_15m) < 200:
+        return None
+    
+    closes_15m = [float(k[4]) for k in kl_15m]
+    ema20_15m = ema(closes_15m, 20)
+    ema50_15m = ema(closes_15m, 50)
+    
+    # Trend direction
+    if ema20_15m[-1] > ema50_15m[-1]:
+        trend = "UP"
+    elif ema20_15m[-1] < ema50_15m[-1]:
+        trend = "DOWN"
+    else:
+        return None  # No clear trend    
+    
+    # 5m entry signal (Donchian breakout)
+    kl_5m = futures_get_klines(sym, "5m", 50)
+    if len(kl_5m) < 25:
+        return None
+    
+    highs_5m = [float(k[2]) for k in kl_5m]
+    lows_5m = [float(k[3]) for k in kl_5m]
+    closes_5m = [float(k[4]) for k in kl_5m]
+    
+    # Donchian Channel (period 20)
+    period = 20
+    donchian_high = max(highs_5m[-period-1:-1])
+    donchian_low = min(lows_5m[-period-1:-1])
+    
+    current_close = closes_5m[-1]
+    prev_close = closes_5m[-2]
+    
+    # Entry signals (breakout with close)
+    direction = None
+    if trend == "UP" and prev_close <= donchian_high and current_close > donchian_high:
+        direction = "UP"
+        tag = "📈 DONCHIAN BUY"
+    elif trend == "DOWN" and prev_close >= donchian_low and current_close < donchian_low:
+        direction = "DOWN"
+        tag = "📉 DONCHIAN SELL"
+    else:
+        return None
+    
+    # TP/SL calculation (2:1 RR)
+    atr_v = atr_like(highs_5m, lows_5m, closes_5m)[-1]
+    r_val = rsi(closes_5m)[-1]
+    
+    if direction == "UP":
+        sl_est = donchian_low
+        risk = current_close - sl_est
+        tp_est = current_close + 2.0 * risk
+    else:
+        sl_est = donchian_high
+        risk = sl_est - current_close
+        tp_est = current_close - 2.0 * risk
+    
+    # Power calculation
+    pwr = 65 + (atr_v / current_close) * 140 + abs(ema20_15m[-1] - ema50_15m[-1]) * 100
+    
+    sig = {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "DONCHIAN",
+        "emoji": "📈" if direction == "UP" else "📉",
+        "entry": current_close,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "DONCHIAN_BREAKOUT",
+        "tag": tag,
+        "trend_15m": trend,
+        "donchian_high": donchian_high,
+        "donchian_low": donchian_low
+    }
+    
+    # 📊 Strategy condition parameters for analysis
+    sig["conditions"] = {
+        "ema20_15m": ema20_15m[-1],
+        "ema50_15m": ema50_15m[-1],
+        "trend_15m": trend,
+        "donchian_high": donchian_high,
+        "donchian_low": donchian_low,
+        "donchian_range": donchian_high - donchian_low,
+        "donchian_range_pct": ((donchian_high - donchian_low) / current_close) * 100,
+        "risk": risk,
+        "rr_ratio": 2.0
+    }
+    
+    return sig
+
+
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
@@ -2438,10 +2551,11 @@ def scan_symbol(sym,bar_i):
     # New high-quality strategies
     s_reentry = build_reentry_signal(sym, kl, bar_i) if PARAM.get("ENABLE_REENTRY", True) else None
     s_fvg_mss = build_fvg_mss_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FVG_MSS", True) else None
+    s_donchian = build_donchian_breakout_signal(sym, kl, bar_i) if PARAM.get("ENABLE_DONCHIAN_BO", True) else None
 
     for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
-              s_reentry, s_fvg_mss):
+              s_reentry, s_fvg_mss, s_donchian):
         if s: res.append(s)
     
     return res
@@ -2796,6 +2910,7 @@ STATE_DEFAULT={
     "bar_index":0, "last_report":0, "auto_trade_active":True,
     "last_api_check":0, "long_blocked":False, "short_blocked":False,
     "cest_long_blocked":False, "cest_short_blocked":False,
+    "donchian_long_blocked":False, "donchian_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0,
@@ -2805,6 +2920,7 @@ PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":350.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
+    "MAX_DONCHIAN_BUY":3, "MAX_DONCHIAN_SELL":3,  # DONCHIAN-specific limits (within global limit)
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":20.0,
@@ -2822,6 +2938,7 @@ PARAM_DEFAULT={
     "ENABLE_FVG_BREAKER": True,
     "ENABLE_REENTRY": True,
     "ENABLE_FVG_MSS": True,
+    "ENABLE_DONCHIAN_BO": True,
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
@@ -3052,7 +3169,7 @@ def is_hour_blocked_for_trading():
     return blocked
 
 def update_directional_limits():
-    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0}
+    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,"donchian_long_count":0,"donchian_short_count":0}
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
         for p in acc:
@@ -3062,11 +3179,17 @@ def update_directional_limits():
                 # Check if this is a CEST position
                 if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
                     live["cest_long_count"] += 1
+                # Check if this is a DONCHIAN position
+                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "DONCHIAN_BREAKOUT":
+                    live["donchian_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
                 # Check if this is a CEST position
                 if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
                     live["cest_short_count"] += 1
+                # Check if this is a DONCHIAN position
+                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "DONCHIAN_BREAKOUT":
+                    live["donchian_short_count"] += 1
         live["long_count"]=len(live["long"])
         live["short_count"]=len(live["short"])
     except Exception as e:
@@ -3076,6 +3199,8 @@ def update_directional_limits():
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
     STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
+    STATE["donchian_long_blocked"]  = (live["donchian_long_count"]  >= PARAM.get("MAX_DONCHIAN_BUY", 3))
+    STATE["donchian_short_blocked"] = (live["donchian_short_count"] >= PARAM.get("MAX_DONCHIAN_SELL", 3))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -3610,7 +3735,8 @@ def ai_update_analysis_snapshot():
         "fvg_breaker_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_BREAKER_BLOCK"),
         # New high-quality strategies tracking
         "reentry_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="REENTRY_4H_5M"),
-        "fvg_mss_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_MSS_ENTRY")
+        "fvg_mss_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="FVG_MSS_ENTRY"),
+        "donchian_signals_total": sum(1 for x in AI_SIGNALS if x.get("kind")=="DONCHIAN_BREAKOUT")
     }
     AI_ANALYSIS.append(snapshot); safe_save(AI_ANALYSIS_FILE,AI_ANALYSIS)
 
@@ -3752,6 +3878,7 @@ def _cmd_status():
         f"━━━━━━━━━━━━━━━━\n"
         f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',45)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',45)}\n"
         f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
+        f"Donchian long:{live.get('donchian_long_count',0)}/{PARAM.get('MAX_DONCHIAN_BUY',3)} short:{live.get('donchian_short_count',0)}/{PARAM.get('MAX_DONCHIAN_SELL',3)}\n"
         f"Closed trades:{len(REAL_CLOSED)}\n"
         f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
         f"{strategy_msg}"
@@ -3897,7 +4024,7 @@ def _cmd_enable(args):
                     "Available strategies:\n"
                     "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
-                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS, DONCHIAN_BO")
             return
         
         strategy = args[0].upper()
@@ -3906,7 +4033,7 @@ def _cmd_enable(args):
         # Check if it's a valid strategy key
         valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
-                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS", "DONCHIAN_BO"]
         
         if strategy not in valid_strategies:
             tg_send(f"❌ Unknown strategy: {strategy}\n"
@@ -3928,7 +4055,7 @@ def _cmd_disable(args):
                     "Available strategies:\n"
                     "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
-                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS, DONCHIAN_BO")
             return
         
         strategy = args[0].upper()
@@ -3937,7 +4064,7 @@ def _cmd_disable(args):
         # Check if it's a valid strategy key
         valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
-                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS", "DONCHIAN_BO"]
         
         if strategy not in valid_strategies:
             tg_send(f"❌ Unknown strategy: {strategy}\n"
@@ -3966,7 +4093,8 @@ def _cmd_strategies():
             ("ASIAN_BO", "🌏 Asian Breakout"),
             ("FVG_BREAKER", "🧱 FVG+Breaker"),
             ("REENTRY", "🔄 Re-entry 4H+5m"),
-            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)")
+            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)"),
+            ("DONCHIAN_BO", "📈 Donchian Breakout")
         ]
         
         msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
@@ -3980,7 +4108,10 @@ def _cmd_strategies():
         msg += f"Short: {PARAM.get('MAX_SELL', 45)}\n"
         msg += f"\n🧩 CEST Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
-        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}"
+        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
+        msg += f"\n📈 DONCHIAN Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_DONCHIAN_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_DONCHIAN_SELL', 3)}"
         
         tg_send(msg)
     except Exception as e:
@@ -3994,8 +4125,10 @@ def _cmd_setlimits(args):
                     "Types:\n"
                     "  buy, sell - Global limits (all strategies)\n"
                     "  cest_buy, cest_sell - CEST sub-limits\n"
+                    "  donchian_buy, donchian_sell - DONCHIAN sub-limits\n"
                     "Example: /setlimits buy 50\n"
-                    "Example: /setlimits cest_buy 20")
+                    "Example: /setlimits cest_buy 20\n"
+                    "Example: /setlimits donchian_buy 5")
             return
         
         limit_type = args[0].lower()
@@ -4025,9 +4158,19 @@ def _cmd_setlimits(args):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"✅ CEST MAX_SELL limit set to {value} (within global limit)")
             log(f"[SETLIMITS] MAX_CEST_SELL = {value}")
+        elif limit_type == "donchian_buy":
+            PARAM["MAX_DONCHIAN_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ DONCHIAN MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_DONCHIAN_BUY = {value}")
+        elif limit_type == "donchian_sell":
+            PARAM["MAX_DONCHIAN_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ DONCHIAN MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_DONCHIAN_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell")
+                    "Available: buy, sell, cest_buy, cest_sell, donchian_buy, donchian_sell")
             return
         
     except ValueError:
@@ -4390,6 +4533,15 @@ def _can_direction(direction, kind=""):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
             return False
     
+    # Check DONCHIAN-specific limits (in addition to global limits)
+    if kind == "DONCHIAN_BREAKOUT":
+        if direction=="UP" and STATE.get("donchian_long_blocked",False):
+            log(f"[DONCHIAN LIMIT] Donchian long positions blocked (max: {PARAM.get('MAX_DONCHIAN_BUY', 3)})")
+            return False
+        if direction=="DOWN" and STATE.get("donchian_short_blocked",False):
+            log(f"[DONCHIAN LIMIT] Donchian short positions blocked (max: {PARAM.get('MAX_DONCHIAN_SELL', 3)})")
+            return False
+    
     return True
 
 def execute_real_trade(sig):
@@ -4507,11 +4659,11 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.69 aktif — KIVANC removed, Asian/London disabled\n"
-            "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
+    tg_send("🚀 EMA ULTRA v15.9.70 aktif — DONCHIAN Breakout eklendi\n"
+            "📊 11 strategies active | Donchian: max 3 buy/sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.66 - KIVANC removed, Asian & London disabled")
+    log("[START] EMA ULTRA v15.9.70 - DONCHIAN Breakout added")
 
     symbols=auto_init_symbols()
 
