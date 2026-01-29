@@ -22,7 +22,7 @@ import numpy as np
 #  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
-#  - TAKE_PROFIT_MARKET order type used with closePosition=true to fix API errors -4136 and -4120
+#  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
 #  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
 # ==============================================================================
 
@@ -3142,13 +3142,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Format stop price according to symbol's tick size
                 stop_price_str = format_price_by_tick(sym, mark_price)
                 
-                # Use TAKE_PROFIT_MARKET which is compatible with closePosition=true
-                # This is a market order that triggers when stopPrice is reached
+                # Use TAKE_PROFIT_MARKET with Algo Order API endpoint (required since Dec 2025)
+                # This is a market order that triggers when triggerPrice is reached
                 payload = {
                     "symbol": sym,
                     "side": side,
                     "type": "TAKE_PROFIT_MARKET",
-                    "stopPrice": stop_price_str,
+                    "algoType": "CONDITIONAL",
+                    "triggerPrice": stop_price_str,
                     "workingType": "MARK_PRICE",
                     "closePosition": "true",
                     "positionSide": pos_side,
@@ -3156,7 +3157,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 }
                 
                 try:
-                    res = _signed_request("POST", "/fapi/v1/order", payload)
+                    res = _signed_request("POST", "/fapi/v1/algoOrder", payload)
                     closed_symbols.append(sym)
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
@@ -4280,18 +4281,18 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
                     log(f"[TP GUARD] {sym} stop=0 minp jump failed")
                     return False,None,None
             
-            # Use TAKE_PROFIT_MARKET which is compatible with closePosition=true
-            # This is a market order that triggers when stopPrice is reached
-            payload={"symbol":sym,"side":side,"type":"TAKE_PROFIT_MARKET","stopPrice":stop_str,
-                     "workingType":"MARK_PRICE","closePosition":"true",
+            # Use TAKE_PROFIT_MARKET with Algo Order API endpoint (required since Dec 2025)
+            # This is a market order that triggers when triggerPrice is reached
+            payload={"symbol":sym,"side":side,"type":"TAKE_PROFIT_MARKET","algoType":"CONDITIONAL",
+                     "triggerPrice":stop_str,"workingType":"MARK_PRICE","closePosition":"true",
                      "positionSide":pos_side,"timestamp":now_ts_ms()}
             
             try:
-                _signed_request("POST","/fapi/v1/order",payload)
-                log(f"[TP OK] {sym} TAKE_PROFIT_MARKET stop={stop_str}")
+                _signed_request("POST","/fapi/v1/algoOrder",payload)
+                log(f"[TP OK] {sym} TAKE_PROFIT_MARKET triggerPrice={stop_str}")
                 return True,tp_usd_used,tp_pct_used
             except Exception as e:
-                log(f"[TP FAIL] {sym} TAKE_PROFIT_MARKET stop={stop_str} err={e}")
+                log(f"[TP FAIL] {sym} TAKE_PROFIT_MARKET triggerPrice={stop_str} err={e}")
                 return False,None,None
 
         if usd_based:
