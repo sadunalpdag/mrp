@@ -2904,11 +2904,11 @@ def update_hourly_stats_from_closed_trade(closed_trade):
         
         if pnl_pct:
             hour_stats["total_pnl_pct"] += pnl_pct
-            hour_stats["avg_pnl_pct"] = hour_stats["total_pnl_pct"] / hour_stats["total_trades"]
+            hour_stats["avg_pnl_pct"] = float(hour_stats["total_pnl_pct"]) / float(hour_stats["total_trades"])
         
         # Calculate win rate
         if hour_stats["total_trades"] > 0:
-            hour_stats["win_rate"] = (hour_stats["wins"] / hour_stats["total_trades"]) * 100
+            hour_stats["win_rate"] = (float(hour_stats["wins"]) / float(hour_stats["total_trades"])) * 100
         
         # Update strategy-specific stats for this hour
         if strategy not in hour_stats["strategies"]:
@@ -2930,10 +2930,10 @@ def update_hourly_stats_from_closed_trade(closed_trade):
         
         if pnl_pct:
             strat_stats["total_pnl_pct"] += pnl_pct
-            strat_stats["avg_pnl_pct"] = strat_stats["total_pnl_pct"] / strat_stats["total_trades"]
+            strat_stats["avg_pnl_pct"] = float(strat_stats["total_pnl_pct"]) / float(strat_stats["total_trades"])
         
         if strat_stats["total_trades"] > 0:
-            strat_stats["win_rate"] = (strat_stats["wins"] / strat_stats["total_trades"]) * 100
+            strat_stats["win_rate"] = (float(strat_stats["wins"]) / float(strat_stats["total_trades"])) * 100
         
         # Save updated stats
         safe_save(HOURLY_STATS_FILE, HOURLY_STATS)
