@@ -2692,7 +2692,7 @@ def parse_iso_to_timestamp(iso_str):
     try:
         dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
         return int(dt.timestamp())
-    except:
+    except (ValueError, AttributeError, TypeError):
         return 0
 
 def _signed_request(m,path,payload):
@@ -3307,6 +3307,68 @@ def check_profit_target():
                     f"Realized profit: ${final_profit:.2f}")
             log(f"[CASH OUT] Complete. New balance: ${new_balance:.2f}, Realized: ${final_profit:.2f}")
 
+def get_recent_closed_position_stats(now):
+    """
+    Calculate statistics about recently closed positions (last hour).
+    Returns a formatted string with stats, or empty string if no recent trades.
+    """
+    if len(REAL_CLOSED) == 0:
+        return ""
+    
+    # Get recent closed trades (last hour)
+    recent_closed = [t for t in REAL_CLOSED if t.get("close_time") and 
+                    (now - parse_iso_to_timestamp(t["close_time"]) < 3600)]
+    
+    if len(recent_closed) == 0:
+        return ""
+    
+    # Calculate stats about position targets
+    targets_reached = 0
+    valid_trades = 0  # Count trades with valid tp_target and pnl_pct
+    avg_target_pct = 0
+    avg_actual_pnl = 0
+    
+    for trade in recent_closed:
+        tp_target = trade.get("tp_target")
+        pnl_pct = trade.get("pnl_pct")
+        
+        if tp_target is not None and pnl_pct is not None:
+            # Convert tp_target to percentage if needed
+            try:
+                if isinstance(tp_target, (int, float)):
+                    target_value = float(tp_target)
+                    if 0 < target_value < 1:
+                        target_pct = target_value * 100
+                    else:
+                        target_pct = target_value
+                elif isinstance(tp_target, str):
+                    target_pct = float(tp_target)
+                else:
+                    continue  # Skip invalid types
+            except (ValueError, TypeError):
+                continue  # Skip if conversion fails
+            
+            valid_trades += 1
+            avg_target_pct += target_pct
+            avg_actual_pnl += pnl_pct
+            
+            # Check if target was reached (95% of target counts as reached)
+            if pnl_pct >= target_pct * 0.95:
+                targets_reached += 1
+    
+    if valid_trades == 0:
+        return ""
+    
+    avg_target_pct /= valid_trades
+    avg_actual_pnl /= valid_trades
+    
+    return (f"\n━━━━━━━━━━━━━━━━\n"
+           f"📍 Recent Closed (1h):\n"
+           f"   Total: {len(recent_closed)}\n"
+           f"   Targets Reached: {targets_reached}/{valid_trades}\n"
+           f"   Avg Target: {avg_target_pct:.2f}%\n"
+           f"   Avg PnL: {avg_actual_pnl:.2f}%")
+
 def send_hourly_margin_log():
     """
     Send hourly Telegram log showing how much is left until margin cashout target.
@@ -3448,49 +3510,10 @@ def send_hourly_margin_log():
                    f"🔝 Avg Max Profit: ${avg_max_profit:.2f}")
             
             # Add position target info when all positions are closed
-            if open_positions == 0 and len(REAL_CLOSED) > 0:
-                # Get recent closed trades (last hour)
-                recent_closed = [t for t in REAL_CLOSED if t.get("close_time") and 
-                                (now - parse_iso_to_timestamp(t["close_time"]) < 3600)]
-                
-                if len(recent_closed) > 0:
-                    # Calculate stats about position targets
-                    targets_reached = 0
-                    total_closed = len(recent_closed)
-                    avg_target_pct = 0
-                    avg_actual_pnl = 0
-                    
-                    for trade in recent_closed:
-                        tp_target = trade.get("tp_target")
-                        pnl_pct = trade.get("pnl_pct")
-                        
-                        if tp_target and pnl_pct is not None:
-                            # Convert tp_target to percentage if needed
-                            if isinstance(tp_target, float):
-                                if 0 < tp_target < 1:
-                                    target_pct = tp_target * 100
-                                else:
-                                    target_pct = tp_target
-                            else:
-                                target_pct = tp_target
-                            
-                            avg_target_pct += target_pct
-                            avg_actual_pnl += pnl_pct
-                            
-                            # Check if target was reached
-                            if pnl_pct >= target_pct * 0.95:  # 95% of target counts as reached
-                                targets_reached += 1
-                    
-                    if total_closed > 0:
-                        avg_target_pct /= total_closed
-                        avg_actual_pnl /= total_closed
-                        
-                        msg += (f"\n━━━━━━━━━━━━━━━━\n"
-                               f"📍 Recent Closed (1h):\n"
-                               f"   Total: {total_closed}\n"
-                               f"   Targets Reached: {targets_reached}/{total_closed}\n"
-                               f"   Avg Target: {avg_target_pct:.2f}%\n"
-                               f"   Avg PnL: {avg_actual_pnl:.2f}%")
+            if open_positions == 0:
+                stats = get_recent_closed_position_stats(now)
+                if stats:
+                    msg += stats
             
             # Add estimated time to target if available
             if estimated_hours is not None:
@@ -3517,49 +3540,10 @@ def send_hourly_margin_log():
                    f"🕐 {now_local_iso()}")
             
             # Add position target info when all positions are closed
-            if open_positions == 0 and len(REAL_CLOSED) > 0:
-                # Get recent closed trades (last hour)
-                recent_closed = [t for t in REAL_CLOSED if t.get("close_time") and 
-                                (now - parse_iso_to_timestamp(t["close_time"]) < 3600)]
-                
-                if len(recent_closed) > 0:
-                    # Calculate stats about position targets
-                    targets_reached = 0
-                    total_closed = len(recent_closed)
-                    avg_target_pct = 0
-                    avg_actual_pnl = 0
-                    
-                    for trade in recent_closed:
-                        tp_target = trade.get("tp_target")
-                        pnl_pct = trade.get("pnl_pct")
-                        
-                        if tp_target and pnl_pct is not None:
-                            # Convert tp_target to percentage if needed
-                            if isinstance(tp_target, float):
-                                if 0 < tp_target < 1:
-                                    target_pct = tp_target * 100
-                                else:
-                                    target_pct = tp_target
-                            else:
-                                target_pct = tp_target
-                            
-                            avg_target_pct += target_pct
-                            avg_actual_pnl += pnl_pct
-                            
-                            # Check if target was reached
-                            if pnl_pct >= target_pct * 0.95:  # 95% of target counts as reached
-                                targets_reached += 1
-                    
-                    if total_closed > 0:
-                        avg_target_pct /= total_closed
-                        avg_actual_pnl /= total_closed
-                        
-                        msg += (f"\n━━━━━━━━━━━━━━━━\n"
-                               f"📍 Recent Closed (1h):\n"
-                               f"   Total: {total_closed}\n"
-                               f"   Targets Reached: {targets_reached}/{total_closed}\n"
-                               f"   Avg Target: {avg_target_pct:.2f}%\n"
-                               f"   Avg PnL: {avg_actual_pnl:.2f}%")
+            if open_positions == 0:
+                stats = get_recent_closed_position_stats(now)
+                if stats:
+                    msg += stats
         
         tg_send(msg)
         log(f"[HOURLY MARGIN LOG] Sent. Profit: ${current_profit:.2f}, Remaining: ${remaining:.2f}, Est: {estimated_hours:.1f}h" if estimated_hours else f"[HOURLY MARGIN LOG] Sent. Profit: ${current_profit:.2f}, Remaining: ${remaining:.2f}")
