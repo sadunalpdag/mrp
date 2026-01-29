@@ -696,7 +696,7 @@ def detect_5m_reentry(klines_5m, zone_high, zone_low, trend_direction):
         trend_direction: "UP" or "DOWN" from 4H analysis
     
     Returns:
-        ("LONG", entry_price, sl_price) or ("SHORT", entry_price, sl_price) or (None, None, None)
+        ("UP", entry_price, sl_price) or ("DOWN", entry_price, sl_price) or (None, None, None)
     """
     if len(klines_5m) < 10:
         return None, None, None
@@ -746,7 +746,7 @@ def detect_5m_reentry(klines_5m, zone_high, zone_low, trend_direction):
                         
                         # Stop loss below the swing low
                         sl = lows[i] - (zone_high - zone_low) * 0.1  # 10% buffer
-                        return "LONG", reenter_close, sl
+                        return "UP", reenter_close, sl
         
         # SHORT setup (4H bearish, looking at upper zone)
         elif trend_direction == "DOWN":
@@ -768,7 +768,7 @@ def detect_5m_reentry(klines_5m, zone_high, zone_low, trend_direction):
                         
                         # Stop loss above the swing high
                         sl = highs[i] + (zone_high - zone_low) * 0.1  # 10% buffer
-                        return "SHORT", reenter_close, sl
+                        return "DOWN", reenter_close, sl
     
     return None, None, None
 
@@ -2242,7 +2242,7 @@ def build_reentry_signal(sym, kl, bar_i):
     r_val = rsi(closes_5m)[-1]
     
     risk = abs(entry - sl)
-    if direction == "LONG":
+    if direction == "UP":
         tp = entry + 2.0 * risk
     else:
         tp = entry - 2.0 * risk
@@ -2264,7 +2264,7 @@ def build_reentry_signal(sym, kl, bar_i):
         "born_bar": bar_i,
         "early": False,
         "kind": "REENTRY_4H_5M",
-        "tag": f"🔄 REENTRY {'BUY' if direction == 'LONG' else 'SELL'}",
+        "tag": f"🔄 REENTRY {'BUY' if direction == 'UP' else 'SELL'}",
         "zone_high": zone_high,
         "zone_low": zone_low,
         "trend_4h": trend_4h
@@ -4506,7 +4506,7 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.67 aktif — KIVANC removed, Asian/London disabled\n"
+    tg_send("🚀 EMA ULTRA v15.9.69 aktif — KIVANC removed, Asian/London disabled\n"
             "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
