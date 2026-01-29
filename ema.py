@@ -496,7 +496,7 @@ def get_session_range(klines, start_hour_utc, end_hour_utc):
     # Get recent candles within the time window
     session_candles = []
     for k in klines[-30:]:  # Check last 30 candles (30 hours)
-        candle_time = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
+        candle_time = datetime.fromtimestamp(float(k[0]) / 1000, tz=timezone.utc)
         candle_hour = candle_time.hour
         
         # Check if candle is in session
