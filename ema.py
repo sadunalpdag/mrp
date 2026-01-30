@@ -1,4 +1,4 @@
-import os, time, requests, hmac, hashlib, threading, math, json
+import os, time, requests, hmac, hashlib, threading, math, json, traceback
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
@@ -173,6 +173,15 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
     Returns: (supertrend_values, supertrend_direction)
     direction: "UP" for bullish, "DOWN" for bearish
     """
+    # Validate inputs are numeric (convert to float if needed)
+    try:
+        highs = [float(h) for h in highs]
+        lows = [float(l) for l in lows]
+        closes = [float(c) for c in closes]
+    except (ValueError, TypeError) as e:
+        log(f"[SUPERTREND ERR] Invalid data type in highs/lows/closes: {e}")
+        return [], []
+    
     atr_vals = atr_like(highs, lows, closes, period)
     
     basic_ub = []
@@ -2773,8 +2782,29 @@ def futures_get_klines(sym,it,lim):
                        timeout=10).json()
         if r and int(r[-1][6])>now_ts_ms():
             r=r[:-1]
+        
+        # Validate kline data structure
+        if r and len(r) > 0:
+            # Check first kline has correct structure
+            first_kline = r[0]
+            if not isinstance(first_kline, list) or len(first_kline) < 6:
+                log(f"[KLINES ERR] Invalid kline structure for {sym}: {first_kline}")
+                return []
+            
+            # Validate that numeric fields can be converted to float
+            try:
+                _ = float(first_kline[1])  # open
+                _ = float(first_kline[2])  # high
+                _ = float(first_kline[3])  # low
+                _ = float(first_kline[4])  # close
+                _ = float(first_kline[5])  # volume
+            except (ValueError, TypeError) as e:
+                log(f"[KLINES ERR] Invalid numeric data for {sym}: {e}, kline: {first_kline}")
+                return []
+        
         return r
-    except:
+    except Exception as e:
+        log(f"[KLINES ERR] Failed to fetch klines for {sym}: {e}")
         return []
 
 # ===================== POWER/TIER (Bilgi amaçlı) =====================
@@ -4602,7 +4632,10 @@ def main():
             time.sleep(30)
 
         except Exception as e:
-            log(f"[LOOP ERR]{e}")
+            # Log detailed error information including traceback
+            tb = traceback.format_exc()
+            log(f"[LOOP ERR] {type(e).__name__}: {e}")
+            log(f"[LOOP ERR TRACEBACK]\n{tb}")
             time.sleep(10)
 
 # ===================== ENTRY =====================
