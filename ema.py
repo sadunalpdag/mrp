@@ -182,6 +182,11 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
         log(f"[SUPERTREND ERR] Invalid data type in highs/lows/closes: {e}")
         return [], []
     
+    # Validate all arrays have the same length
+    if not (len(highs) == len(lows) == len(closes)):
+        log(f"[SUPERTREND ERR] Array length mismatch: highs={len(highs)}, lows={len(lows)}, closes={len(closes)}")
+        return [], []
+    
     atr_vals = atr_like(highs, lows, closes, period)
     
     basic_ub = []
@@ -2785,22 +2790,27 @@ def futures_get_klines(sym,it,lim):
         
         # Validate kline data structure
         if r and len(r) > 0:
-            # Check first kline has correct structure
-            first_kline = r[0]
-            if not isinstance(first_kline, list) or len(first_kline) < 6:
-                log(f"[KLINES ERR] Invalid kline structure for {sym}: {first_kline}")
-                return []
+            # Sample validation: check first, middle, and last kline
+            sample_indices = [0, len(r) // 2, -1] if len(r) > 2 else [0]
             
-            # Validate that numeric fields can be converted to float
-            try:
-                _ = float(first_kline[1])  # open
-                _ = float(first_kline[2])  # high
-                _ = float(first_kline[3])  # low
-                _ = float(first_kline[4])  # close
-                _ = float(first_kline[5])  # volume
-            except (ValueError, TypeError) as e:
-                log(f"[KLINES ERR] Invalid numeric data for {sym}: {e}, kline: {first_kline}")
-                return []
+            for idx in sample_indices:
+                sample_kline = r[idx]
+                
+                # Check kline has correct structure (Binance returns 12 elements)
+                if not isinstance(sample_kline, list) or len(sample_kline) < 12:
+                    log(f"[KLINES ERR] Invalid kline structure for {sym} at index {idx}: expected 12 elements, got {len(sample_kline) if isinstance(sample_kline, list) else 'not a list'}")
+                    return []
+                
+                # Validate that numeric fields can be converted to float
+                try:
+                    _ = float(sample_kline[1])  # open
+                    _ = float(sample_kline[2])  # high
+                    _ = float(sample_kline[3])  # low
+                    _ = float(sample_kline[4])  # close
+                    _ = float(sample_kline[5])  # volume
+                except (ValueError, TypeError) as e:
+                    log(f"[KLINES ERR] Invalid numeric data for {sym} at index {idx}: {e}")
+                    return []
         
         return r
     except Exception as e:
@@ -4632,10 +4642,9 @@ def main():
             time.sleep(30)
 
         except Exception as e:
-            # Log detailed error information including traceback
+            # Log detailed error information including traceback (atomic log to prevent splitting)
             tb = traceback.format_exc()
-            log(f"[LOOP ERR] {type(e).__name__}: {e}")
-            log(f"[LOOP ERR TRACEBACK]\n{tb}")
+            log(f"[LOOP ERR] {type(e).__name__}: {e}\n[LOOP ERR TRACEBACK]\n{tb}")
             time.sleep(10)
 
 # ===================== ENTRY =====================
