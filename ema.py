@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.66 — Active Strategies (Asian & London disabled)
+# 📘 EMA ULTRA v15.9.70 — Active Strategies (Asian & London disabled)
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
 #  - Aktif stratejiler (10 strateji - Asian & London disabled):
 #       📈 MACD (EMA20/200 + MACD crossover)
@@ -58,7 +58,7 @@ HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
 # Trading Signal Quality Filter
-DEFAULT_MIN_POWER_THRESHOLD = 70.0  # Minimum power score to execute trades (scale: ~50-100)
+DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
 # ===================== UTILITIES =====================
 
@@ -4507,11 +4507,11 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.69 aktif — KIVANC removed, Asian/London disabled\n"
+    tg_send("🚀 EMA ULTRA v15.9.70 aktif — KIVANC removed, Asian/London disabled\n"
             "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.66 - KIVANC removed, Asian & London disabled")
+    log("[START] EMA ULTRA v15.9.70 - KIVANC removed, Asian & London disabled")
 
     symbols=auto_init_symbols()
 
