@@ -58,7 +58,7 @@ HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
 # Trading Signal Quality Filter
-DEFAULT_MIN_POWER_THRESHOLD = 70.0  # Minimum power score to execute trades (scale: ~50-100)
+DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
 # ===================== UTILITIES =====================
 
