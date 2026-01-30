@@ -1,4 +1,4 @@
-import os, time, requests, hmac, hashlib, threading, math, json
+import os, time, requests, hmac, hashlib, threading, math, json, traceback
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
@@ -173,6 +173,20 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
     Returns: (supertrend_values, supertrend_direction)
     direction: "UP" for bullish, "DOWN" for bearish
     """
+    # Validate inputs are numeric (convert to float if needed)
+    try:
+        highs = [float(h) for h in highs]
+        lows = [float(l) for l in lows]
+        closes = [float(c) for c in closes]
+    except (ValueError, TypeError) as e:
+        log(f"[SUPERTREND ERR] Invalid data type in highs/lows/closes: {e}")
+        return [], []
+    
+    # Validate all arrays have the same length
+    if not (len(highs) == len(lows) == len(closes)):
+        log(f"[SUPERTREND ERR] Array length mismatch: highs={len(highs)}, lows={len(lows)}, closes={len(closes)}")
+        return [], []
+    
     atr_vals = atr_like(highs, lows, closes, period)
     
     basic_ub = []
@@ -2773,8 +2787,34 @@ def futures_get_klines(sym,it,lim):
                        timeout=10).json()
         if r and int(r[-1][6])>now_ts_ms():
             r=r[:-1]
+        
+        # Validate kline data structure
+        if r and len(r) > 0:
+            # Sample validation: check first, middle, and last kline
+            sample_indices = [0, len(r) // 2, -1] if len(r) > 2 else [0]
+            
+            for idx in sample_indices:
+                sample_kline = r[idx]
+                
+                # Check kline has correct structure (Binance returns 12 elements)
+                if not isinstance(sample_kline, list) or len(sample_kline) < 12:
+                    log(f"[KLINES ERR] Invalid kline structure for {sym} at index {idx}: expected 12 elements, got {len(sample_kline) if isinstance(sample_kline, list) else 'not a list'}")
+                    return []
+                
+                # Validate that numeric fields can be converted to float
+                try:
+                    _ = float(sample_kline[1])  # open
+                    _ = float(sample_kline[2])  # high
+                    _ = float(sample_kline[3])  # low
+                    _ = float(sample_kline[4])  # close
+                    _ = float(sample_kline[5])  # volume
+                except (ValueError, TypeError) as e:
+                    log(f"[KLINES ERR] Invalid numeric data for {sym} at index {idx}: {e}")
+                    return []
+        
         return r
-    except:
+    except Exception as e:
+        log(f"[KLINES ERR] Failed to fetch klines for {sym}: {e}")
         return []
 
 # ===================== POWER/TIER (Bilgi amaçlı) =====================
@@ -4602,7 +4642,9 @@ def main():
             time.sleep(30)
 
         except Exception as e:
-            log(f"[LOOP ERR]{e}")
+            # Log detailed error information including traceback (atomic log to prevent splitting)
+            tb = traceback.format_exc()
+            log(f"[LOOP ERR] {type(e).__name__}: {e}\n[LOOP ERR TRACEBACK]\n{tb}")
             time.sleep(10)
 
 # ===================== ENTRY =====================
