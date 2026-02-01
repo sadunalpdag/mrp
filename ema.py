@@ -63,6 +63,10 @@ ALGO_ORDER_TYPES = [
     "STOP_LOSS", "STOP", "TAKE_PROFIT_LIMIT", "STOP_LOSS_LIMIT"
 ]
 
+# Cashout TP order offset to avoid immediate trigger
+# Positions close at slightly favorable prices instead of immediate market execution
+CASHOUT_TP_OFFSET_PCT = 0.001  # 0.1% offset from current price
+
 # Trading Signal Quality Filter
 DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
@@ -3210,15 +3214,13 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Adjust trigger price to avoid immediate trigger (-2021 error)
                 # For LONG (selling to close): trigger slightly above current price
                 # For SHORT (buying to close): trigger slightly below current price
-                # Use 0.1% offset to ensure order doesn't trigger immediately
-                offset_pct = 0.001  # 0.1% offset
                 
                 if pos_side == "LONG":
                     # Selling to close long - trigger above current price
-                    trigger_price = mark_price * (1 + offset_pct)
+                    trigger_price = mark_price * (1 + CASHOUT_TP_OFFSET_PCT)
                 else:
                     # Buying to close short - trigger below current price
-                    trigger_price = mark_price * (1 - offset_pct)
+                    trigger_price = mark_price * (1 - CASHOUT_TP_OFFSET_PCT)
                 
                 # Format stop price according to symbol's tick size
                 stop_price_str = format_price_by_tick(sym, trigger_price)
@@ -3242,10 +3244,10 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     closed_symbols.append(sym)
                     log(f"[CLOSE ALL] {sym} {pos_side} TP order placed at {stop_price_str} (mark: {mark_price:.6f})")
                 except Exception as tp_err:
-                    # If still getting errors, log and skip (don't force close with market order)
+                    # TP order placement failed - position remains open without TP order
                     err_str = str(tp_err)
                     log(f"[CLOSE ALL WARN] {sym} TP order failed: {tp_err}")
-                    # Don't add to closed_symbols as position remains open with TP pending
+                    # Don't add to closed_symbols as position remains open
                     continue
                 
                 # Note: TRENDLOCK is intentionally NOT removed during cashout
@@ -3253,7 +3255,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 
                 # Log to closed trades with exit reason
                 entry_price = float(p.get("entryPrice", 0))
-                # Use trigger price as exit price (where TP order will execute)
+                # Use trigger price as approximate exit price
+                # Note: TAKE_PROFIT_MARKET executes at market when triggered, 
+                # so actual exit price may differ slightly from trigger_price
                 exit_price = trigger_price
                 
                 # Get position info from tracker if available
