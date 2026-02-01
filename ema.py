@@ -66,6 +66,10 @@ ALGO_ORDER_TYPES = [
 # Trading Signal Quality Filter
 DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
+# Cash out settlement delays
+ORDER_CLOSE_SETTLEMENT_SEC = 3  # Time to wait after closing positions
+ORDER_REOPEN_SETTLEMENT_SEC = 2  # Time to wait after reopening positions
+
 # ===================== UTILITIES =====================
 
 def log(msg):
@@ -3359,7 +3363,7 @@ def reopen_positions_with_tp(closed_positions_info):
             opened = open_market_position(sym, direction, qty)
             entry_exec = opened.get("entry")
             if entry_exec is None or entry_exec <= 0:
-                entry_exec = futures_get_price(sym)
+                entry_exec = current_price  # Reuse the previously fetched current price
             if entry_exec is None or entry_exec <= 0:
                 log(f"[REOPEN FAIL] {sym} - unable to get entry price")
                 continue
@@ -3375,13 +3379,15 @@ def reopen_positions_with_tp(closed_positions_info):
             log(f"[TRENDLOCK SET] {sym} {direction}")
             
             # Track the new position
+            # Note: power is set to 0.0 for cashout reopens since they're not based on
+            # strategy signals but rather maintaining positions after profit realization
             REAL_POSITIONS_TRACKER[sym] = {
                 "symbol": sym,
                 "direction": direction,
                 "entry_price": entry_exec,
                 "kind": "CASHOUT_REOPEN",
                 "tag": "💰 REOPEN",
-                "power": 0.0,  # No power score for cashout reopens
+                "power": 0.0,  # No power score for cashout reopens (not signal-based)
                 "open_time": now_local_iso(),
                 "tp_target": tp_usd_used or tp_pct_used,
                 "market_state": "",
@@ -3469,7 +3475,7 @@ def check_profit_target():
             tg_send(f"ℹ️ No open positions to close")
         
         # Wait for orders to settle
-        time.sleep(3)
+        time.sleep(ORDER_CLOSE_SETTLEMENT_SEC)
         
         # Reopen positions at current prices with TO (take profit) orders
         if closed_positions_info:
@@ -3486,7 +3492,7 @@ def check_profit_target():
                 log(f"[CASH OUT] Failed to reopen any positions")
         
         # Get new balance after closing and reopening
-        time.sleep(2)  # Wait for reopen orders to settle
+        time.sleep(ORDER_REOPEN_SETTLEMENT_SEC)  # Wait for reopen orders to settle
         new_balance = get_account_balance()
         if new_balance:
             STATE["initial_margin_balance"] = new_balance
