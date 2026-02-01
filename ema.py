@@ -57,6 +57,12 @@ LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
+# Algo order types that should be cancelled before closing positions
+ALGO_ORDER_TYPES = [
+    "TAKE_PROFIT_MARKET", "STOP_MARKET", "TAKE_PROFIT", 
+    "STOP_LOSS", "STOP", "TAKE_PROFIT_LIMIT", "STOP_LOSS_LIMIT"
+]
+
 # Trading Signal Quality Filter
 DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
@@ -2714,10 +2720,14 @@ def cancel_all_algo_orders(sym):
     """
     Cancel all open algo orders (TAKE_PROFIT_MARKET, STOP_MARKET, etc.) for a symbol.
     This is necessary before closing positions to avoid error -4130.
-    Returns True if successful, False otherwise.
+    
+    Returns:
+        dict: {"success": bool, "cancelled": int, "failed": int}
     """
+    result = {"success": False, "cancelled": 0, "failed": 0}
+    
     try:
-        # Get all open algo orders for the symbol
+        # Get all open orders for the symbol
         payload = {
             "symbol": sym,
             "timestamp": now_ts_ms()
@@ -2725,11 +2735,10 @@ def cancel_all_algo_orders(sym):
         open_orders = _signed_request("GET", "/fapi/v1/openOrders", payload)
         
         # Cancel each algo order
-        cancelled_count = 0
         for order in open_orders:
             order_type = order.get("type")
             # Cancel stop loss and take profit orders
-            if order_type in ["TAKE_PROFIT_MARKET", "STOP_MARKET", "TAKE_PROFIT", "STOP_LOSS", "STOP", "TAKE_PROFIT_LIMIT", "STOP_LOSS_LIMIT"]:
+            if order_type in ALGO_ORDER_TYPES:
                 try:
                     cancel_payload = {
                         "symbol": sym,
@@ -2737,17 +2746,22 @@ def cancel_all_algo_orders(sym):
                         "timestamp": now_ts_ms()
                     }
                     _signed_request("DELETE", "/fapi/v1/order", cancel_payload)
-                    cancelled_count += 1
+                    result["cancelled"] += 1
                 except Exception as cancel_err:
+                    result["failed"] += 1
                     log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
         
-        if cancelled_count > 0:
-            log(f"[CANCEL ORDERS] {sym} cancelled {cancelled_count} algo order(s)")
+        if result["cancelled"] > 0:
+            log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
         
-        return True
+        if result["failed"] > 0:
+            log(f"[CANCEL ORDERS] {sym} failed to cancel {result['failed']} order(s)")
+        
+        result["success"] = True
+        return result
     except Exception as e:
         log(f"[CANCEL ORDERS ERR] {sym} {e}")
-        return False
+        return result
 
 def get_symbol_filters(sym):
     if sym in PRECISION_CACHE:
