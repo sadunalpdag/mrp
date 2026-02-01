@@ -57,6 +57,12 @@ LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
+# Algo order types that should be cancelled before closing positions
+ALGO_ORDER_TYPES = [
+    "TAKE_PROFIT_MARKET", "STOP_MARKET", "TAKE_PROFIT", 
+    "STOP_LOSS", "STOP", "TAKE_PROFIT_LIMIT", "STOP_LOSS_LIMIT"
+]
+
 # Trading Signal Quality Filter
 DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
@@ -2700,10 +2706,62 @@ def _signed_request(m,path,payload):
     sig=hmac.new(BINANCE_SECRET.encode(),q.encode(),hashlib.sha256).hexdigest()
     headers={"X-MBX-APIKEY":BINANCE_KEY}
     url=BINANCE_FAPI+path+"?"+q+"&signature="+sig
-    r = (requests.post(url,headers=headers,timeout=10) if m=="POST" else requests.get(url,headers=headers,timeout=10))
+    if m=="POST":
+        r = requests.post(url,headers=headers,timeout=10)
+    elif m=="DELETE":
+        r = requests.delete(url,headers=headers,timeout=10)
+    else:
+        r = requests.get(url,headers=headers,timeout=10)
     if r.status_code!=200:
         raise RuntimeError(f"Binance {r.status_code}: {r.text}")
     return r.json()
+
+def cancel_all_algo_orders(sym):
+    """
+    Cancel all open algo orders (TAKE_PROFIT_MARKET, STOP_MARKET, etc.) for a symbol.
+    This is necessary before closing positions to avoid error -4130.
+    
+    Returns:
+        dict: {"success": bool, "cancelled": int, "failed": int}
+    """
+    result = {"success": False, "cancelled": 0, "failed": 0}
+    
+    try:
+        # Get all open orders for the symbol
+        payload = {
+            "symbol": sym,
+            "timestamp": now_ts_ms()
+        }
+        open_orders = _signed_request("GET", "/fapi/v1/openOrders", payload)
+        
+        # Cancel each algo order
+        for order in open_orders:
+            order_type = order.get("type")
+            # Cancel stop loss and take profit orders
+            if order_type in ALGO_ORDER_TYPES:
+                try:
+                    cancel_payload = {
+                        "symbol": sym,
+                        "orderId": order["orderId"],
+                        "timestamp": now_ts_ms()
+                    }
+                    _signed_request("DELETE", "/fapi/v1/order", cancel_payload)
+                    result["cancelled"] += 1
+                except Exception as cancel_err:
+                    result["failed"] += 1
+                    log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
+        
+        if result["cancelled"] > 0:
+            log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
+        
+        if result["failed"] > 0:
+            log(f"[CANCEL ORDERS] {sym} failed to cancel {result['failed']} order(s)")
+        
+        result["success"] = True
+        return result
+    except Exception as e:
+        log(f"[CANCEL ORDERS ERR] {sym} {e}")
+        return result
 
 def get_symbol_filters(sym):
     if sym in PRECISION_CACHE:
@@ -3122,6 +3180,10 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
             
             sym = p["symbol"]
             
+            # Cancel any existing algo orders (TP/SL) for this symbol first
+            # This prevents error -4130: "An open stop or take profit order with GTE and closePosition in the direction is existing."
+            cancel_all_algo_orders(sym)
+            
             # Determine side and position side
             if amt > 0:  # Long position
                 side = "SELL"
@@ -3161,11 +3223,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     closed_symbols.append(sym)
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
-                    # Check if error is -2021 "Order would immediately trigger"
+                    # Check if error is -2021 "Order would immediately trigger" or 
+                    # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
+                    # -4509 "Time in Force (TIF) GTE can only be used with open positions"
                     err_str = str(tp_err)
-                    if "-2021" in err_str or "would immediately trigger" in err_str.lower():
+                    if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
+                        "-4130" in err_str or "-4509" in err_str):
                         # Fallback: close position directly with MARKET order
-                        log(f"[CLOSE ALL] {sym} TP failed (would immediately trigger), using MARKET order")
+                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using MARKET order. Error: {tp_err}")
                         market_payload = {
                             "symbol": sym,
                             "side": side,
