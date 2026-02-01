@@ -3166,9 +3166,10 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
     Close all open positions at market price.
     Args:
         exit_reason: Reason for closing ("PROFIT_TARGET" or "MANUAL_CLOSE")
-    Returns list of closed position symbols.
+    Returns tuple: (list of closed position symbols, list of closed position info dicts)
     """
     closed_symbols = []
+    closed_positions_info = []
     try:
         # Get all open positions
         acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
@@ -3221,6 +3222,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 try:
                     res = _signed_request("POST", "/fapi/v1/algoOrder", payload)
                     closed_symbols.append(sym)
+                    # Store position info for reopening
+                    direction = "UP" if pos_side == "LONG" else "DOWN"
+                    closed_positions_info.append({
+                        "symbol": sym,
+                        "direction": direction,
+                        "pos_side": pos_side,
+                        "amount": amt
+                    })
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
                     # Check if error is -2021 "Order would immediately trigger" or 
@@ -3241,6 +3250,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         }
                         res = _signed_request("POST", "/fapi/v1/order", market_payload)
                         closed_symbols.append(sym)
+                        # Store position info for reopening
+                        direction = "UP" if pos_side == "LONG" else "DOWN"
+                        closed_positions_info.append({
+                            "symbol": sym,
+                            "direction": direction,
+                            "pos_side": pos_side,
+                            "amount": amt
+                        })
                         log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (direct close)")
                     else:
                         # Re-raise if it's a different error
@@ -3300,10 +3317,100 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
         if closed_symbols:
             safe_save(REAL_CLOSED_FILE, REAL_CLOSED)
         
-        return closed_symbols
+        return closed_symbols, closed_positions_info
     except Exception as e:
         log(f"[CLOSE ALL POSITIONS ERR] {e}")
-        return []
+        return [], []
+
+def reopen_positions_with_tp(closed_positions_info):
+    """
+    Reopen positions at current market prices with take profit orders.
+    This is called after cashout to reenter positions with proper TO setup.
+    Args:
+        closed_positions_info: List of dicts with position info (symbol, direction, pos_side, amount)
+    Returns:
+        Number of positions successfully reopened
+    """
+    reopened_count = 0
+    
+    for pos_info in closed_positions_info:
+        sym = pos_info["symbol"]
+        direction = pos_info["direction"]
+        
+        try:
+            # Clear TRENDLOCK for this symbol to allow reopening
+            if sym in TREND_LOCK:
+                TREND_LOCK.pop(sym, None)
+                TREND_LOCK_TIME.pop(sym, None)
+                log(f"[REOPEN] Cleared TRENDLOCK for {sym}")
+            
+            # Calculate quantity using the same logic as regular trades
+            current_price = futures_get_price(sym)
+            if not current_price or current_price <= 0:
+                log(f"[REOPEN SKIP] {sym} - unable to get current price")
+                continue
+            
+            qty = calc_order_qty(sym, current_price, PARAM["TRADE_SIZE_USDT"])
+            if not qty or qty <= 0:
+                log(f"[REOPEN SKIP] {sym} - unable to calculate quantity")
+                continue
+            
+            # Open position at market price
+            opened = open_market_position(sym, direction, qty)
+            entry_exec = opened.get("entry")
+            if entry_exec is None or entry_exec <= 0:
+                entry_exec = futures_get_price(sym)
+            if entry_exec is None or entry_exec <= 0:
+                log(f"[REOPEN FAIL] {sym} - unable to get entry price")
+                continue
+            
+            # Set take profit order with standard parameters
+            tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
+                sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0
+            )
+            
+            # Set TRENDLOCK for the new position
+            TREND_LOCK[sym] = direction
+            TREND_LOCK_TIME[sym] = now_ts_s()
+            log(f"[TRENDLOCK SET] {sym} {direction}")
+            
+            # Track the new position
+            REAL_POSITIONS_TRACKER[sym] = {
+                "symbol": sym,
+                "direction": direction,
+                "entry_price": entry_exec,
+                "kind": "CASHOUT_REOPEN",
+                "tag": "💰 REOPEN",
+                "power": 0.0,  # No power score for cashout reopens
+                "open_time": now_local_iso(),
+                "tp_target": tp_usd_used or tp_pct_used,
+                "market_state": "",
+                "conditions": {},
+                "max_profit": 0.0
+            }
+            
+            # Send notification
+            if tp_ok:
+                tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
+                          else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
+                tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',250.0),1e-12))*100
+                tg_send(f"💰 REOPEN {sym} {direction} qty:{qty}\n"
+                       f"Entry:{entry_exec:.12f}\n"
+                       f"{tp_line} ({tp_pct_show:.3f}%)\n"
+                       f"Reopened after cashout at current price")
+            else:
+                tg_send(f"💰 REOPEN {sym} {direction} qty:{qty}\n"
+                       f"Entry:{entry_exec:.12f}\n"
+                       f"TP: YOK (USD/% tarama başarısız)\n"
+                       f"Reopened after cashout at current price")
+            
+            log(f"[REOPEN SUCCESS] {sym} {direction} at {entry_exec}")
+            reopened_count += 1
+            
+        except Exception as e:
+            log(f"[REOPEN ERR] {sym} {e}")
+    
+    return reopened_count
 
 def check_profit_target():
     """
@@ -3350,10 +3457,10 @@ def check_profit_target():
                 f"Initial Balance: ${initial_balance:.2f}\n"
                 f"Current Balance: ${current_balance:.2f}\n"
                 f"Profit: ${profit:.2f} (Target: ${profit_target:.2f})\n"
-                f"Closing all positions at mark price...")
+                f"Closing all positions and reopening at current prices...")
         
-        # Close all positions
-        closed_symbols = close_all_positions_at_market()
+        # Close all positions and get position info for reopening
+        closed_symbols, closed_positions_info = close_all_positions_at_market()
         
         if closed_symbols:
             tg_send(f"✅ Closed {len(closed_symbols)} positions: {', '.join(closed_symbols[:10])}")
@@ -3361,8 +3468,25 @@ def check_profit_target():
         else:
             tg_send(f"ℹ️ No open positions to close")
         
-        # Get new balance after closing
-        time.sleep(2)  # Wait for orders to settle
+        # Wait for orders to settle
+        time.sleep(3)
+        
+        # Reopen positions at current prices with TO (take profit) orders
+        if closed_positions_info:
+            log(f"[CASH OUT] Reopening {len(closed_positions_info)} positions at current prices...")
+            tg_send(f"🔄 Reopening {len(closed_positions_info)} positions at current market prices with TP orders...")
+            
+            reopened_count = reopen_positions_with_tp(closed_positions_info)
+            
+            if reopened_count > 0:
+                tg_send(f"✅ Successfully reopened {reopened_count} positions with take profit orders")
+                log(f"[CASH OUT] Reopened {reopened_count} positions")
+            else:
+                tg_send(f"⚠️ Failed to reopen positions")
+                log(f"[CASH OUT] Failed to reopen any positions")
+        
+        # Get new balance after closing and reopening
+        time.sleep(2)  # Wait for reopen orders to settle
         new_balance = get_account_balance()
         if new_balance:
             STATE["initial_margin_balance"] = new_balance
@@ -3370,7 +3494,8 @@ def check_profit_target():
             final_profit = new_balance - initial_balance
             tg_send(f"✅ Cash out complete!\n"
                     f"New margin balance: ${new_balance:.2f}\n"
-                    f"Realized profit: ${final_profit:.2f}")
+                    f"Realized profit: ${final_profit:.2f}\n"
+                    f"Positions reopened: {reopened_count}/{len(closed_positions_info)}")
             log(f"[CASH OUT] Complete. New balance: ${new_balance:.2f}, Realized: ${final_profit:.2f}")
 
 def get_recent_closed_position_stats(now):
@@ -3941,7 +4066,7 @@ def _cmd_closeall():
         
         tg_send(f"🔄 Closing {open_count} open positions at market price...")
         
-        closed_symbols = close_all_positions_at_market(exit_reason="MANUAL_CLOSE")
+        closed_symbols, _ = close_all_positions_at_market(exit_reason="MANUAL_CLOSE")
         
         if closed_symbols:
             tg_send(f"✅ Closed {len(closed_symbols)} positions: {', '.join(closed_symbols[:10])}")
