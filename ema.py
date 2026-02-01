@@ -3163,10 +3163,16 @@ def get_unrealized_pnl():
 
 def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
     """
-    Close all open positions at market price.
+    Close all open positions by placing TAKE_PROFIT orders at adjusted prices.
+    
+    Instead of immediate market close (which causes slippage losses), this function:
+    1. Cancels all existing algo orders for each position
+    2. Places TAKE_PROFIT_MARKET orders at prices slightly away from current market
+       to avoid immediate triggering and slippage
+    
     Args:
         exit_reason: Reason for closing ("PROFIT_TARGET" or "MANUAL_CLOSE")
-    Returns list of closed position symbols.
+    Returns list of symbols with TP orders placed.
     """
     closed_symbols = []
     try:
@@ -3193,7 +3199,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 pos_side = "SHORT"
                 amt = abs(amt)
             
-            # Place take profit order at mark price
+            # Place take profit order at adjusted price to avoid immediate trigger
             try:
                 # Get current mark price
                 mark_price = futures_get_mark_price(sym)
@@ -3201,8 +3207,21 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     log(f"[CLOSE ALL SKIP] {sym} - unable to get mark price")
                     continue
                 
+                # Adjust trigger price to avoid immediate trigger (-2021 error)
+                # For LONG (selling to close): trigger slightly above current price
+                # For SHORT (buying to close): trigger slightly below current price
+                # Use 0.1% offset to ensure order doesn't trigger immediately
+                offset_pct = 0.001  # 0.1% offset
+                
+                if pos_side == "LONG":
+                    # Selling to close long - trigger above current price
+                    trigger_price = mark_price * (1 + offset_pct)
+                else:
+                    # Buying to close short - trigger below current price
+                    trigger_price = mark_price * (1 - offset_pct)
+                
                 # Format stop price according to symbol's tick size
-                stop_price_str = format_price_by_tick(sym, mark_price)
+                stop_price_str = format_price_by_tick(sym, trigger_price)
                 
                 # Use TAKE_PROFIT_MARKET with Algo Order API endpoint (required since Dec 2025)
                 # This is a market order that triggers when triggerPrice is reached
@@ -3221,38 +3240,21 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 try:
                     res = _signed_request("POST", "/fapi/v1/algoOrder", payload)
                     closed_symbols.append(sym)
-                    log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
+                    log(f"[CLOSE ALL] {sym} {pos_side} TP order placed at {stop_price_str} (mark: {mark_price:.6f})")
                 except Exception as tp_err:
-                    # Check if error is -2021 "Order would immediately trigger" or 
-                    # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
-                    # -4509 "Time in Force (TIF) GTE can only be used with open positions"
+                    # If still getting errors, log and skip (don't force close with market order)
                     err_str = str(tp_err)
-                    if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
-                        "-4130" in err_str or "-4509" in err_str):
-                        # Fallback: close position directly with MARKET order
-                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using MARKET order. Error: {tp_err}")
-                        market_payload = {
-                            "symbol": sym,
-                            "side": side,
-                            "type": "MARKET",
-                            "quantity": f"{amt}",
-                            "positionSide": pos_side,
-                            "timestamp": now_ts_ms()
-                        }
-                        res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                        closed_symbols.append(sym)
-                        log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (direct close)")
-                    else:
-                        # Re-raise if it's a different error
-                        raise
+                    log(f"[CLOSE ALL WARN] {sym} TP order failed: {tp_err}")
+                    # Don't add to closed_symbols as position remains open with TP pending
+                    continue
                 
                 # Note: TRENDLOCK is intentionally NOT removed during cashout
                 # This prevents reopening positions for same symbols immediately after cashout
                 
                 # Log to closed trades with exit reason
                 entry_price = float(p.get("entryPrice", 0))
-                # Get mark price as exit price
-                exit_price = futures_get_mark_price(sym)
+                # Use trigger price as exit price (where TP order will execute)
+                exit_price = trigger_price
                 
                 # Get position info from tracker if available
                 pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
