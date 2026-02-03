@@ -3233,32 +3233,26 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 }
                 res = _signed_request("POST", "/fapi/v1/order", limit_payload)
                 
-                # Check if order was filled (even partially)
+                # Check if order was filled completely
+                # IOC orders are automatically cancelled if not immediately filled
                 filled_qty = float(res.get("executedQty", 0))
-                ordered_qty = float(res.get("origQty", amt))
+                ordered_qty = float(amt)
                 
                 if filled_qty < ordered_qty * 0.95:  # Less than 95% filled
-                    log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
-                    # Cancel the IOC order if it's still open
-                    try:
-                        _signed_request("DELETE", "/fapi/v1/order", {
-                            "symbol": sym,
-                            "timestamp": now_ts_ms()
-                        })
-                    except:
-                        pass  # Order might already be cancelled
+                    remaining_qty = ordered_qty - filled_qty
+                    log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder ({remaining_qty})")
                     
                     # Use MARKET order to close remaining position
                     market_payload = {
                         "symbol": sym,
                         "side": side,
                         "type": "MARKET",
-                        "quantity": f"{amt}",
+                        "quantity": f"{remaining_qty}",
                         "positionSide": pos_side,
                         "timestamp": now_ts_ms()
                     }
                     res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                    log(f"[CLOSE ALL] {sym} {pos_side} closed remaining with MARKET order")
+                    log(f"[CLOSE ALL] {sym} {pos_side} closed remaining {remaining_qty} with MARKET order")
                 
                 closed_symbols.append(sym)
                 # Store position info for function return value (maintained for backward compatibility)
