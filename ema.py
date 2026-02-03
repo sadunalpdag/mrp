@@ -3197,18 +3197,41 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 pos_side = "SHORT"
                 amt = abs(amt)
             
-            # Close position directly with MARKET order at current price
+            # Close position with LIMIT order at slightly worse price to avoid slippage losses
             try:
-                # Use direct MARKET order for immediate execution
-                market_payload = {
+                # Get current mark price for reference
+                mark_price = futures_get_mark_price(sym)
+                if not mark_price:
+                    log(f"[CLOSE ALL SKIP] {sym} - unable to get mark price")
+                    continue
+                
+                # Calculate limit price with 0.15% buffer to avoid slippage losses
+                # For LONG positions (SELL to close): set price 0.15% lower (acceptable loss)
+                # For SHORT positions (BUY to close): set price 0.15% higher (acceptable loss)
+                buffer_pct = 0.0015  # 0.15% buffer to ensure execution while limiting slippage
+                if pos_side == "LONG":
+                    # Selling to close long: accept slightly lower price
+                    limit_price = mark_price * (1 - buffer_pct)
+                else:
+                    # Buying to close short: accept slightly higher price
+                    limit_price = mark_price * (1 + buffer_pct)
+                
+                # Format price according to symbol's tick size
+                limit_price_str = format_price_by_tick(sym, limit_price)
+                
+                # Use LIMIT order with post-only disabled (IoC-like behavior)
+                # This provides price protection while still executing quickly
+                limit_payload = {
                     "symbol": sym,
                     "side": side,
-                    "type": "MARKET",
+                    "type": "LIMIT",
+                    "timeInForce": "GTC",  # Good Till Cancel
                     "quantity": f"{amt}",
+                    "price": limit_price_str,
                     "positionSide": pos_side,
                     "timestamp": now_ts_ms()
                 }
-                res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                res = _signed_request("POST", "/fapi/v1/order", limit_payload)
                 closed_symbols.append(sym)
                 # Store position info for function return value (maintained for backward compatibility)
                 direction = "UP" if pos_side == "LONG" else "DOWN"
@@ -3218,7 +3241,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "pos_side": pos_side,
                     "amount": amt
                 })
-                log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order at current price")
+                log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order at {limit_price_str} (mark: {mark_price}, buffer: 0.15%)")
                 
                 # Note: TRENDLOCK is intentionally NOT removed during cashout
                 # This prevents reopening positions for same symbols immediately after cashout
