@@ -3186,7 +3186,6 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
             sym = p["symbol"]
             
             # Cancel any existing algo orders (TP/SL) for this symbol first
-            # This prevents error -4130: "An open stop or take profit order with GTE and closePosition in the direction is existing."
             cancel_all_algo_orders(sym)
             
             # Determine side and position side
@@ -3198,74 +3197,28 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 pos_side = "SHORT"
                 amt = abs(amt)
             
-            # Place take profit order at mark price
+            # Close position directly with MARKET order at current price
             try:
-                # Get current mark price
-                mark_price = futures_get_mark_price(sym)
-                if not mark_price:
-                    log(f"[CLOSE ALL SKIP] {sym} - unable to get mark price")
-                    continue
-                
-                # Format stop price according to symbol's tick size
-                stop_price_str = format_price_by_tick(sym, mark_price)
-                
-                # Use TAKE_PROFIT_MARKET with Algo Order API endpoint (required since Dec 2025)
-                # This is a market order that triggers when triggerPrice is reached
-                payload = {
+                # Use direct MARKET order for immediate execution
+                market_payload = {
                     "symbol": sym,
                     "side": side,
-                    "type": "TAKE_PROFIT_MARKET",
-                    "algoType": "CONDITIONAL",
-                    "triggerPrice": stop_price_str,
-                    "workingType": "MARK_PRICE",
-                    "closePosition": "true",
+                    "type": "MARKET",
+                    "quantity": f"{amt}",
                     "positionSide": pos_side,
                     "timestamp": now_ts_ms()
                 }
-                
-                try:
-                    res = _signed_request("POST", "/fapi/v1/algoOrder", payload)
-                    closed_symbols.append(sym)
-                    # Store position info for reopening
-                    direction = "UP" if pos_side == "LONG" else "DOWN"
-                    closed_positions_info.append({
-                        "symbol": sym,
-                        "direction": direction,
-                        "pos_side": pos_side,
-                        "amount": amt
-                    })
-                    log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
-                except Exception as tp_err:
-                    # Check if error is -2021 "Order would immediately trigger" or 
-                    # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
-                    # -4509 "Time in Force (TIF) GTE can only be used with open positions"
-                    err_str = str(tp_err)
-                    if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
-                        "-4130" in err_str or "-4509" in err_str):
-                        # Fallback: close position directly with MARKET order
-                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using MARKET order. Error: {tp_err}")
-                        market_payload = {
-                            "symbol": sym,
-                            "side": side,
-                            "type": "MARKET",
-                            "quantity": f"{amt}",
-                            "positionSide": pos_side,
-                            "timestamp": now_ts_ms()
-                        }
-                        res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                        closed_symbols.append(sym)
-                        # Store position info for reopening
-                        direction = "UP" if pos_side == "LONG" else "DOWN"
-                        closed_positions_info.append({
-                            "symbol": sym,
-                            "direction": direction,
-                            "pos_side": pos_side,
-                            "amount": amt
-                        })
-                        log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (direct close)")
-                    else:
-                        # Re-raise if it's a different error
-                        raise
+                res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                closed_symbols.append(sym)
+                # Store position info (not used for reopening anymore)
+                direction = "UP" if pos_side == "LONG" else "DOWN"
+                closed_positions_info.append({
+                    "symbol": sym,
+                    "direction": direction,
+                    "pos_side": pos_side,
+                    "amount": amt
+                })
+                log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order at current price")
                 
                 # Note: TRENDLOCK is intentionally NOT removed during cashout
                 # This prevents reopening positions for same symbols immediately after cashout
@@ -3463,7 +3416,7 @@ def check_profit_target():
                 f"Initial Balance: ${initial_balance:.2f}\n"
                 f"Current Balance: ${current_balance:.2f}\n"
                 f"Profit: ${profit:.2f} (Target: ${profit_target:.2f})\n"
-                f"Closing all positions and reopening at current prices...")
+                f"Closing all positions at current market prices...")
         
         # Close all positions and get position info for reopening
         closed_symbols, closed_positions_info = close_all_positions_at_market()
@@ -3477,22 +3430,10 @@ def check_profit_target():
         # Wait for orders to settle
         time.sleep(ORDER_CLOSE_SETTLEMENT_SEC)
         
-        # Reopen positions at current prices with TO (take profit) orders
-        if closed_positions_info:
-            log(f"[CASH OUT] Reopening {len(closed_positions_info)} positions at current prices...")
-            tg_send(f"🔄 Reopening {len(closed_positions_info)} positions at current market prices with TP orders...")
-            
-            reopened_count = reopen_positions_with_tp(closed_positions_info)
-            
-            if reopened_count > 0:
-                tg_send(f"✅ Successfully reopened {reopened_count} positions with take profit orders")
-                log(f"[CASH OUT] Reopened {reopened_count} positions")
-            else:
-                tg_send(f"⚠️ Failed to reopen positions")
-                log(f"[CASH OUT] Failed to reopen any positions")
+        # Note: Positions are NOT automatically reopened after cashout.
+        # New positions will be opened by regular trading signals.
         
-        # Get new balance after closing and reopening
-        time.sleep(ORDER_REOPEN_SETTLEMENT_SEC)  # Wait for reopen orders to settle
+        # Get new balance after closing
         new_balance = get_account_balance()
         if new_balance:
             STATE["initial_margin_balance"] = new_balance
@@ -3501,7 +3442,7 @@ def check_profit_target():
             tg_send(f"✅ Cash out complete!\n"
                     f"New margin balance: ${new_balance:.2f}\n"
                     f"Realized profit: ${final_profit:.2f}\n"
-                    f"Positions reopened: {reopened_count}/{len(closed_positions_info)}")
+                    f"Positions will be reopened by trading signals.")
             log(f"[CASH OUT] Complete. New balance: ${new_balance:.2f}, Realized: ${final_profit:.2f}")
 
 def get_recent_closed_position_stats(now):
