@@ -3285,17 +3285,19 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                 raise Exception(f"Invalid response from LIMIT order: {res}")
                                 
                             filled_qty = float(res.get("executedQty", 0))
-                            ordered_qty = float(amt_formatted)
+                            ordered_qty = amt  # Use original float value for accurate comparison
                             
                             if filled_qty < ordered_qty * MIN_FILL_THRESHOLD:  # Less than threshold filled
                                 log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
                                 
                                 # Use MARKET order for remaining quantity to ensure position is fully closed
                                 remaining_qty = ordered_qty - filled_qty
+                                
                                 # Format remaining quantity according to symbol's lot size
                                 remaining_qty_formatted = adjust_precision(sym, remaining_qty, "qty")
                                 
-                                if remaining_qty_formatted > 0:
+                                # Check if remaining quantity is significant after precision adjustment
+                                if float(remaining_qty_formatted) > 0:
                                     market_payload = {
                                         "symbol": sym,
                                         "side": side,
