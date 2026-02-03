@@ -3242,17 +3242,60 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     err_str = str(tp_err)
                     if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
                         "-4130" in err_str or "-4509" in err_str):
-                        # Fallback: close position directly with MARKET order
-                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using MARKET order. Error: {tp_err}")
-                        market_payload = {
+                        # Fallback: close position with LIMIT order (IOC) for price protection
+                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
+                        
+                        # Calculate limit price with 0.15% buffer to avoid slippage losses
+                        # For LONG positions (SELL to close): set price 0.15% lower (acceptable loss)
+                        # For SHORT positions (BUY to close): set price 0.15% higher (acceptable loss)
+                        buffer_pct = 0.0015  # 0.15% buffer to ensure execution while limiting slippage
+                        if pos_side == "LONG":
+                            # Selling to close LONG: price slightly lower
+                            limit_price = mark_price * (1 - buffer_pct)
+                        else:
+                            # Buying to close SHORT: price slightly higher
+                            limit_price = mark_price * (1 + buffer_pct)
+                        
+                        # Format price according to symbol's tick size
+                        limit_price_str = format_price_by_tick(sym, limit_price)
+                        
+                        # Use LIMIT order with IOC (Immediate or Cancel) for price protection
+                        # This ensures execution at limited price or cancellation, preventing hanging orders
+                        limit_payload = {
                             "symbol": sym,
                             "side": side,
-                            "type": "MARKET",
+                            "type": "LIMIT",
+                            "timeInForce": "IOC",  # Immediate or Cancel - execute immediately or cancel
                             "quantity": f"{amt}",
+                            "price": limit_price_str,
                             "positionSide": pos_side,
                             "timestamp": now_ts_ms()
                         }
-                        res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                        res = _signed_request("POST", "/fapi/v1/order", limit_payload)
+                        
+                        # Check if order was filled completely
+                        # IOC orders are automatically cancelled if not immediately filled
+                        filled_qty = float(res.get("executedQty", 0))
+                        ordered_qty = float(amt)
+                        
+                        if filled_qty < ordered_qty * 0.95:  # Less than 95% filled
+                            log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
+                            
+                            # Use MARKET order for remaining quantity to ensure position is fully closed
+                            remaining_qty = ordered_qty - filled_qty
+                            market_payload = {
+                                "symbol": sym,
+                                "side": side,
+                                "type": "MARKET",
+                                "quantity": f"{remaining_qty}",
+                                "positionSide": pos_side,
+                                "timestamp": now_ts_ms()
+                            }
+                            market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty} via MARKET")
+                        else:
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str}")
+                        
                         closed_symbols.append(sym)
                         # Store position info for reopening
                         direction = "UP" if pos_side == "LONG" else "DOWN"
@@ -3262,7 +3305,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             "pos_side": pos_side,
                             "amount": amt
                         })
-                        log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (direct close)")
+                        
                     else:
                         # Re-raise if it's a different error
                         raise
