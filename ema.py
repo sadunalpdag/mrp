@@ -2555,7 +2555,7 @@ def check_and_log_real_closed_trades():
                     pass
                 
                 # Calculate PnL percentage if we have exit price
-                entry_price = pos_info.get("entry_price", 0)
+                entry_price = float(pos_info.get("entry_price", 0))
                 direction = pos_info.get("direction")
                 if exit_price and entry_price > 0:
                     if direction == "UP":
