@@ -3219,19 +3219,47 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Format price according to symbol's tick size
                 limit_price_str = format_price_by_tick(sym, limit_price)
                 
-                # Use LIMIT order with post-only disabled (IoC-like behavior)
-                # This provides price protection while still executing quickly
+                # Use LIMIT order with IOC (Immediate or Cancel) for price protection
+                # This ensures execution at limited price or cancellation, preventing hanging orders
                 limit_payload = {
                     "symbol": sym,
                     "side": side,
                     "type": "LIMIT",
-                    "timeInForce": "GTC",  # Good Till Cancel
+                    "timeInForce": "IOC",  # Immediate or Cancel - execute immediately or cancel
                     "quantity": f"{amt}",
                     "price": limit_price_str,
                     "positionSide": pos_side,
                     "timestamp": now_ts_ms()
                 }
                 res = _signed_request("POST", "/fapi/v1/order", limit_payload)
+                
+                # Check if order was filled (even partially)
+                filled_qty = float(res.get("executedQty", 0))
+                ordered_qty = float(res.get("origQty", amt))
+                
+                if filled_qty < ordered_qty * 0.95:  # Less than 95% filled
+                    log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
+                    # Cancel the IOC order if it's still open
+                    try:
+                        _signed_request("DELETE", "/fapi/v1/order", {
+                            "symbol": sym,
+                            "timestamp": now_ts_ms()
+                        })
+                    except:
+                        pass  # Order might already be cancelled
+                    
+                    # Use MARKET order to close remaining position
+                    market_payload = {
+                        "symbol": sym,
+                        "side": side,
+                        "type": "MARKET",
+                        "quantity": f"{amt}",
+                        "positionSide": pos_side,
+                        "timestamp": now_ts_ms()
+                    }
+                    res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                    log(f"[CLOSE ALL] {sym} {pos_side} closed remaining with MARKET order")
+                
                 closed_symbols.append(sym)
                 # Store position info for function return value (maintained for backward compatibility)
                 direction = "UP" if pos_side == "LONG" else "DOWN"
