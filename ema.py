@@ -3261,6 +3261,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         
                         # Format price and quantity according to symbol's filters
                         limit_price_str = format_price_by_tick(sym, limit_price)
+                        # adjust_precision() formats quantity to match exchange's lot size requirements
+                        # This prevents order rejections due to invalid quantity precision
                         amt_formatted = adjust_precision(sym, amt, "qty")
                         
                         # Use LIMIT order with IOC (Immediate or Cancel) for price protection
@@ -3288,8 +3290,11 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             # Use the formatted amount that was actually sent to the exchange
                             ordered_qty = float(amt_formatted)
                             
-                            if filled_qty < ordered_qty * MIN_FILL_THRESHOLD:  # Less than threshold filled
-                                log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
+                            # Calculate fill percentage for clarity
+                            fill_pct = filled_qty / ordered_qty if ordered_qty > 0 else 0
+                            
+                            if fill_pct < MIN_FILL_THRESHOLD:  # Less than threshold filled
+                                log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}, {fill_pct:.1%}), using MARKET for remainder")
                                 
                                 # Use MARKET order for remaining quantity to ensure position is fully closed
                                 # Calculate remainder based on actual ordered quantity
@@ -3299,7 +3304,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                 remaining_qty_formatted = adjust_precision(sym, remaining_qty, "qty")
                                 
                                 # Check if remaining quantity is significant after precision adjustment
-                                if float(remaining_qty_formatted) > 0:
+                                remaining_qty_float = float(remaining_qty_formatted)
+                                if remaining_qty_float > 0:
                                     market_payload = {
                                         "symbol": sym,
                                         "side": side,
@@ -3316,9 +3322,10 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                         # Position may be partially open - re-raise to prevent marking as closed
                                         raise
                                 else:
-                                    log(f"[CLOSE ALL] {sym} {pos_side} remaining quantity too small after precision adjustment, considering fully closed")
+                                    # Log when remaining quantity is too small to close after precision adjustment
+                                    log(f"[CLOSE ALL] {sym} {pos_side} remaining quantity {remaining_qty:.8f} rounded to {remaining_qty_formatted} after precision adjustment, considering fully closed")
                             else:
-                                log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str}")
+                                log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str} ({fill_pct:.1%} filled)")
                             
                             closed_symbols.append(sym)
                             # Store position info for reopening
