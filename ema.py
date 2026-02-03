@@ -3259,8 +3259,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             # Buying to close SHORT: price slightly higher
                             limit_price = mark_price * (1 + LIMIT_ORDER_BUFFER_PCT)
                         
-                        # Format price according to symbol's tick size
+                        # Format price and quantity according to symbol's filters
                         limit_price_str = format_price_by_tick(sym, limit_price)
+                        amt_formatted = adjust_precision(sym, amt, "qty")
                         
                         # Use LIMIT order with IOC (Immediate or Cancel) for price protection
                         # This ensures execution at limited price or cancellation, preventing hanging orders
@@ -3269,48 +3270,66 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             "side": side,
                             "type": "LIMIT",
                             "timeInForce": "IOC",  # Immediate or Cancel - execute immediately or cancel
-                            "quantity": f"{amt}",
+                            "quantity": f"{amt_formatted}",
                             "price": limit_price_str,
                             "positionSide": pos_side,
                             "timestamp": now_ts_ms()
                         }
-                        res = _signed_request("POST", "/fapi/v1/order", limit_payload)
                         
-                        # Check if order was filled completely
-                        # IOC orders are automatically cancelled if not immediately filled
-                        filled_qty = float(res.get("executedQty", 0))
-                        ordered_qty = float(amt)
-                        
-                        if filled_qty < ordered_qty * MIN_FILL_THRESHOLD:  # Less than threshold filled
-                            log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
+                        try:
+                            res = _signed_request("POST", "/fapi/v1/order", limit_payload)
                             
-                            # Use MARKET order for remaining quantity to ensure position is fully closed
-                            remaining_qty = ordered_qty - filled_qty
-                            # Format remaining quantity according to symbol's lot size
-                            remaining_qty_formatted = adjust_precision(sym, remaining_qty, "qty")
+                            # Validate response and check if order was filled completely
+                            # IOC orders are automatically cancelled if not immediately filled
+                            if not isinstance(res, dict):
+                                raise Exception(f"Invalid response from LIMIT order: {res}")
+                                
+                            filled_qty = float(res.get("executedQty", 0))
+                            ordered_qty = float(amt_formatted)
                             
-                            market_payload = {
+                            if filled_qty < ordered_qty * MIN_FILL_THRESHOLD:  # Less than threshold filled
+                                log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
+                                
+                                # Use MARKET order for remaining quantity to ensure position is fully closed
+                                remaining_qty = ordered_qty - filled_qty
+                                # Format remaining quantity according to symbol's lot size
+                                remaining_qty_formatted = adjust_precision(sym, remaining_qty, "qty")
+                                
+                                if remaining_qty_formatted > 0:
+                                    market_payload = {
+                                        "symbol": sym,
+                                        "side": side,
+                                        "type": "MARKET",
+                                        "quantity": f"{remaining_qty_formatted}",
+                                        "positionSide": pos_side,
+                                        "timestamp": now_ts_ms()
+                                    }
+                                    try:
+                                        market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                                        log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty_formatted} via MARKET")
+                                    except Exception as market_err:
+                                        log(f"[CLOSE ALL ERROR] {sym} MARKET fallback failed: {market_err}")
+                                        # Position may be partially open - re-raise to prevent marking as closed
+                                        raise
+                                else:
+                                    log(f"[CLOSE ALL] {sym} {pos_side} remaining quantity too small after precision adjustment, considering fully closed")
+                            else:
+                                log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str}")
+                            
+                            closed_symbols.append(sym)
+                            # Store position info for reopening
+                            direction = "UP" if pos_side == "LONG" else "DOWN"
+                            closed_positions_info.append({
                                 "symbol": sym,
-                                "side": side,
-                                "type": "MARKET",
-                                "quantity": f"{remaining_qty_formatted}",
-                                "positionSide": pos_side,
-                                "timestamp": now_ts_ms()
-                            }
-                            market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                            log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty_formatted} via MARKET")
-                        else:
-                            log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str}")
-                        
-                        closed_symbols.append(sym)
-                        # Store position info for reopening
-                        direction = "UP" if pos_side == "LONG" else "DOWN"
-                        closed_positions_info.append({
-                            "symbol": sym,
-                            "direction": direction,
-                            "pos_side": pos_side,
-                            "amount": amt
-                        })
+                                "direction": direction,
+                                "pos_side": pos_side,
+                                "amount": amt
+                            })
+                        except Exception as limit_err:
+                            # If LIMIT order completely fails, log error but don't add to closed list
+                            log(f"[CLOSE ALL ERROR] {sym} LIMIT order with fallback failed: {limit_err}")
+                            # Re-raise to allow outer exception handler to decide
+                            raise
                         
                     else:
                         # Re-raise if it's a different error
