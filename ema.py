@@ -70,6 +70,10 @@ DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (sca
 ORDER_CLOSE_SETTLEMENT_SEC = 3  # Time to wait after closing positions
 ORDER_REOPEN_SETTLEMENT_SEC = 2  # Time to wait after reopening positions
 
+# LIMIT order protection parameters for position closing
+LIMIT_ORDER_BUFFER_PCT = 0.0015  # 0.15% price buffer to limit slippage while ensuring execution
+MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
+
 # ===================== UTILITIES =====================
 
 def log(msg):
@@ -3242,27 +3246,102 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     err_str = str(tp_err)
                     if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
                         "-4130" in err_str or "-4509" in err_str):
-                        # Fallback: close position directly with MARKET order
-                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using MARKET order. Error: {tp_err}")
-                        market_payload = {
+                        # Fallback: close position with LIMIT order (IOC) for price protection
+                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
+                        
+                        # Calculate limit price with buffer to avoid slippage losses
+                        # For LONG positions (SELL to close): set price slightly lower (acceptable loss)
+                        # For SHORT positions (BUY to close): set price slightly higher (acceptable loss)
+                        if pos_side == "LONG":
+                            # Selling to close LONG: price slightly lower
+                            limit_price = mark_price * (1 - LIMIT_ORDER_BUFFER_PCT)
+                        else:
+                            # Buying to close SHORT: price slightly higher
+                            limit_price = mark_price * (1 + LIMIT_ORDER_BUFFER_PCT)
+                        
+                        # Format price and quantity according to symbol's filters
+                        limit_price_str = format_price_by_tick(sym, limit_price)
+                        # adjust_precision() formats quantity to match exchange's lot size requirements
+                        # This prevents order rejections due to invalid quantity precision
+                        amt_formatted = adjust_precision(sym, amt, "qty")
+                        
+                        # Use LIMIT order with IOC (Immediate or Cancel) for price protection
+                        # This ensures execution at limited price or cancellation, preventing hanging orders
+                        limit_payload = {
                             "symbol": sym,
                             "side": side,
-                            "type": "MARKET",
-                            "quantity": f"{amt}",
+                            "type": "LIMIT",
+                            "timeInForce": "IOC",  # Immediate or Cancel - execute immediately or cancel
+                            "quantity": f"{amt_formatted}",
+                            "price": limit_price_str,
                             "positionSide": pos_side,
                             "timestamp": now_ts_ms()
                         }
-                        res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                        closed_symbols.append(sym)
-                        # Store position info for reopening
-                        direction = "UP" if pos_side == "LONG" else "DOWN"
-                        closed_positions_info.append({
-                            "symbol": sym,
-                            "direction": direction,
-                            "pos_side": pos_side,
-                            "amount": amt
-                        })
-                        log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (direct close)")
+                        
+                        try:
+                            res = _signed_request("POST", "/fapi/v1/order", limit_payload)
+                            
+                            # Validate response and check if order was filled completely
+                            # IOC orders are automatically cancelled if not immediately filled
+                            if not isinstance(res, dict):
+                                raise Exception(f"Invalid response from LIMIT order: {res}")
+                                
+                            filled_qty = float(res.get("executedQty", 0))
+                            # Use the formatted amount that was actually sent to the exchange
+                            ordered_qty = float(amt_formatted)
+                            
+                            # Calculate fill percentage for clarity
+                            fill_pct = filled_qty / ordered_qty if ordered_qty > 0 else 0
+                            
+                            if fill_pct < MIN_FILL_THRESHOLD:  # Less than threshold filled
+                                log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}, {fill_pct:.1%}), using MARKET for remainder")
+                                
+                                # Use MARKET order for remaining quantity to ensure position is fully closed
+                                # Calculate remainder based on actual ordered quantity
+                                remaining_qty = ordered_qty - filled_qty
+                                
+                                # Format remaining quantity according to symbol's lot size
+                                remaining_qty_formatted = adjust_precision(sym, remaining_qty, "qty")
+                                
+                                # Check if remaining quantity is significant after precision adjustment
+                                remaining_qty_float = float(remaining_qty_formatted)
+                                if remaining_qty_float > 0:
+                                    market_payload = {
+                                        "symbol": sym,
+                                        "side": side,
+                                        "type": "MARKET",
+                                        "quantity": f"{remaining_qty_formatted}",
+                                        "positionSide": pos_side,
+                                        "timestamp": now_ts_ms()
+                                    }
+                                    try:
+                                        market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                                        log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty_formatted} via MARKET")
+                                    except Exception as market_err:
+                                        log(f"[CLOSE ALL ERROR] {sym} MARKET fallback failed: {market_err}")
+                                        # Position may be partially open - re-raise to prevent marking as closed
+                                        raise
+                                else:
+                                    # Log when remaining quantity is too small to close after precision adjustment
+                                    log(f"[CLOSE ALL] {sym} {pos_side} remaining quantity {remaining_qty:.8f} rounded to {remaining_qty_formatted} after precision adjustment, considering fully closed")
+                            else:
+                                log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str} ({fill_pct:.1%} filled)")
+                            
+                            closed_symbols.append(sym)
+                            # Store position info for reopening
+                            direction = "UP" if pos_side == "LONG" else "DOWN"
+                            closed_positions_info.append({
+                                "symbol": sym,
+                                "direction": direction,
+                                "pos_side": pos_side,
+                                "amount": amt
+                            })
+                        except Exception as limit_err:
+                            # If LIMIT order completely fails, log error but don't add to closed list
+                            log(f"[CLOSE ALL ERROR] {sym} LIMIT order with fallback failed: {limit_err}")
+                            # Re-raise to allow outer exception handler to decide
+                            raise
+                        
                     else:
                         # Re-raise if it's a different error
                         raise
