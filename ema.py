@@ -70,6 +70,10 @@ DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (sca
 ORDER_CLOSE_SETTLEMENT_SEC = 3  # Time to wait after closing positions
 ORDER_REOPEN_SETTLEMENT_SEC = 2  # Time to wait after reopening positions
 
+# LIMIT order protection parameters for position closing
+LIMIT_ORDER_BUFFER_PCT = 0.0015  # 0.15% price buffer to limit slippage while ensuring execution
+MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
+
 # ===================== UTILITIES =====================
 
 def log(msg):
@@ -3245,16 +3249,15 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         # Fallback: close position with LIMIT order (IOC) for price protection
                         log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
                         
-                        # Calculate limit price with 0.15% buffer to avoid slippage losses
-                        # For LONG positions (SELL to close): set price 0.15% lower (acceptable loss)
-                        # For SHORT positions (BUY to close): set price 0.15% higher (acceptable loss)
-                        buffer_pct = 0.0015  # 0.15% buffer to ensure execution while limiting slippage
+                        # Calculate limit price with buffer to avoid slippage losses
+                        # For LONG positions (SELL to close): set price slightly lower (acceptable loss)
+                        # For SHORT positions (BUY to close): set price slightly higher (acceptable loss)
                         if pos_side == "LONG":
                             # Selling to close LONG: price slightly lower
-                            limit_price = mark_price * (1 - buffer_pct)
+                            limit_price = mark_price * (1 - LIMIT_ORDER_BUFFER_PCT)
                         else:
                             # Buying to close SHORT: price slightly higher
-                            limit_price = mark_price * (1 + buffer_pct)
+                            limit_price = mark_price * (1 + LIMIT_ORDER_BUFFER_PCT)
                         
                         # Format price according to symbol's tick size
                         limit_price_str = format_price_by_tick(sym, limit_price)
@@ -3278,21 +3281,24 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         filled_qty = float(res.get("executedQty", 0))
                         ordered_qty = float(amt)
                         
-                        if filled_qty < ordered_qty * 0.95:  # Less than 95% filled
+                        if filled_qty < ordered_qty * MIN_FILL_THRESHOLD:  # Less than threshold filled
                             log(f"[CLOSE ALL] {sym} LIMIT order only partially filled ({filled_qty}/{ordered_qty}), using MARKET for remainder")
                             
                             # Use MARKET order for remaining quantity to ensure position is fully closed
                             remaining_qty = ordered_qty - filled_qty
+                            # Format remaining quantity according to symbol's lot size
+                            remaining_qty_formatted = adjust_precision(sym, remaining_qty, "qty")
+                            
                             market_payload = {
                                 "symbol": sym,
                                 "side": side,
                                 "type": "MARKET",
-                                "quantity": f"{remaining_qty}",
+                                "quantity": f"{remaining_qty_formatted}",
                                 "positionSide": pos_side,
                                 "timestamp": now_ts_ms()
                             }
                             market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                            log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty} via MARKET")
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty_formatted} via MARKET")
                         else:
                             log(f"[CLOSE ALL] {sym} {pos_side} closed with LIMIT order (IOC) at {limit_price_str}")
                         
