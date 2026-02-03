@@ -3210,7 +3210,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 }
                 res = _signed_request("POST", "/fapi/v1/order", market_payload)
                 closed_symbols.append(sym)
-                # Store position info (not used for reopening anymore)
+                # Store position info for function return value (maintained for backward compatibility)
                 direction = "UP" if pos_side == "LONG" else "DOWN"
                 closed_positions_info.append({
                     "symbol": sym,
@@ -3418,7 +3418,7 @@ def check_profit_target():
                 f"Profit: ${profit:.2f} (Target: ${profit_target:.2f})\n"
                 f"Closing all positions at current market prices...")
         
-        # Close all positions and get position info for reopening
+        # Close all positions at market price
         closed_symbols, closed_positions_info = close_all_positions_at_market()
         
         if closed_symbols:
