@@ -5,9 +5,9 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.71 — Active Strategies (Asian & London disabled)
+# 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (10 strateji - Asian & London disabled):
+#  - Aktif stratejiler (13 strateji - Asian & London disabled):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
@@ -18,6 +18,10 @@ import numpy as np
 #       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
 #       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
 #       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
+#       📊 BOLLINGER BANDS (Mean Reversion + Squeeze Breakout)
+#       🔄 STOCHASTIC RSI (Overbought/Oversold with trend filter)
+#       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
+#  - NEW: 3 advanced technical strategies added for better performance
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
@@ -251,6 +255,96 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
                 st_direction.append("DOWN")
     
     return st_values, st_direction
+
+def bollinger_bands(vals, period=20, std_dev=2.0):
+    """
+    Calculate Bollinger Bands
+    Returns: (middle_band, upper_band, lower_band, bandwidth)
+    """
+    if len(vals) < period:
+        return [vals[0]] * len(vals), [vals[0]] * len(vals), [vals[0]] * len(vals), [0] * len(vals)
+    
+    middle = []
+    upper = []
+    lower = []
+    bandwidth = []
+    
+    for i in range(len(vals)):
+        if i < period - 1:
+            middle.append(vals[i])
+            upper.append(vals[i])
+            lower.append(vals[i])
+            bandwidth.append(0)
+        else:
+            window = vals[i - period + 1:i + 1]
+            mean = sum(window) / period
+            variance = sum((x - mean) ** 2 for x in window) / period
+            std = variance ** 0.5
+            
+            middle.append(mean)
+            upper.append(mean + std_dev * std)
+            lower.append(mean - std_dev * std)
+            bandwidth.append((std_dev * std * 2) / mean if mean > 0 else 0)
+    
+    return middle, upper, lower, bandwidth
+
+def stochastic_rsi(vals, period=14, smooth_k=3, smooth_d=3):
+    """
+    Calculate Stochastic RSI
+    Returns: (stoch_k, stoch_d) - values between 0 and 100
+    """
+    rsi_vals = rsi(vals, period)
+    
+    if len(rsi_vals) < period:
+        return [50] * len(vals), [50] * len(vals)
+    
+    stoch_rsi = []
+    for i in range(len(rsi_vals)):
+        if i < period - 1:
+            stoch_rsi.append(50)
+        else:
+            window = rsi_vals[i - period + 1:i + 1]
+            min_rsi = min(window)
+            max_rsi = max(window)
+            
+            if max_rsi - min_rsi > 0:
+                stoch_rsi.append(100 * (rsi_vals[i] - min_rsi) / (max_rsi - min_rsi))
+            else:
+                stoch_rsi.append(50)
+    
+    # Smooth K line
+    k_line = []
+    for i in range(len(stoch_rsi)):
+        if i < smooth_k - 1:
+            k_line.append(stoch_rsi[i])
+        else:
+            k_line.append(sum(stoch_rsi[i - smooth_k + 1:i + 1]) / smooth_k)
+    
+    # D line (SMA of K)
+    d_line = []
+    for i in range(len(k_line)):
+        if i < smooth_d - 1:
+            d_line.append(k_line[i])
+        else:
+            d_line.append(sum(k_line[i - smooth_d + 1:i + 1]) / smooth_d)
+    
+    return k_line, d_line
+
+def fibonacci_levels(high, low):
+    """
+    Calculate Fibonacci retracement levels
+    Returns: dict with fib levels
+    """
+    diff = high - low
+    return {
+        '0.0': high,
+        '0.236': high - 0.236 * diff,
+        '0.382': high - 0.382 * diff,
+        '0.500': high - 0.500 * diff,
+        '0.618': high - 0.618 * diff,
+        '0.786': high - 0.786 * diff,
+        '1.0': low
+    }
 
 # ===================== VWAP & VOLUME HELPERS =====================
 
@@ -2432,6 +2526,403 @@ def build_fvg_mss_signal(sym, kl, bar_i):
     return sig
 
 
+def build_bollinger_bands_signal(sym, kl, bar_i):
+    """
+    Bollinger Bands Mean Reversion & Breakout Strategy
+    
+    Entry Rules:
+    📈 Long:
+        - Price touches or breaks below lower band (oversold)
+        - RSI < 30 confirms oversold
+        - Volume spike indicates reversal
+        - Entry: When price closes back inside bands
+    
+    📉 Short:
+        - Price touches or breaks above upper band (overbought)
+        - RSI > 70 confirms overbought
+        - Volume spike indicates reversal
+        - Entry: When price closes back inside bands
+    
+    🎯 Bollinger Squeeze Breakout:
+        - Low bandwidth indicates consolidation
+        - High volume breakout from squeeze
+        - Strong directional move
+    
+    TP/SL: Target middle band, stop outside bands
+    """
+    if len(kl) < 30:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    volumes = [float(k[5]) for k in kl]
+    
+    # Calculate Bollinger Bands
+    middle, upper, lower, bandwidth = bollinger_bands(closes, period=20, std_dev=2.0)
+    
+    c_now = closes[-1]
+    c_prev = closes[-2]
+    middle_now = middle[-1]
+    upper_now = upper[-1]
+    lower_now = lower[-1]
+    bandwidth_now = bandwidth[-1]
+    
+    # Calculate RSI
+    r_val = rsi(closes)[-1]
+    
+    # Calculate ATR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    
+    # Check for volume spike
+    avg_volume = sum(volumes[-10:-1]) / 9
+    current_volume = volumes[-1]
+    has_volume_spike = current_volume > avg_volume * 1.3
+    
+    # Check for Bollinger Squeeze (low bandwidth)
+    avg_bandwidth = sum(bandwidth[-20:]) / 20
+    is_squeeze = bandwidth_now < avg_bandwidth * 0.7
+    
+    direction = None
+    tag = None
+    entry_type = None
+    
+    # MEAN REVERSION STRATEGY
+    # Bullish mean reversion: touched lower band and now reverting
+    if c_prev < lower_now and c_now > lower_now and r_val < 35:
+        direction = "UP"
+        tag = "📊 BB MEAN REVERSION BUY"
+        entry_type = "MEAN_REVERSION"
+    
+    # Bearish mean reversion: touched upper band and now reverting
+    elif c_prev > upper_now and c_now < upper_now and r_val > 65:
+        direction = "DOWN"
+        tag = "📊 BB MEAN REVERSION SELL"
+        entry_type = "MEAN_REVERSION"
+    
+    # SQUEEZE BREAKOUT STRATEGY
+    elif is_squeeze and has_volume_spike:
+        # Bullish breakout from squeeze
+        if c_now > upper_now and c_prev <= upper_now:
+            direction = "UP"
+            tag = "📊 BB SQUEEZE BREAKOUT BUY"
+            entry_type = "SQUEEZE_BREAKOUT"
+        
+        # Bearish breakout from squeeze
+        elif c_now < lower_now and c_prev >= lower_now:
+            direction = "DOWN"
+            tag = "📊 BB SQUEEZE BREAKOUT SELL"
+            entry_type = "SQUEEZE_BREAKOUT"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL
+    if entry_type == "MEAN_REVERSION":
+        # For mean reversion: target middle band
+        if direction == "UP":
+            tp_est = middle_now
+            sl_est = c_now - atr_v * 1.5
+            # Ensure minimum 1:1.5 RR
+            risk = c_now - sl_est
+            if (tp_est - c_now) < (risk * 1.5):
+                tp_est = c_now + (risk * 1.5)
+        else:
+            tp_est = middle_now
+            sl_est = c_now + atr_v * 1.5
+            # Ensure minimum 1:1.5 RR
+            risk = sl_est - c_now
+            if (c_now - tp_est) < (risk * 1.5):
+                tp_est = c_now - (risk * 1.5)
+    
+    else:  # SQUEEZE_BREAKOUT
+        # For breakout: larger target
+        if direction == "UP":
+            sl_est = lower_now
+            risk = c_now - sl_est
+            tp_est = c_now + 2.5 * risk
+        else:
+            sl_est = upper_now
+            risk = sl_est - c_now
+            tp_est = c_now - 2.5 * risk
+    
+    # Power calculation
+    pwr = 60 + (atr_v / c_now) * 120
+    
+    if entry_type == "MEAN_REVERSION":
+        # RSI bonus
+        if direction == "UP":
+            pwr += (35 - r_val) / 2.0  # More oversold = higher power
+        else:
+            pwr += (r_val - 65) / 2.0  # More overbought = higher power
+    else:  # SQUEEZE_BREAKOUT
+        pwr += 8  # Squeeze breakouts have good win rate
+        if has_volume_spike:
+            pwr += 5
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "BB_STRATEGY",
+        "emoji": "📊",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "BOLLINGER_BANDS",
+        "tag": tag,
+        "conditions": {
+            "bb_upper": upper_now,
+            "bb_middle": middle_now,
+            "bb_lower": lower_now,
+            "bandwidth": bandwidth_now,
+            "is_squeeze": is_squeeze,
+            "entry_type": entry_type,
+            "has_volume_spike": has_volume_spike
+        }
+    }
+
+
+def build_stochastic_rsi_signal(sym, kl, bar_i):
+    """
+    Stochastic RSI Overbought/Oversold Strategy
+    
+    Entry Rules:
+    📈 Long:
+        - Stoch RSI crosses above 20 from oversold
+        - K line crosses above D line (bullish crossover)
+        - Price above EMA 50 (trend filter)
+    
+    📉 Short:
+        - Stoch RSI crosses below 80 from overbought
+        - K line crosses below D line (bearish crossover)
+        - Price below EMA 50 (trend filter)
+    
+    TP/SL: 1:2 Risk/Reward
+    """
+    if len(kl) < 50:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Calculate Stochastic RSI
+    k_line, d_line = stochastic_rsi(closes, period=14, smooth_k=3, smooth_d=3)
+    
+    k_now = k_line[-1]
+    k_prev = k_line[-2]
+    d_now = d_line[-1]
+    d_prev = d_line[-2]
+    
+    c_now = closes[-1]
+    
+    # Calculate EMA 50 for trend filter
+    ema50 = ema(closes, 50)
+    ema50_now = ema50[-1]
+    
+    # Calculate ATR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    direction = None
+    tag = None
+    
+    # Bullish: Oversold crossover + price above EMA50
+    if k_prev < 20 and k_now >= 20 and k_now > d_now and k_prev <= d_prev and c_now > ema50_now:
+        direction = "UP"
+        tag = "🔄 STOCH RSI OVERSOLD BUY"
+    
+    # Bearish: Overbought crossover + price below EMA50
+    elif k_prev > 80 and k_now <= 80 and k_now < d_now and k_prev >= d_prev and c_now < ema50_now:
+        direction = "DOWN"
+        tag = "🔄 STOCH RSI OVERBOUGHT SELL"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL with 1:2 RR
+    if direction == "UP":
+        sl_est = c_now - atr_v * 1.2
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+    else:
+        sl_est = c_now + atr_v * 1.2
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+    
+    # Power calculation
+    pwr = 62 + (atr_v / c_now) * 100
+    
+    # Bonus for strong crossover
+    if direction == "UP":
+        pwr += (k_now - k_prev) / 5.0
+    else:
+        pwr += (k_prev - k_now) / 5.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "STOCH_RSI",
+        "emoji": "🔄",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "STOCHASTIC_RSI",
+        "tag": tag,
+        "conditions": {
+            "stoch_k": k_now,
+            "stoch_d": d_now,
+            "ema50": ema50_now,
+            "k_crossover": k_now > d_now
+        }
+    }
+
+
+def build_fibonacci_retracement_signal(sym, kl, bar_i):
+    """
+    Fibonacci Retracement Trend Continuation Strategy
+    
+    Entry Rules:
+    📈 Long (in uptrend):
+        - Identify swing high and swing low
+        - Price retraces to 0.618 or 0.786 Fibonacci level
+        - Bullish reversal candle at Fib level
+        - RSI shows momentum return
+    
+    📉 Short (in downtrend):
+        - Identify swing low and swing high
+        - Price retraces to 0.618 or 0.786 Fibonacci level
+        - Bearish reversal candle at Fib level
+        - RSI shows momentum return
+    
+    TP/SL: Target previous swing high/low, stop below/above Fib level
+    """
+    if len(kl) < 50:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    
+    c_now = closes[-1]
+    c_prev = closes[-2]
+    o_now = opens[-1]
+    
+    # Calculate ATR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    # Find swing high and low in recent 20 bars
+    lookback = 20
+    swing_high = max(highs[-lookback:])
+    swing_low = min(lows[-lookback:])
+    
+    # Determine trend
+    ema_vals = ema(closes, 50)
+    trend = "UP" if c_now > ema_vals[-1] else "DOWN"
+    
+    direction = None
+    tag = None
+    fib_level_hit = None
+    
+    if trend == "UP":
+        # Calculate Fibonacci levels from low to high
+        fib = fibonacci_levels(swing_high, swing_low)
+        
+        # Check if price is at 0.618 or 0.786 retracement
+        tolerance = atr_v * 0.3
+        
+        if abs(c_now - fib['0.618']) < tolerance or abs(c_prev - fib['0.618']) < tolerance:
+            fib_level_hit = 0.618
+        elif abs(c_now - fib['0.786']) < tolerance or abs(c_prev - fib['0.786']) < tolerance:
+            fib_level_hit = 0.786
+        
+        # Check for bullish reversal candle
+        if fib_level_hit and c_now > o_now and r_val > 40:
+            direction = "UP"
+            tag = f"📐 FIB {fib_level_hit} RETRACEMENT BUY"
+    
+    else:  # Downtrend
+        # Calculate Fibonacci levels from high to low  
+        fib = fibonacci_levels(swing_low, swing_high)
+        
+        # Check if price is at 0.618 or 0.786 retracement
+        tolerance = atr_v * 0.3
+        
+        if abs(c_now - fib['0.618']) < tolerance or abs(c_prev - fib['0.618']) < tolerance:
+            fib_level_hit = 0.618
+        elif abs(c_now - fib['0.786']) < tolerance or abs(c_prev - fib['0.786']) < tolerance:
+            fib_level_hit = 0.786
+        
+        # Check for bearish reversal candle
+        if fib_level_hit and c_now < o_now and r_val < 60:
+            direction = "DOWN"
+            tag = f"📐 FIB {fib_level_hit} RETRACEMENT SELL"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL
+    if direction == "UP":
+        tp_est = swing_high  # Target previous high
+        sl_est = c_now - atr_v * 1.5
+        # Ensure minimum 1:2 RR
+        risk = c_now - sl_est
+        if (tp_est - c_now) < (risk * 2.0):
+            tp_est = c_now + (risk * 2.0)
+    else:
+        tp_est = swing_low  # Target previous low
+        sl_est = c_now + atr_v * 1.5
+        # Ensure minimum 1:2 RR
+        risk = sl_est - c_now
+        if (c_now - tp_est) < (risk * 2.0):
+            tp_est = c_now - (risk * 2.0)
+    
+    # Power calculation
+    pwr = 65 + (atr_v / c_now) * 130
+    
+    # 0.786 is stronger level than 0.618
+    if fib_level_hit == 0.786:
+        pwr += 5
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "FIBONACCI",
+        "emoji": "📐",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "FIBONACCI_RETRACEMENT",
+        "tag": tag,
+        "conditions": {
+            "swing_high": swing_high,
+            "swing_low": swing_low,
+            "fib_level": fib_level_hit,
+            "trend": trend
+        }
+    }
+
+
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
@@ -2462,10 +2953,15 @@ def scan_symbol(sym,bar_i):
     # New high-quality strategies
     s_reentry = build_reentry_signal(sym, kl, bar_i) if PARAM.get("ENABLE_REENTRY", True) else None
     s_fvg_mss = build_fvg_mss_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FVG_MSS", True) else None
+    
+    # NEW: Advanced technical strategies
+    s_bb = build_bollinger_bands_signal(sym, kl, bar_i) if PARAM.get("ENABLE_BB", True) else None
+    s_stoch_rsi = build_stochastic_rsi_signal(sym, kl, bar_i) if PARAM.get("ENABLE_STOCH_RSI", True) else None
+    s_fib = build_fibonacci_retracement_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FIB", True) else None
 
     for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
-              s_reentry, s_fvg_mss):
+              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib):
         if s: res.append(s)
     
     return res
@@ -2905,6 +3401,10 @@ PARAM_DEFAULT={
     "ENABLE_FVG_BREAKER": True,
     "ENABLE_REENTRY": True,
     "ENABLE_FVG_MSS": True,
+    # NEW: Advanced technical strategies
+    "ENABLE_BB": True,  # Bollinger Bands strategy
+    "ENABLE_STOCH_RSI": True,  # Stochastic RSI strategy
+    "ENABLE_FIB": True,  # Fibonacci retracement strategy
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
@@ -4191,7 +4691,8 @@ def _cmd_enable(args):
                     "Available strategies:\n"
                     "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
-                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS,\n"
+                    "BB, STOCH_RSI, FIB")
             return
         
         strategy = args[0].upper()
@@ -4200,7 +4701,8 @@ def _cmd_enable(args):
         # Check if it's a valid strategy key
         valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
-                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS",
+                          "BB", "STOCH_RSI", "FIB"]
         
         if strategy not in valid_strategies:
             tg_send(f"❌ Unknown strategy: {strategy}\n"
@@ -4222,7 +4724,8 @@ def _cmd_disable(args):
                     "Available strategies:\n"
                     "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
-                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS,\n"
+                    "BB, STOCH_RSI, FIB")
             return
         
         strategy = args[0].upper()
@@ -4231,7 +4734,8 @@ def _cmd_disable(args):
         # Check if it's a valid strategy key
         valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
-                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS",
+                          "BB", "STOCH_RSI", "FIB"]
         
         if strategy not in valid_strategies:
             tg_send(f"❌ Unknown strategy: {strategy}\n"
@@ -4260,7 +4764,10 @@ def _cmd_strategies():
             ("ASIAN_BO", "🌏 Asian Breakout"),
             ("FVG_BREAKER", "🧱 FVG+Breaker"),
             ("REENTRY", "🔄 Re-entry 4H+5m"),
-            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)")
+            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)"),
+            ("BB", "📊 Bollinger Bands"),
+            ("STOCH_RSI", "🔄 Stochastic RSI"),
+            ("FIB", "📐 Fibonacci Retracement")
         ]
         
         msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
