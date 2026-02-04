@@ -76,6 +76,16 @@ MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
 
 # ===================== UTILITIES =====================
 
+def safe_float(value, default=0.0):
+    """
+    Safely convert any value to float, preventing type errors in arithmetic operations.
+    This is the DEFINITIVE fix for 'unsupported operand type(s) for /: 'str' and 'float'' error.
+    """
+    try:
+        return float(value)
+    except (ValueError, TypeError, AttributeError):
+        return default
+
 def log(msg):
     print(msg, flush=True)
     try:
@@ -2559,9 +2569,12 @@ def check_and_log_real_closed_trades():
                     pass
                 
                 # Calculate PnL percentage if we have exit price
-                entry_price = float(pos_info.get("entry_price", 0))
+                entry_price = safe_float(pos_info.get("entry_price", 0))
                 direction = pos_info.get("direction")
                 if exit_price and entry_price > 0:
+                    # Use safe_float to prevent ALL type errors
+                    exit_price = safe_float(exit_price)
+                    entry_price = safe_float(entry_price)
                     if direction == "UP":
                         pnl_pct = ((exit_price / entry_price) - 1) * 100
                     else:  # SHORT
@@ -3350,7 +3363,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # This prevents reopening positions for same symbols immediately after cashout
                 
                 # Log to closed trades with exit reason
-                entry_price = float(p.get("entryPrice", 0))
+                entry_price = safe_float(p.get("entryPrice", 0))
                 # Get mark price as exit price
                 exit_price = futures_get_mark_price(sym)
                 
@@ -3360,6 +3373,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Calculate PnL percentage
                 direction = "UP" if pos_side == "LONG" else "DOWN"
                 if exit_price and entry_price > 0:
+                    # Use safe_float to prevent ALL type errors
+                    exit_price = safe_float(exit_price)
+                    entry_price = safe_float(entry_price)
                     if direction == "UP":
                         pnl_pct = ((exit_price / entry_price) - 1) * 100
                     else:
@@ -4525,14 +4541,24 @@ def check_telegram_commands():
 def adjust_precision(sym,v,kind="qty"):
     f=get_symbol_filters(sym)
     step=f["stepSize"] if kind=="qty" else f["tickSize"]
+    # Use safe_float to prevent ANY type errors in division
+    v = safe_float(v)
+    step = safe_float(step)
     if step<=0: return v
     return round(round(v/step)*step,12)
 
 def calc_order_qty(sym,entry,usd):
+    # Use safe_float to prevent type errors
+    entry = safe_float(entry, 1e-12)
+    usd = safe_float(usd)
     raw = usd/max(entry,1e-12)
     return adjust_precision(sym,raw,"qty")
 
 def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
+    # Use safe_float to prevent ALL type errors
+    entry_exec = safe_float(entry_exec)
+    tp_usd = safe_float(tp_usd)
+    trade_usd = safe_float(trade_usd, 1e-12)
     tp_pct = tp_usd / max(trade_usd,1e-12)
     return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
 
@@ -4876,8 +4902,16 @@ def main():
             safe_save(STATE_FILE,STATE)
             time.sleep(30)
 
+        except TypeError as te:
+            # Catch type errors (like str/float division) with detailed logging
+            import traceback
+            log(f"[LOOP TYPE ERR] {te}")
+            log(f"[LOOP TYPE ERR TRACE] {traceback.format_exc()}")
+            time.sleep(10)
         except Exception as e:
+            import traceback
             log(f"[LOOP ERR]{e}")
+            log(f"[LOOP ERR TRACE] {traceback.format_exc()}")
             time.sleep(10)
 
 # ===================== ENTRY =====================
