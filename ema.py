@@ -282,9 +282,11 @@ def bollinger_bands(vals, period=20, std_dev=2.0):
             std = variance ** 0.5
             
             middle.append(mean)
-            upper.append(mean + std_dev * std)
-            lower.append(mean - std_dev * std)
-            bandwidth.append((std_dev * std * 2) / mean if mean > 0 else 0)
+            upper_band = mean + std_dev * std
+            lower_band = mean - std_dev * std
+            upper.append(upper_band)
+            lower.append(lower_band)
+            bandwidth.append((upper_band - lower_band) / mean if mean > 0 else 0)
     
     return middle, upper, lower, bandwidth
 
@@ -2713,8 +2715,11 @@ def build_bollinger_bands_signal(sym, kl, bar_i):
     c_now = closes[-1]
     c_prev = closes[-2]
     middle_now = middle[-1]
+    middle_prev = middle[-2]
     upper_now = upper[-1]
+    upper_prev = upper[-2]
     lower_now = lower[-1]
+    lower_prev = lower[-2]
     bandwidth_now = bandwidth[-1]
     
     # Calculate RSI
@@ -2738,13 +2743,13 @@ def build_bollinger_bands_signal(sym, kl, bar_i):
     
     # MEAN REVERSION STRATEGY
     # Bullish mean reversion: touched lower band and now reverting
-    if c_prev < lower_now and c_now > lower_now and r_val < 35:
+    if c_prev < lower_prev and c_now > lower_now and r_val < 35:
         direction = "UP"
         tag = "📊 BB MEAN REVERSION BUY"
         entry_type = "MEAN_REVERSION"
     
     # Bearish mean reversion: touched upper band and now reverting
-    elif c_prev > upper_now and c_now < upper_now and r_val > 65:
+    elif c_prev > upper_prev and c_now < upper_now and r_val > 65:
         direction = "DOWN"
         tag = "📊 BB MEAN REVERSION SELL"
         entry_type = "MEAN_REVERSION"
@@ -2752,13 +2757,13 @@ def build_bollinger_bands_signal(sym, kl, bar_i):
     # SQUEEZE BREAKOUT STRATEGY
     elif is_squeeze and has_volume_spike:
         # Bullish breakout from squeeze
-        if c_now > upper_now and c_prev <= upper_now:
+        if c_now > upper_now and c_prev <= upper_prev:
             direction = "UP"
             tag = "📊 BB SQUEEZE BREAKOUT BUY"
             entry_type = "SQUEEZE_BREAKOUT"
         
         # Bearish breakout from squeeze
-        elif c_now < lower_now and c_prev >= lower_now:
+        elif c_now < lower_now and c_prev >= lower_prev:
             direction = "DOWN"
             tag = "📊 BB SQUEEZE BREAKOUT SELL"
             entry_type = "SQUEEZE_BREAKOUT"
@@ -2882,13 +2887,19 @@ def build_stochastic_rsi_signal(sym, kl, bar_i):
     direction = None
     tag = None
     
-    # Bullish: Oversold crossover + price above EMA50
-    if k_prev < 20 and k_now >= 20 and k_now > d_now and k_prev <= d_prev and c_now > ema50_now:
+    # Bullish: K crosses above 20 from oversold AND crosses above D AND price above EMA50
+    oversold_cross = k_prev < 20 and k_now >= 20
+    bullish_k_d_cross = k_now > d_now and k_prev <= d_prev
+    
+    if oversold_cross and bullish_k_d_cross and c_now > ema50_now:
         direction = "UP"
         tag = "🔄 STOCH RSI OVERSOLD BUY"
     
-    # Bearish: Overbought crossover + price below EMA50
-    elif k_prev > 80 and k_now <= 80 and k_now < d_now and k_prev >= d_prev and c_now < ema50_now:
+    # Bearish: K crosses below 80 from overbought AND crosses below D AND price below EMA50
+    overbought_cross = k_prev > 80 and k_now <= 80
+    bearish_k_d_cross = k_now < d_now and k_prev >= d_prev
+    
+    if overbought_cross and bearish_k_d_cross and c_now < ema50_now:
         direction = "DOWN"
         tag = "🔄 STOCH RSI OVERBOUGHT SELL"
     
@@ -3005,16 +3016,18 @@ def build_fibonacci_retracement_signal(sym, kl, bar_i):
             tag = f"📐 FIB {fib_level_hit} RETRACEMENT BUY"
     
     else:  # Downtrend
-        # Calculate Fibonacci levels from high to low  
-        fib = fibonacci_levels(swing_low, swing_high)
+        # Calculate Fibonacci levels from high to low (for downtrend, measure from swing_high to swing_low)
+        fib = fibonacci_levels(swing_high, swing_low)
         
-        # Check if price is at 0.618 or 0.786 retracement
+        # In downtrend, price retraces UP to 0.618 or 0.786 (measuring from bottom)
+        # We need to invert the levels since price moves up during retracement
         tolerance = atr_v * 0.3
         
-        if abs(c_now - fib['0.618']) < tolerance or abs(c_prev - fib['0.618']) < tolerance:
-            fib_level_hit = 0.618
-        elif abs(c_now - fib['0.786']) < tolerance or abs(c_prev - fib['0.786']) < tolerance:
-            fib_level_hit = 0.786
+        # For downtrend retracement, check 0.382 and 0.236 (these are the upward retracements)
+        if abs(c_now - fib['0.382']) < tolerance or abs(c_prev - fib['0.382']) < tolerance:
+            fib_level_hit = 0.618  # Label as 0.618 for consistency
+        elif abs(c_now - fib['0.236']) < tolerance or abs(c_prev - fib['0.236']) < tolerance:
+            fib_level_hit = 0.786  # Label as 0.786 for consistency
         
         # Check for bearish reversal candle
         if fib_level_hit and c_now < o_now and r_val < 60:
