@@ -2572,9 +2572,8 @@ def check_and_log_real_closed_trades():
                 entry_price = safe_float(pos_info.get("entry_price", 0))
                 direction = pos_info.get("direction")
                 if exit_price and entry_price > 0:
-                    # Use safe_float to prevent ALL type errors
+                    # Use safe_float to prevent ALL type errors (exit_price already needs conversion)
                     exit_price = safe_float(exit_price)
-                    entry_price = safe_float(entry_price)
                     if direction == "UP":
                         pnl_pct = ((exit_price / entry_price) - 1) * 100
                     else:  # SHORT
@@ -3373,9 +3372,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 # Calculate PnL percentage
                 direction = "UP" if pos_side == "LONG" else "DOWN"
                 if exit_price and entry_price > 0:
-                    # Use safe_float to prevent ALL type errors
+                    # Use safe_float to prevent ALL type errors (exit_price already needs conversion)
                     exit_price = safe_float(exit_price)
-                    entry_price = safe_float(entry_price)
                     if direction == "UP":
                         pnl_pct = ((exit_price / entry_price) - 1) * 100
                     else:
@@ -4542,14 +4540,19 @@ def adjust_precision(sym,v,kind="qty"):
     f=get_symbol_filters(sym)
     step=f["stepSize"] if kind=="qty" else f["tickSize"]
     # Use safe_float to prevent ANY type errors in division
+    # Use small positive default for step to avoid division issues
     v = safe_float(v)
-    step = safe_float(step)
-    if step<=0: return v
+    step = safe_float(step, 0.0001)  # Use small positive default instead of 0
+    if step<=0: 
+        step = 0.0001  # Fallback to prevent division by zero
     return round(round(v/step)*step,12)
 
 def calc_order_qty(sym,entry,usd):
-    # Use safe_float to prevent type errors
-    entry = safe_float(entry, 1e-12)
+    # Use safe_float with appropriate defaults to prevent type errors
+    # Entry must be positive to calculate quantity
+    entry = safe_float(entry)
+    if entry <= 0:
+        entry = 1e-12  # Prevent division by zero
     usd = safe_float(usd)
     raw = usd/max(entry,1e-12)
     return adjust_precision(sym,raw,"qty")
@@ -4558,7 +4561,10 @@ def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
     # Use safe_float to prevent ALL type errors
     entry_exec = safe_float(entry_exec)
     tp_usd = safe_float(tp_usd)
-    trade_usd = safe_float(trade_usd, 1e-12)
+    trade_usd = safe_float(trade_usd)
+    # Prevent division by zero
+    if trade_usd <= 0:
+        trade_usd = 1e-12
     tp_pct = tp_usd / max(trade_usd,1e-12)
     return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
 
