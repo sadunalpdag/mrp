@@ -2475,8 +2475,13 @@ def run_parallel(symbols,bar_i):
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs=[ex.submit(scan_symbol,s,bar_i) for s in symbols]
         for f in as_completed(futs):
-            try: sigs=f.result()
-            except: sigs=[]
+            try: 
+                sigs=f.result()
+            except Exception as e:
+                # Log exception instead of silently ignoring - this was hiding strategy errors
+                log(f"[STRATEGY SCAN ERR] {e}")
+                log(f"[STRATEGY SCAN TRACE] {traceback.format_exc()}")
+                sigs=[]
             if sigs: out.extend(sigs)
     return out
 
