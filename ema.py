@@ -4635,8 +4635,8 @@ def open_market_position(sym, direction, qty):
             "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
             "positionSide":pos_side,"timestamp":now_ts_ms()
         })
-    except (RuntimeError, requests.exceptions.RequestException) as e:
-        # Handle API errors (HTTP errors, network errors, timeouts)
+    except (RuntimeError, requests.exceptions.RequestException, ValueError) as e:
+        # Handle API errors (HTTP errors, network errors, timeouts, JSON decode errors)
         log(f"[ORDER API ERR] {sym} {direction} - {e}")
         # Return a failed order dict with entry=0 to signal failure
         return {"symbol":sym,"dir":direction,"qty":qty,"entry":0.0,"pos_side":pos_side}
