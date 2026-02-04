@@ -4540,9 +4540,11 @@ def adjust_precision(sym,v,kind="qty"):
     f=get_symbol_filters(sym)
     step=f["stepSize"] if kind=="qty" else f["tickSize"]
     # Use safe_float to prevent ANY type errors in division
-    # Use small positive default for step to avoid division issues
     v = safe_float(v)
-    step = safe_float(step, 0.0001)  # Use small positive default - already prevents <= 0
+    step = safe_float(step, 0.0001)  # Default to 0.0001 if conversion fails
+    # Additional safety: ensure step is positive
+    if step <= 0:
+        step = 0.0001
     return round(round(v/step)*step,12)
 
 def calc_order_qty(sym,entry,usd):
