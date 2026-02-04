@@ -346,6 +346,155 @@ def fibonacci_levels(high, low):
         '1.0': low
     }
 
+def calculate_signal_power(
+    base_power=60.0,
+    atr_factor=0.0,
+    rsi_value=50.0,
+    volume_spike=False,
+    trend_alignment=False,
+    multi_timeframe_confirm=False,
+    structure_quality=0.0,
+    risk_reward_ratio=1.0,
+    volatility_normalized=0.0
+):
+    """
+    Advanced power scoring algorithm with multi-factor weighting.
+    
+    This function provides a standardized way to calculate signal power
+    across all strategies with consistent weighting.
+    
+    Args:
+        base_power: Base power score (50-70 range)
+        atr_factor: ATR/price ratio contribution (0-150)
+        rsi_value: RSI value for momentum scoring (0-100)
+        volume_spike: Boolean indicating volume spike
+        trend_alignment: Boolean indicating higher timeframe trend alignment
+        multi_timeframe_confirm: Boolean indicating multi-timeframe confirmation
+        structure_quality: Market structure quality score (0-10)
+        risk_reward_ratio: Risk/reward ratio (higher is better)
+        volatility_normalized: Normalized volatility score (0-1)
+    
+    Returns:
+        float: Calculated power score (typically 50-100 range)
+    """
+    power = base_power
+    
+    # ATR contribution (volatility-based)
+    power += atr_factor * 100
+    
+    # RSI momentum contribution (divergence from neutral 50)
+    # Extreme RSI values add power (oversold/overbought reversions)
+    rsi_divergence = abs(rsi_value - 50.0)
+    power += rsi_divergence / 2.5
+    
+    # Volume spike bonus
+    if volume_spike:
+        power += 5.0
+    
+    # Trend alignment bonus (higher timeframe confirmation)
+    if trend_alignment:
+        power += 6.0
+    
+    # Multi-timeframe confirmation bonus
+    if multi_timeframe_confirm:
+        power += 7.0
+    
+    # Market structure quality (swing highs/lows, order blocks, etc.)
+    power += structure_quality * 1.5
+    
+    # Risk/reward ratio contribution (better RR = higher power)
+    if risk_reward_ratio >= 2.0:
+        power += 8.0
+    elif risk_reward_ratio >= 1.5:
+        power += 4.0
+    elif risk_reward_ratio >= 1.2:
+        power += 2.0
+    
+    # Volatility normalization penalty (too high volatility reduces reliability)
+    if volatility_normalized > 0.7:
+        power -= 5.0
+    elif volatility_normalized < 0.3:
+        power += 3.0
+    
+    # Ensure power stays within reasonable bounds
+    power = max(50.0, min(100.0, power))
+    
+    return power
+
+def calculate_adaptive_position_size(
+    base_size_usdt=350.0,
+    atr_value=0.0,
+    entry_price=0.0,
+    power_score=70.0,
+    max_risk_pct=0.02,
+    min_size_multiplier=0.5,
+    max_size_multiplier=2.0
+):
+    """
+    Calculate adaptive position size based on ATR (volatility) and signal power.
+    
+    Higher volatility -> smaller position size (risk management)
+    Higher power score -> slightly larger position size (confidence-based)
+    
+    Args:
+        base_size_usdt: Base position size in USDT
+        atr_value: Current ATR value
+        entry_price: Entry price
+        power_score: Signal power score (50-100)
+        max_risk_pct: Maximum risk per trade as % of account (default 2%)
+        min_size_multiplier: Minimum multiplier (default 0.5x = 50% of base)
+        max_size_multiplier: Maximum multiplier (default 2.0x = 200% of base)
+    
+    Returns:
+        float: Adjusted position size in USDT
+    """
+    if entry_price <= 0 or atr_value <= 0:
+        return base_size_usdt
+    
+    # Normalize ATR to percentage of price
+    atr_pct = (atr_value / entry_price) * 100
+    
+    # Volatility adjustment (inverse relationship)
+    # Low volatility (0.5-1.5%) -> larger size
+    # Medium volatility (1.5-3%) -> base size
+    # High volatility (3%+) -> smaller size
+    if atr_pct < 1.5:
+        vol_multiplier = 1.2  # Increase size by 20%
+    elif atr_pct < 2.5:
+        vol_multiplier = 1.0  # Base size
+    elif atr_pct < 4.0:
+        vol_multiplier = 0.8  # Reduce size by 20%
+    else:
+        vol_multiplier = 0.6  # Reduce size by 40%
+    
+    # Power score adjustment (direct relationship but limited impact)
+    # Power 50-60: -10%
+    # Power 60-70: 0%
+    # Power 70-80: +5%
+    # Power 80-90: +10%
+    # Power 90+: +15%
+    if power_score >= 90:
+        power_multiplier = 1.15
+    elif power_score >= 80:
+        power_multiplier = 1.10
+    elif power_score >= 70:
+        power_multiplier = 1.05
+    elif power_score >= 60:
+        power_multiplier = 1.0
+    else:
+        power_multiplier = 0.9
+    
+    # Combine multipliers
+    total_multiplier = vol_multiplier * power_multiplier
+    
+    # Apply bounds
+    total_multiplier = max(min_size_multiplier, min(max_size_multiplier, total_multiplier))
+    
+    # Calculate final size
+    adjusted_size = base_size_usdt * total_multiplier
+    
+    return adjusted_size
+
 # ===================== VWAP & VOLUME HELPERS =====================
 
 def calculate_vwap(klines):
