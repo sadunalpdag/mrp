@@ -2,10 +2,11 @@
 
 ## Problem Statement
 > "On ema.py, Do you have more better strategy"
+> "Limit these New strategies 3 of each"
 
 ## Solution Implemented
 
-I've enhanced the EMA trading bot with **3 new advanced trading strategies** plus **2 sophisticated helper algorithms** to significantly improve trading performance.
+I've enhanced the EMA trading bot with **3 new advanced trading strategies** plus **2 sophisticated helper algorithms** to significantly improve trading performance. Additionally, implemented **position limits of 3 per strategy** to ensure balanced risk management.
 
 ---
 
@@ -178,6 +179,35 @@ All new components have been tested:
 
 ---
 
+## 🎯 Position Limits (NEW)
+
+**Implementation:**
+Each new strategy has position limits to ensure balanced risk:
+
+| Strategy | Long Limit | Short Limit |
+|----------|------------|-------------|
+| Bollinger Bands | 3 | 3 |
+| Stochastic RSI | 3 | 3 |
+| Fibonacci Retracement | 3 | 3 |
+
+**Benefits:**
+- Prevents over-concentration in any single strategy
+- Ensures diversified exposure across all 13 strategies
+- Allows each strategy to prove itself without dominating portfolio
+- Fully adjustable via Telegram commands
+
+**Telegram Commands:**
+```
+/strategies                    # View all limits
+/setlimits bb_buy 5           # Change BB long limit
+/setlimits stoch_rsi_sell 4   # Change Stoch RSI short limit
+/setlimits fib_buy 2          # Change Fib long limit
+```
+
+**Documentation:** See `STRATEGY_LIMITS.md` for complete details
+
+---
+
 ## 📈 Expected Performance Impact
 
 Based on the strategy improvements:
@@ -216,14 +246,17 @@ Based on the strategy improvements:
 
 ## ✅ Summary
 
-**Question:** "Do you have more better strategy"
+**Questions:** 
+1. "Do you have more better strategy"
+2. "Limit these New strategies 3 of each"
 
-**Answer:** **Yes!** I've added:
+**Answers:** **Yes!** I've added:
 - ✅ 3 new proven trading strategies
+- ✅ Position limits (3 long / 3 short per new strategy)
 - ✅ Advanced multi-factor power scoring
 - ✅ Intelligent adaptive position sizing
 - ✅ Full Telegram integration
 - ✅ Comprehensive testing
 - ✅ Detailed documentation
 
-Total active strategies increased from **10 to 13** (+30%), with significantly improved signal quality and risk management.
+Total active strategies increased from **10 to 13** (+30%), with significantly improved signal quality and risk management. Each new strategy is limited to maximum 3 long and 3 short positions to ensure balanced exposure.
