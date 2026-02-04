@@ -1,4 +1,4 @@
-import os, time, requests, hmac, hashlib, threading, math, json
+import os, time, requests, hmac, hashlib, threading, math, json, traceback
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
@@ -4542,19 +4542,17 @@ def adjust_precision(sym,v,kind="qty"):
     # Use safe_float to prevent ANY type errors in division
     # Use small positive default for step to avoid division issues
     v = safe_float(v)
-    step = safe_float(step, 0.0001)  # Use small positive default instead of 0
-    if step<=0: 
-        step = 0.0001  # Fallback to prevent division by zero
+    step = safe_float(step, 0.0001)  # Use small positive default - already prevents <= 0
     return round(round(v/step)*step,12)
 
 def calc_order_qty(sym,entry,usd):
     # Use safe_float with appropriate defaults to prevent type errors
     # Entry must be positive to calculate quantity
     entry = safe_float(entry)
-    if entry <= 0:
-        entry = 1e-12  # Prevent division by zero
     usd = safe_float(usd)
-    raw = usd/max(entry,1e-12)
+    # Ensure entry is positive to prevent division by zero
+    entry = max(entry, 1e-12)
+    raw = usd/entry
     return adjust_precision(sym,raw,"qty")
 
 def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
@@ -4563,9 +4561,8 @@ def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
     tp_usd = safe_float(tp_usd)
     trade_usd = safe_float(trade_usd)
     # Prevent division by zero
-    if trade_usd <= 0:
-        trade_usd = 1e-12
-    tp_pct = tp_usd / max(trade_usd,1e-12)
+    trade_usd = max(trade_usd, 1e-12)
+    tp_pct = tp_usd / trade_usd
     return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
 
 def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0):
@@ -4910,12 +4907,10 @@ def main():
 
         except TypeError as te:
             # Catch type errors (like str/float division) with detailed logging
-            import traceback
             log(f"[LOOP TYPE ERR] {te}")
             log(f"[LOOP TYPE ERR TRACE] {traceback.format_exc()}")
             time.sleep(10)
         except Exception as e:
-            import traceback
             log(f"[LOOP ERR]{e}")
             log(f"[LOOP ERR TRACE] {traceback.format_exc()}")
             time.sleep(10)
