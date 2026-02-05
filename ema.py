@@ -3652,29 +3652,29 @@ def update_directional_limits():
             amt=float(p["positionAmt"]); sym=p["symbol"]
             if amt>0: 
                 live["long"][sym]=amt
-                # Check if this is a CEST position
+                # Check strategy type from position tracker
                 if sym in REAL_POSITIONS_TRACKER:
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
                     if pos_kind == "CEST":
                         live["cest_long_count"] += 1
-                    elif pos_kind == "BB":
+                    elif pos_kind == "BOLLINGER_BANDS":
                         live["bb_long_count"] += 1
-                    elif pos_kind == "STOCH_RSI":
+                    elif pos_kind == "STOCHASTIC_RSI":
                         live["stoch_rsi_long_count"] += 1
-                    elif pos_kind == "FIB":
+                    elif pos_kind == "FIBONACCI_RETRACEMENT":
                         live["fib_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
-                # Check if this is a CEST position
+                # Check strategy type from position tracker
                 if sym in REAL_POSITIONS_TRACKER:
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
                     if pos_kind == "CEST":
                         live["cest_short_count"] += 1
-                    elif pos_kind == "BB":
+                    elif pos_kind == "BOLLINGER_BANDS":
                         live["bb_short_count"] += 1
-                    elif pos_kind == "STOCH_RSI":
+                    elif pos_kind == "STOCHASTIC_RSI":
                         live["stoch_rsi_short_count"] += 1
-                    elif pos_kind == "FIB":
+                    elif pos_kind == "FIBONACCI_RETRACEMENT":
                         live["fib_short_count"] += 1
         live["long_count"]=len(live["long"])
         live["short_count"]=len(live["short"])
@@ -5296,31 +5296,31 @@ def _can_direction(direction, kind=""):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
             return False
     
-    # Check BB-specific limits (in addition to global limits)
-    if kind == "BB":
+    # Check BOLLINGER_BANDS-specific limits (in addition to global limits)
+    if kind == "BOLLINGER_BANDS":
         if direction=="UP" and STATE.get("bb_long_blocked",False):
-            log(f"[BB LIMIT] BB long positions blocked (max: {PARAM.get('MAX_BB_BUY', 5)})")
+            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 5)})")
             return False
         if direction=="DOWN" and STATE.get("bb_short_blocked",False):
-            log(f"[BB LIMIT] BB short positions blocked (max: {PARAM.get('MAX_BB_SELL', 5)})")
+            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 5)})")
             return False
     
-    # Check STOCH_RSI-specific limits (in addition to global limits)
-    if kind == "STOCH_RSI":
+    # Check STOCHASTIC_RSI-specific limits (in addition to global limits)
+    if kind == "STOCHASTIC_RSI":
         if direction=="UP" and STATE.get("stoch_rsi_long_blocked",False):
-            log(f"[STOCH_RSI LIMIT] STOCH_RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 5)})")
+            log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 5)})")
             return False
         if direction=="DOWN" and STATE.get("stoch_rsi_short_blocked",False):
-            log(f"[STOCH_RSI LIMIT] STOCH_RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 5)})")
+            log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 5)})")
             return False
     
-    # Check FIB-specific limits (in addition to global limits)
-    if kind == "FIB":
+    # Check FIBONACCI_RETRACEMENT-specific limits (in addition to global limits)
+    if kind == "FIBONACCI_RETRACEMENT":
         if direction=="UP" and STATE.get("fib_long_blocked",False):
-            log(f"[FIB LIMIT] FIB long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 5)})")
+            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 5)})")
             return False
         if direction=="DOWN" and STATE.get("fib_short_blocked",False):
-            log(f"[FIB LIMIT] FIB short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 5)})")
+            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 5)})")
             return False
     
     return True
