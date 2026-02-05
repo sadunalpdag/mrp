@@ -1,0 +1,2 @@
+2026-02-05T19:50:30.881923+00:00 [BB LIMIT] Bollinger Bands long positions blocked (max: 5)
+2026-02-05T19:50:30.882017+00:00 [STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: 5)
