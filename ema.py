@@ -108,7 +108,8 @@ def safe_load(p,d):
 def handle_numpy_serialization(item):
     """Fallback handler for json serialization of special types"""
     item_type = type(item).__name__
-    if 'numpy' in str(type(item).__module__):
+    module_name = getattr(type(item), '__module__', '')
+    if 'numpy' in module_name:
         if hasattr(item, 'tolist'):
             return item.tolist()
         elif hasattr(item, 'item'):
