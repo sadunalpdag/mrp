@@ -5,9 +5,9 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.9.71 — Active Strategies (Asian & London disabled)
+# 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (10 strateji - Asian & London disabled):
+#  - Aktif stratejiler (13 strateji - Asian & London disabled):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
@@ -18,6 +18,10 @@ import numpy as np
 #       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
 #       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
 #       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
+#       📊 BOLLINGER BANDS (Mean Reversion + Squeeze Breakout)
+#       🔄 STOCHASTIC RSI (Overbought/Oversold with trend filter)
+#       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
+#  - NEW: 3 advanced technical strategies added for better performance
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
 #  - Strategy enable/disable via Telegram commands
@@ -251,6 +255,247 @@ def supertrend(highs, lows, closes, period=10, multiplier=3.0):
                 st_direction.append("DOWN")
     
     return st_values, st_direction
+
+def bollinger_bands(vals, period=20, std_dev=2.0):
+    """
+    Calculate Bollinger Bands
+    Returns: (middle_band, upper_band, lower_band, bandwidth)
+    """
+    if len(vals) < period:
+        return [vals[0]] * len(vals), [vals[0]] * len(vals), [vals[0]] * len(vals), [0] * len(vals)
+    
+    middle = []
+    upper = []
+    lower = []
+    bandwidth = []
+    
+    for i in range(len(vals)):
+        if i < period - 1:
+            middle.append(vals[i])
+            upper.append(vals[i])
+            lower.append(vals[i])
+            bandwidth.append(0)
+        else:
+            window = vals[i - period + 1:i + 1]
+            mean = sum(window) / period
+            variance = sum((x - mean) ** 2 for x in window) / period
+            std = variance ** 0.5
+            
+            middle.append(mean)
+            upper_band = mean + std_dev * std
+            lower_band = mean - std_dev * std
+            upper.append(upper_band)
+            lower.append(lower_band)
+            bandwidth.append((upper_band - lower_band) / mean if mean > 0 else 0)
+    
+    return middle, upper, lower, bandwidth
+
+def stochastic_rsi(vals, period=14, smooth_k=3, smooth_d=3):
+    """
+    Calculate Stochastic RSI
+    Returns: (stoch_k, stoch_d) - values between 0 and 100
+    """
+    rsi_vals = rsi(vals, period)
+    
+    if len(rsi_vals) < period:
+        return [50] * len(vals), [50] * len(vals)
+    
+    stoch_rsi = []
+    for i in range(len(rsi_vals)):
+        if i < period - 1:
+            stoch_rsi.append(50)
+        else:
+            window = rsi_vals[i - period + 1:i + 1]
+            min_rsi = min(window)
+            max_rsi = max(window)
+            
+            if max_rsi - min_rsi > 0:
+                stoch_rsi.append(100 * (rsi_vals[i] - min_rsi) / (max_rsi - min_rsi))
+            else:
+                stoch_rsi.append(50)
+    
+    # Smooth K line
+    k_line = []
+    for i in range(len(stoch_rsi)):
+        if i < smooth_k - 1:
+            k_line.append(stoch_rsi[i])
+        else:
+            k_line.append(sum(stoch_rsi[i - smooth_k + 1:i + 1]) / smooth_k)
+    
+    # D line (SMA of K)
+    d_line = []
+    for i in range(len(k_line)):
+        if i < smooth_d - 1:
+            d_line.append(k_line[i])
+        else:
+            d_line.append(sum(k_line[i - smooth_d + 1:i + 1]) / smooth_d)
+    
+    return k_line, d_line
+
+def fibonacci_levels(high, low):
+    """
+    Calculate Fibonacci retracement levels
+    Returns: dict with fib levels
+    """
+    diff = high - low
+    return {
+        '0.0': high,
+        '0.236': high - 0.236 * diff,
+        '0.382': high - 0.382 * diff,
+        '0.500': high - 0.500 * diff,
+        '0.618': high - 0.618 * diff,
+        '0.786': high - 0.786 * diff,
+        '1.0': low
+    }
+
+def calculate_signal_power(
+    base_power=60.0,
+    atr_factor=0.0,
+    rsi_value=50.0,
+    volume_spike=False,
+    trend_alignment=False,
+    multi_timeframe_confirm=False,
+    structure_quality=0.0,
+    risk_reward_ratio=1.0,
+    volatility_normalized=0.0
+):
+    """
+    Advanced power scoring algorithm with multi-factor weighting.
+    
+    This function provides a standardized way to calculate signal power
+    across all strategies with consistent weighting.
+    
+    Args:
+        base_power: Base power score (50-70 range)
+        atr_factor: ATR/price ratio contribution (0-150)
+        rsi_value: RSI value for momentum scoring (0-100)
+        volume_spike: Boolean indicating volume spike
+        trend_alignment: Boolean indicating higher timeframe trend alignment
+        multi_timeframe_confirm: Boolean indicating multi-timeframe confirmation
+        structure_quality: Market structure quality score (0-10)
+        risk_reward_ratio: Risk/reward ratio (higher is better)
+        volatility_normalized: Normalized volatility score (0-1)
+    
+    Returns:
+        float: Calculated power score (typically 50-100 range)
+    """
+    power = base_power
+    
+    # ATR contribution (volatility-based)
+    power += atr_factor * 100
+    
+    # RSI momentum contribution (divergence from neutral 50)
+    # Extreme RSI values add power (oversold/overbought reversions)
+    rsi_divergence = abs(rsi_value - 50.0)
+    power += rsi_divergence / 2.5
+    
+    # Volume spike bonus
+    if volume_spike:
+        power += 5.0
+    
+    # Trend alignment bonus (higher timeframe confirmation)
+    if trend_alignment:
+        power += 6.0
+    
+    # Multi-timeframe confirmation bonus
+    if multi_timeframe_confirm:
+        power += 7.0
+    
+    # Market structure quality (swing highs/lows, order blocks, etc.)
+    power += structure_quality * 1.5
+    
+    # Risk/reward ratio contribution (better RR = higher power)
+    if risk_reward_ratio >= 2.0:
+        power += 8.0
+    elif risk_reward_ratio >= 1.5:
+        power += 4.0
+    elif risk_reward_ratio >= 1.2:
+        power += 2.0
+    
+    # Volatility normalization penalty (too high volatility reduces reliability)
+    if volatility_normalized > 0.7:
+        power -= 5.0
+    elif volatility_normalized < 0.3:
+        power += 3.0
+    
+    # Ensure power stays within reasonable bounds
+    power = max(50.0, min(100.0, power))
+    
+    return power
+
+def calculate_adaptive_position_size(
+    base_size_usdt=350.0,
+    atr_value=0.0,
+    entry_price=0.0,
+    power_score=70.0,
+    max_risk_pct=0.02,
+    min_size_multiplier=0.5,
+    max_size_multiplier=2.0
+):
+    """
+    Calculate adaptive position size based on ATR (volatility) and signal power.
+    
+    Higher volatility -> smaller position size (risk management)
+    Higher power score -> slightly larger position size (confidence-based)
+    
+    Args:
+        base_size_usdt: Base position size in USDT
+        atr_value: Current ATR value
+        entry_price: Entry price
+        power_score: Signal power score (50-100)
+        max_risk_pct: Maximum risk per trade as % of account (default 2%)
+        min_size_multiplier: Minimum multiplier (default 0.5x = 50% of base)
+        max_size_multiplier: Maximum multiplier (default 2.0x = 200% of base)
+    
+    Returns:
+        float: Adjusted position size in USDT
+    """
+    if entry_price <= 0 or atr_value <= 0:
+        return base_size_usdt
+    
+    # Normalize ATR to percentage of price
+    atr_pct = (atr_value / entry_price) * 100
+    
+    # Volatility adjustment (inverse relationship)
+    # Low volatility (0.5-1.5%) -> larger size
+    # Medium volatility (1.5-3%) -> base size
+    # High volatility (3%+) -> smaller size
+    if atr_pct < 1.5:
+        vol_multiplier = 1.2  # Increase size by 20%
+    elif atr_pct < 2.5:
+        vol_multiplier = 1.0  # Base size
+    elif atr_pct < 4.0:
+        vol_multiplier = 0.8  # Reduce size by 20%
+    else:
+        vol_multiplier = 0.6  # Reduce size by 40%
+    
+    # Power score adjustment (direct relationship but limited impact)
+    # Power 50-60: -10%
+    # Power 60-70: 0%
+    # Power 70-80: +5%
+    # Power 80-90: +10%
+    # Power 90+: +15%
+    if power_score >= 90:
+        power_multiplier = 1.15
+    elif power_score >= 80:
+        power_multiplier = 1.10
+    elif power_score >= 70:
+        power_multiplier = 1.05
+    elif power_score >= 60:
+        power_multiplier = 1.0
+    else:
+        power_multiplier = 0.9
+    
+    # Combine multipliers
+    total_multiplier = vol_multiplier * power_multiplier
+    
+    # Apply bounds
+    total_multiplier = max(min_size_multiplier, min(max_size_multiplier, total_multiplier))
+    
+    # Calculate final size
+    adjusted_size = base_size_usdt * total_multiplier
+    
+    return adjusted_size
 
 # ===================== VWAP & VOLUME HELPERS =====================
 
@@ -2432,6 +2677,414 @@ def build_fvg_mss_signal(sym, kl, bar_i):
     return sig
 
 
+def build_bollinger_bands_signal(sym, kl, bar_i):
+    """
+    Bollinger Bands Mean Reversion & Breakout Strategy
+    
+    Entry Rules:
+    📈 Long:
+        - Price touches or breaks below lower band (oversold)
+        - RSI < 30 confirms oversold
+        - Volume spike indicates reversal
+        - Entry: When price closes back inside bands
+    
+    📉 Short:
+        - Price touches or breaks above upper band (overbought)
+        - RSI > 70 confirms overbought
+        - Volume spike indicates reversal
+        - Entry: When price closes back inside bands
+    
+    🎯 Bollinger Squeeze Breakout:
+        - Low bandwidth indicates consolidation
+        - High volume breakout from squeeze
+        - Strong directional move
+    
+    TP/SL: Target middle band, stop outside bands
+    """
+    if len(kl) < 30:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    volumes = [float(k[5]) for k in kl]
+    
+    # Calculate Bollinger Bands
+    middle, upper, lower, bandwidth = bollinger_bands(closes, period=20, std_dev=2.0)
+    
+    c_now = closes[-1]
+    c_prev = closes[-2]
+    middle_now = middle[-1]
+    middle_prev = middle[-2]
+    upper_now = upper[-1]
+    upper_prev = upper[-2]
+    lower_now = lower[-1]
+    lower_prev = lower[-2]
+    bandwidth_now = bandwidth[-1]
+    
+    # Calculate RSI
+    r_val = rsi(closes)[-1]
+    
+    # Calculate ATR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    
+    # Check for volume spike
+    avg_volume = sum(volumes[-10:-1]) / 9
+    current_volume = volumes[-1]
+    has_volume_spike = current_volume > avg_volume * 1.3
+    
+    # Check for Bollinger Squeeze (low bandwidth)
+    avg_bandwidth = sum(bandwidth[-20:]) / 20
+    is_squeeze = bandwidth_now < avg_bandwidth * 0.7
+    
+    direction = None
+    tag = None
+    entry_type = None
+    
+    # MEAN REVERSION STRATEGY
+    # Bullish mean reversion: touched lower band and now reverting
+    if c_prev < lower_prev and c_now > lower_now and r_val < 35:
+        direction = "UP"
+        tag = "📊 BB MEAN REVERSION BUY"
+        entry_type = "MEAN_REVERSION"
+    
+    # Bearish mean reversion: touched upper band and now reverting
+    elif c_prev > upper_prev and c_now < upper_now and r_val > 65:
+        direction = "DOWN"
+        tag = "📊 BB MEAN REVERSION SELL"
+        entry_type = "MEAN_REVERSION"
+    
+    # SQUEEZE BREAKOUT STRATEGY
+    elif is_squeeze and has_volume_spike:
+        # Bullish breakout from squeeze
+        if c_now > upper_now and c_prev <= upper_prev:
+            direction = "UP"
+            tag = "📊 BB SQUEEZE BREAKOUT BUY"
+            entry_type = "SQUEEZE_BREAKOUT"
+        
+        # Bearish breakout from squeeze
+        elif c_now < lower_now and c_prev >= lower_prev:
+            direction = "DOWN"
+            tag = "📊 BB SQUEEZE BREAKOUT SELL"
+            entry_type = "SQUEEZE_BREAKOUT"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL
+    if entry_type == "MEAN_REVERSION":
+        # For mean reversion: target middle band
+        if direction == "UP":
+            tp_est = middle_now
+            sl_est = c_now - atr_v * 1.5
+            # Ensure minimum 1:1.5 RR
+            risk = c_now - sl_est
+            if (tp_est - c_now) < (risk * 1.5):
+                tp_est = c_now + (risk * 1.5)
+        else:
+            tp_est = middle_now
+            sl_est = c_now + atr_v * 1.5
+            # Ensure minimum 1:1.5 RR
+            risk = sl_est - c_now
+            if (c_now - tp_est) < (risk * 1.5):
+                tp_est = c_now - (risk * 1.5)
+    
+    else:  # SQUEEZE_BREAKOUT
+        # For breakout: larger target
+        if direction == "UP":
+            sl_est = lower_now
+            risk = c_now - sl_est
+            tp_est = c_now + 2.5 * risk
+        else:
+            sl_est = upper_now
+            risk = sl_est - c_now
+            tp_est = c_now - 2.5 * risk
+    
+    # Power calculation
+    pwr = 60 + (atr_v / c_now) * 120
+    
+    if entry_type == "MEAN_REVERSION":
+        # RSI bonus
+        if direction == "UP":
+            pwr += (35 - r_val) / 2.0  # More oversold = higher power
+        else:
+            pwr += (r_val - 65) / 2.0  # More overbought = higher power
+    else:  # SQUEEZE_BREAKOUT
+        pwr += 8  # Squeeze breakouts have good win rate
+        if has_volume_spike:
+            pwr += 5
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "BB_STRATEGY",
+        "emoji": "📊",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "BOLLINGER_BANDS",
+        "tag": tag,
+        "conditions": {
+            "bb_upper": upper_now,
+            "bb_middle": middle_now,
+            "bb_lower": lower_now,
+            "bandwidth": bandwidth_now,
+            "is_squeeze": is_squeeze,
+            "entry_type": entry_type,
+            "has_volume_spike": has_volume_spike
+        }
+    }
+
+
+def build_stochastic_rsi_signal(sym, kl, bar_i):
+    """
+    Stochastic RSI Overbought/Oversold Strategy
+    
+    Entry Rules:
+    📈 Long:
+        - Stoch RSI crosses above 20 from oversold
+        - K line crosses above D line (bullish crossover)
+        - Price above EMA 50 (trend filter)
+    
+    📉 Short:
+        - Stoch RSI crosses below 80 from overbought
+        - K line crosses below D line (bearish crossover)
+        - Price below EMA 50 (trend filter)
+    
+    TP/SL: 1:2 Risk/Reward
+    """
+    if len(kl) < 50:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    
+    # Calculate Stochastic RSI
+    k_line, d_line = stochastic_rsi(closes, period=14, smooth_k=3, smooth_d=3)
+    
+    k_now = k_line[-1]
+    k_prev = k_line[-2]
+    d_now = d_line[-1]
+    d_prev = d_line[-2]
+    
+    c_now = closes[-1]
+    
+    # Calculate EMA 50 for trend filter
+    ema50 = ema(closes, 50)
+    ema50_now = ema50[-1]
+    
+    # Calculate ATR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    direction = None
+    tag = None
+    
+    # Bullish: K crosses above 20 from oversold AND crosses above D AND price above EMA50
+    oversold_cross = k_prev < 20 and k_now >= 20
+    bullish_k_d_cross = k_now > d_now and k_prev <= d_prev
+    
+    if oversold_cross and bullish_k_d_cross and c_now > ema50_now:
+        direction = "UP"
+        tag = "🔄 STOCH RSI OVERSOLD BUY"
+    
+    # Bearish: K crosses below 80 from overbought AND crosses below D AND price below EMA50
+    overbought_cross = k_prev > 80 and k_now <= 80
+    bearish_k_d_cross = k_now < d_now and k_prev >= d_prev
+    
+    if overbought_cross and bearish_k_d_cross and c_now < ema50_now:
+        direction = "DOWN"
+        tag = "🔄 STOCH RSI OVERBOUGHT SELL"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL with 1:2 RR
+    if direction == "UP":
+        sl_est = c_now - atr_v * 1.2
+        risk = c_now - sl_est
+        tp_est = c_now + 2.0 * risk
+    else:
+        sl_est = c_now + atr_v * 1.2
+        risk = sl_est - c_now
+        tp_est = c_now - 2.0 * risk
+    
+    # Power calculation
+    pwr = 62 + (atr_v / c_now) * 100
+    
+    # Bonus for strong crossover
+    if direction == "UP":
+        pwr += (k_now - k_prev) / 5.0
+    else:
+        pwr += (k_prev - k_now) / 5.0
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "STOCH_RSI",
+        "emoji": "🔄",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "STOCHASTIC_RSI",
+        "tag": tag,
+        "conditions": {
+            "stoch_k": k_now,
+            "stoch_d": d_now,
+            "ema50": ema50_now,
+            "k_crossover": k_now > d_now
+        }
+    }
+
+
+def build_fibonacci_retracement_signal(sym, kl, bar_i):
+    """
+    Fibonacci Retracement Trend Continuation Strategy
+    
+    Entry Rules:
+    📈 Long (in uptrend):
+        - Identify swing high and swing low
+        - Price retraces to 0.618 or 0.786 Fibonacci level
+        - Bullish reversal candle at Fib level
+        - RSI shows momentum return
+    
+    📉 Short (in downtrend):
+        - Identify swing low and swing high
+        - Price retraces to 0.618 or 0.786 Fibonacci level
+        - Bearish reversal candle at Fib level
+        - RSI shows momentum return
+    
+    TP/SL: Target previous swing high/low, stop below/above Fib level
+    """
+    if len(kl) < 50:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    
+    c_now = closes[-1]
+    c_prev = closes[-2]
+    o_now = opens[-1]
+    
+    # Calculate ATR
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    # Find swing high and low in recent 20 bars
+    lookback = 20
+    swing_high = max(highs[-lookback:])
+    swing_low = min(lows[-lookback:])
+    
+    # Determine trend
+    ema_vals = ema(closes, 50)
+    trend = "UP" if c_now > ema_vals[-1] else "DOWN"
+    
+    direction = None
+    tag = None
+    fib_level_hit = None
+    
+    if trend == "UP":
+        # Calculate Fibonacci levels from low to high
+        fib = fibonacci_levels(swing_high, swing_low)
+        
+        # Check if price is at 0.618 or 0.786 retracement
+        tolerance = atr_v * 0.3
+        
+        if abs(c_now - fib['0.618']) < tolerance or abs(c_prev - fib['0.618']) < tolerance:
+            fib_level_hit = 0.618
+        elif abs(c_now - fib['0.786']) < tolerance or abs(c_prev - fib['0.786']) < tolerance:
+            fib_level_hit = 0.786
+        
+        # Check for bullish reversal candle
+        if fib_level_hit and c_now > o_now and r_val > 40:
+            direction = "UP"
+            tag = f"📐 FIB {fib_level_hit} RETRACEMENT BUY"
+    
+    else:  # Downtrend
+        # Calculate Fibonacci levels from high to low (for downtrend, measure from swing_high to swing_low)
+        fib = fibonacci_levels(swing_high, swing_low)
+        
+        # In downtrend, price retraces UP to 0.618 or 0.786 (measuring from bottom)
+        # We need to invert the levels since price moves up during retracement
+        tolerance = atr_v * 0.3
+        
+        # For downtrend retracement, check 0.382 and 0.236 (these are the upward retracements)
+        if abs(c_now - fib['0.382']) < tolerance or abs(c_prev - fib['0.382']) < tolerance:
+            fib_level_hit = 0.618  # Label as 0.618 for consistency
+        elif abs(c_now - fib['0.236']) < tolerance or abs(c_prev - fib['0.236']) < tolerance:
+            fib_level_hit = 0.786  # Label as 0.786 for consistency
+        
+        # Check for bearish reversal candle
+        if fib_level_hit and c_now < o_now and r_val < 60:
+            direction = "DOWN"
+            tag = f"📐 FIB {fib_level_hit} RETRACEMENT SELL"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL
+    if direction == "UP":
+        tp_est = swing_high  # Target previous high
+        sl_est = c_now - atr_v * 1.5
+        # Ensure minimum 1:2 RR
+        risk = c_now - sl_est
+        if (tp_est - c_now) < (risk * 2.0):
+            tp_est = c_now + (risk * 2.0)
+    else:
+        tp_est = swing_low  # Target previous low
+        sl_est = c_now + atr_v * 1.5
+        # Ensure minimum 1:2 RR
+        risk = sl_est - c_now
+        if (c_now - tp_est) < (risk * 2.0):
+            tp_est = c_now - (risk * 2.0)
+    
+    # Power calculation
+    pwr = 65 + (atr_v / c_now) * 130
+    
+    # 0.786 is stronger level than 0.618
+    if fib_level_hit == 0.786:
+        pwr += 5
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": "FIBONACCI",
+        "emoji": "📐",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "FIBONACCI_RETRACEMENT",
+        "tag": tag,
+        "conditions": {
+            "swing_high": swing_high,
+            "swing_low": swing_low,
+            "fib_level": fib_level_hit,
+            "trend": trend
+        }
+    }
+
+
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
@@ -2462,10 +3115,15 @@ def scan_symbol(sym,bar_i):
     # New high-quality strategies
     s_reentry = build_reentry_signal(sym, kl, bar_i) if PARAM.get("ENABLE_REENTRY", True) else None
     s_fvg_mss = build_fvg_mss_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FVG_MSS", True) else None
+    
+    # NEW: Advanced technical strategies
+    s_bb = build_bollinger_bands_signal(sym, kl, bar_i) if PARAM.get("ENABLE_BB", True) else None
+    s_stoch_rsi = build_stochastic_rsi_signal(sym, kl, bar_i) if PARAM.get("ENABLE_STOCH_RSI", True) else None
+    s_fib = build_fibonacci_retracement_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FIB", True) else None
 
     for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
-              s_reentry, s_fvg_mss):
+              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib):
         if s: res.append(s)
     
     return res
@@ -2879,6 +3537,9 @@ STATE_DEFAULT={
     "bar_index":0, "last_report":0, "auto_trade_active":True,
     "last_api_check":0, "long_blocked":False, "short_blocked":False,
     "cest_long_blocked":False, "cest_short_blocked":False,
+    "bb_long_blocked":False, "bb_short_blocked":False,
+    "stoch_rsi_long_blocked":False, "stoch_rsi_short_blocked":False,
+    "fib_long_blocked":False, "fib_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0,
@@ -2888,6 +3549,9 @@ PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":350.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
+    "MAX_BB_BUY":3, "MAX_BB_SELL":3,  # Bollinger Bands strategy limits
+    "MAX_STOCH_RSI_BUY":3, "MAX_STOCH_RSI_SELL":3,  # Stochastic RSI strategy limits
+    "MAX_FIB_BUY":3, "MAX_FIB_SELL":3,  # Fibonacci Retracement strategy limits
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":20.0,
@@ -2905,6 +3569,10 @@ PARAM_DEFAULT={
     "ENABLE_FVG_BREAKER": True,
     "ENABLE_REENTRY": True,
     "ENABLE_FVG_MSS": True,
+    # NEW: Advanced technical strategies
+    "ENABLE_BB": True,  # Bollinger Bands strategy
+    "ENABLE_STOCH_RSI": True,  # Stochastic RSI strategy
+    "ENABLE_FIB": True,  # Fibonacci retracement strategy
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
@@ -3135,21 +3803,41 @@ def is_hour_blocked_for_trading():
     return blocked
 
 def update_directional_limits():
-    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0}
+    live={"long":{}, "short":{},"long_count":0,"short_count":0,
+          "cest_long_count":0,"cest_short_count":0,
+          "bb_long_count":0,"bb_short_count":0,
+          "stoch_rsi_long_count":0,"stoch_rsi_short_count":0,
+          "fib_long_count":0,"fib_short_count":0}
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
         for p in acc:
             amt=float(p["positionAmt"]); sym=p["symbol"]
             if amt>0: 
                 live["long"][sym]=amt
-                # Check if this is a CEST position
-                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
-                    live["cest_long_count"] += 1
+                # Check strategy type and count accordingly
+                if sym in REAL_POSITIONS_TRACKER:
+                    kind = REAL_POSITIONS_TRACKER[sym].get("kind")
+                    if kind == "CEST":
+                        live["cest_long_count"] += 1
+                    elif kind == "BOLLINGER_BANDS":
+                        live["bb_long_count"] += 1
+                    elif kind == "STOCHASTIC_RSI":
+                        live["stoch_rsi_long_count"] += 1
+                    elif kind == "FIBONACCI_RETRACEMENT":
+                        live["fib_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
-                # Check if this is a CEST position
-                if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
-                    live["cest_short_count"] += 1
+                # Check strategy type and count accordingly
+                if sym in REAL_POSITIONS_TRACKER:
+                    kind = REAL_POSITIONS_TRACKER[sym].get("kind")
+                    if kind == "CEST":
+                        live["cest_short_count"] += 1
+                    elif kind == "BOLLINGER_BANDS":
+                        live["bb_short_count"] += 1
+                    elif kind == "STOCHASTIC_RSI":
+                        live["stoch_rsi_short_count"] += 1
+                    elif kind == "FIBONACCI_RETRACEMENT":
+                        live["fib_short_count"] += 1
         live["long_count"]=len(live["long"])
         live["short_count"]=len(live["short"])
     except Exception as e:
@@ -3159,6 +3847,12 @@ def update_directional_limits():
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
     STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
+    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 3))
+    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 3))
+    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
+    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
+    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 3))
+    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 3))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -3722,6 +4416,12 @@ def send_hourly_margin_log():
             open_positions = 0
             cest_long_count = 0
             cest_short_count = 0
+            bb_long_count = 0
+            bb_short_count = 0
+            stoch_rsi_long_count = 0
+            stoch_rsi_short_count = 0
+            fib_long_count = 0
+            fib_short_count = 0
             
             for p in acc:
                 amt = float(p["positionAmt"])
@@ -3729,16 +4429,39 @@ def send_hourly_margin_log():
                     open_positions += 1
                     sym = p["symbol"]
                     
-                    # Check if this is a CEST position
-                    if sym in REAL_POSITIONS_TRACKER and REAL_POSITIONS_TRACKER[sym].get("kind") == "CEST":
-                        if amt > 0:
-                            cest_long_count += 1
-                        else:
-                            cest_short_count += 1
+                    # Check strategy type and count accordingly
+                    if sym in REAL_POSITIONS_TRACKER:
+                        kind = REAL_POSITIONS_TRACKER[sym].get("kind")
+                        if kind == "CEST":
+                            if amt > 0:
+                                cest_long_count += 1
+                            else:
+                                cest_short_count += 1
+                        elif kind == "BOLLINGER_BANDS":
+                            if amt > 0:
+                                bb_long_count += 1
+                            else:
+                                bb_short_count += 1
+                        elif kind == "STOCHASTIC_RSI":
+                            if amt > 0:
+                                stoch_rsi_long_count += 1
+                            else:
+                                stoch_rsi_short_count += 1
+                        elif kind == "FIBONACCI_RETRACEMENT":
+                            if amt > 0:
+                                fib_long_count += 1
+                            else:
+                                fib_short_count += 1
         except:
             open_positions = 0
             cest_long_count = 0
             cest_short_count = 0
+            bb_long_count = 0
+            bb_short_count = 0
+            stoch_rsi_long_count = 0
+            stoch_rsi_short_count = 0
+            fib_long_count = 0
+            fib_short_count = 0
         
         # Calculate estimated hours to target based on recent profit rate
         estimated_hours = None
@@ -3777,6 +4500,12 @@ def send_hourly_margin_log():
             "open_positions": open_positions,
             "cest_long_count": cest_long_count,
             "cest_short_count": cest_short_count,
+            "bb_long_count": bb_long_count,
+            "bb_short_count": bb_short_count,
+            "stoch_rsi_long_count": stoch_rsi_long_count,
+            "stoch_rsi_short_count": stoch_rsi_short_count,
+            "fib_long_count": fib_long_count,
+            "fib_short_count": fib_short_count,
             "profit_per_hour": profit_per_hour,
             "estimated_hours_to_target": estimated_hours,
             "avg_max_profit": avg_max_profit
@@ -3802,6 +4531,12 @@ def send_hourly_margin_log():
                    f"📌 Open Positions: {open_positions}\n"
                    f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
                    f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"📊 BB Long: {bb_long_count}/{PARAM.get('MAX_BB_BUY', 3)}\n"
+                   f"📊 BB Short: {bb_short_count}/{PARAM.get('MAX_BB_SELL', 3)}\n"
+                   f"🔄 Stoch RSI Long: {stoch_rsi_long_count}/{PARAM.get('MAX_STOCH_RSI_BUY', 3)}\n"
+                   f"🔄 Stoch RSI Short: {stoch_rsi_short_count}/{PARAM.get('MAX_STOCH_RSI_SELL', 3)}\n"
+                   f"📐 Fib Long: {fib_long_count}/{PARAM.get('MAX_FIB_BUY', 3)}\n"
+                   f"📐 Fib Short: {fib_short_count}/{PARAM.get('MAX_FIB_SELL', 3)}\n"
                    f"🔝 Avg Max Profit: ${avg_max_profit:.2f}")
             
             # Add position target info when all positions are closed
@@ -4046,6 +4781,9 @@ def _cmd_status():
         f"━━━━━━━━━━━━━━━━\n"
         f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',45)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',45)}\n"
         f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
+        f"BB long:{live.get('bb_long_count',0)}/{PARAM.get('MAX_BB_BUY',3)} short:{live.get('bb_short_count',0)}/{PARAM.get('MAX_BB_SELL',3)}\n"
+        f"Stoch RSI long:{live.get('stoch_rsi_long_count',0)}/{PARAM.get('MAX_STOCH_RSI_BUY',3)} short:{live.get('stoch_rsi_short_count',0)}/{PARAM.get('MAX_STOCH_RSI_SELL',3)}\n"
+        f"Fib long:{live.get('fib_long_count',0)}/{PARAM.get('MAX_FIB_BUY',3)} short:{live.get('fib_short_count',0)}/{PARAM.get('MAX_FIB_SELL',3)}\n"
         f"Closed trades:{len(REAL_CLOSED)}\n"
         f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
         f"{strategy_msg}"
@@ -4191,7 +4929,8 @@ def _cmd_enable(args):
                     "Available strategies:\n"
                     "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
-                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS,\n"
+                    "BB, STOCH_RSI, FIB")
             return
         
         strategy = args[0].upper()
@@ -4200,7 +4939,8 @@ def _cmd_enable(args):
         # Check if it's a valid strategy key
         valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
-                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS",
+                          "BB", "STOCH_RSI", "FIB"]
         
         if strategy not in valid_strategies:
             tg_send(f"❌ Unknown strategy: {strategy}\n"
@@ -4222,7 +4962,8 @@ def _cmd_disable(args):
                     "Available strategies:\n"
                     "MACD, FVG, CEST, PULLBACK,\n"
                     "ORB_FVG, LONDON_BO, NY_REV, ICT_P3,\n"
-                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS")
+                    "ASIAN_BO, FVG_BREAKER, REENTRY, FVG_MSS,\n"
+                    "BB, STOCH_RSI, FIB")
             return
         
         strategy = args[0].upper()
@@ -4231,7 +4972,8 @@ def _cmd_disable(args):
         # Check if it's a valid strategy key
         valid_strategies = ["MACD", "FVG", "CEST", "PULLBACK", 
                           "ORB_FVG", "LONDON_BO", "NY_REV", "ICT_P3", 
-                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS"]
+                          "ASIAN_BO", "FVG_BREAKER", "REENTRY", "FVG_MSS",
+                          "BB", "STOCH_RSI", "FIB"]
         
         if strategy not in valid_strategies:
             tg_send(f"❌ Unknown strategy: {strategy}\n"
@@ -4260,7 +5002,10 @@ def _cmd_strategies():
             ("ASIAN_BO", "🌏 Asian Breakout"),
             ("FVG_BREAKER", "🧱 FVG+Breaker"),
             ("REENTRY", "🔄 Re-entry 4H+5m"),
-            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)")
+            ("FVG_MSS", "⭐ FVG+MSS (Highest WR)"),
+            ("BB", "📊 Bollinger Bands"),
+            ("STOCH_RSI", "🔄 Stochastic RSI"),
+            ("FIB", "📐 Fibonacci Retracement")
         ]
         
         msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
@@ -4274,7 +5019,16 @@ def _cmd_strategies():
         msg += f"Short: {PARAM.get('MAX_SELL', 45)}\n"
         msg += f"\n🧩 CEST Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
-        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}"
+        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
+        msg += f"\n📊 BB Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_BB_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_BB_SELL', 3)}\n"
+        msg += f"\n🔄 Stoch RSI Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_STOCH_RSI_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 3)}\n"
+        msg += f"\n📐 Fib Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_FIB_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}"
         
         tg_send(msg)
     except Exception as e:
@@ -4288,8 +5042,11 @@ def _cmd_setlimits(args):
                     "Types:\n"
                     "  buy, sell - Global limits (all strategies)\n"
                     "  cest_buy, cest_sell - CEST sub-limits\n"
+                    "  bb_buy, bb_sell - Bollinger Bands sub-limits\n"
+                    "  stoch_rsi_buy, stoch_rsi_sell - Stochastic RSI sub-limits\n"
+                    "  fib_buy, fib_sell - Fibonacci sub-limits\n"
                     "Example: /setlimits buy 50\n"
-                    "Example: /setlimits cest_buy 20")
+                    "Example: /setlimits bb_buy 5")
             return
         
         limit_type = args[0].lower()
@@ -4319,9 +5076,40 @@ def _cmd_setlimits(args):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"✅ CEST MAX_SELL limit set to {value} (within global limit)")
             log(f"[SETLIMITS] MAX_CEST_SELL = {value}")
+        elif limit_type == "bb_buy":
+            PARAM["MAX_BB_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ BB MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_BB_BUY = {value}")
+        elif limit_type == "bb_sell":
+            PARAM["MAX_BB_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ BB MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_BB_SELL = {value}")
+        elif limit_type == "stoch_rsi_buy":
+            PARAM["MAX_STOCH_RSI_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ Stoch RSI MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_STOCH_RSI_BUY = {value}")
+        elif limit_type == "stoch_rsi_sell":
+            PARAM["MAX_STOCH_RSI_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ Stoch RSI MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_STOCH_RSI_SELL = {value}")
+        elif limit_type == "fib_buy":
+            PARAM["MAX_FIB_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ Fib MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_FIB_BUY = {value}")
+        elif limit_type == "fib_sell":
+            PARAM["MAX_FIB_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ Fib MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_FIB_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell")
+                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, "
+                    "stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell")
             return
         
     except ValueError:
@@ -4692,13 +5480,37 @@ def _can_direction(direction, kind=""):
         log(f"[GLOBAL LIMIT] Short positions blocked (max: {PARAM['MAX_SELL']})")
         return False
     
-    # Check CEST-specific limits (in addition to global limits)
+    # Check strategy-specific limits (in addition to global limits)
     if kind == "CEST":
         if direction=="UP" and STATE.get("cest_long_blocked",False):
             log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 15)})")
             return False
         if direction=="DOWN" and STATE.get("cest_short_blocked",False):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
+            return False
+    
+    elif kind == "BOLLINGER_BANDS":
+        if direction=="UP" and STATE.get("bb_long_blocked",False):
+            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 3)})")
+            return False
+        if direction=="DOWN" and STATE.get("bb_short_blocked",False):
+            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 3)})")
+            return False
+    
+    elif kind == "STOCHASTIC_RSI":
+        if direction=="UP" and STATE.get("stoch_rsi_long_blocked",False):
+            log(f"[STOCH RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 3)})")
+            return False
+        if direction=="DOWN" and STATE.get("stoch_rsi_short_blocked",False):
+            log(f"[STOCH RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 3)})")
+            return False
+    
+    elif kind == "FIBONACCI_RETRACEMENT":
+        if direction=="UP" and STATE.get("fib_long_blocked",False):
+            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 3)})")
+            return False
+        if direction=="DOWN" and STATE.get("fib_short_blocked",False):
+            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 3)})")
             return False
     
     return True
@@ -4862,7 +5674,7 @@ def main():
                     STATE["long_blocked"] = (total_long_count >= PARAM["MAX_BUY"])
                     STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
                     
-                    # Update CEST-specific counts (only CEST has sub-limits)
+                    # Update strategy-specific counts (for strategies with sub-limits)
                     if kind == "CEST":
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
@@ -4872,6 +5684,30 @@ def main():
                             batch_opened["cest_short"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
                             STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
+                    
+                    elif kind == "BOLLINGER_BANDS":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
+                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
+                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 3))
+                    
+                    elif kind == "STOCHASTIC_RSI":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
+                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
+                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
+                    
+                    elif kind == "FIBONACCI_RETRACEMENT":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
+                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
+                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 3))
                     
                     # Log the current counts for monitoring
                     log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']}")
