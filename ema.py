@@ -105,12 +105,29 @@ def safe_load(p,d):
     except: pass
     return d
 
+def convert_for_json(obj):
+    """Convert numpy types and other non-serializable types to native Python types"""
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_for_json(item) for item in obj]
+    return obj
+
 def safe_save(p,d):
     try:
         with SAVE_LOCK:
             tmp=p+".tmp"
             with open(tmp,"w",encoding="utf-8") as f:
-                json.dump(d,f,ensure_ascii=False,indent=2)
+                cleaned_data = convert_for_json(d)
+                json.dump(cleaned_data,f,ensure_ascii=False,indent=2)
                 f.flush(); os.fsync(f.fileno())
             os.replace(tmp,p)
     except Exception as e:
