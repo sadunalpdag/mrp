@@ -3881,13 +3881,17 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             direction = "UP" if pos_side == "LONG" else "DOWN"
                             # Preserve original strategy kind for proper limit tracking
                             pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
-                            original_kind = pos_info.get("kind", "UNKNOWN")
+                            original_kind = pos_info.get("kind")
+                            if not original_kind:
+                                # Position not tracked or missing kind - log warning
+                                log(f"[CASHOUT WARNING] {sym} missing strategy kind in tracker, will use fallback on reopen")
+                                original_kind = None  # Will use fallback in reopen
                             closed_positions_info.append({
                                 "symbol": sym,
                                 "direction": direction,
                                 "pos_side": pos_side,
                                 "amount": amt,
-                                "kind": original_kind  # Preserve strategy kind
+                                "kind": original_kind  # Preserve strategy kind (may be None)
                             })
                         except Exception as limit_err:
                             # If LIMIT order completely fails, log error but don't add to closed list
@@ -4014,8 +4018,11 @@ def reopen_positions_with_tp(closed_positions_info):
             
             # Track the new position
             # Preserve the original strategy kind to maintain proper position limits
-            # If no kind was provided (old data), use CASHOUT_REOPEN as fallback
-            original_kind = pos_info.get("kind", "CASHOUT_REOPEN")
+            # If no kind was provided (old data or missing tracker), use CASHOUT_REOPEN as fallback
+            original_kind = pos_info.get("kind")
+            if not original_kind:
+                original_kind = "CASHOUT_REOPEN"
+                log(f"[REOPEN WARNING] {sym} missing strategy kind, using fallback: {original_kind}")
             REAL_POSITIONS_TRACKER[sym] = {
                 "symbol": sym,
                 "direction": direction,
