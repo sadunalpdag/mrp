@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Data directory (contains runtime state)
+data/
+
+# Temporary files
+*.tmp
