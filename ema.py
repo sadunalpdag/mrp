@@ -5499,7 +5499,9 @@ def main():
                     STATE["long_blocked"] = (total_long_count >= PARAM["MAX_BUY"])
                     STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
                     
-                    # Update CEST-specific counts (only CEST has sub-limits)
+                    # Update strategy-specific counts for strategies with sub-limits
+                    # Calculate count once to avoid redundant iterations
+                    current_count = 0
                     if kind == "CEST":
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
@@ -5510,8 +5512,38 @@ def main():
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
                             STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
                     
-                    # Log the current counts for monitoring
-                    log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']}")
+                    # Update BOLLINGER_BANDS-specific counts
+                    elif kind == "BOLLINGER_BANDS":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
+                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 5))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
+                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 5))
+                    
+                    # Update STOCHASTIC_RSI-specific counts
+                    elif kind == "STOCHASTIC_RSI":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
+                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
+                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 5))
+                    
+                    # Update FIBONACCI_RETRACEMENT-specific counts
+                    elif kind == "FIBONACCI_RETRACEMENT":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
+                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 5))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
+                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 5))
+                    
+                    # Log the current counts for monitoring (reuse current_count to avoid redundant iteration)
+                    if kind in ["CEST", "BOLLINGER_BANDS", "STOCHASTIC_RSI", "FIBONACCI_RETRACEMENT"]:
+                        log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']} | {kind}: {current_count}")
+                    else:
+                        log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']}")
             
             # Update limits once after batch to sync with exchange state
             if any(batch_opened.values()):
