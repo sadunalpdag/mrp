@@ -5500,6 +5500,8 @@ def main():
                     STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
                     
                     # Update strategy-specific counts for strategies with sub-limits
+                    # Calculate count once to avoid redundant iterations
+                    current_count = 0
                     if kind == "CEST":
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
@@ -5537,10 +5539,9 @@ def main():
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
                             STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 5))
                     
-                    # Log the current counts for monitoring (including strategy-specific counts)
+                    # Log the current counts for monitoring (reuse current_count to avoid redundant iteration)
                     if kind in ["CEST", "BOLLINGER_BANDS", "STOCHASTIC_RSI", "FIBONACCI_RETRACEMENT"]:
-                        strategy_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == kind and s.get("direction") == direction])
-                        log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']} | {kind}: {strategy_count}")
+                        log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']} | {kind}: {current_count}")
                     else:
                         log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']}")
             
