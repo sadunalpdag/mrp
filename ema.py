@@ -3900,10 +3900,11 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                                     # Calculate weighted average of LIMIT and MARKET fills
                                                     if actual_exit_price and filled_qty > 0:
                                                         total_qty = filled_qty + remaining_qty_float
-                                                        actual_exit_price = (actual_exit_price * filled_qty + market_price * remaining_qty_float) / total_qty
+                                                        if total_qty > 0:
+                                                            actual_exit_price = (actual_exit_price * filled_qty + market_price * remaining_qty_float) / total_qty
                                                     else:
                                                         actual_exit_price = market_price
-                                            except (ValueError, TypeError):
+                                            except (ValueError, TypeError, ZeroDivisionError):
                                                 pass
                                         
                                         log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty_formatted} via MARKET")
