@@ -3394,7 +3394,7 @@ STATE_DEFAULT={
     "avg_max_profit":0.0  # Average of max profits from open positions
 }
 PARAM_DEFAULT={
-    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":350.0,
+    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
     # Last 3 strategies limits (within global limit)
