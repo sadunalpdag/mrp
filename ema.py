@@ -3387,7 +3387,8 @@ PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":350.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
-    # Last 3 strategies limits (within global limit)
+    # Re-entry and last 3 strategies limits (within global limit)
+    "MAX_REENTRY_BUY":5, "MAX_REENTRY_SELL":5,  # Re-entry 4H+5m strategy limits
     "MAX_BB_BUY":5, "MAX_BB_SELL":5,  # Bollinger Bands strategy limits
     "MAX_STOCH_RSI_BUY":5, "MAX_STOCH_RSI_SELL":5,  # Stochastic RSI strategy limits
     "MAX_FIB_BUY":5, "MAX_FIB_SELL":5,  # Fibonacci retracement strategy limits
@@ -3643,6 +3644,7 @@ def is_hour_blocked_for_trading():
 
 def update_directional_limits():
     live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,
+          "reentry_long_count":0,"reentry_short_count":0,
           "bb_long_count":0,"bb_short_count":0,
           "stoch_rsi_long_count":0,"stoch_rsi_short_count":0,
           "fib_long_count":0,"fib_short_count":0}
@@ -3657,6 +3659,8 @@ def update_directional_limits():
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
                     if pos_kind == "CEST":
                         live["cest_long_count"] += 1
+                    elif pos_kind == "REENTRY_4H_5M":
+                        live["reentry_long_count"] += 1
                     elif pos_kind == "BOLLINGER_BANDS":
                         live["bb_long_count"] += 1
                     elif pos_kind == "STOCHASTIC_RSI":
@@ -3670,6 +3674,8 @@ def update_directional_limits():
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
                     if pos_kind == "CEST":
                         live["cest_short_count"] += 1
+                    elif pos_kind == "REENTRY_4H_5M":
+                        live["reentry_short_count"] += 1
                     elif pos_kind == "BOLLINGER_BANDS":
                         live["bb_short_count"] += 1
                     elif pos_kind == "STOCHASTIC_RSI":
@@ -3685,6 +3691,8 @@ def update_directional_limits():
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
     STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
+    STATE["reentry_long_blocked"]  = (live["reentry_long_count"]  >= PARAM.get("MAX_REENTRY_BUY", 5))
+    STATE["reentry_short_blocked"] = (live["reentry_short_count"] >= PARAM.get("MAX_REENTRY_SELL", 5))
     STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 5))
     STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 5))
     STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
@@ -4814,6 +4822,9 @@ def _cmd_strategies():
         msg += f"\n🧩 CEST Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
         msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
+        msg += f"\n🔄 REENTRY Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_REENTRY_BUY', 5)}\n"
+        msg += f"Short: {PARAM.get('MAX_REENTRY_SELL', 5)}\n"
         msg += f"\n📊 BB Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_BB_BUY', 5)}\n"
         msg += f"Short: {PARAM.get('MAX_BB_SELL', 5)}\n"
@@ -4836,6 +4847,7 @@ def _cmd_setlimits(args):
                     "Types:\n"
                     "  buy, sell - Global limits (all strategies)\n"
                     "  cest_buy, cest_sell - CEST sub-limits\n"
+                    "  reentry_buy, reentry_sell - Re-entry sub-limits\n"
                     "  bb_buy, bb_sell - Bollinger Bands sub-limits\n"
                     "  stoch_rsi_buy, stoch_rsi_sell - Stochastic RSI sub-limits\n"
                     "  fib_buy, fib_sell - Fibonacci sub-limits\n"
@@ -4870,6 +4882,16 @@ def _cmd_setlimits(args):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"✅ CEST MAX_SELL limit set to {value} (within global limit)")
             log(f"[SETLIMITS] MAX_CEST_SELL = {value}")
+        elif limit_type == "reentry_buy":
+            PARAM["MAX_REENTRY_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ REENTRY MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_REENTRY_BUY = {value}")
+        elif limit_type == "reentry_sell":
+            PARAM["MAX_REENTRY_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ REENTRY MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_REENTRY_SELL = {value}")
         elif limit_type == "bb_buy":
             PARAM["MAX_BB_BUY"] = value
             safe_save(PARAM_FILE, PARAM)
@@ -4902,7 +4924,7 @@ def _cmd_setlimits(args):
             log(f"[SETLIMITS] MAX_FIB_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell")
+                    "Available: buy, sell, cest_buy, cest_sell, reentry_buy, reentry_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell")
             return
         
     except ValueError:
@@ -5294,6 +5316,15 @@ def _can_direction(direction, kind=""):
             return False
         if direction=="DOWN" and STATE.get("cest_short_blocked",False):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
+            return False
+    
+    # Check REENTRY-specific limits (in addition to global limits)
+    if kind == "REENTRY_4H_5M":
+        if direction=="UP" and STATE.get("reentry_long_blocked",False):
+            log(f"[REENTRY LIMIT] Re-entry long positions blocked (max: {PARAM.get('MAX_REENTRY_BUY', 5)})")
+            return False
+        if direction=="DOWN" and STATE.get("reentry_short_blocked",False):
+            log(f"[REENTRY LIMIT] Re-entry short positions blocked (max: {PARAM.get('MAX_REENTRY_SELL', 5)})")
             return False
     
     # Check BOLLINGER_BANDS-specific limits (in addition to global limits)
