@@ -3879,11 +3879,15 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             closed_symbols.append(sym)
                             # Store position info for reopening
                             direction = "UP" if pos_side == "LONG" else "DOWN"
+                            # Preserve original strategy kind for proper limit tracking
+                            pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
+                            original_kind = pos_info.get("kind", "UNKNOWN")
                             closed_positions_info.append({
                                 "symbol": sym,
                                 "direction": direction,
                                 "pos_side": pos_side,
-                                "amount": amt
+                                "amount": amt,
+                                "kind": original_kind  # Preserve strategy kind
                             })
                         except Exception as limit_err:
                             # If LIMIT order completely fails, log error but don't add to closed list
@@ -4009,13 +4013,14 @@ def reopen_positions_with_tp(closed_positions_info):
             log(f"[TRENDLOCK SET] {sym} {direction}")
             
             # Track the new position
-            # Note: power is set to 0.0 for cashout reopens since they're not based on
-            # strategy signals but rather maintaining positions after profit realization
+            # Preserve the original strategy kind to maintain proper position limits
+            # If no kind was provided (old data), use CASHOUT_REOPEN as fallback
+            original_kind = pos_info.get("kind", "CASHOUT_REOPEN")
             REAL_POSITIONS_TRACKER[sym] = {
                 "symbol": sym,
                 "direction": direction,
                 "entry_price": entry_exec,
-                "kind": "CASHOUT_REOPEN",
+                "kind": original_kind,  # Preserve original strategy kind
                 "tag": "💰 REOPEN",
                 "power": 0.0,  # No power score for cashout reopens (not signal-based)
                 "open_time": now_local_iso(),
