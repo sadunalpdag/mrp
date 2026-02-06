@@ -5169,8 +5169,8 @@ def adjust_precision(sym,v,kind="qty"):
     # For quantity adjustments, ensure we meet minimum quantity requirement
     if kind == "qty":
         min_qty = safe_float(f.get("minQty", 0), 0)
-        # If adjusted is below minQty (including when it's 0 but v was positive), use minQty
-        if min_qty > 0 and ((0 < adjusted < min_qty) or (adjusted == 0 and v > 0)):
+        # Use minQty if adjusted quantity is below minimum and original value was positive
+        if min_qty > 0 and 0 <= adjusted < min_qty and v > 0:
             adjusted = min_qty
     
     return adjusted
