@@ -3121,7 +3121,7 @@ def check_and_log_real_closed_trades():
         for sym in closed_symbols:
             REAL_POSITIONS_TRACKER.pop(sym, None)
         
-        # Save tracker if any positions were removed
+        # Save tracker after removing closed positions
         if closed_symbols:
             save_positions_tracker()
             
@@ -3437,9 +3437,7 @@ STATE=safe_load(STATE_FILE,STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
 
 # Load positions tracker from file (restores strategy tracking after restart)
-loaded_tracker = safe_load(POSITIONS_TRACKER_FILE, {})
-if isinstance(loaded_tracker, dict):
-    REAL_POSITIONS_TRACKER.update(loaded_tracker)
+REAL_POSITIONS_TRACKER.update(safe_load(POSITIONS_TRACKER_FILE, {}))
 
 # ===================== HOURLY PERFORMANCE TRACKING =====================
 
