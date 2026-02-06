@@ -3396,10 +3396,8 @@ PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":350.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
-    # Last 3 strategies limits (within global limit)
-    "MAX_BB_BUY":5, "MAX_BB_SELL":5,  # Bollinger Bands strategy limits
-    "MAX_STOCH_RSI_BUY":5, "MAX_STOCH_RSI_SELL":5,  # Stochastic RSI strategy limits
-    "MAX_FIB_BUY":5, "MAX_FIB_SELL":5,  # Fibonacci retracement strategy limits
+    # Last 3 strategies COMBINED limits (within global limit) - total across BB, STOCH_RSI, and FIB
+    "MAX_LAST3_BUY":5, "MAX_LAST3_SELL":5,  # Combined limit for BB + STOCH_RSI + FIB strategies
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":20.0,
@@ -3697,12 +3695,17 @@ def update_directional_limits():
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
     STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
-    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 5))
-    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 5))
-    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
-    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 5))
-    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 5))
-    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 5))
+    # Combined limit for last 3 strategies (BB + STOCH_RSI + FIB)
+    last3_long_count = live["bb_long_count"] + live["stoch_rsi_long_count"] + live["fib_long_count"]
+    last3_short_count = live["bb_short_count"] + live["stoch_rsi_short_count"] + live["fib_short_count"]
+    last3_long_blocked = (last3_long_count >= PARAM.get("MAX_LAST3_BUY", 5))
+    last3_short_blocked = (last3_short_count >= PARAM.get("MAX_LAST3_SELL", 5))
+    STATE["bb_long_blocked"]  = last3_long_blocked
+    STATE["bb_short_blocked"] = last3_short_blocked
+    STATE["stoch_rsi_long_blocked"]  = last3_long_blocked
+    STATE["stoch_rsi_short_blocked"] = last3_short_blocked
+    STATE["fib_long_blocked"]  = last3_long_blocked
+    STATE["fib_short_blocked"] = last3_short_blocked
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -4828,15 +4831,9 @@ def _cmd_strategies():
         msg += f"\n🧩 CEST Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
         msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
-        msg += f"\n📊 BB Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_BB_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_BB_SELL', 5)}\n"
-        msg += f"\n🔄 STOCH_RSI Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_STOCH_RSI_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 5)}\n"
-        msg += f"\n📐 FIB Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_FIB_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 5)}"
+        msg += f"\n📊 Last 3 Strategies COMBINED Sub-Limits (within global):\n"
+        msg += f"BB + STOCH_RSI + FIB Long: {PARAM.get('MAX_LAST3_BUY', 5)}\n"
+        msg += f"BB + STOCH_RSI + FIB Short: {PARAM.get('MAX_LAST3_SELL', 5)}"
         
         tg_send(msg)
     except Exception as e:
@@ -4850,11 +4847,9 @@ def _cmd_setlimits(args):
                     "Types:\n"
                     "  buy, sell - Global limits (all strategies)\n"
                     "  cest_buy, cest_sell - CEST sub-limits\n"
-                    "  bb_buy, bb_sell - Bollinger Bands sub-limits\n"
-                    "  stoch_rsi_buy, stoch_rsi_sell - Stochastic RSI sub-limits\n"
-                    "  fib_buy, fib_sell - Fibonacci sub-limits\n"
+                    "  last3_buy, last3_sell - Combined limit for BB+STOCH_RSI+FIB\n"
                     "Example: /setlimits buy 50\n"
-                    "Example: /setlimits bb_buy 10")
+                    "Example: /setlimits last3_buy 5")
             return
         
         limit_type = args[0].lower()
@@ -4884,39 +4879,19 @@ def _cmd_setlimits(args):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"✅ CEST MAX_SELL limit set to {value} (within global limit)")
             log(f"[SETLIMITS] MAX_CEST_SELL = {value}")
-        elif limit_type == "bb_buy":
-            PARAM["MAX_BB_BUY"] = value
+        elif limit_type == "last3_buy":
+            PARAM["MAX_LAST3_BUY"] = value
             safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ BB MAX_BUY limit set to {value} (within global limit)")
-            log(f"[SETLIMITS] MAX_BB_BUY = {value}")
-        elif limit_type == "bb_sell":
-            PARAM["MAX_BB_SELL"] = value
+            tg_send(f"✅ Last 3 strategies (BB+STOCH_RSI+FIB) combined MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_LAST3_BUY = {value}")
+        elif limit_type == "last3_sell":
+            PARAM["MAX_LAST3_SELL"] = value
             safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ BB MAX_SELL limit set to {value} (within global limit)")
-            log(f"[SETLIMITS] MAX_BB_SELL = {value}")
-        elif limit_type == "stoch_rsi_buy":
-            PARAM["MAX_STOCH_RSI_BUY"] = value
-            safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ STOCH_RSI MAX_BUY limit set to {value} (within global limit)")
-            log(f"[SETLIMITS] MAX_STOCH_RSI_BUY = {value}")
-        elif limit_type == "stoch_rsi_sell":
-            PARAM["MAX_STOCH_RSI_SELL"] = value
-            safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ STOCH_RSI MAX_SELL limit set to {value} (within global limit)")
-            log(f"[SETLIMITS] MAX_STOCH_RSI_SELL = {value}")
-        elif limit_type == "fib_buy":
-            PARAM["MAX_FIB_BUY"] = value
-            safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ FIB MAX_BUY limit set to {value} (within global limit)")
-            log(f"[SETLIMITS] MAX_FIB_BUY = {value}")
-        elif limit_type == "fib_sell":
-            PARAM["MAX_FIB_SELL"] = value
-            safe_save(PARAM_FILE, PARAM)
-            tg_send(f"✅ FIB MAX_SELL limit set to {value} (within global limit)")
-            log(f"[SETLIMITS] MAX_FIB_SELL = {value}")
+            tg_send(f"✅ Last 3 strategies (BB+STOCH_RSI+FIB) combined MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_LAST3_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell")
+                    "Available: buy, sell, cest_buy, cest_sell, last3_buy, last3_sell")
             return
         
     except ValueError:
@@ -5313,28 +5288,28 @@ def _can_direction(direction, kind=""):
     # Check BOLLINGER_BANDS-specific limits (in addition to global limits)
     if kind == "BOLLINGER_BANDS":
         if direction=="UP" and STATE.get("bb_long_blocked",False):
-            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 5)})")
+            log(f"[BB LIMIT] Last 3 strategies (BB+STOCH_RSI+FIB) long positions blocked (combined max: {PARAM.get('MAX_LAST3_BUY', 5)})")
             return False
         if direction=="DOWN" and STATE.get("bb_short_blocked",False):
-            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 5)})")
+            log(f"[BB LIMIT] Last 3 strategies (BB+STOCH_RSI+FIB) short positions blocked (combined max: {PARAM.get('MAX_LAST3_SELL', 5)})")
             return False
     
     # Check STOCHASTIC_RSI-specific limits (in addition to global limits)
     if kind == "STOCHASTIC_RSI":
         if direction=="UP" and STATE.get("stoch_rsi_long_blocked",False):
-            log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 5)})")
+            log(f"[STOCH_RSI LIMIT] Last 3 strategies (BB+STOCH_RSI+FIB) long positions blocked (combined max: {PARAM.get('MAX_LAST3_BUY', 5)})")
             return False
         if direction=="DOWN" and STATE.get("stoch_rsi_short_blocked",False):
-            log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 5)})")
+            log(f"[STOCH_RSI LIMIT] Last 3 strategies (BB+STOCH_RSI+FIB) short positions blocked (combined max: {PARAM.get('MAX_LAST3_SELL', 5)})")
             return False
     
     # Check FIBONACCI_RETRACEMENT-specific limits (in addition to global limits)
     if kind == "FIBONACCI_RETRACEMENT":
         if direction=="UP" and STATE.get("fib_long_blocked",False):
-            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 5)})")
+            log(f"[FIB LIMIT] Last 3 strategies (BB+STOCH_RSI+FIB) long positions blocked (combined max: {PARAM.get('MAX_LAST3_BUY', 5)})")
             return False
         if direction=="DOWN" and STATE.get("fib_short_blocked",False):
-            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 5)})")
+            log(f"[FIB LIMIT] Last 3 strategies (BB+STOCH_RSI+FIB) short positions blocked (combined max: {PARAM.get('MAX_LAST3_SELL', 5)})")
             return False
     
     return True
