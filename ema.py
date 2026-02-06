@@ -3303,14 +3303,14 @@ def get_symbol_filters(sym):
         pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
         PRECISION_CACHE[sym]={
             "stepSize":float(lot.get("stepSize","1")),
-            "minQty":float(lot.get("minQty","0.001")),
+            "minQty":float(lot.get("minQty","0")),
             "tickSize":float(pricef.get("tickSize","0.01")),
             "minPrice":float(pricef.get("minPrice","0.00000001")),
             "maxPrice":float(pricef.get("maxPrice","100000000"))
         }
     except Exception as e:
-        log(f"[PREC WARN]{sym}{e}")
-        PRECISION_CACHE[sym]={"stepSize":0.0001,"minQty":0.001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
+        log(f"[PREC WARN]{sym}{e} - Using fallback precision values")
+        PRECISION_CACHE[sym]={"stepSize":0.0001,"minQty":0,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
     return PRECISION_CACHE[sym]
 
 def _decimals_from_tick(tick_str):
@@ -5169,11 +5169,8 @@ def adjust_precision(sym,v,kind="qty"):
     # For quantity adjustments, ensure we meet minimum quantity requirement
     if kind == "qty":
         min_qty = safe_float(f.get("minQty", 0), 0)
-        # If adjusted is 0 but original value was positive, and minQty is set, use minQty
-        if adjusted == 0 and v > 0 and min_qty > 0:
-            adjusted = min_qty
-        elif adjusted > 0 and adjusted < min_qty:
-            # Round up to minimum quantity if we're below it but above 0
+        # If adjusted is below minQty (including when it's 0 but v was positive), use minQty
+        if min_qty > 0 and ((0 < adjusted < min_qty) or (adjusted == 0 and v > 0)):
             adjusted = min_qty
     
     return adjusted
