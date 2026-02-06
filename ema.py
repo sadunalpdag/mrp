@@ -3303,13 +3303,14 @@ def get_symbol_filters(sym):
         pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
         PRECISION_CACHE[sym]={
             "stepSize":float(lot.get("stepSize","1")),
+            "minQty":float(lot.get("minQty","0")),
             "tickSize":float(pricef.get("tickSize","0.01")),
             "minPrice":float(pricef.get("minPrice","0.00000001")),
             "maxPrice":float(pricef.get("maxPrice","100000000"))
         }
     except Exception as e:
-        log(f"[PREC WARN]{sym}{e}")
-        PRECISION_CACHE[sym]={"stepSize":0.0001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
+        log(f"[PREC WARN]{sym}{e} - Using fallback precision values")
+        PRECISION_CACHE[sym]={"stepSize":0.0001,"minQty":0,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
     return PRECISION_CACHE[sym]
 
 def _decimals_from_tick(tick_str):
@@ -3393,7 +3394,7 @@ STATE_DEFAULT={
     "avg_max_profit":0.0  # Average of max profits from open positions
 }
 PARAM_DEFAULT={
-    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":350.0,
+    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
     "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
     "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
     # Last 3 strategies limits (within global limit)
@@ -5159,7 +5160,20 @@ def adjust_precision(sym,v,kind="qty"):
     # Additional safety: ensure step is positive
     if step <= 0:
         step = 0.0001
-    return round(round(v/step)*step,12)
+    
+    # Calculate how many steps we have and round to nearest step
+    num_steps = v / step
+    adjusted = round(num_steps) * step
+    adjusted = round(adjusted, 12)
+    
+    # For quantity adjustments, ensure we meet minimum quantity requirement
+    if kind == "qty":
+        min_qty = safe_float(f.get("minQty", 0), 0)
+        # Use minQty if adjusted quantity is below minimum and original value was positive
+        if min_qty > 0 and 0 <= adjusted < min_qty and v > 0:
+            adjusted = min_qty
+    
+    return adjusted
 
 def calc_order_qty(sym,entry,usd):
     # Use safe_float with appropriate defaults to prevent type errors
