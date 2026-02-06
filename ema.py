@@ -43,6 +43,7 @@ REAL_CLOSED_FILE = os.path.join(DATA_DIR,"real_closed.json")
 LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
 BALANCE_HISTORY_FILE = os.path.join(DATA_DIR,"balance_history.json")
 HOURLY_STATS_FILE = os.path.join(DATA_DIR,"hourly_stats.json")
+POSITIONS_TRACKER_FILE = os.path.join(DATA_DIR,"positions_tracker.json")
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -115,6 +116,10 @@ def safe_save(p,d):
             os.replace(tmp,p)
     except Exception as e:
         log(f"[SAVE ERR]{e}")
+
+def save_positions_tracker():
+    """Save REAL_POSITIONS_TRACKER to file for persistence across restarts"""
+    safe_save(POSITIONS_TRACKER_FILE, REAL_POSITIONS_TRACKER)
 
 def now_local_iso():
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
@@ -3115,6 +3120,10 @@ def check_and_log_real_closed_trades():
         # Remove closed positions from tracker
         for sym in closed_symbols:
             REAL_POSITIONS_TRACKER.pop(sym, None)
+        
+        # Save tracker after removing closed positions
+        if closed_symbols:
+            save_positions_tracker()
             
     except Exception as e:
         log(f"[CHECK REAL CLOSED ERR] {e}")
@@ -3426,6 +3435,9 @@ PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
 if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
 STATE=safe_load(STATE_FILE,STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
+
+# Load positions tracker from file (restores strategy tracking after restart)
+REAL_POSITIONS_TRACKER.update(safe_load(POSITIONS_TRACKER_FILE, {}))
 
 # ===================== HOURLY PERFORMANCE TRACKING =====================
 
@@ -3947,9 +3959,10 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
             except Exception as e:
                 log(f"[CLOSE ALL ERR] {sym} {e}")
         
-        # Save closed trades
+        # Save closed trades and tracker
         if closed_symbols:
             safe_save(REAL_CLOSED_FILE, REAL_CLOSED)
+            save_positions_tracker()  # Persist tracker changes
         
         return closed_symbols, closed_positions_info
     except Exception as e:
@@ -4024,6 +4037,7 @@ def reopen_positions_with_tp(closed_positions_info):
                 "conditions": {},
                 "max_profit": 0.0
             }
+            save_positions_tracker()  # Persist tracker to file
             
             # Send notification
             if tp_ok:
@@ -5409,6 +5423,7 @@ def execute_real_trade(sig):
             "conditions": sig.get("conditions", {}),  # 📊 Store strategy condition parameters
             "max_profit": 0.0  # Track maximum profit reached
         }
+        save_positions_tracker()  # Persist tracker to file
         
         return True  # Successfully opened position
 
