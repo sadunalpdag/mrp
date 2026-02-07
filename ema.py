@@ -3302,15 +3302,15 @@ def get_symbol_filters(sym):
         lot=next((f for f in s["filters"] if f["filterType"]=="LOT_SIZE"),{})
         pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
         PRECISION_CACHE[sym]={
-            "stepSize":float(lot.get("stepSize","1")),
-            "minQty":float(lot.get("minQty","0")),
+            "stepSize":float(lot.get("stepSize","0.001")),
+            "minQty":float(lot.get("minQty","0.001")),
             "tickSize":float(pricef.get("tickSize","0.01")),
             "minPrice":float(pricef.get("minPrice","0.00000001")),
             "maxPrice":float(pricef.get("maxPrice","100000000"))
         }
     except Exception as e:
         log(f"[PREC WARN]{sym}{e} - Using fallback precision values")
-        PRECISION_CACHE[sym]={"stepSize":0.0001,"minQty":0,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
+        PRECISION_CACHE[sym]={"stepSize":0.001,"minQty":0.001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
     return PRECISION_CACHE[sym]
 
 def _decimals_from_tick(tick_str):
