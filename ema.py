@@ -3310,6 +3310,8 @@ def get_symbol_filters(sym):
         }
     except Exception as e:
         log(f"[PREC WARN]{sym}{e} - Using fallback precision values")
+        # Note: stepSize (quantity precision) and tickSize (price precision) intentionally differ
+        # stepSize=0.001 allows small BTC quantities, tickSize=0.0001 for finer price precision
         PRECISION_CACHE[sym]={"stepSize":0.001,"minQty":0.001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
     return PRECISION_CACHE[sym]
 
