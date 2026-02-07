@@ -3302,15 +3302,17 @@ def get_symbol_filters(sym):
         lot=next((f for f in s["filters"] if f["filterType"]=="LOT_SIZE"),{})
         pricef=next((f for f in s["filters"] if f["filterType"]=="PRICE_FILTER"),{})
         PRECISION_CACHE[sym]={
-            "stepSize":float(lot.get("stepSize","1")),
-            "minQty":float(lot.get("minQty","0")),
+            "stepSize":float(lot.get("stepSize","0.001")),
+            "minQty":float(lot.get("minQty","0.001")),
             "tickSize":float(pricef.get("tickSize","0.01")),
             "minPrice":float(pricef.get("minPrice","0.00000001")),
             "maxPrice":float(pricef.get("maxPrice","100000000"))
         }
     except Exception as e:
         log(f"[PREC WARN]{sym}{e} - Using fallback precision values")
-        PRECISION_CACHE[sym]={"stepSize":0.0001,"minQty":0,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
+        # Note: stepSize (quantity precision) and tickSize (price precision) intentionally differ
+        # stepSize=0.001 allows small BTC quantities, tickSize=0.0001 for finer price precision
+        PRECISION_CACHE[sym]={"stepSize":0.001,"minQty":0.001,"tickSize":0.0001,"minPrice":0.00000001,"maxPrice":99999999}
     return PRECISION_CACHE[sym]
 
 def _decimals_from_tick(tick_str):
@@ -4044,7 +4046,7 @@ def reopen_positions_with_tp(closed_positions_info):
             if tp_ok:
                 tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
                           else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
-                tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',250.0),1e-12))*100
+                tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',500.0),1e-12))*100
                 tg_send(f"💰 REOPEN {sym} {direction} qty:{qty}\n"
                        f"Entry:{entry_exec:.12f}\n"
                        f"{tp_line} ({tp_pct_show:.3f}%)\n"
@@ -4533,7 +4535,7 @@ def _cmd_status():
                     distance_pct = tp_pct - current_pnl_pct
                 else:
                     # tp_target is in USD, estimate percentage
-                    trade_size = PARAM.get("TRADE_SIZE_USDT", 250.0)
+                    trade_size = PARAM.get("TRADE_SIZE_USDT", 500.0)
                     tp_pct = (tp_target / trade_size) * 100
                     distance_pct = tp_pct - current_pnl_pct
                 
@@ -5200,7 +5202,7 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         f=get_symbol_filters(sym)
         minp=f["minPrice"]; maxp=f["maxPrice"]
         pos_side="LONG" if direction=="UP" else "SHORT"; side="SELL" if direction=="UP" else "BUY"
-        trade_usd=PARAM.get("TRADE_SIZE_USDT",250.0)
+        trade_usd=PARAM.get("TRADE_SIZE_USDT",500.0)
         usd_based = entry_exec>0.2
 
         def try_once(tp_price_candidate, tp_usd_used=None, tp_pct_used=None):
@@ -5401,7 +5403,7 @@ def execute_real_trade(sig):
         if tp_ok:
             tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
                        else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
-            tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',250.0),1e-12))*100
+            tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',500.0),1e-12))*100
             tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
                     f"{ms_line}Power:{pwr:.2f}\n"
                     f"Entry:{entry_exec:.12f}\n"
