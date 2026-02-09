@@ -16,7 +16,7 @@ def safe_float(value, default=0.0):
 def calculate_avg_max_loss(closed_trades):
     """Calculate the average max loss from all closed trades."""
     if not closed_trades:
-        return 0.0
+        return 0.0, 0
     
     max_losses = []
     for trade in closed_trades:
@@ -25,19 +25,17 @@ def calculate_avg_max_loss(closed_trades):
             max_losses.append(max_loss)
     
     if not max_losses:
-        return 0.0
+        return 0.0, 0
     
     avg_max_loss = sum(max_losses) / len(max_losses)
-    return avg_max_loss
+    return avg_max_loss, len(max_losses)
 
 def get_recommended_stop_loss(closed_trades, trade_size=500.0):
     """Calculate recommended stop loss based on historical data."""
-    avg_max_loss = calculate_avg_max_loss(closed_trades)
+    avg_max_loss, sample_size = calculate_avg_max_loss(closed_trades)
     buffer_pct = 20.0
     recommended_sl_usd = abs(avg_max_loss) * (1 + buffer_pct / 100)
     recommended_sl_pct = (recommended_sl_usd / trade_size) * 100 if trade_size > 0 else 0.0
-    
-    sample_size = len([t for t in closed_trades if safe_float(t.get("max_loss", 0.0)) <= 0])
     
     return {
         "avg_max_loss_usd": avg_max_loss,

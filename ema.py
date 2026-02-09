@@ -59,6 +59,7 @@ TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
+LAST_STOPLOSS_NOTIFICATION = 0  # Timestamp of last stop loss recommendation notification
 HOURLY_STATS = {}  # Hourly performance statistics
 getcontext().prec = 28
 
@@ -3565,14 +3566,15 @@ def calculate_avg_max_loss_from_history():
     This helps determine appropriate stop loss levels based on actual trading data.
     
     Returns:
-        float: Average max loss (as negative dollar amount), or 0.0 if no data
+        tuple: (avg_max_loss, sample_size) where avg_max_loss is the average (as negative dollar amount)
+               and sample_size is the number of trades with loss data
     """
     global REAL_CLOSED
     
     try:
         if not REAL_CLOSED:
             log("[STOP LOSS CALC] No closed trades data available")
-            return 0.0
+            return 0.0, 0
         
         # Collect all max_loss values from closed trades
         max_losses = []
@@ -3584,18 +3586,19 @@ def calculate_avg_max_loss_from_history():
         
         if not max_losses:
             log("[STOP LOSS CALC] No max loss data in closed trades")
-            return 0.0
+            return 0.0, 0
         
         # Calculate average
         avg_max_loss = sum(max_losses) / len(max_losses)
+        sample_size = len(max_losses)
         
-        log(f"[STOP LOSS CALC] Analyzed {len(max_losses)} trades, Avg Max Loss: ${avg_max_loss:.2f}")
+        log(f"[STOP LOSS CALC] Analyzed {sample_size} trades, Avg Max Loss: ${avg_max_loss:.2f}")
         
-        return avg_max_loss
+        return avg_max_loss, sample_size
         
     except Exception as e:
         log(f"[STOP LOSS CALC ERR] {e}")
-        return 0.0
+        return 0.0, 0
 
 def get_recommended_stop_loss():
     """
@@ -3613,10 +3616,11 @@ def get_recommended_stop_loss():
             - recommended_sl_pct: Recommended stop loss as percentage
             - trade_size_usdt: Current trade size setting
             - buffer_pct: Safety buffer percentage applied
+            - sample_size: Number of trades analyzed
     """
     try:
-        # Get average max loss from history
-        avg_max_loss = calculate_avg_max_loss_from_history()
+        # Get average max loss from history (optimized to return both avg and count)
+        avg_max_loss, sample_size = calculate_avg_max_loss_from_history()
         
         # Get current trade size
         trade_size = safe_float(PARAM.get("TRADE_SIZE_USDT", 500.0))
@@ -3634,7 +3638,7 @@ def get_recommended_stop_loss():
             "recommended_sl_pct": recommended_sl_pct,
             "trade_size_usdt": trade_size,
             "buffer_pct": buffer_pct,
-            "sample_size": len([t for t in REAL_CLOSED if safe_float(t.get("max_loss", 0.0)) <= 0])
+            "sample_size": sample_size
         }
         
         log(f"[STOP LOSS RECOMMENDATION] "
@@ -5721,12 +5725,15 @@ def main():
             check_and_activate_hourly_analysis()
             
             # 3.6) Calculate and log stop loss recommendations periodically
-            # Log every 100 bar cycles to avoid excessive logging
-            if bar_i % 100 == 0:
+            # Send notification once per day (86400 seconds) to avoid rate limiting
+            global LAST_STOPLOSS_NOTIFICATION
+            now_sec = now_ts_s()
+            if now_sec - LAST_STOPLOSS_NOTIFICATION >= 86400:  # 24 hours
                 sl_recommendation = get_recommended_stop_loss()
                 if sl_recommendation["sample_size"] > 0:
+                    LAST_STOPLOSS_NOTIFICATION = now_sec
                     tg_send(f"📊 Stop Loss Recommendation (based on {sl_recommendation['sample_size']} trades):\n"
-                           f"Average Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}\n"
+                           f"Average Max Loss: ${abs(sl_recommendation['avg_max_loss_usd']):.2f}\n"
                            f"Recommended SL: ${sl_recommendation['recommended_sl_usd']:.2f} "
                            f"({sl_recommendation['recommended_sl_pct']:.2f}% of ${sl_recommendation['trade_size_usdt']:.0f} trade size)\n"
                            f"Buffer: {sl_recommendation['buffer_pct']:.0f}% safety margin")

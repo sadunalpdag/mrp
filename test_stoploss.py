@@ -22,11 +22,12 @@ def calculate_avg_max_loss(closed_trades):
         closed_trades: List of closed trade dictionaries
         
     Returns:
-        float: Average max loss (as negative dollar amount), or 0.0 if no data
+        tuple: (avg_max_loss, sample_size) where avg_max_loss is average (as negative dollar amount)
+               and sample_size is number of trades with loss data
     """
     if not closed_trades:
         print("No closed trades data available")
-        return 0.0
+        return 0.0, 0
     
     # Collect all max_loss values from closed trades
     max_losses = []
@@ -38,15 +39,16 @@ def calculate_avg_max_loss(closed_trades):
     
     if not max_losses:
         print("No max loss data in closed trades")
-        return 0.0
+        return 0.0, 0
     
     # Calculate average
     avg_max_loss = sum(max_losses) / len(max_losses)
+    sample_size = len(max_losses)
     
-    print(f"Analyzed {len(max_losses)} trades with loss data")
+    print(f"Analyzed {sample_size} trades with loss data")
     print(f"Average Max Loss: ${avg_max_loss:.2f}")
     
-    return avg_max_loss
+    return avg_max_loss, sample_size
 
 def get_recommended_stop_loss(closed_trades, trade_size=500.0):
     """
@@ -59,8 +61,8 @@ def get_recommended_stop_loss(closed_trades, trade_size=500.0):
     Returns:
         dict: Dictionary with stop loss recommendations
     """
-    # Get average max loss from history
-    avg_max_loss = calculate_avg_max_loss(closed_trades)
+    # Get average max loss from history (optimized to return both avg and count)
+    avg_max_loss, sample_size = calculate_avg_max_loss(closed_trades)
     
     # Apply safety buffer (20% more conservative than average)
     buffer_pct = 20.0
@@ -68,8 +70,6 @@ def get_recommended_stop_loss(closed_trades, trade_size=500.0):
     
     # Calculate as percentage of trade size
     recommended_sl_pct = (recommended_sl_usd / trade_size) * 100 if trade_size > 0 else 0.0
-    
-    sample_size = len([t for t in closed_trades if safe_float(t.get("max_loss", 0.0)) <= 0])
     
     return {
         "avg_max_loss_usd": avg_max_loss,
