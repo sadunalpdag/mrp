@@ -101,8 +101,8 @@ experienced across all your closed trades, plus a 20% safety buffer.
 The system automatically:
 1. **Tracks max_loss** for all open positions (every 30 seconds)
 2. **Logs max_loss** when positions close
-3. **Calculates recommendations** every 100 bar cycles (~50 minutes)
-4. **Sends Telegram notifications** with recommendations periodically
+3. **Calculates and logs recommendations** in the system log as needed
+4. **Sends Telegram notifications** with recommendations once per 24 hours
 
 ### Log Messages
 
