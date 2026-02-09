@@ -3974,8 +3974,17 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
 
 def reopen_positions_with_tp(closed_positions_info):
     """
+    DEPRECATED: This function is no longer used.
+    
+    Previously reopened positions after cashout, but this was causing losses
+    as it defeated the purpose of cashing out profit and exposed trader to
+    immediate new risk at potentially bad entry points.
+    
+    After cashout, positions are now only opened based on actual trading signals.
+    
+    Original description:
     Reopen positions at current market prices with take profit orders.
-    This is called after cashout to reenter positions with proper TO setup.
+    This was called after cashout to reenter positions with proper TP setup.
     Args:
         closed_positions_info: List of dicts with position info (symbol, direction, pos_side, amount)
     Returns:
@@ -4110,9 +4119,9 @@ def check_profit_target():
                 f"Initial Balance: ${initial_balance:.2f}\n"
                 f"Current Balance: ${current_balance:.2f}\n"
                 f"Profit: ${profit:.2f} (Target: ${profit_target:.2f})\n"
-                f"Closing all positions and reopening at current prices...")
+                f"Closing all positions...")
         
-        # Close all positions and get position info for reopening
+        # Close all positions
         closed_symbols, closed_positions_info = close_all_positions_at_market()
         
         if closed_symbols:
@@ -4124,22 +4133,7 @@ def check_profit_target():
         # Wait for orders to settle
         time.sleep(ORDER_CLOSE_SETTLEMENT_SEC)
         
-        # Reopen positions at current prices with TO (take profit) orders
-        if closed_positions_info:
-            log(f"[CASH OUT] Reopening {len(closed_positions_info)} positions at current prices...")
-            tg_send(f"🔄 Reopening {len(closed_positions_info)} positions at current market prices with TP orders...")
-            
-            reopened_count = reopen_positions_with_tp(closed_positions_info)
-            
-            if reopened_count > 0:
-                tg_send(f"✅ Successfully reopened {reopened_count} positions with take profit orders")
-                log(f"[CASH OUT] Reopened {reopened_count} positions")
-            else:
-                tg_send(f"⚠️ Failed to reopen positions")
-                log(f"[CASH OUT] Failed to reopen any positions")
-        
-        # Get new balance after closing and reopening
-        time.sleep(ORDER_REOPEN_SETTLEMENT_SEC)  # Wait for reopen orders to settle
+        # Get new balance after closing all positions
         new_balance = get_account_balance()
         if new_balance:
             STATE["initial_margin_balance"] = new_balance
@@ -4148,7 +4142,7 @@ def check_profit_target():
             tg_send(f"✅ Cash out complete!\n"
                     f"New margin balance: ${new_balance:.2f}\n"
                     f"Realized profit: ${final_profit:.2f}\n"
-                    f"Positions reopened: {reopened_count}/{len(closed_positions_info)}")
+                    f"All positions closed. New trades will be based on signals.")
             log(f"[CASH OUT] Complete. New balance: ${new_balance:.2f}, Realized: ${final_profit:.2f}")
 
 def get_recent_closed_position_stats(now):
