@@ -3102,7 +3102,8 @@ def check_and_log_real_closed_trades():
                     "tp_target": pos_info.get("tp_target"),
                     "market_state": pos_info.get("market_state", ""),
                     "conditions": pos_info.get("conditions", {}),  # 📊 Include strategy condition parameters
-                    "max_profit": pos_info.get("max_profit", 0.0)  # Include maximum profit reached
+                    "max_profit": pos_info.get("max_profit", 0.0),  # Include maximum profit reached
+                    "max_loss": pos_info.get("max_loss", 0.0)  # Include maximum loss (minimum unrealized PnL)
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -3114,8 +3115,9 @@ def check_and_log_real_closed_trades():
                 pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
                 exit_str = f"{exit_price}" if exit_price is not None else "N/A"
                 max_profit_str = f"{pos_info.get('max_profit', 0.0):.2f}"
+                max_loss_str = f"{pos_info.get('max_loss', 0.0):.2f}"
                 log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
-                    f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str}")
+                    f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str} MaxLoss:${max_loss_str}")
         
         # Remove closed positions from tracker
         for sym in closed_symbols:
@@ -3130,8 +3132,8 @@ def check_and_log_real_closed_trades():
 
 def update_max_profit_tracking():
     """
-    Update max profit tracking for all open positions.
-    Tracks the maximum profit value reached by each unclosed trade.
+    Update max profit and max loss tracking for all open positions.
+    Tracks the maximum profit and maximum loss (minimum unrealized PnL) reached by each unclosed trade.
     Returns the average of all max profits.
     Throttled to run max once per 30 seconds to avoid rate limiting.
     """
@@ -3153,6 +3155,7 @@ def update_max_profit_tracking():
             return STATE.get("avg_max_profit", 0.0)
         
         total_max_profit = 0.0
+        total_max_loss = 0.0
         position_count = 0
         
         for p in acc:
@@ -3167,25 +3170,33 @@ def update_max_profit_tracking():
             # Get position info
             pos_info = REAL_POSITIONS_TRACKER[sym]
             
-            # Get current unrealized profit
-            unrealized_pnl = float(p.get("unRealizedProfit", 0))
+            # Get current unrealized profit (use safe_float to prevent type errors)
+            unrealized_pnl = safe_float(p.get("unRealizedProfit", 0))
             
             # Update max profit if current profit is higher
-            current_max_profit = pos_info.get("max_profit", 0.0)
+            current_max_profit = safe_float(pos_info.get("max_profit", 0.0))
             if unrealized_pnl > current_max_profit:
                 REAL_POSITIONS_TRACKER[sym]["max_profit"] = unrealized_pnl
                 current_max_profit = unrealized_pnl
             
-            # Add to total for average calculation
+            # Update max loss if current loss is lower (more negative)
+            current_max_loss = safe_float(pos_info.get("max_loss", 0.0))
+            if unrealized_pnl < current_max_loss:
+                REAL_POSITIONS_TRACKER[sym]["max_loss"] = unrealized_pnl
+                current_max_loss = unrealized_pnl
+            
+            # Add to totals for average calculation
             total_max_profit += current_max_profit
+            total_max_loss += current_max_loss
             position_count += 1
         
-        # Calculate average max profit
+        # Calculate averages
         avg_max_profit = total_max_profit / position_count if position_count > 0 else 0.0
+        avg_max_loss = total_max_loss / position_count if position_count > 0 else 0.0
         
-        # Log the average if there are open positions
+        # Log the averages if there are open positions
         if position_count > 0:
-            log(f"[MAX PROFIT] Open positions: {position_count}, Avg max profit: ${avg_max_profit:.2f}")
+            log(f"[MAX PROFIT/LOSS] Open positions: {position_count}, Avg max profit: ${avg_max_profit:.2f}, Avg max loss: ${avg_max_loss:.2f}")
         
         return avg_max_profit
         
@@ -3547,6 +3558,102 @@ def update_hourly_stats_from_closed_trade(closed_trade):
         
     except Exception as e:
         log(f"[HOURLY STATS ERR] {e}")
+
+def calculate_avg_max_loss_from_history():
+    """
+    Calculate the average max loss from all closed trades in history.
+    This helps determine appropriate stop loss levels based on actual trading data.
+    
+    Returns:
+        float: Average max loss (as negative dollar amount), or 0.0 if no data
+    """
+    global REAL_CLOSED
+    
+    try:
+        if not REAL_CLOSED:
+            log("[STOP LOSS CALC] No closed trades data available")
+            return 0.0
+        
+        # Collect all max_loss values from closed trades
+        max_losses = []
+        for trade in REAL_CLOSED:
+            max_loss = safe_float(trade.get("max_loss", 0.0))
+            # Only include actual losses (negative values or zero)
+            if max_loss <= 0:
+                max_losses.append(max_loss)
+        
+        if not max_losses:
+            log("[STOP LOSS CALC] No max loss data in closed trades")
+            return 0.0
+        
+        # Calculate average
+        avg_max_loss = sum(max_losses) / len(max_losses)
+        
+        log(f"[STOP LOSS CALC] Analyzed {len(max_losses)} trades, Avg Max Loss: ${avg_max_loss:.2f}")
+        
+        return avg_max_loss
+        
+    except Exception as e:
+        log(f"[STOP LOSS CALC ERR] {e}")
+        return 0.0
+
+def get_recommended_stop_loss():
+    """
+    Calculate recommended stop loss percentage based on historical max loss data.
+    
+    The recommended stop loss is calculated by:
+    1. Getting the average max loss from all closed trades
+    2. Adding a safety buffer (e.g., 20% more than average)
+    3. Converting to a percentage of trade size
+    
+    Returns:
+        dict: Dictionary with stop loss recommendations including:
+            - avg_max_loss_usd: Average max loss in USD
+            - recommended_sl_usd: Recommended stop loss in USD (with buffer)
+            - recommended_sl_pct: Recommended stop loss as percentage
+            - trade_size_usdt: Current trade size setting
+            - buffer_pct: Safety buffer percentage applied
+    """
+    try:
+        # Get average max loss from history
+        avg_max_loss = calculate_avg_max_loss_from_history()
+        
+        # Get current trade size
+        trade_size = safe_float(PARAM.get("TRADE_SIZE_USDT", 500.0))
+        
+        # Apply safety buffer (20% more conservative than average)
+        buffer_pct = 20.0
+        recommended_sl_usd = abs(avg_max_loss) * (1 + buffer_pct / 100)
+        
+        # Calculate as percentage of trade size
+        recommended_sl_pct = (recommended_sl_usd / trade_size) * 100 if trade_size > 0 else 0.0
+        
+        result = {
+            "avg_max_loss_usd": avg_max_loss,
+            "recommended_sl_usd": recommended_sl_usd,
+            "recommended_sl_pct": recommended_sl_pct,
+            "trade_size_usdt": trade_size,
+            "buffer_pct": buffer_pct,
+            "sample_size": len([t for t in REAL_CLOSED if safe_float(t.get("max_loss", 0.0)) <= 0])
+        }
+        
+        log(f"[STOP LOSS RECOMMENDATION] "
+            f"Based on {result['sample_size']} trades: "
+            f"Avg Max Loss: ${avg_max_loss:.2f}, "
+            f"Recommended SL: ${recommended_sl_usd:.2f} ({recommended_sl_pct:.2f}% of trade size)")
+        
+        return result
+        
+    except Exception as e:
+        log(f"[STOP LOSS RECOMMENDATION ERR] {e}")
+        return {
+            "avg_max_loss_usd": 0.0,
+            "recommended_sl_usd": 0.0,
+            "recommended_sl_pct": 0.0,
+            "trade_size_usdt": safe_float(PARAM.get("TRADE_SIZE_USDT", 500.0)),
+            "buffer_pct": 20.0,
+            "sample_size": 0
+        }
 
 def check_and_activate_hourly_analysis():
     """
@@ -4047,7 +4154,8 @@ def reopen_positions_with_tp(closed_positions_info):
                 "tp_target": tp_usd_used or tp_pct_used,
                 "market_state": "",
                 "conditions": {},
-                "max_profit": 0.0
+                "max_profit": 0.0,
+                "max_loss": 0.0
             }
             save_positions_tracker()  # Persist tracker to file
             
@@ -5095,6 +5203,37 @@ def _cmd_forcehourlyanalysis():
         tg_send(f"❌ /forcehourlyanalysis error: {e}")
         log(f"[FORCEHOURLYANALYSIS ERR] {e}")
 
+def _cmd_stoploss():
+    """Show stop loss recommendation based on historical max loss data"""
+    try:
+        sl_recommendation = get_recommended_stop_loss()
+        
+        if sl_recommendation["sample_size"] == 0:
+            tg_send("📊 STOP LOSS RECOMMENDATION\n"
+                   "━━━━━━━━━━━━━━━━\n"
+                   "❌ No closed trades data available yet.\n"
+                   "Start trading to collect data for stop loss calculation.")
+            return
+        
+        msg = f"📊 STOP LOSS RECOMMENDATION\n"
+        msg += f"━━━━━━━━━━━━━━━━\n"
+        msg += f"📈 Analysis based on {sl_recommendation['sample_size']} closed trades\n\n"
+        msg += f"💰 Trade Size: ${sl_recommendation['trade_size_usdt']:.0f}\n"
+        msg += f"📉 Avg Max Loss: ${abs(sl_recommendation['avg_max_loss_usd']):.2f}\n"
+        msg += f"🛡️ Safety Buffer: {sl_recommendation['buffer_pct']:.0f}%\n\n"
+        msg += f"✅ RECOMMENDED STOP LOSS:\n"
+        msg += f"   💵 ${sl_recommendation['recommended_sl_usd']:.2f}\n"
+        msg += f"   📊 {sl_recommendation['recommended_sl_pct']:.2f}% of trade size\n\n"
+        msg += f"ℹ️ This recommendation is based on the average maximum loss\n"
+        msg += f"experienced across all your closed trades, plus a {sl_recommendation['buffer_pct']:.0f}% safety buffer."
+        
+        tg_send(msg)
+        log(f"[STOPLOSS CMD] Recommendation sent to Telegram")
+        
+    except Exception as e:
+        tg_send(f"❌ /stoploss error: {e}")
+        log(f"[STOPLOSS CMD ERR] {e}")
+
 def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
@@ -5125,6 +5264,7 @@ def check_telegram_commands():
         elif cmd=="/blockhour": _cmd_blockhour(args)
         elif cmd=="/resethourlystats": _cmd_resethourlystats()
         elif cmd=="/forcehourlyanalysis": _cmd_forcehourlyanalysis()
+        elif cmd=="/stoploss": _cmd_stoploss()
         else:
             tg_send("📋 AVAILABLE COMMANDS:\n"
                     "━━━━━━━━━━━━━━━━\n"
@@ -5141,6 +5281,7 @@ def check_telegram_commands():
                     "/blockhour <hour> [block|unblock] - Block/unblock hour\n"
                     "/resethourlystats - Reset hourly data\n"
                     "/forcehourlyanalysis - Force activate analysis\n"
+                    "/stoploss - Show stop loss recommendation\n"
                     "/set KEY VALUE - Set parameter\n"
                     "/report - Generate report\n"
                     "/export - Export all data")
@@ -5431,7 +5572,8 @@ def execute_real_trade(sig):
             "tp_target": tp_usd_used or tp_pct_used,
             "market_state": sig.get("market_state", ""),
             "conditions": sig.get("conditions", {}),  # 📊 Store strategy condition parameters
-            "max_profit": 0.0  # Track maximum profit reached
+            "max_profit": 0.0,  # Track maximum profit reached
+            "max_loss": 0.0  # Track maximum loss (minimum unrealized PnL)
         }
         save_positions_tracker()  # Persist tracker to file
         
@@ -5577,6 +5719,17 @@ def main():
             
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
+            
+            # 3.6) Calculate and log stop loss recommendations periodically
+            # Log every 100 bar cycles to avoid excessive logging
+            if bar_i % 100 == 0:
+                sl_recommendation = get_recommended_stop_loss()
+                if sl_recommendation["sample_size"] > 0:
+                    tg_send(f"📊 Stop Loss Recommendation (based on {sl_recommendation['sample_size']} trades):\n"
+                           f"Average Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}\n"
+                           f"Recommended SL: ${sl_recommendation['recommended_sl_usd']:.2f} "
+                           f"({sl_recommendation['recommended_sl_pct']:.2f}% of ${sl_recommendation['trade_size_usdt']:.0f} trade size)\n"
+                           f"Buffer: {sl_recommendation['buffer_pct']:.0f}% safety margin")
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
