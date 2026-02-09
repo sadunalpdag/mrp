@@ -3984,7 +3984,7 @@ def reopen_positions_with_tp(closed_positions_info):
     
     Original description:
     Reopen positions at current market prices with take profit orders.
-    This was called after cashout to reenter positions with proper TO setup.
+    This was called after cashout to reenter positions with proper TP setup.
     Args:
         closed_positions_info: List of dicts with position info (symbol, direction, pos_side, amount)
     Returns:
