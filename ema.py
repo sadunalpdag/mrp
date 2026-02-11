@@ -3293,12 +3293,15 @@ def cancel_all_algo_orders(sym):
             # Response should contain cancelled order count or confirmation
             if isinstance(algo_cancel_res, dict):
                 # Log successful cancellation of algo orders
-                log(f"[CANCEL ALGO ORDERS] {sym} cancelled algo orders via algoOrders endpoint")
-                result["cancelled"] += 1
+                log(f"[CANCEL ALGO ORDERS] {sym} cancelled algo orders via algoOrders endpoint: {algo_cancel_res}")
         except Exception as algo_err:
             # Don't fail if there are no algo orders to cancel (expected in many cases)
             err_str = str(algo_err)
-            if "-2022" not in err_str and "No algo order" not in err_str:
+            # Common error codes when no algo orders exist: -2022, or responses indicating no orders
+            # We only log warnings for unexpected errors
+            if ("-2022" not in err_str and 
+                "No algo order" not in err_str and
+                "no open algo order" not in err_str.lower()):
                 log(f"[CANCEL ALGO ORDERS WARN] {sym} {algo_err}")
         
         if result["cancelled"] > 0:
