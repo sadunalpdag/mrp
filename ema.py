@@ -3281,6 +3281,26 @@ def cancel_all_algo_orders(sym):
                     result["failed"] += 1
                     log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
         
+        # Also cancel algo orders placed via algoOrder endpoint (required for TAKE_PROFIT_MARKET with closePosition)
+        # These orders don't appear in openOrders and need special handling
+        try:
+            algo_payload = {
+                "symbol": sym,
+                "timestamp": now_ts_ms()
+            }
+            # Cancel all algo orders for this symbol using DELETE /fapi/v1/algoOrders
+            algo_cancel_res = _signed_request("DELETE", "/fapi/v1/algoOrders", algo_payload)
+            # Response should contain cancelled order count or confirmation
+            if isinstance(algo_cancel_res, dict):
+                # Log successful cancellation of algo orders
+                log(f"[CANCEL ALGO ORDERS] {sym} cancelled algo orders via algoOrders endpoint")
+                result["cancelled"] += 1
+        except Exception as algo_err:
+            # Don't fail if there are no algo orders to cancel (expected in many cases)
+            err_str = str(algo_err)
+            if "-2022" not in err_str and "No algo order" not in err_str:
+                log(f"[CANCEL ALGO ORDERS WARN] {sym} {algo_err}")
+        
         if result["cancelled"] > 0:
             log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
         
@@ -3876,6 +3896,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                         "type": "MARKET",
                                         "quantity": f"{remaining_qty_formatted}",
                                         "positionSide": pos_side,
+                                        "reduceOnly": "true",  # Ensure order only reduces existing position, prevents error -2022
                                         "timestamp": now_ts_ms()
                                     }
                                     try:
