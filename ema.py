@@ -3257,14 +3257,14 @@ def cancel_all_algo_orders(sym):
     result = {"success": False, "cancelled": 0, "failed": 0}
     
     try:
-        # Get all open orders for the symbol
+        # Get all open orders for the symbol from regular order API
         payload = {
             "symbol": sym,
             "timestamp": now_ts_ms()
         }
         open_orders = _signed_request("GET", "/fapi/v1/openOrders", payload)
         
-        # Cancel each algo order
+        # Cancel each algo order from regular order API
         for order in open_orders:
             order_type = order.get("type")
             # Cancel stop loss and take profit orders
@@ -3281,8 +3281,35 @@ def cancel_all_algo_orders(sym):
                     result["failed"] += 1
                     log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
         
+        # Also get and cancel algo orders from the algo order API endpoint
+        # These are orders placed via /fapi/v1/algoOrder (e.g., TAKE_PROFIT_MARKET with closePosition)
+        try:
+            algo_payload = {
+                "symbol": sym,
+                "timestamp": now_ts_ms()
+            }
+            open_algo_orders = _signed_request("GET", "/fapi/v1/openAlgoOrders", algo_payload)
+            
+            # Cancel each algo order using the algo order DELETE endpoint
+            for algo_order in open_algo_orders:
+                try:
+                    # Use algoId for algo orders (not orderId)
+                    cancel_algo_payload = {
+                        "symbol": sym,
+                        "algoId": algo_order["algoId"],
+                        "timestamp": now_ts_ms()
+                    }
+                    _signed_request("DELETE", "/fapi/v1/algoOrder", cancel_algo_payload)
+                    result["cancelled"] += 1
+                except Exception as cancel_algo_err:
+                    result["failed"] += 1
+                    log(f"[CANCEL ALGO ORDER WARN] {sym} algoId={algo_order.get('algoId')} {cancel_algo_err}")
+        except Exception as algo_err:
+            # Log but don't fail if algo order API has issues
+            log(f"[CANCEL ALGO ORDERS WARN] {sym} Error querying algo orders: {algo_err}")
+        
         if result["cancelled"] > 0:
-            log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
+            log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} order(s)")
         
         if result["failed"] > 0:
             log(f"[CANCEL ORDERS] {sym} failed to cancel {result['failed']} order(s)")
@@ -3805,10 +3832,12 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
                     # Check if error is -2021 "Order would immediately trigger" or 
+                    # -2022 "ReduceOnly Order is rejected" or
                     # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
                     # -4509 "Time in Force (TIF) GTE can only be used with open positions"
                     err_str = str(tp_err)
                     if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
+                        "-2022" in err_str or "ReduceOnly" in err_str or
                         "-4130" in err_str or "-4509" in err_str):
                         # Fallback: close position with LIMIT order (IOC) for price protection
                         log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
