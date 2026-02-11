@@ -3281,7 +3281,7 @@ def cancel_all_algo_orders(sym):
                     result["cancelled"] += 1
                 except Exception as cancel_err:
                     result["failed"] += 1
-                    log(f"[CANCEL ALGO ORDER WARN] {sym} algoId={order.get('algoId')} {cancel_err}")
+                    log(f"[CANCEL ALGO ORDER WARN] {sym} algoId={order['algoId']} {cancel_err}")
         except Exception as algo_err:
             # If algoOpenOrders endpoint fails, log but continue to try regular orders
             log(f"[CANCEL ALGO ORDERS WARN] {sym} Failed to query algo orders: {algo_err}")
