@@ -3251,38 +3251,65 @@ def cancel_all_algo_orders(sym):
     Cancel all open algo orders (TAKE_PROFIT_MARKET, STOP_MARKET, etc.) for a symbol.
     This is necessary before closing positions to avoid error -4130.
     
+    Handles both:
+    - Algo orders created with /fapi/v1/algoOrder (cancelled using algoId)
+    - Regular conditional orders created with /fapi/v1/order (cancelled using orderId)
+    
     Returns:
         dict: {"success": bool, "cancelled": int, "failed": int}
     """
     result = {"success": False, "cancelled": 0, "failed": 0}
     
     try:
-        # Get all open orders for the symbol
         payload = {
             "symbol": sym,
             "timestamp": now_ts_ms()
         }
-        open_orders = _signed_request("GET", "/fapi/v1/openOrders", payload)
         
-        # Cancel each algo order
-        for order in open_orders:
-            order_type = order.get("type")
-            # Cancel stop loss and take profit orders
-            if order_type in ALGO_ORDER_TYPES:
+        # First, cancel algo orders created with /fapi/v1/algoOrder endpoint
+        # These must be cancelled using the algoOrder endpoint with algoId
+        try:
+            algo_orders = _signed_request("GET", "/fapi/v1/algoOpenOrders", payload)
+            for order in algo_orders:
                 try:
                     cancel_payload = {
                         "symbol": sym,
-                        "orderId": order["orderId"],
+                        "algoId": order["algoId"],
                         "timestamp": now_ts_ms()
                     }
-                    _signed_request("DELETE", "/fapi/v1/order", cancel_payload)
+                    _signed_request("DELETE", "/fapi/v1/algoOrder", cancel_payload)
                     result["cancelled"] += 1
                 except Exception as cancel_err:
                     result["failed"] += 1
-                    log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
+                    log(f"[CANCEL ALGO ORDER WARN] {sym} algoId={order.get('algoId')} {cancel_err}")
+        except Exception as algo_err:
+            # If algoOpenOrders endpoint fails, log but continue to try regular orders
+            log(f"[CANCEL ALGO ORDERS WARN] {sym} Failed to query algo orders: {algo_err}")
+        
+        # Second, cancel regular conditional orders from /fapi/v1/openOrders
+        # These are cancelled using the regular order endpoint with orderId
+        try:
+            open_orders = _signed_request("GET", "/fapi/v1/openOrders", payload)
+            for order in open_orders:
+                order_type = order.get("type")
+                # Cancel stop loss and take profit orders
+                if order_type in ALGO_ORDER_TYPES:
+                    try:
+                        cancel_payload = {
+                            "symbol": sym,
+                            "orderId": order["orderId"],
+                            "timestamp": now_ts_ms()
+                        }
+                        _signed_request("DELETE", "/fapi/v1/order", cancel_payload)
+                        result["cancelled"] += 1
+                    except Exception as cancel_err:
+                        result["failed"] += 1
+                        log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
+        except Exception as order_err:
+            log(f"[CANCEL ORDERS WARN] {sym} Failed to query regular orders: {order_err}")
         
         if result["cancelled"] > 0:
-            log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
+            log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} order(s)")
         
         if result["failed"] > 0:
             log(f"[CANCEL ORDERS] {sym} failed to cancel {result['failed']} order(s)")
@@ -3805,10 +3832,12 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
                     # Check if error is -2021 "Order would immediately trigger" or 
+                    # -2022 "ReduceOnly Order is rejected" or
                     # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
                     # -4509 "Time in Force (TIF) GTE can only be used with open positions"
                     err_str = str(tp_err)
                     if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
+                        "-2022" in err_str or "reduceonly" in err_str.lower() or
                         "-4130" in err_str or "-4509" in err_str):
                         # Fallback: close position with LIMIT order (IOC) for price protection
                         log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
