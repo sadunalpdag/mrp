@@ -3281,6 +3281,29 @@ def cancel_all_algo_orders(sym):
                     result["failed"] += 1
                     log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
         
+        # Also cancel algo orders placed via algoOrder endpoint (required for TAKE_PROFIT_MARKET with closePosition)
+        # These orders don't appear in openOrders and need special handling
+        try:
+            algo_payload = {
+                "symbol": sym,
+                "timestamp": now_ts_ms()
+            }
+            # Cancel all algo orders for this symbol using DELETE /fapi/v1/algoOrders
+            algo_cancel_res = _signed_request("DELETE", "/fapi/v1/algoOrders", algo_payload)
+            # Response should contain cancelled order count or confirmation
+            if isinstance(algo_cancel_res, dict):
+                # Log successful cancellation of algo orders
+                log(f"[CANCEL ALGO ORDERS] {sym} cancelled algo orders via algoOrders endpoint: {algo_cancel_res}")
+        except Exception as algo_err:
+            # Don't fail if there are no algo orders to cancel (expected in many cases)
+            err_str = str(algo_err)
+            # Common error codes when no algo orders exist: -2022, or responses indicating no orders
+            # We only log warnings for unexpected errors
+            if ("-2022" not in err_str and 
+                "No algo order" not in err_str and
+                "no open algo order" not in err_str.lower()):
+                log(f"[CANCEL ALGO ORDERS WARN] {sym} {algo_err}")
+        
         if result["cancelled"] > 0:
             log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
         
@@ -3804,14 +3827,51 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     })
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
-                    # Check if error is -2021 "Order would immediately trigger" or 
-                    # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
-                    # -4509 "Time in Force (TIF) GTE can only be used with open positions"
+                    # Error handling for TAKE_PROFIT_MARKET algo order failures
+                    # -2021: "Order would immediately trigger" - Price is favorable, should use MARKET order
+                    # -4130: "An open stop or take profit order with GTE and closePosition in the direction is existing"
+                    # -4509: "Time in Force (TIF) GTE can only be used with open positions"
                     err_str = str(tp_err)
-                    if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
-                        "-4130" in err_str or "-4509" in err_str):
-                        # Fallback: close position with LIMIT order (IOC) for price protection
-                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
+                    
+                    # Check if error is -2021 (favorable price condition)
+                    if "-2021" in err_str or "would immediately trigger" in err_str.lower():
+                        # Error -2021 means price has already reached/passed target - this is FAVORABLE
+                        # Use MARKET order immediately to capture the best available price
+                        log(f"[CLOSE ALL] {sym} TP order would trigger immediately (favorable price), using MARKET order. Error: {tp_err}")
+                        
+                        amt_formatted = adjust_precision(sym, amt, "qty")
+                        
+                        # Use MARKET order to close at best available price
+                        market_payload = {
+                            "symbol": sym,
+                            "side": side,
+                            "type": "MARKET",
+                            "quantity": f"{amt_formatted}",
+                            "positionSide": pos_side,
+                            "reduceOnly": "true",
+                            "timestamp": now_ts_ms()
+                        }
+                        
+                        try:
+                            res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order at favorable price")
+                            
+                            closed_symbols.append(sym)
+                            # Store position info for reopening
+                            direction = "UP" if pos_side == "LONG" else "DOWN"
+                            closed_positions_info.append({
+                                "symbol": sym,
+                                "direction": direction,
+                                "pos_side": pos_side,
+                                "amount": amt
+                            })
+                        except Exception as market_err:
+                            log(f"[CLOSE ALL ERROR] {sym} MARKET order failed: {market_err}")
+                            raise
+                    
+                    elif "-4130" in err_str or "-4509" in err_str:
+                        # Errors -4130/-4509 are order conflicts, use LIMIT order approach
+                        log(f"[CLOSE ALL] {sym} TP/Algo order failed due to order conflict, using LIMIT order with IOC. Error: {tp_err}")
                         
                         # Calculate limit price with buffer to avoid slippage losses
                         # For LONG positions (SELL to close): set price slightly lower (acceptable loss)
@@ -3876,6 +3936,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                         "type": "MARKET",
                                         "quantity": f"{remaining_qty_formatted}",
                                         "positionSide": pos_side,
+                                        "reduceOnly": "true",  # Ensure order only reduces existing position, prevents error -2022
                                         "timestamp": now_ts_ms()
                                     }
                                     try:
