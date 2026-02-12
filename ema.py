@@ -3804,8 +3804,9 @@ def update_directional_limits():
             amt=float(p["positionAmt"]); sym=p["symbol"]
             if amt>0: 
                 live["long"][sym]=amt
-                # Check strategy type from position tracker
+                # Only count positions that are tracked
                 if sym in REAL_POSITIONS_TRACKER:
+                    live["long_count"] += 1
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
                     if pos_kind == "CEST":
                         live["cest_long_count"] += 1
@@ -3817,8 +3818,9 @@ def update_directional_limits():
                         live["fib_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
-                # Check strategy type from position tracker
+                # Only count positions that are tracked
                 if sym in REAL_POSITIONS_TRACKER:
+                    live["short_count"] += 1
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
                     if pos_kind == "CEST":
                         live["cest_short_count"] += 1
@@ -3828,8 +3830,6 @@ def update_directional_limits():
                         live["stoch_rsi_short_count"] += 1
                     elif pos_kind == "FIBONACCI_RETRACEMENT":
                         live["fib_short_count"] += 1
-        live["long_count"]=len(live["long"])
-        live["short_count"]=len(live["short"])
     except Exception as e:
         log(f"[FETCH POS ERR]{e}")
 
