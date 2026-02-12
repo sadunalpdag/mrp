@@ -5295,6 +5295,37 @@ def _cmd_forcehourlyanalysis():
         tg_send(f"❌ /forcehourlyanalysis error: {e}")
         log(f"[FORCEHOURLYANALYSIS ERR] {e}")
 
+def _cmd_stoploss():
+    """Show stop loss recommendation based on historical max loss data"""
+    try:
+        sl_recommendation = get_recommended_stop_loss()
+        
+        if sl_recommendation["sample_size"] == 0:
+            tg_send("📊 STOP LOSS RECOMMENDATION\n"
+                   "━━━━━━━━━━━━━━━━\n"
+                   "❌ No closed trades data available yet.\n"
+                   "Start trading to collect data for stop loss calculation.")
+            return
+        
+        msg = f"📊 STOP LOSS RECOMMENDATION\n"
+        msg += f"━━━━━━━━━━━━━━━━\n"
+        msg += f"📈 Analysis based on {sl_recommendation['sample_size']} closed trades\n\n"
+        msg += f"💰 Trade Size: ${sl_recommendation['trade_size_usdt']:.0f}\n"
+        msg += f"📉 Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}\n\n"
+        msg += f"🎯 RECOMMENDED STOP LOSS:\n"
+        msg += f"   ${abs(sl_recommendation['recommended_sl_usd']):.2f}\n"
+        msg += f"   ({sl_recommendation['recommended_sl_pct']:.2f}% of trade size)\n\n"
+        msg += f"🛡️ Safety Buffer: {sl_recommendation['buffer_pct']:.0f}%\n\n"
+        msg += f"ℹ️ This recommendation is based on historical\n"
+        msg += f"   maximum drawdown data from your closed trades."
+        
+        tg_send(msg)
+        log(f"[STOPLOSS CMD] Recommendation sent: SL=${abs(sl_recommendation['recommended_sl_usd']):.2f}")
+        
+    except Exception as e:
+        tg_send(f"❌ /stoploss error: {e}")
+        log(f"[STOPLOSS CMD ERR] {e}")
+
 def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
@@ -5325,6 +5356,7 @@ def check_telegram_commands():
         elif cmd=="/blockhour": _cmd_blockhour(args)
         elif cmd=="/resethourlystats": _cmd_resethourlystats()
         elif cmd=="/forcehourlyanalysis": _cmd_forcehourlyanalysis()
+        elif cmd=="/stoploss": _cmd_stoploss()
         else:
             tg_send("📋 AVAILABLE COMMANDS:\n"
                     "━━━━━━━━━━━━━━━━\n"
@@ -5341,6 +5373,7 @@ def check_telegram_commands():
                     "/blockhour <hour> [block|unblock] - Block/unblock hour\n"
                     "/resethourlystats - Reset hourly data\n"
                     "/forcehourlyanalysis - Force activate analysis\n"
+                    "/stoploss - Show stop loss recommendation\n"
                     "/set KEY VALUE - Set parameter\n"
                     "/report - Generate report\n"
                     "/export - Export all data")
@@ -5778,6 +5811,16 @@ def main():
             
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
+            
+            # 3.6) Calculate and log stop loss recommendations periodically
+            # Log every 100 bar cycles to avoid excessive logging
+            if bar_i % 100 == 0:
+                sl_recommendation = get_recommended_stop_loss()
+                if sl_recommendation["sample_size"] > 0:
+                    log(f"[STOP LOSS RECOMMENDATION] Based on {sl_recommendation['sample_size']} trades: "
+                        f"Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}, "
+                        f"Recommended SL: ${abs(sl_recommendation['recommended_sl_usd']):.2f} "
+                        f"({sl_recommendation['recommended_sl_pct']:.2f}% of ${sl_recommendation['trade_size_usdt']:.0f} trade size)")
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
