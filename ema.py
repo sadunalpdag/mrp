@@ -23,7 +23,7 @@ import numpy as np
 #       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
 #  - NEW: 3 advanced technical strategies added for better performance
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
-#  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
+#  - STRICT LIMITS: ALL strategies limited to 3 buy / 3 sell
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
 #  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
@@ -3439,15 +3439,15 @@ STATE_DEFAULT={
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
-    "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
-    "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
+    "MAX_BUY":3, "MAX_SELL":3,  # Global limits for all strategies combined - STRICT RULE
+    "MAX_CEST_BUY":3, "MAX_CEST_SELL":3,  # CEST-specific limits (within global limit)
     # Last 3 strategies limits (within global limit)
-    "MAX_BB_BUY":5, "MAX_BB_SELL":5,  # Bollinger Bands strategy limits
-    "MAX_STOCH_RSI_BUY":5, "MAX_STOCH_RSI_SELL":5,  # Stochastic RSI strategy limits
-    "MAX_FIB_BUY":5, "MAX_FIB_SELL":5,  # Fibonacci retracement strategy limits
+    "MAX_BB_BUY":3, "MAX_BB_SELL":3,  # Bollinger Bands strategy limits
+    "MAX_STOCH_RSI_BUY":3, "MAX_STOCH_RSI_SELL":3,  # Stochastic RSI strategy limits
+    "MAX_FIB_BUY":3, "MAX_FIB_SELL":3,  # Fibonacci retracement strategy limits
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
-    "PROFIT_TARGET_USD":20.0,
+    "PROFIT_TARGET_USD":2000.0,
     "MIN_POWER_THRESHOLD":DEFAULT_MIN_POWER_THRESHOLD,  # Minimum power score to execute trades (power scale: ~50-100, higher = stronger signal)
     # Strategy enable/disable flags (all enabled by default)
     "ENABLE_MACD": True,
@@ -3835,14 +3835,14 @@ def update_directional_limits():
 
     STATE["long_blocked"]  = (live["long_count"]  >= PARAM["MAX_BUY"])
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
-    STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
-    STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
-    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 5))
-    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 5))
-    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
-    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 5))
-    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 5))
-    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 5))
+    STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 3))
+    STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 3))
+    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 3))
+    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 3))
+    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
+    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
+    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 3))
+    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 3))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -4451,7 +4451,7 @@ def send_hourly_margin_log():
             return
         
         # Get profit target
-        profit_target = PARAM.get("PROFIT_TARGET_USD", 60.0)
+        profit_target = PARAM.get("PROFIT_TARGET_USD", 2000.0)
         
         # Calculate current profit
         current_profit = current_balance - initial_balance
@@ -4549,8 +4549,8 @@ def send_hourly_margin_log():
                    f"📈 Progress: {progress_pct:.1f}%\n"
                    f"💵 Unrealized PnL: ${unrealized_pnl:.2f}\n"
                    f"📌 Open Positions: {open_positions}\n"
-                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
-                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 3)}\n"
+                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 3)}\n"
                    f"🔝 Avg Max Profit: ${avg_max_profit:.2f}")
             
             # Add position target info when all positions are closed
@@ -4578,8 +4578,8 @@ def send_hourly_margin_log():
                    f"📊 Excess: ${-remaining:.2f}\n"
                    f"💵 Unrealized PnL: ${unrealized_pnl:.2f}\n"
                    f"📌 Open Positions: {open_positions}\n"
-                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
-                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 3)}\n"
+                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 3)}\n"
                    f"🔝 Avg Max Profit: ${avg_max_profit:.2f}\n"
                    f"🕐 {now_local_iso()}")
             
@@ -4793,8 +4793,8 @@ def _cmd_status():
         f"📊 STATUS bar:{STATE.get('bar_index')} "
         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',45)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',45)}\n"
-        f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
+        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',3)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',3)}\n"
+        f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',3)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',3)}\n"
         f"Closed trades:{len(REAL_CLOSED)}\n"
         f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
         f"{strategy_msg}"
@@ -5026,20 +5026,20 @@ def _cmd_strategies():
             msg += f"{status} {name}\n"
         
         msg += f"\n📌 Global Limits (All Strategies):\n"
-        msg += f"Long: {PARAM.get('MAX_BUY', 45)}\n"
-        msg += f"Short: {PARAM.get('MAX_SELL', 45)}\n"
+        msg += f"Long: {PARAM.get('MAX_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_SELL', 3)}\n"
         msg += f"\n🧩 CEST Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
-        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
+        msg += f"Long: {PARAM.get('MAX_CEST_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 3)}\n"
         msg += f"\n📊 BB Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_BB_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_BB_SELL', 5)}\n"
+        msg += f"Long: {PARAM.get('MAX_BB_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_BB_SELL', 3)}\n"
         msg += f"\n🔄 STOCH_RSI Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_STOCH_RSI_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 5)}\n"
+        msg += f"Long: {PARAM.get('MAX_STOCH_RSI_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 3)}\n"
         msg += f"\n📐 FIB Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_FIB_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 5)}"
+        msg += f"Long: {PARAM.get('MAX_FIB_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}"
         
         tg_send(msg)
     except Exception as e:
@@ -5553,37 +5553,37 @@ def _can_direction(direction, kind=""):
     # Check CEST-specific limits (in addition to global limits)
     if kind == "CEST":
         if direction=="UP" and STATE.get("cest_long_blocked",False):
-            log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 15)})")
+            log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("cest_short_blocked",False):
-            log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
+            log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 3)})")
             return False
     
     # Check BOLLINGER_BANDS-specific limits (in addition to global limits)
     if kind == "BOLLINGER_BANDS":
         if direction=="UP" and STATE.get("bb_long_blocked",False):
-            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 5)})")
+            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("bb_short_blocked",False):
-            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 5)})")
+            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 3)})")
             return False
     
     # Check STOCHASTIC_RSI-specific limits (in addition to global limits)
     if kind == "STOCHASTIC_RSI":
         if direction=="UP" and STATE.get("stoch_rsi_long_blocked",False):
-            log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 5)})")
+            log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("stoch_rsi_short_blocked",False):
-            log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 5)})")
+            log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 3)})")
             return False
     
     # Check FIBONACCI_RETRACEMENT-specific limits (in addition to global limits)
     if kind == "FIBONACCI_RETRACEMENT":
         if direction=="UP" and STATE.get("fib_long_blocked",False):
-            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 5)})")
+            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("fib_short_blocked",False):
-            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 5)})")
+            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 3)})")
             return False
     
     return True
@@ -5706,10 +5706,10 @@ def main():
     initialize_hourly_stats()
     
     tg_send("🚀 EMA ULTRA v15.9.71 aktif — KIVANC removed, Asian/London disabled\n"
-            "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
+            "📊 10 strategies active (Asian & London disabled) | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.71 - KIVANC removed, Asian & London disabled")
+    log("[START] EMA ULTRA v15.9.71 - KIVANC removed, Asian & London disabled - STRICT LIMITS: 3/3")
 
     symbols=auto_init_symbols()
 
@@ -5756,38 +5756,38 @@ def main():
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
-                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 15))
+                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 3))
                         else:
                             batch_opened["cest_short"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
-                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
+                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 3))
                     
                     # Update BOLLINGER_BANDS-specific counts
                     elif kind == "BOLLINGER_BANDS":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
-                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 5))
+                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 3))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
-                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 5))
+                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 3))
                     
                     # Update STOCHASTIC_RSI-specific counts
                     elif kind == "STOCHASTIC_RSI":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
-                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
+                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
-                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 5))
+                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
                     
                     # Update FIBONACCI_RETRACEMENT-specific counts
                     elif kind == "FIBONACCI_RETRACEMENT":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
-                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 5))
+                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 3))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
-                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 5))
+                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 3))
                     
                     # Log the current counts for monitoring (reuse current_count to avoid redundant iteration)
                     if kind in ["CEST", "BOLLINGER_BANDS", "STOCHASTIC_RSI", "FIBONACCI_RETRACEMENT"]:
