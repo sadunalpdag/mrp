@@ -23,7 +23,7 @@ import numpy as np
 #       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
 #  - NEW: 3 advanced technical strategies added for better performance
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
-#  - Re-entry specific limits: 5 buy / 5 sell (adjustable via Telegram)
+#  - STRICT LIMITS: ALL strategies limited to 3 buy / 3 sell
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
 #  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
@@ -3102,7 +3102,8 @@ def check_and_log_real_closed_trades():
                     "tp_target": pos_info.get("tp_target"),
                     "market_state": pos_info.get("market_state", ""),
                     "conditions": pos_info.get("conditions", {}),  # 📊 Include strategy condition parameters
-                    "max_profit": pos_info.get("max_profit", 0.0)  # Include maximum profit reached
+                    "max_profit": pos_info.get("max_profit", 0.0),  # Include maximum profit reached
+                    "max_loss": pos_info.get("max_loss", 0.0)  # Include maximum loss (minimum unrealized PnL)
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -3114,8 +3115,9 @@ def check_and_log_real_closed_trades():
                 pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
                 exit_str = f"{exit_price}" if exit_price is not None else "N/A"
                 max_profit_str = f"{pos_info.get('max_profit', 0.0):.2f}"
+                max_loss_str = f"{pos_info.get('max_loss', 0.0):.2f}"
                 log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
-                    f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str}")
+                    f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str} MaxLoss:${max_loss_str}")
         
         # Remove closed positions from tracker
         for sym in closed_symbols:
@@ -3130,8 +3132,8 @@ def check_and_log_real_closed_trades():
 
 def update_max_profit_tracking():
     """
-    Update max profit tracking for all open positions.
-    Tracks the maximum profit value reached by each unclosed trade.
+    Update max profit and max loss tracking for all open positions.
+    Tracks the maximum profit and maximum loss (minimum unrealized PnL) reached by each unclosed trade.
     Returns the average of all max profits.
     Throttled to run max once per 30 seconds to avoid rate limiting.
     """
@@ -3153,6 +3155,7 @@ def update_max_profit_tracking():
             return STATE.get("avg_max_profit", 0.0)
         
         total_max_profit = 0.0
+        total_max_loss = 0.0
         position_count = 0
         
         for p in acc:
@@ -3176,16 +3179,28 @@ def update_max_profit_tracking():
                 REAL_POSITIONS_TRACKER[sym]["max_profit"] = unrealized_pnl
                 current_max_profit = unrealized_pnl
             
+            # Update max loss if current loss is deeper (more negative)
+            current_max_loss = pos_info.get("max_loss", 0.0)
+            if unrealized_pnl < current_max_loss:
+                REAL_POSITIONS_TRACKER[sym]["max_loss"] = unrealized_pnl
+                current_max_loss = unrealized_pnl
+            
             # Add to total for average calculation
             total_max_profit += current_max_profit
+            total_max_loss += current_max_loss
             position_count += 1
         
-        # Calculate average max profit
+        # Calculate average max profit and max loss
         avg_max_profit = total_max_profit / position_count if position_count > 0 else 0.0
+        avg_max_loss = total_max_loss / position_count if position_count > 0 else 0.0
         
-        # Log the average if there are open positions
+        # Store in STATE for persistence
+        STATE["avg_max_profit"] = avg_max_profit
+        STATE["avg_max_loss"] = avg_max_loss
+        
+        # Log the averages if there are open positions
         if position_count > 0:
-            log(f"[MAX PROFIT] Open positions: {position_count}, Avg max profit: ${avg_max_profit:.2f}")
+            log(f"[MAX PROFIT/LOSS] Open positions: {position_count}, Avg max profit: ${avg_max_profit:.2f}, Avg max loss: ${avg_max_loss:.2f}")
         
         return avg_max_profit
         
@@ -3280,6 +3295,33 @@ def cancel_all_algo_orders(sym):
                 except Exception as cancel_err:
                     result["failed"] += 1
                     log(f"[CANCEL ORDER WARN] {sym} orderId={order['orderId']} {cancel_err}")
+        
+        # Query and cancel algo orders placed via /fapi/v1/algoOrder endpoint
+        # These are not returned by /fapi/v1/openOrders and must be queried separately
+        try:
+            algo_payload = {
+                "symbol": sym,
+                "timestamp": now_ts_ms()
+            }
+            open_algo_orders = _signed_request("GET", "/fapi/v1/openAlgoOrders", algo_payload)
+            
+            # Cancel each algo order using the algo order endpoint
+            for algo_order in open_algo_orders:
+                try:
+                    cancel_algo_payload = {
+                        "symbol": sym,
+                        "algoId": algo_order["algoId"],
+                        "timestamp": now_ts_ms()
+                    }
+                    _signed_request("DELETE", "/fapi/v1/algoOrder", cancel_algo_payload)
+                    result["cancelled"] += 1
+                except Exception as cancel_err:
+                    result["failed"] += 1
+                    log(f"[CANCEL ALGO ORDER WARN] {sym} algoId={algo_order.get('algoId', 'unknown')} {cancel_err}")
+        except Exception as algo_err:
+            # Graceful degradation if algo order API is unavailable or returns error
+            # This ensures regular orders are still cancelled even if algo API fails
+            log(f"[CANCEL ALGO ORDERS WARN] {sym} Failed to query/cancel algo orders: {algo_err}")
         
         if result["cancelled"] > 0:
             log(f"[CANCEL ORDERS] {sym} cancelled {result['cancelled']} algo order(s)")
@@ -3397,15 +3439,15 @@ STATE_DEFAULT={
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
-    "MAX_BUY":45, "MAX_SELL":45,  # Global limits for all strategies combined
-    "MAX_CEST_BUY":15, "MAX_CEST_SELL":15,  # CEST-specific limits (within global limit)
+    "MAX_BUY":3, "MAX_SELL":3,  # Global limits for all strategies combined - STRICT RULE
+    "MAX_CEST_BUY":3, "MAX_CEST_SELL":3,  # CEST-specific limits (within global limit)
     # Last 3 strategies limits (within global limit)
-    "MAX_BB_BUY":5, "MAX_BB_SELL":5,  # Bollinger Bands strategy limits
-    "MAX_STOCH_RSI_BUY":5, "MAX_STOCH_RSI_SELL":5,  # Stochastic RSI strategy limits
-    "MAX_FIB_BUY":5, "MAX_FIB_SELL":5,  # Fibonacci retracement strategy limits
+    "MAX_BB_BUY":3, "MAX_BB_SELL":3,  # Bollinger Bands strategy limits
+    "MAX_STOCH_RSI_BUY":3, "MAX_STOCH_RSI_SELL":3,  # Stochastic RSI strategy limits
+    "MAX_FIB_BUY":3, "MAX_FIB_SELL":3,  # Fibonacci retracement strategy limits
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
-    "PROFIT_TARGET_USD":20.0,
+    "PROFIT_TARGET_USD":2000.0,
     "MIN_POWER_THRESHOLD":DEFAULT_MIN_POWER_THRESHOLD,  # Minimum power score to execute trades (power scale: ~50-100, higher = stronger signal)
     # Strategy enable/disable flags (all enabled by default)
     "ENABLE_MACD": True,
@@ -3547,6 +3589,101 @@ def update_hourly_stats_from_closed_trade(closed_trade):
         
     except Exception as e:
         log(f"[HOURLY STATS ERR] {e}")
+
+def calculate_avg_max_loss_from_history():
+    """
+    Calculate the average max loss from all closed trades in history.
+    This helps determine appropriate stop loss levels based on actual trading data.
+    
+    Returns:
+        float: Average max loss (as negative dollar amount), or 0.0 if no data
+    """
+    global REAL_CLOSED
+    
+    try:
+        if not REAL_CLOSED:
+            log("[STOP LOSS CALC] No closed trades data available")
+            return 0.0
+        
+        # Collect all max_loss values from closed trades
+        max_losses = []
+        for trade in REAL_CLOSED:
+            max_loss = trade.get("max_loss", 0.0)
+            # Only include actual losses (negative values)
+            if max_loss < 0:
+                max_losses.append(max_loss)
+        
+        if not max_losses:
+            log("[STOP LOSS CALC] No max loss data found in closed trades")
+            return 0.0
+        
+        # Calculate average
+        avg_max_loss = sum(max_losses) / len(max_losses)
+        
+        log(f"[STOP LOSS CALC] Analyzed {len(max_losses)} trades with max loss data")
+        log(f"[STOP LOSS CALC] Average max loss: ${avg_max_loss:.2f}")
+        
+        return avg_max_loss
+        
+    except Exception as e:
+        log(f"[STOP LOSS CALC ERR] {e}")
+        return 0.0
+
+def get_recommended_stop_loss(buffer_pct=1.2):
+    """
+    Calculate recommended stop loss level based on historical average max loss.
+    
+    Args:
+        buffer_pct: Safety margin divisor (default 1.2 = 20% safer than historical avg)
+                   Higher values make stop loss less aggressive (closer to 0)
+                   Example: If avg_max_loss = -100, buffer_pct = 1.2 gives SL = -83.33
+    
+    Returns:
+        dict: Stop loss recommendation with details
+    """
+    try:
+        # Get average max loss from history
+        avg_max_loss = calculate_avg_max_loss_from_history()
+        
+        # Get current trade size from parameters
+        trade_size_usdt = PARAM.get("TRADE_SIZE_USDT", 500.0)
+        
+        # Calculate recommended stop loss with buffer
+        # Since avg_max_loss is negative, we divide by buffer_pct to get a less aggressive SL
+        # Example: avg_max_loss = -100, buffer_pct = 1.2 -> recommended = -100/1.2 = -83.33 (safer)
+        if avg_max_loss < 0:
+            recommended_sl_usd = avg_max_loss / buffer_pct
+        else:
+            recommended_sl_usd = 0.0
+        
+        # Calculate as percentage of trade size
+        if trade_size_usdt > 0:
+            recommended_sl_pct = (abs(recommended_sl_usd) / trade_size_usdt) * 100
+        else:
+            recommended_sl_pct = 0.0
+        
+        # Count how many trades were analyzed
+        sample_size = len([t for t in REAL_CLOSED if t.get("max_loss", 0.0) < 0])
+        
+        return {
+            "avg_max_loss_usd": avg_max_loss,
+            "recommended_sl_usd": recommended_sl_usd,
+            "recommended_sl_pct": recommended_sl_pct,
+            "trade_size_usdt": trade_size_usdt,
+            "buffer_pct": (buffer_pct - 1.0) * 100,  # Convert to percentage for display
+            "sample_size": sample_size
+        }
+        
+    except Exception as e:
+        log(f"[GET RECOMMENDED SL ERR] {e}")
+        return {
+            "avg_max_loss_usd": 0.0,
+            "recommended_sl_usd": 0.0,
+            "recommended_sl_pct": 0.0,
+            "trade_size_usdt": 0.0,
+            "buffer_pct": 0.0,
+            "sample_size": 0
+        }
 
 def check_and_activate_hourly_analysis():
     """
@@ -3698,14 +3835,14 @@ def update_directional_limits():
 
     STATE["long_blocked"]  = (live["long_count"]  >= PARAM["MAX_BUY"])
     STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
-    STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 15))
-    STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 15))
-    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 5))
-    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 5))
-    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
-    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 5))
-    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 5))
-    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 5))
+    STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 3))
+    STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 3))
+    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 3))
+    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 3))
+    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
+    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
+    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 3))
+    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 3))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -3804,14 +3941,81 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     })
                     log(f"[CLOSE ALL] {sym} {pos_side} closed with TP at mark price {stop_price_str}")
                 except Exception as tp_err:
-                    # Check if error is -2021 "Order would immediately trigger" or 
-                    # -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
-                    # -4509 "Time in Force (TIF) GTE can only be used with open positions"
                     err_str = str(tp_err)
-                    if ("-2021" in err_str or "would immediately trigger" in err_str.lower() or
-                        "-4130" in err_str or "-4509" in err_str):
+                    
+                    # Error -2021 "Order would immediately trigger" means price already reached target (favorable)
+                    # Use MARKET order to capture best available price immediately
+                    if "-2021" in err_str or "would immediately trigger" in err_str.lower():
+                        log(f"[CLOSE ALL] {sym} Price already favorable (error -2021), using MARKET order for best execution")
+                        
+                        # Format quantity according to symbol's lot size requirements
+                        amt_formatted = adjust_precision(sym, amt, "qty")
+                        
+                        # Use MARKET order with reduceOnly to ensure position closure
+                        market_payload = {
+                            "symbol": sym,
+                            "side": side,
+                            "type": "MARKET",
+                            "quantity": f"{amt_formatted}",
+                            "positionSide": pos_side,
+                            "reduceOnly": "true",  # Prevents error -2022 when closing positions
+                            "timestamp": now_ts_ms()
+                        }
+                        
+                        try:
+                            market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (price already favorable)")
+                            closed_symbols.append(sym)
+                            direction = "UP" if pos_side == "LONG" else "DOWN"
+                            closed_positions_info.append({
+                                "symbol": sym,
+                                "direction": direction,
+                                "pos_side": pos_side,
+                                "amount": amt
+                            })
+                        except Exception as market_err:
+                            log(f"[CLOSE ALL ERROR] {sym} MARKET order failed: {market_err}")
+                            raise
+                    
+                    # Error -2022 "ReduceOnly Order is rejected" - retry with MARKET order and reduceOnly flag
+                    elif "-2022" in err_str or "ReduceOnly" in err_str:
+                        log(f"[CLOSE ALL] {sym} ReduceOnly error detected, using MARKET order with reduceOnly flag")
+                        
+                        # Format quantity according to symbol's lot size requirements
+                        amt_formatted = adjust_precision(sym, amt, "qty")
+                        
+                        # Use MARKET order with reduceOnly flag
+                        market_payload = {
+                            "symbol": sym,
+                            "side": side,
+                            "type": "MARKET",
+                            "quantity": f"{amt_formatted}",
+                            "positionSide": pos_side,
+                            "reduceOnly": "true",  # Fix for error -2022
+                            "timestamp": now_ts_ms()
+                        }
+                        
+                        try:
+                            market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (reduceOnly)")
+                            closed_symbols.append(sym)
+                            direction = "UP" if pos_side == "LONG" else "DOWN"
+                            closed_positions_info.append({
+                                "symbol": sym,
+                                "direction": direction,
+                                "pos_side": pos_side,
+                                "amount": amt
+                            })
+                        except Exception as market_err:
+                            log(f"[CLOSE ALL ERROR] {sym} MARKET order with reduceOnly failed: {market_err}")
+                            raise
+                    
+                    # Error -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
+                    # -4509 "Time in Force (TIF) GTE can only be used with open positions"
+                    # Use LIMIT order with buffer for safety in case of order conflicts
+                    elif "-4130" in err_str or "-4509" in err_str:
                         # Fallback: close position with LIMIT order (IOC) for price protection
-                        log(f"[CLOSE ALL] {sym} TP/Algo order failed, using LIMIT order with IOC. Error: {tp_err}")
+                        log(f"[CLOSE ALL] {sym} Order conflict detected (error -4130/-4509), using LIMIT order with IOC. Error: {tp_err}")
                         
                         # Calculate limit price with buffer to avoid slippage losses
                         # For LONG positions (SELL to close): set price slightly lower (acceptable loss)
@@ -3876,6 +4080,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                         "type": "MARKET",
                                         "quantity": f"{remaining_qty_formatted}",
                                         "positionSide": pos_side,
+                                        "reduceOnly": "true",  # Prevents error -2022 when closing positions
                                         "timestamp": now_ts_ms()
                                     }
                                     try:
@@ -4047,7 +4252,8 @@ def reopen_positions_with_tp(closed_positions_info):
                 "tp_target": tp_usd_used or tp_pct_used,
                 "market_state": "",
                 "conditions": {},
-                "max_profit": 0.0
+                "max_profit": 0.0,
+                "max_loss": 0.0
             }
             save_positions_tracker()  # Persist tracker to file
             
@@ -4245,7 +4451,7 @@ def send_hourly_margin_log():
             return
         
         # Get profit target
-        profit_target = PARAM.get("PROFIT_TARGET_USD", 60.0)
+        profit_target = PARAM.get("PROFIT_TARGET_USD", 2000.0)
         
         # Calculate current profit
         current_profit = current_balance - initial_balance
@@ -4343,8 +4549,8 @@ def send_hourly_margin_log():
                    f"📈 Progress: {progress_pct:.1f}%\n"
                    f"💵 Unrealized PnL: ${unrealized_pnl:.2f}\n"
                    f"📌 Open Positions: {open_positions}\n"
-                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
-                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 3)}\n"
+                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 3)}\n"
                    f"🔝 Avg Max Profit: ${avg_max_profit:.2f}")
             
             # Add position target info when all positions are closed
@@ -4372,8 +4578,8 @@ def send_hourly_margin_log():
                    f"📊 Excess: ${-remaining:.2f}\n"
                    f"💵 Unrealized PnL: ${unrealized_pnl:.2f}\n"
                    f"📌 Open Positions: {open_positions}\n"
-                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 15)}\n"
-                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 15)}\n"
+                   f"🧩 CEST Long: {cest_long_count}/{PARAM.get('MAX_CEST_BUY', 3)}\n"
+                   f"🧩 CEST Short: {cest_short_count}/{PARAM.get('MAX_CEST_SELL', 3)}\n"
                    f"🔝 Avg Max Profit: ${avg_max_profit:.2f}\n"
                    f"🕐 {now_local_iso()}")
             
@@ -4587,8 +4793,8 @@ def _cmd_status():
         f"📊 STATUS bar:{STATE.get('bar_index')} "
         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',45)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',45)}\n"
-        f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',15)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',15)}\n"
+        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',3)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',3)}\n"
+        f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',3)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',3)}\n"
         f"Closed trades:{len(REAL_CLOSED)}\n"
         f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
         f"{strategy_msg}"
@@ -4820,20 +5026,20 @@ def _cmd_strategies():
             msg += f"{status} {name}\n"
         
         msg += f"\n📌 Global Limits (All Strategies):\n"
-        msg += f"Long: {PARAM.get('MAX_BUY', 45)}\n"
-        msg += f"Short: {PARAM.get('MAX_SELL', 45)}\n"
+        msg += f"Long: {PARAM.get('MAX_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_SELL', 3)}\n"
         msg += f"\n🧩 CEST Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_CEST_BUY', 15)}\n"
-        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 15)}\n"
+        msg += f"Long: {PARAM.get('MAX_CEST_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_CEST_SELL', 3)}\n"
         msg += f"\n📊 BB Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_BB_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_BB_SELL', 5)}\n"
+        msg += f"Long: {PARAM.get('MAX_BB_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_BB_SELL', 3)}\n"
         msg += f"\n🔄 STOCH_RSI Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_STOCH_RSI_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 5)}\n"
+        msg += f"Long: {PARAM.get('MAX_STOCH_RSI_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 3)}\n"
         msg += f"\n📐 FIB Sub-Limits (within global):\n"
-        msg += f"Long: {PARAM.get('MAX_FIB_BUY', 5)}\n"
-        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 5)}"
+        msg += f"Long: {PARAM.get('MAX_FIB_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}"
         
         tg_send(msg)
     except Exception as e:
@@ -5095,6 +5301,37 @@ def _cmd_forcehourlyanalysis():
         tg_send(f"❌ /forcehourlyanalysis error: {e}")
         log(f"[FORCEHOURLYANALYSIS ERR] {e}")
 
+def _cmd_stoploss():
+    """Show stop loss recommendation based on historical max loss data"""
+    try:
+        sl_recommendation = get_recommended_stop_loss()
+        
+        if sl_recommendation["sample_size"] == 0:
+            tg_send("📊 STOP LOSS RECOMMENDATION\n"
+                   "━━━━━━━━━━━━━━━━\n"
+                   "❌ No closed trades data available yet.\n"
+                   "Start trading to collect data for stop loss calculation.")
+            return
+        
+        msg = f"📊 STOP LOSS RECOMMENDATION\n"
+        msg += f"━━━━━━━━━━━━━━━━\n"
+        msg += f"📈 Analysis based on {sl_recommendation['sample_size']} closed trades\n\n"
+        msg += f"💰 Trade Size: ${sl_recommendation['trade_size_usdt']:.0f}\n"
+        msg += f"📉 Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}\n\n"
+        msg += f"🎯 RECOMMENDED STOP LOSS:\n"
+        msg += f"   ${abs(sl_recommendation['recommended_sl_usd']):.2f}\n"
+        msg += f"   ({sl_recommendation['recommended_sl_pct']:.2f}% of trade size)\n\n"
+        msg += f"🛡️ Safety Buffer: {sl_recommendation['buffer_pct']:.0f}%\n\n"
+        msg += f"ℹ️ This recommendation is based on historical\n"
+        msg += f"   maximum drawdown data from your closed trades."
+        
+        tg_send(msg)
+        log(f"[STOPLOSS CMD] Recommendation sent: SL=${abs(sl_recommendation['recommended_sl_usd']):.2f}")
+        
+    except Exception as e:
+        tg_send(f"❌ /stoploss error: {e}")
+        log(f"[STOPLOSS CMD ERR] {e}")
+
 def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
@@ -5125,6 +5362,7 @@ def check_telegram_commands():
         elif cmd=="/blockhour": _cmd_blockhour(args)
         elif cmd=="/resethourlystats": _cmd_resethourlystats()
         elif cmd=="/forcehourlyanalysis": _cmd_forcehourlyanalysis()
+        elif cmd=="/stoploss": _cmd_stoploss()
         else:
             tg_send("📋 AVAILABLE COMMANDS:\n"
                     "━━━━━━━━━━━━━━━━\n"
@@ -5141,6 +5379,7 @@ def check_telegram_commands():
                     "/blockhour <hour> [block|unblock] - Block/unblock hour\n"
                     "/resethourlystats - Reset hourly data\n"
                     "/forcehourlyanalysis - Force activate analysis\n"
+                    "/stoploss - Show stop loss recommendation\n"
                     "/set KEY VALUE - Set parameter\n"
                     "/report - Generate report\n"
                     "/export - Export all data")
@@ -5314,37 +5553,37 @@ def _can_direction(direction, kind=""):
     # Check CEST-specific limits (in addition to global limits)
     if kind == "CEST":
         if direction=="UP" and STATE.get("cest_long_blocked",False):
-            log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 15)})")
+            log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("cest_short_blocked",False):
-            log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 15)})")
+            log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 3)})")
             return False
     
     # Check BOLLINGER_BANDS-specific limits (in addition to global limits)
     if kind == "BOLLINGER_BANDS":
         if direction=="UP" and STATE.get("bb_long_blocked",False):
-            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 5)})")
+            log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("bb_short_blocked",False):
-            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 5)})")
+            log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 3)})")
             return False
     
     # Check STOCHASTIC_RSI-specific limits (in addition to global limits)
     if kind == "STOCHASTIC_RSI":
         if direction=="UP" and STATE.get("stoch_rsi_long_blocked",False):
-            log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 5)})")
+            log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("stoch_rsi_short_blocked",False):
-            log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 5)})")
+            log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 3)})")
             return False
     
     # Check FIBONACCI_RETRACEMENT-specific limits (in addition to global limits)
     if kind == "FIBONACCI_RETRACEMENT":
         if direction=="UP" and STATE.get("fib_long_blocked",False):
-            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 5)})")
+            log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 3)})")
             return False
         if direction=="DOWN" and STATE.get("fib_short_blocked",False):
-            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 5)})")
+            log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 3)})")
             return False
     
     return True
@@ -5431,7 +5670,8 @@ def execute_real_trade(sig):
             "tp_target": tp_usd_used or tp_pct_used,
             "market_state": sig.get("market_state", ""),
             "conditions": sig.get("conditions", {}),  # 📊 Store strategy condition parameters
-            "max_profit": 0.0  # Track maximum profit reached
+            "max_profit": 0.0,  # Track maximum profit reached
+            "max_loss": 0.0  # Track maximum loss (minimum unrealized PnL)
         }
         save_positions_tracker()  # Persist tracker to file
         
@@ -5466,10 +5706,10 @@ def main():
     initialize_hourly_stats()
     
     tg_send("🚀 EMA ULTRA v15.9.71 aktif — KIVANC removed, Asian/London disabled\n"
-            "📊 10 strategies active (Asian & London disabled) | Re-entry limits: 5 buy/5 sell\n"
+            "📊 10 strategies active (Asian & London disabled) | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.71 - KIVANC removed, Asian & London disabled")
+    log("[START] EMA ULTRA v15.9.71 - KIVANC removed, Asian & London disabled - STRICT LIMITS: 3/3")
 
     symbols=auto_init_symbols()
 
@@ -5516,38 +5756,38 @@ def main():
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
-                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 15))
+                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 3))
                         else:
                             batch_opened["cest_short"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
-                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 15))
+                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 3))
                     
                     # Update BOLLINGER_BANDS-specific counts
                     elif kind == "BOLLINGER_BANDS":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
-                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 5))
+                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 3))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
-                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 5))
+                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 3))
                     
                     # Update STOCHASTIC_RSI-specific counts
                     elif kind == "STOCHASTIC_RSI":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
-                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 5))
+                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
-                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 5))
+                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
                     
                     # Update FIBONACCI_RETRACEMENT-specific counts
                     elif kind == "FIBONACCI_RETRACEMENT":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
-                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 5))
+                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 3))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
-                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 5))
+                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 3))
                     
                     # Log the current counts for monitoring (reuse current_count to avoid redundant iteration)
                     if kind in ["CEST", "BOLLINGER_BANDS", "STOCHASTIC_RSI", "FIBONACCI_RETRACEMENT"]:
@@ -5577,6 +5817,16 @@ def main():
             
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
+            
+            # 3.6) Calculate and log stop loss recommendations periodically
+            # Log every 100 bar cycles (with 30s per cycle = ~50 minutes) to avoid excessive logging
+            if bar_i % 100 == 0:
+                sl_recommendation = get_recommended_stop_loss()
+                if sl_recommendation["sample_size"] > 0:
+                    log(f"[STOP LOSS RECOMMENDATION] Based on {sl_recommendation['sample_size']} trades: "
+                        f"Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}, "
+                        f"Recommended SL: ${abs(sl_recommendation['recommended_sl_usd']):.2f} "
+                        f"({sl_recommendation['recommended_sl_pct']:.2f}% of ${sl_recommendation['trade_size_usdt']:.0f} trade size)")
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
