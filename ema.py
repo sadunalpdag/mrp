@@ -3634,7 +3634,9 @@ def get_recommended_stop_loss(buffer_pct=1.2):
     Calculate recommended stop loss level based on historical average max loss.
     
     Args:
-        buffer_pct: Safety margin multiplier (default 1.2 = 20% buffer)
+        buffer_pct: Safety margin divisor (default 1.2 = 20% safer than historical avg)
+                   Higher values make stop loss less aggressive (closer to 0)
+                   Example: If avg_max_loss = -100, buffer_pct = 1.2 gives SL = -83.33
     
     Returns:
         dict: Stop loss recommendation with details
@@ -3647,8 +3649,12 @@ def get_recommended_stop_loss(buffer_pct=1.2):
         trade_size_usdt = PARAM.get("TRADE_SIZE_USDT", 500.0)
         
         # Calculate recommended stop loss with buffer
-        # Since avg_max_loss is negative, we multiply by buffer_pct
-        recommended_sl_usd = avg_max_loss * buffer_pct
+        # Since avg_max_loss is negative, we divide by buffer_pct to get a less aggressive SL
+        # Example: avg_max_loss = -100, buffer_pct = 1.2 -> recommended = -100/1.2 = -83.33 (safer)
+        if avg_max_loss < 0:
+            recommended_sl_usd = avg_max_loss / buffer_pct
+        else:
+            recommended_sl_usd = 0.0
         
         # Calculate as percentage of trade size
         if trade_size_usdt > 0:
@@ -5813,7 +5819,7 @@ def main():
             check_and_activate_hourly_analysis()
             
             # 3.6) Calculate and log stop loss recommendations periodically
-            # Log every 100 bar cycles to avoid excessive logging
+            # Log every 100 bar cycles (with 30s per cycle = ~50 minutes) to avoid excessive logging
             if bar_i % 100 == 0:
                 sl_recommendation = get_recommended_stop_loss()
                 if sl_recommendation["sample_size"] > 0:
