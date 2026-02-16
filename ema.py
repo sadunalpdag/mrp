@@ -357,8 +357,33 @@ CM_BASE_URL = "https://community-api.coinmetrics.io/v4"
 ONCHAIN_CACHE = {}  # Cache on-chain data (updated daily)
 ONCHAIN_CACHE_FILE = os.path.join(DATA_DIR, "onchain_cache.json")
 
+# On-chain strategy constants
+MIN_ONCHAIN_HISTORY = 60  # Minimum days of data required for z-score calculation
+ONCHAIN_ZSCORE_WINDOW = 60  # Days to use for z-score calculation
+
+# Tier-based signal configuration
+ONCHAIN_TIER1_POWER_BASE = 75  # Base power for strong signals (z > 1.0)
+ONCHAIN_TIER2_POWER_BASE = 65  # Base power for medium signals (z > 0.5)
+ONCHAIN_TIER3_POWER_BASE = 55  # Base power for weak signals (z > 0)
+
+ONCHAIN_TIER1_RR_RATIO = 3.0   # Risk/Reward ratio for tier 1 signals
+ONCHAIN_TIER2_RR_RATIO = 2.0   # Risk/Reward ratio for tier 2 signals
+ONCHAIN_TIER3_RR_RATIO = 1.5   # Risk/Reward ratio for tier 3 signals
+
+
 def cm_get_asset_metrics(asset="btc", metrics=("AdrActCnt", "TxCnt"), days_back=90):
-    """Fetch on-chain metrics from CoinMetrics API"""
+    """
+    Fetch on-chain metrics from CoinMetrics API
+    
+    Args:
+        asset: Asset symbol (e.g., "btc")
+        metrics: Tuple of metric names to fetch
+        days_back: Number of days of historical data to fetch
+    
+    Returns:
+        Dict mapping date strings (YYYY-MM-DD) to metric dicts
+        Example: {"2024-01-01": {"AdrActCnt": 12345.0, "TxCnt": 67890.0}}
+    """
     try:
         end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=days_back)
@@ -3046,7 +3071,7 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     
     This strategy is BTC-focused but can be applied to highly correlated assets.
     """
-    if len(kl) < 60:
+    if len(kl) < MIN_ONCHAIN_HISTORY:
         return None
     
     closes = [float(k[4]) for k in kl]
@@ -3065,8 +3090,8 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     volume_spike = current_volume > avg_volume * 1.5
     
     # Get on-chain z-scores
-    addr_zscore = calculate_onchain_zscore("AdrActCnt", window=60)
-    txcnt_zscore = calculate_onchain_zscore("TxCnt", window=60)
+    addr_zscore = calculate_onchain_zscore("AdrActCnt", window=ONCHAIN_ZSCORE_WINDOW)
+    txcnt_zscore = calculate_onchain_zscore("TxCnt", window=ONCHAIN_ZSCORE_WINDOW)
     
     if addr_zscore is None or txcnt_zscore is None:
         return None  # No on-chain data available
@@ -3112,16 +3137,24 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     if direction is None:
         return None
     
-    # Calculate power based on tier
-    base_power = {1: 75, 2: 65, 3: 55}[tier_level]
+    # Calculate power based on tier (using predefined constants)
+    base_power = {
+        1: ONCHAIN_TIER1_POWER_BASE, 
+        2: ONCHAIN_TIER2_POWER_BASE, 
+        3: ONCHAIN_TIER3_POWER_BASE
+    }[tier_level]
     power = base_power + abs(onchain_z) * 5
     
     # Calculate ATR and RSI
     atr_v = atr_like(highs, lows, closes)[-1]
     r_val = rsi(closes)[-1]
     
-    # Calculate TP/SL with tier-based risk/reward
-    rr_ratio = {1: 3.0, 2: 2.0, 3: 1.5}[tier_level]
+    # Calculate TP/SL with tier-based risk/reward (using predefined constants)
+    rr_ratio = {
+        1: ONCHAIN_TIER1_RR_RATIO, 
+        2: ONCHAIN_TIER2_RR_RATIO, 
+        3: ONCHAIN_TIER3_RR_RATIO
+    }[tier_level]
     
     if direction == "UP":
         sl_est = c_now - atr_v * 1.5
@@ -5991,8 +6024,10 @@ def main():
             STATE["bar_index"]=STATE.get("bar_index",0)+1
             bar_i=STATE["bar_index"]
             
-            # Update on-chain cache once per day (every 2880 bars = 24 hours at 30-second intervals)
-            if bar_i % 2880 == 0:  # 30s * 2880 = 86400s = 24h
+            # Update on-chain cache once per day
+            # Bot runs every 30 seconds, so 2880 iterations = 24 hours
+            # (30 seconds * 2880 = 86400 seconds = 24 hours)
+            if bar_i % 2880 == 0:
                 update_onchain_cache()
 
             # 1) Sinyal tarama
