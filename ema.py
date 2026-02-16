@@ -2944,6 +2944,9 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     
     Similar logic for short signals (inverted).
     """
+    # Constants
+    MOMENTUM_LOOKBACK = 5  # Periods to look back for momentum calculation
+    
     # ⚡ FILTER: Only trade top 25 by volume
     if sym not in TOP_VOLUME_SYMBOLS:
         return None
@@ -2973,8 +2976,8 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     avg_vol = sum(volumes[-20:]) / 20
     vol_ratio = vol_now / avg_vol if avg_vol > 0 else 1.0
     
-    # Momentum (price change over 5 periods)
-    momentum = ((c_now - closes[-6]) / closes[-6] * 100) if len(closes) >= 6 else 0
+    # Momentum (price change over MOMENTUM_LOOKBACK periods)
+    momentum = ((c_now - closes[-(MOMENTUM_LOOKBACK+1)]) / closes[-(MOMENTUM_LOOKBACK+1)] * 100) if len(closes) > MOMENTUM_LOOKBACK else 0
     
     # Determine tier and direction
     direction = None
@@ -5501,12 +5504,10 @@ def _cmd_topvolume():
         msg += f"━━━━━━━━━━━━━━━━\n"
         msg += f"Last update: {datetime.fromtimestamp(TOP_VOLUME_LAST_UPDATE, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if TOP_VOLUME_LAST_UPDATE else 'Never'}\n\n"
         
-        for i, sym in enumerate(TOP_VOLUME_SYMBOLS[:15], 1):
+        # Show all 25 coins
+        for i, sym in enumerate(TOP_VOLUME_SYMBOLS, 1):
             vol = volume_map.get(sym, 0)
             msg += f"{i}. {sym}: ${vol:,.0f}\n"
-        
-        if len(TOP_VOLUME_SYMBOLS) > 15:
-            msg += f"\n...and {len(TOP_VOLUME_SYMBOLS) - 15} more\n"
         
         msg += f"\n💡 On-chain signals only generated for these coins"
         
@@ -5979,7 +5980,7 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.10.0 aktif — On-chain strategy: Top 25 by volume\n"
+    tg_send("🚀 EMA ULTRA v15.10.0 active — On-chain strategy: Top 25 by volume\n"
             "📊 11 strategies active | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled\n"
@@ -6000,9 +6001,9 @@ def main():
             STATE["bar_index"]=STATE.get("bar_index",0)+1
             bar_i=STATE["bar_index"]
             
-            # Update top volume list every 6 hours
-            if bar_i % 720 == 0:  # Every 6 hours (30s * 720 = 6h)
-                update_top_volume_symbols(symbols)
+            # Update top volume list every 6 hours (timestamp-based, not bar count)
+            # This is handled internally by update_top_volume_symbols checking TOP_VOLUME_LAST_UPDATE
+            update_top_volume_symbols(symbols)
 
             # 1) Sinyal tarama
             sigs=run_parallel(symbols,bar_i)
