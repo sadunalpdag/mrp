@@ -23,7 +23,7 @@ import numpy as np
 #       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
 #  - NEW: 3 advanced technical strategies added for better performance
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
-#  - STRICT LIMITS: ALL strategies limited to 3 buy / 3 sell
+#  - PER-STRATEGY LIMITS: Each strategy limited to 3 buy / 3 sell independently
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
 #  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
@@ -3591,9 +3591,17 @@ STATE_DEFAULT={
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
-    "MAX_BUY":3, "MAX_SELL":3,  # Global limits for all strategies combined - STRICT RULE
-    "MAX_CEST_BUY":3, "MAX_CEST_SELL":3,  # CEST-specific limits (within global limit)
-    # Last 3 strategies limits (within global limit)
+    # Per-strategy limits: Each strategy limited to 3 buy / 3 sell independently
+    "MAX_MACD_BUY":3, "MAX_MACD_SELL":3,  # MACD strategy limits
+    "MAX_FVG_BUY":3, "MAX_FVG_SELL":3,  # FVG strategy limits
+    "MAX_EMA_PULLBACK_BUY":3, "MAX_EMA_PULLBACK_SELL":3,  # EMA Pullback strategy limits
+    "MAX_CEST_BUY":3, "MAX_CEST_SELL":3,  # CEST strategy limits
+    "MAX_ORB_FVG_BUY":3, "MAX_ORB_FVG_SELL":3,  # ORB+FVG strategy limits
+    "MAX_NY_REVERSAL_BUY":3, "MAX_NY_REVERSAL_SELL":3,  # NY Reversal strategy limits
+    "MAX_ICT_POWER_OF_3_BUY":3, "MAX_ICT_POWER_OF_3_SELL":3,  # ICT Power of 3 strategy limits
+    "MAX_FVG_BREAKER_BLOCK_BUY":3, "MAX_FVG_BREAKER_BLOCK_SELL":3,  # FVG Breaker Block strategy limits
+    "MAX_REENTRY_4H_5M_BUY":3, "MAX_REENTRY_4H_5M_SELL":3,  # Re-entry strategy limits
+    "MAX_FVG_MSS_ENTRY_BUY":3, "MAX_FVG_MSS_ENTRY_SELL":3,  # FVG MSS strategy limits
     "MAX_BB_BUY":3, "MAX_BB_SELL":3,  # Bollinger Bands strategy limits
     "MAX_STOCH_RSI_BUY":3, "MAX_STOCH_RSI_SELL":3,  # Stochastic RSI strategy limits
     "MAX_FIB_BUY":3, "MAX_FIB_SELL":3,  # Fibonacci retracement strategy limits
@@ -3946,36 +3954,87 @@ def is_hour_blocked_for_trading():
     return blocked
 
 def update_directional_limits():
-    live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,
-          "bb_long_count":0,"bb_short_count":0,
-          "stoch_rsi_long_count":0,"stoch_rsi_short_count":0,
-          "fib_long_count":0,"fib_short_count":0}
+    # Initialize counters for all strategies
+    live = {
+        "long": {}, "short": {},
+        # Strategy-specific counts
+        "macd_long_count": 0, "macd_short_count": 0,
+        "fvg_long_count": 0, "fvg_short_count": 0,
+        "ema_pullback_long_count": 0, "ema_pullback_short_count": 0,
+        "cest_long_count": 0, "cest_short_count": 0,
+        "orb_fvg_long_count": 0, "orb_fvg_short_count": 0,
+        "ny_reversal_long_count": 0, "ny_reversal_short_count": 0,
+        "ict_power_of_3_long_count": 0, "ict_power_of_3_short_count": 0,
+        "fvg_breaker_block_long_count": 0, "fvg_breaker_block_short_count": 0,
+        "reentry_4h_5m_long_count": 0, "reentry_4h_5m_short_count": 0,
+        "fvg_mss_entry_long_count": 0, "fvg_mss_entry_short_count": 0,
+        "bb_long_count": 0, "bb_short_count": 0,
+        "stoch_rsi_long_count": 0, "stoch_rsi_short_count": 0,
+        "fib_long_count": 0, "fib_short_count": 0
+    }
+    
     try:
-        acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
+        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
         for p in acc:
-            amt=float(p["positionAmt"]); sym=p["symbol"]
-            if amt>0: 
-                live["long"][sym]=amt
+            amt = float(p["positionAmt"])
+            sym = p["symbol"]
+            
+            if amt > 0:
+                live["long"][sym] = amt
                 # Only count positions that are tracked
                 if sym in REAL_POSITIONS_TRACKER:
-                    live["long_count"] += 1
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
-                    if pos_kind == "CEST":
+                    if pos_kind == "MACD":
+                        live["macd_long_count"] += 1
+                    elif pos_kind == "FVG":
+                        live["fvg_long_count"] += 1
+                    elif pos_kind == "EMA_PULLBACK":
+                        live["ema_pullback_long_count"] += 1
+                    elif pos_kind == "CEST":
                         live["cest_long_count"] += 1
+                    elif pos_kind == "ORB_FVG_CONFIRM":
+                        live["orb_fvg_long_count"] += 1
+                    elif pos_kind == "NY_REVERSAL":
+                        live["ny_reversal_long_count"] += 1
+                    elif pos_kind == "ICT_POWER_OF_3":
+                        live["ict_power_of_3_long_count"] += 1
+                    elif pos_kind == "FVG_BREAKER_BLOCK":
+                        live["fvg_breaker_block_long_count"] += 1
+                    elif pos_kind == "REENTRY_4H_5M":
+                        live["reentry_4h_5m_long_count"] += 1
+                    elif pos_kind == "FVG_MSS_ENTRY":
+                        live["fvg_mss_entry_long_count"] += 1
                     elif pos_kind == "BOLLINGER_BANDS":
                         live["bb_long_count"] += 1
                     elif pos_kind == "STOCHASTIC_RSI":
                         live["stoch_rsi_long_count"] += 1
                     elif pos_kind == "FIBONACCI_RETRACEMENT":
                         live["fib_long_count"] += 1
-            elif amt<0: 
-                live["short"][sym]=abs(amt)
+            elif amt < 0:
+                live["short"][sym] = abs(amt)
                 # Only count positions that are tracked
                 if sym in REAL_POSITIONS_TRACKER:
-                    live["short_count"] += 1
                     pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
-                    if pos_kind == "CEST":
+                    if pos_kind == "MACD":
+                        live["macd_short_count"] += 1
+                    elif pos_kind == "FVG":
+                        live["fvg_short_count"] += 1
+                    elif pos_kind == "EMA_PULLBACK":
+                        live["ema_pullback_short_count"] += 1
+                    elif pos_kind == "CEST":
                         live["cest_short_count"] += 1
+                    elif pos_kind == "ORB_FVG_CONFIRM":
+                        live["orb_fvg_short_count"] += 1
+                    elif pos_kind == "NY_REVERSAL":
+                        live["ny_reversal_short_count"] += 1
+                    elif pos_kind == "ICT_POWER_OF_3":
+                        live["ict_power_of_3_short_count"] += 1
+                    elif pos_kind == "FVG_BREAKER_BLOCK":
+                        live["fvg_breaker_block_short_count"] += 1
+                    elif pos_kind == "REENTRY_4H_5M":
+                        live["reentry_4h_5m_short_count"] += 1
+                    elif pos_kind == "FVG_MSS_ENTRY":
+                        live["fvg_mss_entry_short_count"] += 1
                     elif pos_kind == "BOLLINGER_BANDS":
                         live["bb_short_count"] += 1
                     elif pos_kind == "STOCHASTIC_RSI":
@@ -3985,18 +4044,52 @@ def update_directional_limits():
     except Exception as e:
         log(f"[FETCH POS ERR]{e}")
 
-    STATE["long_blocked"]  = (live["long_count"]  >= PARAM["MAX_BUY"])
-    STATE["short_blocked"] = (live["short_count"] >= PARAM["MAX_SELL"])
-    STATE["cest_long_blocked"]  = (live["cest_long_count"]  >= PARAM.get("MAX_CEST_BUY", 3))
+    # Update blocked states for all strategies
+    STATE["macd_long_blocked"] = (live["macd_long_count"] >= PARAM.get("MAX_MACD_BUY", 3))
+    STATE["macd_short_blocked"] = (live["macd_short_count"] >= PARAM.get("MAX_MACD_SELL", 3))
+    STATE["fvg_long_blocked"] = (live["fvg_long_count"] >= PARAM.get("MAX_FVG_BUY", 3))
+    STATE["fvg_short_blocked"] = (live["fvg_short_count"] >= PARAM.get("MAX_FVG_SELL", 3))
+    STATE["ema_pullback_long_blocked"] = (live["ema_pullback_long_count"] >= PARAM.get("MAX_EMA_PULLBACK_BUY", 3))
+    STATE["ema_pullback_short_blocked"] = (live["ema_pullback_short_count"] >= PARAM.get("MAX_EMA_PULLBACK_SELL", 3))
+    STATE["cest_long_blocked"] = (live["cest_long_count"] >= PARAM.get("MAX_CEST_BUY", 3))
     STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 3))
-    STATE["bb_long_blocked"]  = (live["bb_long_count"]  >= PARAM.get("MAX_BB_BUY", 3))
+    STATE["orb_fvg_long_blocked"] = (live["orb_fvg_long_count"] >= PARAM.get("MAX_ORB_FVG_BUY", 3))
+    STATE["orb_fvg_short_blocked"] = (live["orb_fvg_short_count"] >= PARAM.get("MAX_ORB_FVG_SELL", 3))
+    STATE["ny_reversal_long_blocked"] = (live["ny_reversal_long_count"] >= PARAM.get("MAX_NY_REVERSAL_BUY", 3))
+    STATE["ny_reversal_short_blocked"] = (live["ny_reversal_short_count"] >= PARAM.get("MAX_NY_REVERSAL_SELL", 3))
+    STATE["ict_power_of_3_long_blocked"] = (live["ict_power_of_3_long_count"] >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", 3))
+    STATE["ict_power_of_3_short_blocked"] = (live["ict_power_of_3_short_count"] >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", 3))
+    STATE["fvg_breaker_block_long_blocked"] = (live["fvg_breaker_block_long_count"] >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", 3))
+    STATE["fvg_breaker_block_short_blocked"] = (live["fvg_breaker_block_short_count"] >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", 3))
+    STATE["reentry_4h_5m_long_blocked"] = (live["reentry_4h_5m_long_count"] >= PARAM.get("MAX_REENTRY_4H_5M_BUY", 3))
+    STATE["reentry_4h_5m_short_blocked"] = (live["reentry_4h_5m_short_count"] >= PARAM.get("MAX_REENTRY_4H_5M_SELL", 3))
+    STATE["fvg_mss_entry_long_blocked"] = (live["fvg_mss_entry_long_count"] >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", 3))
+    STATE["fvg_mss_entry_short_blocked"] = (live["fvg_mss_entry_short_count"] >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", 3))
+    STATE["bb_long_blocked"] = (live["bb_long_count"] >= PARAM.get("MAX_BB_BUY", 3))
     STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 3))
-    STATE["stoch_rsi_long_blocked"]  = (live["stoch_rsi_long_count"]  >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
+    STATE["stoch_rsi_long_blocked"] = (live["stoch_rsi_long_count"] >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
     STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
-    STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 3))
+    STATE["fib_long_blocked"] = (live["fib_long_count"] >= PARAM.get("MAX_FIB_BUY", 3))
     STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 3))
-    STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
-    safe_save(STATE_FILE,STATE)
+    
+    # Check if all strategies are blocked (no trading possible)
+    all_long_blocked = all([
+        STATE["macd_long_blocked"], STATE["fvg_long_blocked"], STATE["ema_pullback_long_blocked"],
+        STATE["cest_long_blocked"], STATE["orb_fvg_long_blocked"], STATE["ny_reversal_long_blocked"],
+        STATE["ict_power_of_3_long_blocked"], STATE["fvg_breaker_block_long_blocked"],
+        STATE["reentry_4h_5m_long_blocked"], STATE["fvg_mss_entry_long_blocked"],
+        STATE["bb_long_blocked"], STATE["stoch_rsi_long_blocked"], STATE["fib_long_blocked"]
+    ])
+    all_short_blocked = all([
+        STATE["macd_short_blocked"], STATE["fvg_short_blocked"], STATE["ema_pullback_short_blocked"],
+        STATE["cest_short_blocked"], STATE["orb_fvg_short_blocked"], STATE["ny_reversal_short_blocked"],
+        STATE["ict_power_of_3_short_blocked"], STATE["fvg_breaker_block_short_blocked"],
+        STATE["reentry_4h_5m_short_blocked"], STATE["fvg_mss_entry_short_blocked"],
+        STATE["bb_short_blocked"], STATE["stoch_rsi_short_blocked"], STATE["fib_short_blocked"]
+    ])
+    
+    STATE["auto_trade_active"] = not (all_long_blocked and all_short_blocked)
+    safe_save(STATE_FILE, STATE)
     return live
 
 # ===================== CASH OUT / PROFIT TARGET =====================
@@ -4945,8 +5038,6 @@ def _cmd_status():
         f"📊 STATUS bar:{STATE.get('bar_index')} "
         f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
         f"━━━━━━━━━━━━━━━━\n"
-        f"General long:{live.get('long_count',0)}/{PARAM.get('MAX_BUY',3)} short:{live.get('short_count',0)}/{PARAM.get('MAX_SELL',3)}\n"
-        f"CEST long:{live.get('cest_long_count',0)}/{PARAM.get('MAX_CEST_BUY',3)} short:{live.get('cest_short_count',0)}/{PARAM.get('MAX_CEST_SELL',3)}\n"
         f"Closed trades:{len(REAL_CLOSED)}\n"
         f"Unrealized PnL: ${total_unrealized_pnl:.2f}"
         f"{strategy_msg}"
@@ -5727,47 +5818,108 @@ def _duplicate_or_locked(sym, direction):
 def _can_direction(direction, kind=""):
     if not STATE.get("auto_trade_active", True): return False
     
-    # Check global limits first - these apply to ALL strategies including REENTRY and CEST
-    if direction=="UP" and STATE.get("long_blocked",False):
-        log(f"[GLOBAL LIMIT] Long positions blocked (max: {PARAM['MAX_BUY']})")
-        return False
-    if direction=="DOWN" and STATE.get("short_blocked",False):
-        log(f"[GLOBAL LIMIT] Short positions blocked (max: {PARAM['MAX_SELL']})")
-        return False
+    # Check strategy-specific limits for each strategy
+    if kind == "MACD":
+        if direction == "UP" and STATE.get("macd_long_blocked", False):
+            log(f"[MACD LIMIT] MACD long positions blocked (max: {PARAM.get('MAX_MACD_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("macd_short_blocked", False):
+            log(f"[MACD LIMIT] MACD short positions blocked (max: {PARAM.get('MAX_MACD_SELL', 3)})")
+            return False
     
-    # Check CEST-specific limits (in addition to global limits)
-    if kind == "CEST":
-        if direction=="UP" and STATE.get("cest_long_blocked",False):
+    elif kind == "FVG":
+        if direction == "UP" and STATE.get("fvg_long_blocked", False):
+            log(f"[FVG LIMIT] FVG long positions blocked (max: {PARAM.get('MAX_FVG_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("fvg_short_blocked", False):
+            log(f"[FVG LIMIT] FVG short positions blocked (max: {PARAM.get('MAX_FVG_SELL', 3)})")
+            return False
+    
+    elif kind == "EMA_PULLBACK":
+        if direction == "UP" and STATE.get("ema_pullback_long_blocked", False):
+            log(f"[EMA_PULLBACK LIMIT] EMA Pullback long positions blocked (max: {PARAM.get('MAX_EMA_PULLBACK_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("ema_pullback_short_blocked", False):
+            log(f"[EMA_PULLBACK LIMIT] EMA Pullback short positions blocked (max: {PARAM.get('MAX_EMA_PULLBACK_SELL', 3)})")
+            return False
+    
+    elif kind == "CEST":
+        if direction == "UP" and STATE.get("cest_long_blocked", False):
             log(f"[CEST LIMIT] CEST long positions blocked (max: {PARAM.get('MAX_CEST_BUY', 3)})")
             return False
-        if direction=="DOWN" and STATE.get("cest_short_blocked",False):
+        if direction == "DOWN" and STATE.get("cest_short_blocked", False):
             log(f"[CEST LIMIT] CEST short positions blocked (max: {PARAM.get('MAX_CEST_SELL', 3)})")
             return False
     
-    # Check BOLLINGER_BANDS-specific limits (in addition to global limits)
-    if kind == "BOLLINGER_BANDS":
-        if direction=="UP" and STATE.get("bb_long_blocked",False):
+    elif kind == "ORB_FVG_CONFIRM":
+        if direction == "UP" and STATE.get("orb_fvg_long_blocked", False):
+            log(f"[ORB_FVG LIMIT] ORB+FVG long positions blocked (max: {PARAM.get('MAX_ORB_FVG_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("orb_fvg_short_blocked", False):
+            log(f"[ORB_FVG LIMIT] ORB+FVG short positions blocked (max: {PARAM.get('MAX_ORB_FVG_SELL', 3)})")
+            return False
+    
+    elif kind == "NY_REVERSAL":
+        if direction == "UP" and STATE.get("ny_reversal_long_blocked", False):
+            log(f"[NY_REVERSAL LIMIT] NY Reversal long positions blocked (max: {PARAM.get('MAX_NY_REVERSAL_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("ny_reversal_short_blocked", False):
+            log(f"[NY_REVERSAL LIMIT] NY Reversal short positions blocked (max: {PARAM.get('MAX_NY_REVERSAL_SELL', 3)})")
+            return False
+    
+    elif kind == "ICT_POWER_OF_3":
+        if direction == "UP" and STATE.get("ict_power_of_3_long_blocked", False):
+            log(f"[ICT_POWER_OF_3 LIMIT] ICT Power of 3 long positions blocked (max: {PARAM.get('MAX_ICT_POWER_OF_3_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("ict_power_of_3_short_blocked", False):
+            log(f"[ICT_POWER_OF_3 LIMIT] ICT Power of 3 short positions blocked (max: {PARAM.get('MAX_ICT_POWER_OF_3_SELL', 3)})")
+            return False
+    
+    elif kind == "FVG_BREAKER_BLOCK":
+        if direction == "UP" and STATE.get("fvg_breaker_block_long_blocked", False):
+            log(f"[FVG_BREAKER_BLOCK LIMIT] FVG Breaker Block long positions blocked (max: {PARAM.get('MAX_FVG_BREAKER_BLOCK_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("fvg_breaker_block_short_blocked", False):
+            log(f"[FVG_BREAKER_BLOCK LIMIT] FVG Breaker Block short positions blocked (max: {PARAM.get('MAX_FVG_BREAKER_BLOCK_SELL', 3)})")
+            return False
+    
+    elif kind == "REENTRY_4H_5M":
+        if direction == "UP" and STATE.get("reentry_4h_5m_long_blocked", False):
+            log(f"[REENTRY_4H_5M LIMIT] Re-entry long positions blocked (max: {PARAM.get('MAX_REENTRY_4H_5M_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("reentry_4h_5m_short_blocked", False):
+            log(f"[REENTRY_4H_5M LIMIT] Re-entry short positions blocked (max: {PARAM.get('MAX_REENTRY_4H_5M_SELL', 3)})")
+            return False
+    
+    elif kind == "FVG_MSS_ENTRY":
+        if direction == "UP" and STATE.get("fvg_mss_entry_long_blocked", False):
+            log(f"[FVG_MSS_ENTRY LIMIT] FVG MSS Entry long positions blocked (max: {PARAM.get('MAX_FVG_MSS_ENTRY_BUY', 3)})")
+            return False
+        if direction == "DOWN" and STATE.get("fvg_mss_entry_short_blocked", False):
+            log(f"[FVG_MSS_ENTRY LIMIT] FVG MSS Entry short positions blocked (max: {PARAM.get('MAX_FVG_MSS_ENTRY_SELL', 3)})")
+            return False
+    
+    elif kind == "BOLLINGER_BANDS":
+        if direction == "UP" and STATE.get("bb_long_blocked", False):
             log(f"[BB LIMIT] Bollinger Bands long positions blocked (max: {PARAM.get('MAX_BB_BUY', 3)})")
             return False
-        if direction=="DOWN" and STATE.get("bb_short_blocked",False):
+        if direction == "DOWN" and STATE.get("bb_short_blocked", False):
             log(f"[BB LIMIT] Bollinger Bands short positions blocked (max: {PARAM.get('MAX_BB_SELL', 3)})")
             return False
     
-    # Check STOCHASTIC_RSI-specific limits (in addition to global limits)
-    if kind == "STOCHASTIC_RSI":
-        if direction=="UP" and STATE.get("stoch_rsi_long_blocked",False):
+    elif kind == "STOCHASTIC_RSI":
+        if direction == "UP" and STATE.get("stoch_rsi_long_blocked", False):
             log(f"[STOCH_RSI LIMIT] Stochastic RSI long positions blocked (max: {PARAM.get('MAX_STOCH_RSI_BUY', 3)})")
             return False
-        if direction=="DOWN" and STATE.get("stoch_rsi_short_blocked",False):
+        if direction == "DOWN" and STATE.get("stoch_rsi_short_blocked", False):
             log(f"[STOCH_RSI LIMIT] Stochastic RSI short positions blocked (max: {PARAM.get('MAX_STOCH_RSI_SELL', 3)})")
             return False
     
-    # Check FIBONACCI_RETRACEMENT-specific limits (in addition to global limits)
-    if kind == "FIBONACCI_RETRACEMENT":
-        if direction=="UP" and STATE.get("fib_long_blocked",False):
+    elif kind == "FIBONACCI_RETRACEMENT":
+        if direction == "UP" and STATE.get("fib_long_blocked", False):
             log(f"[FIB LIMIT] Fibonacci Retracement long positions blocked (max: {PARAM.get('MAX_FIB_BUY', 3)})")
             return False
-        if direction=="DOWN" and STATE.get("fib_short_blocked",False):
+        if direction == "DOWN" and STATE.get("fib_short_blocked", False):
             log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 3)})")
             return False
     
@@ -5981,7 +6133,7 @@ def main():
     initialize_hourly_stats()
     
     tg_send("🚀 EMA ULTRA v15.10.0 active — On-chain strategy: Top 25 by volume\n"
-            "📊 11 strategies active | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
+            "📊 13 strategies active | PER-STRATEGY LIMITS: 3 buy/3 sell per strategy\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
             "⏱️ Hourly performance tracking enabled\n"
             "🔥 On-chain: Top 25 coins by 24h volume")
@@ -6026,16 +6178,33 @@ def main():
                     kind = sig.get("kind", "")
                     direction = sig["dir"]
                     
-                    # Update GLOBAL counts first (counts ALL open positions regardless of strategy)
-                    total_long_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("direction") == "UP"])
-                    total_short_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("direction") == "DOWN"])
-                    STATE["long_blocked"] = (total_long_count >= PARAM["MAX_BUY"])
-                    STATE["short_blocked"] = (total_short_count >= PARAM["MAX_SELL"])
-                    
-                    # Update strategy-specific counts for strategies with sub-limits
-                    # Calculate count once to avoid redundant iterations
+                    # Update strategy-specific counts for all strategies
                     current_count = 0
-                    if kind == "CEST":
+                    if kind == "MACD":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "MACD" and s.get("direction") == "UP"])
+                            STATE["macd_long_blocked"] = (current_count >= PARAM.get("MAX_MACD_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "MACD" and s.get("direction") == "DOWN"])
+                            STATE["macd_short_blocked"] = (current_count >= PARAM.get("MAX_MACD_SELL", 3))
+                    
+                    elif kind == "FVG":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG" and s.get("direction") == "UP"])
+                            STATE["fvg_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG" and s.get("direction") == "DOWN"])
+                            STATE["fvg_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_SELL", 3))
+                    
+                    elif kind == "EMA_PULLBACK":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "EMA_PULLBACK" and s.get("direction") == "UP"])
+                            STATE["ema_pullback_long_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "EMA_PULLBACK" and s.get("direction") == "DOWN"])
+                            STATE["ema_pullback_short_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_SELL", 3))
+                    
+                    elif kind == "CEST":
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
@@ -6045,7 +6214,54 @@ def main():
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
                             STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 3))
                     
-                    # Update BOLLINGER_BANDS-specific counts
+                    elif kind == "ORB_FVG_CONFIRM":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ORB_FVG_CONFIRM" and s.get("direction") == "UP"])
+                            STATE["orb_fvg_long_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ORB_FVG_CONFIRM" and s.get("direction") == "DOWN"])
+                            STATE["orb_fvg_short_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_SELL", 3))
+                    
+                    elif kind == "NY_REVERSAL":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "NY_REVERSAL" and s.get("direction") == "UP"])
+                            STATE["ny_reversal_long_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "NY_REVERSAL" and s.get("direction") == "DOWN"])
+                            STATE["ny_reversal_short_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_SELL", 3))
+                    
+                    elif kind == "ICT_POWER_OF_3":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ICT_POWER_OF_3" and s.get("direction") == "UP"])
+                            STATE["ict_power_of_3_long_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ICT_POWER_OF_3" and s.get("direction") == "DOWN"])
+                            STATE["ict_power_of_3_short_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", 3))
+                    
+                    elif kind == "FVG_BREAKER_BLOCK":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_BREAKER_BLOCK" and s.get("direction") == "UP"])
+                            STATE["fvg_breaker_block_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_BREAKER_BLOCK" and s.get("direction") == "DOWN"])
+                            STATE["fvg_breaker_block_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", 3))
+                    
+                    elif kind == "REENTRY_4H_5M":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
+                            STATE["reentry_4h_5m_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "DOWN"])
+                            STATE["reentry_4h_5m_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_SELL", 3))
+                    
+                    elif kind == "FVG_MSS_ENTRY":
+                        if direction == "UP":
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_MSS_ENTRY" and s.get("direction") == "UP"])
+                            STATE["fvg_mss_entry_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", 3))
+                        else:
+                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_MSS_ENTRY" and s.get("direction") == "DOWN"])
+                            STATE["fvg_mss_entry_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", 3))
+                    
                     elif kind == "BOLLINGER_BANDS":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
@@ -6054,7 +6270,6 @@ def main():
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
                             STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 3))
                     
-                    # Update STOCHASTIC_RSI-specific counts
                     elif kind == "STOCHASTIC_RSI":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
@@ -6063,7 +6278,6 @@ def main():
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
                             STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
                     
-                    # Update FIBONACCI_RETRACEMENT-specific counts
                     elif kind == "FIBONACCI_RETRACEMENT":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
@@ -6072,11 +6286,8 @@ def main():
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
                             STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 3))
                     
-                    # Log the current counts for monitoring (reuse current_count to avoid redundant iteration)
-                    if kind in ["CEST", "BOLLINGER_BANDS", "STOCHASTIC_RSI", "FIBONACCI_RETRACEMENT"]:
-                        log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']} | {kind}: {current_count}")
-                    else:
-                        log(f"[LIMIT CHECK] Total: L={total_long_count}/{PARAM['MAX_BUY']} S={total_short_count}/{PARAM['MAX_SELL']}")
+                    # Log the current counts for monitoring
+                    log(f"[LIMIT CHECK] {kind}: {current_count}/3")
             
             # Update limits once after batch to sync with exchange state
             if any(batch_opened.values()):
