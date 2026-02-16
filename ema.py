@@ -360,6 +360,7 @@ ONCHAIN_CACHE_FILE = os.path.join(DATA_DIR, "onchain_cache.json")
 # On-chain strategy constants
 MIN_ONCHAIN_HISTORY = 60  # Minimum days of data required for z-score calculation
 ONCHAIN_ZSCORE_WINDOW = 60  # Days to use for z-score calculation
+DAILY_UPDATE_INTERVAL = 2880  # Bot cycles per day (30 seconds * 2880 = 24 hours)
 
 # Tier-based signal configuration
 ONCHAIN_TIER1_POWER_BASE = 75  # Base power for strong signals (z > 1.0)
@@ -436,7 +437,7 @@ def update_onchain_cache():
     metrics = cm_get_asset_metrics(
         asset="btc",
         metrics=("AdrActCnt", "TxCnt", "TxTfrValAdjUSD"),
-        days_back=120  # ~4 months for z-score calculation (120 days)
+        days_back=120  # 4 months of historical data (120 days)
     )
     
     if metrics:
@@ -454,6 +455,10 @@ def calculate_onchain_zscore(metric_name="AdrActCnt", window=60):
     try:
         metrics = ONCHAIN_CACHE.get("btc_metrics", {})
         if not metrics:
+            return None
+        
+        # Early validation: ensure we have enough data
+        if len(metrics) < window:
             return None
         
         # Get recent values (last 'window' days)
@@ -3084,8 +3089,9 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     c_now = closes[-1]
     sma50_now = sma50[-1]
     
-    # Calculate volume spike
-    avg_volume = sum(volumes[-10:-1]) / 9 if len(volumes) >= 10 else volumes[-1]
+    # Calculate volume spike (using 10-bar average excluding current bar)
+    # This compares current volume to recent historical average
+    avg_volume = sum(volumes[-11:-1]) / 10 if len(volumes) >= 11 else volumes[-1]
     current_volume = volumes[-1]
     volume_spike = current_volume > avg_volume * 1.5
     
@@ -6025,9 +6031,8 @@ def main():
             bar_i=STATE["bar_index"]
             
             # Update on-chain cache once per day
-            # Bot runs every 30 seconds, so 2880 iterations = 24 hours
-            # (30 seconds * 2880 = 86400 seconds = 24 hours)
-            if bar_i % 2880 == 0:
+            # Bot runs every 30 seconds, DAILY_UPDATE_INTERVAL defines cycles per day
+            if bar_i % DAILY_UPDATE_INTERVAL == 0:
                 update_onchain_cache()
 
             # 1) Sinyal tarama
