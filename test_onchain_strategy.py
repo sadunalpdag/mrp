@@ -75,7 +75,8 @@ def test_build_signals():
     print(f"Created {len(on_df)} days of on-chain data")
     
     # Generate signals
-    strategy_df = build_signals(px_df, on_df, on_metric='AdrActCnt', max_positions=3)
+    max_positions = 3
+    strategy_df = build_signals(px_df, on_df, on_metric='AdrActCnt', max_positions=max_positions)
     
     print(f"\nStrategy DataFrame shape: {strategy_df.shape}")
     print(f"Columns: {strategy_df.columns.tolist()}")
@@ -99,8 +100,31 @@ def test_build_signals():
     max_short = position_counts.get(-1.0, 0)
     
     print(f"\nPosition Limits Check:")
-    print(f"  Max long positions at once: {max_long} (limit: 3)")
-    print(f"  Max short positions at once: {max_short} (limit: 3)")
+    print(f"  Long position days: {max_long}")
+    print(f"  Short position days: {max_short}")
+    
+    # Count number of separate trades (entry cycles)
+    long_entries = 0
+    short_entries = 0
+    prev_pos = 0.0
+    
+    for pos in strategy_df['position']:
+        if pos == 1.0 and prev_pos != 1.0:
+            long_entries += 1
+        elif pos == -1.0 and prev_pos != -1.0:
+            short_entries += 1
+        prev_pos = pos
+    
+    print(f"  Number of long entries: {long_entries} (limit: {max_positions})")
+    print(f"  Number of short entries: {short_entries} (limit: {max_positions})")
+    
+    # Assert position limits are respected
+    assert long_entries <= max_positions, \
+        f"Exceeded max long entries: {long_entries} > {max_positions}"
+    assert short_entries <= max_positions, \
+        f"Exceeded max short entries: {short_entries} > {max_positions}"
+    
+    print(f"  ✓ Position limits respected!")
     
     # Show last 10 rows
     print(f"\nLast 10 rows of strategy data:")

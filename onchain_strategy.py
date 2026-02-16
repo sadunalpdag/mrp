@@ -148,7 +148,7 @@ def zscore(s, window=60):
         pandas Series with z-scores
     """
     m = s.rolling(window).mean()
-    sd = s.rolling(window).std(ddof=0)
+    sd = s.rolling(window).std(ddof=1)
     return (s - m) / sd
 
 def build_signals(px_df, on_df, on_metric="AdrActCnt", max_positions=3):
@@ -189,28 +189,47 @@ def build_signals(px_df, on_df, on_metric="AdrActCnt", max_positions=3):
     df.loc[(df["trend"] == -1) & (df["risk_off"]), "signal"] = -1
     
     # Apply position limits (3 buy / 3 sell max)
+    # Interpretation: Maximum 3 separate long entries and 3 separate short entries
+    # Each signal cycle (entry to exit) counts as one trade
     df["position"] = 0.0
-    current_positions = 0
+    long_entries_used = 0
+    short_entries_used = 0
+    in_position = False
     
-    for i in range(1, len(df)):
-        prev_signal = df.iloc[i-1]["signal"]
+    for i in range(len(df)):
+        current_signal = df.iloc[i]["signal"]
+        prev_position = df.iloc[i-1]["position"] if i > 0 else 0.0
         
-        # Check if we should open a new position
-        if prev_signal == 1 and current_positions < max_positions:
-            # Long signal and we have capacity
-            df.iloc[i, df.columns.get_loc("position")] = 1.0
-            current_positions += 1
-        elif prev_signal == -1 and current_positions > -max_positions:
-            # Short signal and we have capacity
-            df.iloc[i, df.columns.get_loc("position")] = -1.0
-            current_positions -= 1
-        elif prev_signal == 0:
-            # Exit signal - close positions
-            current_positions = 0
-            df.iloc[i, df.columns.get_loc("position")] = 0.0
+        if current_signal == 1:
+            # Long signal
+            if not in_position:
+                # New entry
+                if long_entries_used < max_positions:
+                    df.iloc[i, df.columns.get_loc("position")] = 1.0
+                    long_entries_used += 1
+                    in_position = True
+                else:
+                    df.iloc[i, df.columns.get_loc("position")] = 0.0
+            else:
+                # Continue holding
+                df.iloc[i, df.columns.get_loc("position")] = prev_position
+        elif current_signal == -1:
+            # Short signal
+            if not in_position:
+                # New entry
+                if short_entries_used < max_positions:
+                    df.iloc[i, df.columns.get_loc("position")] = -1.0
+                    short_entries_used += 1
+                    in_position = True
+                else:
+                    df.iloc[i, df.columns.get_loc("position")] = 0.0
+            else:
+                # Continue holding
+                df.iloc[i, df.columns.get_loc("position")] = prev_position
         else:
-            # Keep current position
-            df.iloc[i, df.columns.get_loc("position")] = df.iloc[i-1]["position"]
+            # Exit signal
+            df.iloc[i, df.columns.get_loc("position")] = 0.0
+            in_position = False
     
     # Calculate returns
     df["ret"] = df["close"].pct_change().fillna(0)
@@ -249,7 +268,7 @@ def backtest_summary(df):
     
     total = df["equity"].iloc[-1] - 1
     daily = df["strategy_ret"]
-    sharpe = (daily.mean() / (daily.std(ddof=0) + 1e-12)) * np.sqrt(365)
+    sharpe = (daily.mean() / (daily.std(ddof=1) + 1e-12)) * np.sqrt(365)
     max_dd = (df["equity"] / df["equity"].cummax() - 1).min()
     trades = (df["position"].diff().abs() > 0).sum()
     
