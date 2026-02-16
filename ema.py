@@ -73,6 +73,9 @@ ALGO_ORDER_TYPES = [
 # Trading Signal Quality Filter
 DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
 
+# Per-strategy position limits
+DEFAULT_STRATEGY_POSITION_LIMIT = 3  # Maximum positions per strategy per direction
+
 # Cash out settlement delays
 ORDER_CLOSE_SETTLEMENT_SEC = 3  # Time to wait after closing positions
 ORDER_REOPEN_SETTLEMENT_SEC = 2  # Time to wait after reopening positions
@@ -3591,20 +3594,20 @@ STATE_DEFAULT={
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
-    # Per-strategy limits: Each strategy limited to 3 buy / 3 sell independently
-    "MAX_MACD_BUY":3, "MAX_MACD_SELL":3,  # MACD strategy limits
-    "MAX_FVG_BUY":3, "MAX_FVG_SELL":3,  # FVG strategy limits
-    "MAX_EMA_PULLBACK_BUY":3, "MAX_EMA_PULLBACK_SELL":3,  # EMA Pullback strategy limits
-    "MAX_CEST_BUY":3, "MAX_CEST_SELL":3,  # CEST strategy limits
-    "MAX_ORB_FVG_BUY":3, "MAX_ORB_FVG_SELL":3,  # ORB+FVG strategy limits
-    "MAX_NY_REVERSAL_BUY":3, "MAX_NY_REVERSAL_SELL":3,  # NY Reversal strategy limits
-    "MAX_ICT_POWER_OF_3_BUY":3, "MAX_ICT_POWER_OF_3_SELL":3,  # ICT Power of 3 strategy limits
-    "MAX_FVG_BREAKER_BLOCK_BUY":3, "MAX_FVG_BREAKER_BLOCK_SELL":3,  # FVG Breaker Block strategy limits
-    "MAX_REENTRY_4H_5M_BUY":3, "MAX_REENTRY_4H_5M_SELL":3,  # Re-entry strategy limits
-    "MAX_FVG_MSS_ENTRY_BUY":3, "MAX_FVG_MSS_ENTRY_SELL":3,  # FVG MSS strategy limits
-    "MAX_BB_BUY":3, "MAX_BB_SELL":3,  # Bollinger Bands strategy limits
-    "MAX_STOCH_RSI_BUY":3, "MAX_STOCH_RSI_SELL":3,  # Stochastic RSI strategy limits
-    "MAX_FIB_BUY":3, "MAX_FIB_SELL":3,  # Fibonacci retracement strategy limits
+    # Per-strategy limits: Each strategy limited to DEFAULT_STRATEGY_POSITION_LIMIT buy/sell independently
+    "MAX_MACD_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_MACD_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # MACD strategy limits
+    "MAX_FVG_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FVG_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # FVG strategy limits
+    "MAX_EMA_PULLBACK_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_EMA_PULLBACK_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # EMA Pullback strategy limits
+    "MAX_CEST_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_CEST_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # CEST strategy limits
+    "MAX_ORB_FVG_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_ORB_FVG_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # ORB+FVG strategy limits
+    "MAX_NY_REVERSAL_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_NY_REVERSAL_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # NY Reversal strategy limits
+    "MAX_ICT_POWER_OF_3_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_ICT_POWER_OF_3_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # ICT Power of 3 strategy limits
+    "MAX_FVG_BREAKER_BLOCK_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FVG_BREAKER_BLOCK_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # FVG Breaker Block strategy limits
+    "MAX_REENTRY_4H_5M_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_REENTRY_4H_5M_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Re-entry strategy limits
+    "MAX_FVG_MSS_ENTRY_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FVG_MSS_ENTRY_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # FVG MSS strategy limits
+    "MAX_BB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_BB_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Bollinger Bands strategy limits
+    "MAX_STOCH_RSI_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_STOCH_RSI_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Stochastic RSI strategy limits
+    "MAX_FIB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FIB_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Fibonacci retracement strategy limits
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":2000.0,
@@ -4045,32 +4048,32 @@ def update_directional_limits():
         log(f"[FETCH POS ERR]{e}")
 
     # Update blocked states for all strategies
-    STATE["macd_long_blocked"] = (live["macd_long_count"] >= PARAM.get("MAX_MACD_BUY", 3))
-    STATE["macd_short_blocked"] = (live["macd_short_count"] >= PARAM.get("MAX_MACD_SELL", 3))
-    STATE["fvg_long_blocked"] = (live["fvg_long_count"] >= PARAM.get("MAX_FVG_BUY", 3))
-    STATE["fvg_short_blocked"] = (live["fvg_short_count"] >= PARAM.get("MAX_FVG_SELL", 3))
-    STATE["ema_pullback_long_blocked"] = (live["ema_pullback_long_count"] >= PARAM.get("MAX_EMA_PULLBACK_BUY", 3))
-    STATE["ema_pullback_short_blocked"] = (live["ema_pullback_short_count"] >= PARAM.get("MAX_EMA_PULLBACK_SELL", 3))
-    STATE["cest_long_blocked"] = (live["cest_long_count"] >= PARAM.get("MAX_CEST_BUY", 3))
-    STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", 3))
-    STATE["orb_fvg_long_blocked"] = (live["orb_fvg_long_count"] >= PARAM.get("MAX_ORB_FVG_BUY", 3))
-    STATE["orb_fvg_short_blocked"] = (live["orb_fvg_short_count"] >= PARAM.get("MAX_ORB_FVG_SELL", 3))
-    STATE["ny_reversal_long_blocked"] = (live["ny_reversal_long_count"] >= PARAM.get("MAX_NY_REVERSAL_BUY", 3))
-    STATE["ny_reversal_short_blocked"] = (live["ny_reversal_short_count"] >= PARAM.get("MAX_NY_REVERSAL_SELL", 3))
-    STATE["ict_power_of_3_long_blocked"] = (live["ict_power_of_3_long_count"] >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", 3))
-    STATE["ict_power_of_3_short_blocked"] = (live["ict_power_of_3_short_count"] >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", 3))
-    STATE["fvg_breaker_block_long_blocked"] = (live["fvg_breaker_block_long_count"] >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", 3))
-    STATE["fvg_breaker_block_short_blocked"] = (live["fvg_breaker_block_short_count"] >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", 3))
-    STATE["reentry_4h_5m_long_blocked"] = (live["reentry_4h_5m_long_count"] >= PARAM.get("MAX_REENTRY_4H_5M_BUY", 3))
-    STATE["reentry_4h_5m_short_blocked"] = (live["reentry_4h_5m_short_count"] >= PARAM.get("MAX_REENTRY_4H_5M_SELL", 3))
-    STATE["fvg_mss_entry_long_blocked"] = (live["fvg_mss_entry_long_count"] >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", 3))
-    STATE["fvg_mss_entry_short_blocked"] = (live["fvg_mss_entry_short_count"] >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", 3))
-    STATE["bb_long_blocked"] = (live["bb_long_count"] >= PARAM.get("MAX_BB_BUY", 3))
-    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", 3))
-    STATE["stoch_rsi_long_blocked"] = (live["stoch_rsi_long_count"] >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
-    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
-    STATE["fib_long_blocked"] = (live["fib_long_count"] >= PARAM.get("MAX_FIB_BUY", 3))
-    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 3))
+    STATE["macd_long_blocked"] = (live["macd_long_count"] >= PARAM.get("MAX_MACD_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["macd_short_blocked"] = (live["macd_short_count"] >= PARAM.get("MAX_MACD_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fvg_long_blocked"] = (live["fvg_long_count"] >= PARAM.get("MAX_FVG_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fvg_short_blocked"] = (live["fvg_short_count"] >= PARAM.get("MAX_FVG_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["ema_pullback_long_blocked"] = (live["ema_pullback_long_count"] >= PARAM.get("MAX_EMA_PULLBACK_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["ema_pullback_short_blocked"] = (live["ema_pullback_short_count"] >= PARAM.get("MAX_EMA_PULLBACK_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["cest_long_blocked"] = (live["cest_long_count"] >= PARAM.get("MAX_CEST_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["cest_short_blocked"] = (live["cest_short_count"] >= PARAM.get("MAX_CEST_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["orb_fvg_long_blocked"] = (live["orb_fvg_long_count"] >= PARAM.get("MAX_ORB_FVG_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["orb_fvg_short_blocked"] = (live["orb_fvg_short_count"] >= PARAM.get("MAX_ORB_FVG_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["ny_reversal_long_blocked"] = (live["ny_reversal_long_count"] >= PARAM.get("MAX_NY_REVERSAL_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["ny_reversal_short_blocked"] = (live["ny_reversal_short_count"] >= PARAM.get("MAX_NY_REVERSAL_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["ict_power_of_3_long_blocked"] = (live["ict_power_of_3_long_count"] >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["ict_power_of_3_short_blocked"] = (live["ict_power_of_3_short_count"] >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fvg_breaker_block_long_blocked"] = (live["fvg_breaker_block_long_count"] >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fvg_breaker_block_short_blocked"] = (live["fvg_breaker_block_short_count"] >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["reentry_4h_5m_long_blocked"] = (live["reentry_4h_5m_long_count"] >= PARAM.get("MAX_REENTRY_4H_5M_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["reentry_4h_5m_short_blocked"] = (live["reentry_4h_5m_short_count"] >= PARAM.get("MAX_REENTRY_4H_5M_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fvg_mss_entry_long_blocked"] = (live["fvg_mss_entry_long_count"] >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fvg_mss_entry_short_blocked"] = (live["fvg_mss_entry_short_count"] >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["bb_long_blocked"] = (live["bb_long_count"] >= PARAM.get("MAX_BB_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["bb_short_blocked"] = (live["bb_short_count"] >= PARAM.get("MAX_BB_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["stoch_rsi_long_blocked"] = (live["stoch_rsi_long_count"] >= PARAM.get("MAX_STOCH_RSI_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fib_long_blocked"] = (live["fib_long_count"] >= PARAM.get("MAX_FIB_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
+    STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
     
     # Check if all strategies are blocked (no trading possible)
     all_long_blocked = all([
@@ -6183,108 +6186,108 @@ def main():
                     if kind == "MACD":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "MACD" and s.get("direction") == "UP"])
-                            STATE["macd_long_blocked"] = (current_count >= PARAM.get("MAX_MACD_BUY", 3))
+                            STATE["macd_long_blocked"] = (current_count >= PARAM.get("MAX_MACD_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "MACD" and s.get("direction") == "DOWN"])
-                            STATE["macd_short_blocked"] = (current_count >= PARAM.get("MAX_MACD_SELL", 3))
+                            STATE["macd_short_blocked"] = (current_count >= PARAM.get("MAX_MACD_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "FVG":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG" and s.get("direction") == "UP"])
-                            STATE["fvg_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BUY", 3))
+                            STATE["fvg_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG" and s.get("direction") == "DOWN"])
-                            STATE["fvg_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_SELL", 3))
+                            STATE["fvg_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "EMA_PULLBACK":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "EMA_PULLBACK" and s.get("direction") == "UP"])
-                            STATE["ema_pullback_long_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_BUY", 3))
+                            STATE["ema_pullback_long_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "EMA_PULLBACK" and s.get("direction") == "DOWN"])
-                            STATE["ema_pullback_short_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_SELL", 3))
+                            STATE["ema_pullback_short_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "CEST":
                         if direction == "UP":
                             batch_opened["cest_long"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
-                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", 3))
+                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             batch_opened["cest_short"] += 1
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
-                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", 3))
+                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "ORB_FVG_CONFIRM":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ORB_FVG_CONFIRM" and s.get("direction") == "UP"])
-                            STATE["orb_fvg_long_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_BUY", 3))
+                            STATE["orb_fvg_long_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ORB_FVG_CONFIRM" and s.get("direction") == "DOWN"])
-                            STATE["orb_fvg_short_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_SELL", 3))
+                            STATE["orb_fvg_short_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "NY_REVERSAL":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "NY_REVERSAL" and s.get("direction") == "UP"])
-                            STATE["ny_reversal_long_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_BUY", 3))
+                            STATE["ny_reversal_long_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "NY_REVERSAL" and s.get("direction") == "DOWN"])
-                            STATE["ny_reversal_short_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_SELL", 3))
+                            STATE["ny_reversal_short_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "ICT_POWER_OF_3":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ICT_POWER_OF_3" and s.get("direction") == "UP"])
-                            STATE["ict_power_of_3_long_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", 3))
+                            STATE["ict_power_of_3_long_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ICT_POWER_OF_3" and s.get("direction") == "DOWN"])
-                            STATE["ict_power_of_3_short_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", 3))
+                            STATE["ict_power_of_3_short_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "FVG_BREAKER_BLOCK":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_BREAKER_BLOCK" and s.get("direction") == "UP"])
-                            STATE["fvg_breaker_block_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", 3))
+                            STATE["fvg_breaker_block_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_BREAKER_BLOCK" and s.get("direction") == "DOWN"])
-                            STATE["fvg_breaker_block_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", 3))
+                            STATE["fvg_breaker_block_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "REENTRY_4H_5M":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
-                            STATE["reentry_4h_5m_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_BUY", 3))
+                            STATE["reentry_4h_5m_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "DOWN"])
-                            STATE["reentry_4h_5m_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_SELL", 3))
+                            STATE["reentry_4h_5m_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "FVG_MSS_ENTRY":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_MSS_ENTRY" and s.get("direction") == "UP"])
-                            STATE["fvg_mss_entry_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", 3))
+                            STATE["fvg_mss_entry_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_MSS_ENTRY" and s.get("direction") == "DOWN"])
-                            STATE["fvg_mss_entry_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", 3))
+                            STATE["fvg_mss_entry_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "BOLLINGER_BANDS":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
-                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", 3))
+                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
-                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", 3))
+                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "STOCHASTIC_RSI":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
-                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", 3))
+                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
-                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
+                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     elif kind == "FIBONACCI_RETRACEMENT":
                         if direction == "UP":
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
-                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", 3))
+                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
                         else:
                             current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
-                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", 3))
+                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
                     
                     # Log the current counts for monitoring
                     log(f"[LIMIT CHECK] {kind}: {current_count}/3")
