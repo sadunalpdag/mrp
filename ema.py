@@ -351,6 +351,139 @@ def fibonacci_levels(high, low):
         '1.0': low
     }
 
+# ===================== COINMETRICS API INTEGRATION =====================
+
+CM_BASE_URL = "https://community-api.coinmetrics.io/v4"
+ONCHAIN_CACHE = {}  # Cache on-chain data (updated daily)
+ONCHAIN_CACHE_FILE = os.path.join(DATA_DIR, "onchain_cache.json")
+
+# On-chain strategy constants
+MIN_ONCHAIN_HISTORY = 60  # Minimum days of data required for z-score calculation
+ONCHAIN_ZSCORE_WINDOW = 60  # Days to use for z-score calculation
+DAILY_UPDATE_INTERVAL = 2880  # Bot cycles per day (30 seconds * 2880 = 24 hours)
+
+# Tier-based signal configuration
+ONCHAIN_TIER1_POWER_BASE = 75  # Base power for strong signals (z > 1.0)
+ONCHAIN_TIER2_POWER_BASE = 65  # Base power for medium signals (z > 0.5)
+ONCHAIN_TIER3_POWER_BASE = 55  # Base power for weak signals (z > 0)
+
+ONCHAIN_TIER1_RR_RATIO = 3.0   # Risk/Reward ratio for tier 1 signals
+ONCHAIN_TIER2_RR_RATIO = 2.0   # Risk/Reward ratio for tier 2 signals
+ONCHAIN_TIER3_RR_RATIO = 1.5   # Risk/Reward ratio for tier 3 signals
+
+
+def cm_get_asset_metrics(asset="btc", metrics=("AdrActCnt", "TxCnt"), days_back=90):
+    """
+    Fetch on-chain metrics from CoinMetrics API
+    
+    Args:
+        asset: Asset symbol (e.g., "btc")
+        metrics: Tuple of metric names to fetch
+        days_back: Number of days of historical data to fetch
+    
+    Returns:
+        Dict mapping date strings (YYYY-MM-DD) to metric dicts
+        Example: {"2024-01-01": {"AdrActCnt": 12345.0, "TxCnt": 67890.0}}
+    """
+    try:
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=days_back)
+        
+        params = {
+            "assets": asset,
+            "metrics": ",".join(metrics),
+            "frequency": "1d",
+            "start_time": start_date.strftime("%Y-%m-%d"),
+            "end_time": end_date.strftime("%Y-%m-%d")
+        }
+        
+        response = requests.get(
+            f"{CM_BASE_URL}/timeseries/asset-metrics",
+            params=params,
+            timeout=30
+        )
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        
+        # Parse into dict by date
+        parsed = {}
+        for item in data:
+            date = item.get("time", "").split("T")[0]
+            values_dict = item.get("values", {})
+            parsed[date] = {metric: safe_float(values_dict.get(metric, 0)) for metric in metrics}
+        
+        return parsed
+    except Exception as e:
+        log(f"[COINMETRICS ERR] {e}")
+        return {}
+
+def load_onchain_cache():
+    """Load cached on-chain data from file"""
+    global ONCHAIN_CACHE
+    ONCHAIN_CACHE = safe_load(ONCHAIN_CACHE_FILE, {})
+    
+def update_onchain_cache():
+    """Update on-chain data cache (call once per day)"""
+    global ONCHAIN_CACHE
+    
+    # Check if already updated today
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if ONCHAIN_CACHE.get("last_update") == today:
+        return
+    
+    log("[ONCHAIN UPDATE] Fetching fresh on-chain data...")
+    
+    # Fetch BTC on-chain metrics
+    metrics = cm_get_asset_metrics(
+        asset="btc",
+        metrics=("AdrActCnt", "TxCnt", "TxTfrValAdjUSD"),
+        days_back=120  # 4 months of historical data (120 days)
+    )
+    
+    if metrics:
+        ONCHAIN_CACHE = {
+            "last_update": today,
+            "btc_metrics": metrics
+        }
+        safe_save(ONCHAIN_CACHE_FILE, ONCHAIN_CACHE)
+        log(f"[ONCHAIN UPDATE] Updated {len(metrics)} days of data")
+    else:
+        log("[ONCHAIN UPDATE] Failed to fetch data")
+
+def calculate_onchain_zscore(metric_name="AdrActCnt", window=60):
+    """Calculate z-score for an on-chain metric"""
+    try:
+        metrics = ONCHAIN_CACHE.get("btc_metrics", {})
+        if not metrics:
+            return None
+        
+        # Early validation: ensure we have enough data
+        if len(metrics) < window:
+            return None
+        
+        # Get recent values (last 'window' days)
+        dates = sorted(metrics.keys())[-window:]
+        values = [metrics[d].get(metric_name, 0) for d in dates]
+        
+        if len(values) < window:
+            return None
+        
+        # Calculate z-score
+        mean = sum(values) / len(values)
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
+        std = variance ** 0.5
+        
+        if std < 1e-12:
+            return 0.0
+        
+        current_value = values[-1]
+        z = (current_value - mean) / std
+        
+        return z
+    except Exception as e:
+        log(f"[ONCHAIN ZSCORE ERR] {e}")
+        return None
+
 # ===================== VWAP & VOLUME HELPERS =====================
 
 def calculate_vwap(klines):
@@ -2928,6 +3061,144 @@ def build_fibonacci_retracement_signal(sym, kl, bar_i):
     }
 
 
+def build_onchain_3level_signal(sym, kl, bar_i):
+    """
+    On-Chain 3-Level Buy/Sell Strategy
+    
+    Uses BTC on-chain metrics (Active Addresses, Transaction Count) combined with
+    price action to generate 3-tier signals:
+    
+    📊 TIER 1 (STRONG): On-chain z-score > 1.0 + price > SMA50 + volume spike
+    📊 TIER 2 (MEDIUM): On-chain z-score > 0.5 + price > SMA50
+    📊 TIER 3 (WEAK): On-chain z-score > 0 + price trend aligned
+    
+    Similar logic for short signals (inverted).
+    
+    This strategy is BTC-focused but can be applied to highly correlated assets.
+    """
+    if len(kl) < MIN_ONCHAIN_HISTORY:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    volumes = [float(k[5]) for k in kl]
+    
+    # Calculate price indicators
+    sma50 = ema(closes, 50)
+    c_now = closes[-1]
+    sma50_now = sma50[-1]
+    
+    # Calculate volume spike (using 10-bar average excluding current bar)
+    # This compares current volume to recent historical average
+    avg_volume = sum(volumes[-11:-1]) / 10 if len(volumes) >= 11 else volumes[-1]
+    current_volume = volumes[-1]
+    volume_spike = current_volume > avg_volume * 1.5
+    
+    # Get on-chain z-scores
+    addr_zscore = calculate_onchain_zscore("AdrActCnt", window=ONCHAIN_ZSCORE_WINDOW)
+    txcnt_zscore = calculate_onchain_zscore("TxCnt", window=ONCHAIN_ZSCORE_WINDOW)
+    
+    if addr_zscore is None or txcnt_zscore is None:
+        return None  # No on-chain data available
+    
+    # Combined on-chain score (average of two metrics)
+    onchain_z = (addr_zscore + txcnt_zscore) / 2.0
+    
+    # Determine signal tier and direction
+    direction = None
+    tier_level = 0
+    tag = ""
+    
+    # LONG SIGNALS
+    if c_now > sma50_now:  # Uptrend
+        if onchain_z > 1.0 and volume_spike:
+            direction = "UP"
+            tier_level = 1  # STRONG
+            tag = "🔥 ONCHAIN TIER1 BUY"
+        elif onchain_z > 0.5:
+            direction = "UP"
+            tier_level = 2  # MEDIUM
+            tag = "📊 ONCHAIN TIER2 BUY"
+        elif onchain_z > 0:
+            direction = "UP"
+            tier_level = 3  # WEAK
+            tag = "📈 ONCHAIN TIER3 BUY"
+    
+    # SHORT SIGNALS
+    elif c_now < sma50_now:  # Downtrend
+        if onchain_z < -1.0 and volume_spike:
+            direction = "DOWN"
+            tier_level = 1  # STRONG
+            tag = "🔥 ONCHAIN TIER1 SELL"
+        elif onchain_z < -0.5:
+            direction = "DOWN"
+            tier_level = 2  # MEDIUM
+            tag = "📊 ONCHAIN TIER2 SELL"
+        elif onchain_z < 0:
+            direction = "DOWN"
+            tier_level = 3  # WEAK
+            tag = "📈 ONCHAIN TIER3 SELL"
+    
+    if direction is None:
+        return None
+    
+    # Calculate power based on tier (using predefined constants)
+    base_power = {
+        1: ONCHAIN_TIER1_POWER_BASE, 
+        2: ONCHAIN_TIER2_POWER_BASE, 
+        3: ONCHAIN_TIER3_POWER_BASE
+    }[tier_level]
+    power = base_power + abs(onchain_z) * 5
+    
+    # Calculate ATR and RSI
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    # Calculate TP/SL with tier-based risk/reward (using predefined constants)
+    rr_ratio = {
+        1: ONCHAIN_TIER1_RR_RATIO, 
+        2: ONCHAIN_TIER2_RR_RATIO, 
+        3: ONCHAIN_TIER3_RR_RATIO
+    }[tier_level]
+    
+    if direction == "UP":
+        sl_est = c_now - atr_v * 1.5
+        risk = c_now - sl_est
+        tp_est = c_now + rr_ratio * risk
+    else:
+        sl_est = c_now + atr_v * 1.5
+        risk = sl_est - c_now
+        tp_est = c_now - rr_ratio * risk
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": f"ONCHAIN_T{tier_level}",
+        "emoji": "🔥" if tier_level == 1 else "📊" if tier_level == 2 else "📈",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": power,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "ONCHAIN_3LEVEL",
+        "tag": tag,
+        "conditions": {
+            "onchain_zscore": onchain_z,
+            "addr_zscore": addr_zscore,
+            "txcnt_zscore": txcnt_zscore,
+            "sma50": sma50_now,
+            "volume_spike": volume_spike,
+            "tier_level": tier_level,
+            "rr_ratio": rr_ratio
+        }
+    }
+
+
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
@@ -2963,10 +3234,11 @@ def scan_symbol(sym,bar_i):
     s_bb = build_bollinger_bands_signal(sym, kl, bar_i) if PARAM.get("ENABLE_BB", True) else None
     s_stoch_rsi = build_stochastic_rsi_signal(sym, kl, bar_i) if PARAM.get("ENABLE_STOCH_RSI", True) else None
     s_fib = build_fibonacci_retracement_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FIB", True) else None
+    s_onchain_3level = build_onchain_3level_signal(sym, kl, bar_i) if PARAM.get("ENABLE_ONCHAIN_3LEVEL", True) else None
 
     for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
-              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib):
+              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib, s_onchain_3level):
         if s: res.append(s)
     
     return res
@@ -3445,6 +3717,7 @@ PARAM_DEFAULT={
     "MAX_BB_BUY":3, "MAX_BB_SELL":3,  # Bollinger Bands strategy limits
     "MAX_STOCH_RSI_BUY":3, "MAX_STOCH_RSI_SELL":3,  # Stochastic RSI strategy limits
     "MAX_FIB_BUY":3, "MAX_FIB_SELL":3,  # Fibonacci retracement strategy limits
+    "MAX_ONCHAIN_3LEVEL_BUY":3, "MAX_ONCHAIN_3LEVEL_SELL":3,  # On-chain 3-level strategy limits
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":2000.0,
@@ -3466,6 +3739,7 @@ PARAM_DEFAULT={
     "ENABLE_BB": True,  # Bollinger Bands strategy
     "ENABLE_STOCH_RSI": True,  # Stochastic RSI strategy
     "ENABLE_FIB": True,  # Fibonacci retracement strategy
+    "ENABLE_ONCHAIN_3LEVEL": True,  # On-chain 3-level strategy
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
@@ -3797,7 +4071,8 @@ def update_directional_limits():
     live={"long":{}, "short":{},"long_count":0,"short_count":0,"cest_long_count":0,"cest_short_count":0,
           "bb_long_count":0,"bb_short_count":0,
           "stoch_rsi_long_count":0,"stoch_rsi_short_count":0,
-          "fib_long_count":0,"fib_short_count":0}
+          "fib_long_count":0,"fib_short_count":0,
+          "onchain_3level_long_count":0,"onchain_3level_short_count":0}
     try:
         acc=_signed_request("GET","/fapi/v2/positionRisk",{"timestamp":now_ts_ms()})
         for p in acc:
@@ -3816,6 +4091,8 @@ def update_directional_limits():
                         live["stoch_rsi_long_count"] += 1
                     elif pos_kind == "FIBONACCI_RETRACEMENT":
                         live["fib_long_count"] += 1
+                    elif pos_kind == "ONCHAIN_3LEVEL":
+                        live["onchain_3level_long_count"] += 1
             elif amt<0: 
                 live["short"][sym]=abs(amt)
                 # Only count positions that are tracked
@@ -3830,6 +4107,8 @@ def update_directional_limits():
                         live["stoch_rsi_short_count"] += 1
                     elif pos_kind == "FIBONACCI_RETRACEMENT":
                         live["fib_short_count"] += 1
+                    elif pos_kind == "ONCHAIN_3LEVEL":
+                        live["onchain_3level_short_count"] += 1
     except Exception as e:
         log(f"[FETCH POS ERR]{e}")
 
@@ -3843,6 +4122,8 @@ def update_directional_limits():
     STATE["stoch_rsi_short_blocked"] = (live["stoch_rsi_short_count"] >= PARAM.get("MAX_STOCH_RSI_SELL", 3))
     STATE["fib_long_blocked"]  = (live["fib_long_count"]  >= PARAM.get("MAX_FIB_BUY", 3))
     STATE["fib_short_blocked"] = (live["fib_short_count"] >= PARAM.get("MAX_FIB_SELL", 3))
+    STATE["onchain_3level_long_blocked"]  = (live["onchain_3level_long_count"]  >= PARAM.get("MAX_ONCHAIN_3LEVEL_BUY", 3))
+    STATE["onchain_3level_short_blocked"] = (live["onchain_3level_short_count"] >= PARAM.get("MAX_ONCHAIN_3LEVEL_SELL", 3))
     STATE["auto_trade_active"] = not (STATE["long_blocked"] and STATE["short_blocked"])
     safe_save(STATE_FILE,STATE)
     return live
@@ -5016,7 +5297,8 @@ def _cmd_strategies():
             ("FVG_MSS", "⭐ FVG+MSS (Highest WR)"),
             ("BB", "📊 Bollinger Bands"),
             ("STOCH_RSI", "🔄 Stochastic RSI"),
-            ("FIB", "📐 Fibonacci Retracement")
+            ("FIB", "📐 Fibonacci Retracement"),
+            ("ONCHAIN_3LEVEL", "🔥 On-Chain 3-Level")
         ]
         
         msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
@@ -5039,7 +5321,10 @@ def _cmd_strategies():
         msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 3)}\n"
         msg += f"\n📐 FIB Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_FIB_BUY', 3)}\n"
-        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}"
+        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}\n"
+        msg += f"\n🔥 ONCHAIN_3LEVEL Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_ONCHAIN_3LEVEL_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_ONCHAIN_3LEVEL_SELL', 3)}"
         
         tg_send(msg)
     except Exception as e:
@@ -5056,6 +5341,7 @@ def _cmd_setlimits(args):
                     "  bb_buy, bb_sell - Bollinger Bands sub-limits\n"
                     "  stoch_rsi_buy, stoch_rsi_sell - Stochastic RSI sub-limits\n"
                     "  fib_buy, fib_sell - Fibonacci sub-limits\n"
+                    "  onchain_3level_buy, onchain_3level_sell - On-chain 3-level sub-limits\n"
                     "Example: /setlimits buy 50\n"
                     "Example: /setlimits bb_buy 10")
             return
@@ -5117,9 +5403,19 @@ def _cmd_setlimits(args):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"✅ FIB MAX_SELL limit set to {value} (within global limit)")
             log(f"[SETLIMITS] MAX_FIB_SELL = {value}")
+        elif limit_type == "onchain_3level_buy":
+            PARAM["MAX_ONCHAIN_3LEVEL_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ ONCHAIN_3LEVEL MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_ONCHAIN_3LEVEL_BUY = {value}")
+        elif limit_type == "onchain_3level_sell":
+            PARAM["MAX_ONCHAIN_3LEVEL_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ ONCHAIN_3LEVEL MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_ONCHAIN_3LEVEL_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell")
+                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell, onchain_3level_buy, onchain_3level_sell")
             return
         
     except ValueError:
@@ -5586,6 +5882,15 @@ def _can_direction(direction, kind=""):
             log(f"[FIB LIMIT] Fibonacci Retracement short positions blocked (max: {PARAM.get('MAX_FIB_SELL', 3)})")
             return False
     
+    # Check ONCHAIN_3LEVEL-specific limits (in addition to global limits)
+    if kind == "ONCHAIN_3LEVEL":
+        if direction=="UP" and STATE.get("onchain_3level_long_blocked",False):
+            log(f"[ONCHAIN_3LEVEL LIMIT] On-chain 3-level long positions blocked (max: {PARAM.get('MAX_ONCHAIN_3LEVEL_BUY', 3)})")
+            return False
+        if direction=="DOWN" and STATE.get("onchain_3level_short_blocked",False):
+            log(f"[ONCHAIN_3LEVEL LIMIT] On-chain 3-level short positions blocked (max: {PARAM.get('MAX_ONCHAIN_3LEVEL_SELL', 3)})")
+            return False
+    
     return True
 
 def execute_real_trade(sig):
@@ -5705,6 +6010,9 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
+    # Load on-chain cache on startup
+    load_onchain_cache()
+    
     tg_send("🚀 EMA ULTRA v15.9.71 aktif — KIVANC removed, Asian/London disabled\n"
             "📊 10 strategies active (Asian & London disabled) | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
@@ -5721,6 +6029,11 @@ def main():
             # bar index
             STATE["bar_index"]=STATE.get("bar_index",0)+1
             bar_i=STATE["bar_index"]
+            
+            # Update on-chain cache once per day
+            # Bot runs every 30 seconds, DAILY_UPDATE_INTERVAL defines cycles per day
+            if bar_i % DAILY_UPDATE_INTERVAL == 0:
+                update_onchain_cache()
 
             # 1) Sinyal tarama
             sigs=run_parallel(symbols,bar_i)
