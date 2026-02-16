@@ -383,8 +383,8 @@ def cm_get_asset_metrics(asset="btc", metrics=("AdrActCnt", "TxCnt"), days_back=
         parsed = {}
         for item in data:
             date = item.get("time", "").split("T")[0]
-            values = item.get("values", {})
-            parsed[date] = {m: safe_float(values.get(m, 0)) for m in metrics}
+            values_dict = item.get("values", {})
+            parsed[date] = {metric: safe_float(values_dict.get(metric, 0)) for metric in metrics}
         
         return parsed
     except Exception as e:
@@ -411,7 +411,7 @@ def update_onchain_cache():
     metrics = cm_get_asset_metrics(
         asset="btc",
         metrics=("AdrActCnt", "TxCnt", "TxTfrValAdjUSD"),
-        days_back=120  # 4 months for z-score calculation
+        days_back=120  # ~4 months for z-score calculation (120 days)
     )
     
     if metrics:
@@ -431,8 +431,8 @@ def calculate_onchain_zscore(metric_name="AdrActCnt", window=60):
         if not metrics:
             return None
         
-        # Get recent values
-        dates = sorted(metrics.keys())[-window-1:]
+        # Get recent values (last 'window' days)
+        dates = sorted(metrics.keys())[-window:]
         values = [metrics[d].get(metric_name, 0) for d in dates]
         
         if len(values) < window:
@@ -5991,8 +5991,8 @@ def main():
             STATE["bar_index"]=STATE.get("bar_index",0)+1
             bar_i=STATE["bar_index"]
             
-            # Update on-chain cache once per day
-            if bar_i % 2880 == 0:  # Every 24 hours (30s * 2880 = 24h)
+            # Update on-chain cache once per day (every 2880 bars = 24 hours at 30-second intervals)
+            if bar_i % 2880 == 0:  # 30s * 2880 = 86400s = 24h
                 update_onchain_cache()
 
             # 1) Sinyal tarama
