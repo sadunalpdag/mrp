@@ -60,6 +60,8 @@ REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
+TOP_VOLUME_SYMBOLS = []  # Top 25 coins by 24h volume (on-chain strategy filter)
+TOP_VOLUME_LAST_UPDATE = 0  # Timestamp of last volume ranking update
 getcontext().prec = 28
 
 # Algo order types that should be cancelled before closing positions
@@ -2928,6 +2930,150 @@ def build_fibonacci_retracement_signal(sym, kl, bar_i):
     }
 
 
+def build_onchain_3level_signal(sym, kl, bar_i):
+    """
+    On-Chain 3-Level Buy/Sell Strategy
+    
+    **ONLY ACTIVE FOR TOP 25 COINS BY 24H VOLUME**
+    
+    Uses volume-based metrics combined with price action to generate 3-tier signals:
+    
+    📊 TIER 1 (STRONG): High volume spike + price > SMA50 + strong momentum
+    📊 TIER 2 (MEDIUM): Medium volume + price > SMA50 + good momentum
+    📊 TIER 3 (WEAK): Normal volume + price trend aligned
+    
+    Similar logic for short signals (inverted).
+    """
+    # ⚡ FILTER: Only trade top 25 by volume
+    if sym not in TOP_VOLUME_SYMBOLS:
+        return None
+    
+    if len(kl) < 60:
+        return None
+    
+    closes = [float(k[4]) for k in kl]
+    highs = [float(k[2]) for k in kl]
+    lows = [float(k[3]) for k in kl]
+    opens = [float(k[1]) for k in kl]
+    volumes = [float(k[5]) for k in kl]  # Base asset volume
+    
+    c_now = closes[-1]
+    c_prev = closes[-2]
+    o_now = opens[-1]
+    vol_now = volumes[-1]
+    
+    # Calculate technical indicators
+    atr_v = atr_like(highs, lows, closes)[-1]
+    r_val = rsi(closes)[-1]
+    
+    # SMA 50 for trend
+    sma50 = sum(closes[-50:]) / 50
+    
+    # Volume analysis
+    avg_vol = sum(volumes[-20:]) / 20
+    vol_ratio = vol_now / avg_vol if avg_vol > 0 else 1.0
+    
+    # Momentum (price change over 5 periods)
+    momentum = ((c_now - closes[-6]) / closes[-6] * 100) if len(closes) >= 6 else 0
+    
+    # Determine tier and direction
+    direction = None
+    tier = None
+    tag = None
+    
+    # LONG CONDITIONS
+    if c_now > sma50 and c_now > c_prev:  # Uptrend
+        if vol_ratio > 2.0 and r_val > 60 and momentum > 1.5:
+            # TIER 1: Strong volume spike + strong momentum
+            direction = "UP"
+            tier = "TIER_1"
+            tag = "📊 ON-CHAIN T1 STRONG BUY"
+        elif vol_ratio > 1.5 and r_val > 55 and momentum > 0.8:
+            # TIER 2: Medium volume + good momentum
+            direction = "UP"
+            tier = "TIER_2"
+            tag = "📊 ON-CHAIN T2 MEDIUM BUY"
+        elif vol_ratio > 1.0 and r_val > 50 and momentum > 0.3:
+            # TIER 3: Normal volume + aligned trend
+            direction = "UP"
+            tier = "TIER_3"
+            tag = "📊 ON-CHAIN T3 WEAK BUY"
+    
+    # SHORT CONDITIONS
+    elif c_now < sma50 and c_now < c_prev:  # Downtrend
+        if vol_ratio > 2.0 and r_val < 40 and momentum < -1.5:
+            # TIER 1: Strong volume spike + strong momentum
+            direction = "DOWN"
+            tier = "TIER_1"
+            tag = "📊 ON-CHAIN T1 STRONG SELL"
+        elif vol_ratio > 1.5 and r_val < 45 and momentum < -0.8:
+            # TIER 2: Medium volume + good momentum
+            direction = "DOWN"
+            tier = "TIER_2"
+            tag = "📊 ON-CHAIN T2 MEDIUM SELL"
+        elif vol_ratio > 1.0 and r_val < 50 and momentum < -0.3:
+            # TIER 3: Normal volume + aligned trend
+            direction = "DOWN"
+            tier = "TIER_3"
+            tag = "📊 ON-CHAIN T3 WEAK SELL"
+    
+    if direction is None:
+        return None
+    
+    # Calculate TP/SL based on tier
+    tier_multipliers = {
+        "TIER_1": (3.0, 1.5),  # (TP multiplier, SL multiplier)
+        "TIER_2": (2.5, 1.5),
+        "TIER_3": (2.0, 1.5)
+    }
+    tp_mult, sl_mult = tier_multipliers.get(tier, (2.0, 1.5))
+    
+    if direction == "UP":
+        sl_est = c_now - atr_v * sl_mult
+        risk = c_now - sl_est
+        tp_est = c_now + (risk * tp_mult)
+    else:
+        sl_est = c_now + atr_v * sl_mult
+        risk = sl_est - c_now
+        tp_est = c_now - (risk * tp_mult)
+    
+    # Power calculation based on tier and volume
+    base_power = {
+        "TIER_1": 85,
+        "TIER_2": 75,
+        "TIER_3": 68
+    }
+    pwr = base_power.get(tier, 70)
+    
+    # Boost power for exceptional volume
+    if vol_ratio > 3.0:
+        pwr += 5
+    
+    return {
+        "symbol": sym,
+        "dir": direction,
+        "tier": tier,
+        "emoji": "📊",
+        "entry": c_now,
+        "tp": tp_est,
+        "sl": sl_est,
+        "power": pwr,
+        "rsi": r_val,
+        "atr": atr_v,
+        "time": now_local_iso(),
+        "born_bar": bar_i,
+        "early": False,
+        "kind": "ONCHAIN_3LEVEL",
+        "tag": tag,
+        "conditions": {
+            "volume_ratio": vol_ratio,
+            "momentum": momentum,
+            "sma50": sma50,
+            "avg_volume": avg_vol
+        }
+    }
+
+
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
@@ -2963,10 +3109,13 @@ def scan_symbol(sym,bar_i):
     s_bb = build_bollinger_bands_signal(sym, kl, bar_i) if PARAM.get("ENABLE_BB", True) else None
     s_stoch_rsi = build_stochastic_rsi_signal(sym, kl, bar_i) if PARAM.get("ENABLE_STOCH_RSI", True) else None
     s_fib = build_fibonacci_retracement_signal(sym, kl, bar_i) if PARAM.get("ENABLE_FIB", True) else None
+    
+    # On-Chain 3-Level Strategy (Top 25 volume only)
+    s_onchain = build_onchain_3level_signal(sym, kl, bar_i) if PARAM.get("ENABLE_ONCHAIN", True) else None
 
     for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
-              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib):
+              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib, s_onchain):
         if s: res.append(s)
     
     return res
@@ -5016,7 +5165,8 @@ def _cmd_strategies():
             ("FVG_MSS", "⭐ FVG+MSS (Highest WR)"),
             ("BB", "📊 Bollinger Bands"),
             ("STOCH_RSI", "🔄 Stochastic RSI"),
-            ("FIB", "📐 Fibonacci Retracement")
+            ("FIB", "📐 Fibonacci Retracement"),
+            ("ONCHAIN", "📊 On-Chain 3-Level (Top 25)")
         ]
         
         msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
@@ -5332,6 +5482,38 @@ def _cmd_stoploss():
         tg_send(f"❌ /stoploss error: {e}")
         log(f"[STOPLOSS CMD ERR] {e}")
 
+def _cmd_topvolume():
+    """Show current top 25 coins by volume used for on-chain strategy"""
+    try:
+        if not TOP_VOLUME_SYMBOLS:
+            tg_send("⚠️ Top volume list not initialized yet")
+            return
+        
+        # Get current volumes
+        try:
+            ticker_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+            ticker_response = requests.get(ticker_url, timeout=15).json()
+            volume_map = {t["symbol"]: float(t.get("quoteVolume", 0)) for t in ticker_response}
+        except:
+            volume_map = {}
+        
+        msg = f"📊 TOP 25 COINS (On-Chain Strategy)\n"
+        msg += f"━━━━━━━━━━━━━━━━\n"
+        msg += f"Last update: {datetime.fromtimestamp(TOP_VOLUME_LAST_UPDATE, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if TOP_VOLUME_LAST_UPDATE else 'Never'}\n\n"
+        
+        for i, sym in enumerate(TOP_VOLUME_SYMBOLS[:15], 1):
+            vol = volume_map.get(sym, 0)
+            msg += f"{i}. {sym}: ${vol:,.0f}\n"
+        
+        if len(TOP_VOLUME_SYMBOLS) > 15:
+            msg += f"\n...and {len(TOP_VOLUME_SYMBOLS) - 15} more\n"
+        
+        msg += f"\n💡 On-chain signals only generated for these coins"
+        
+        tg_send(msg)
+    except Exception as e:
+        tg_send(f"❌ /topvolume error: {e}")
+
 def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
@@ -5363,6 +5545,7 @@ def check_telegram_commands():
         elif cmd=="/resethourlystats": _cmd_resethourlystats()
         elif cmd=="/forcehourlyanalysis": _cmd_forcehourlyanalysis()
         elif cmd=="/stoploss": _cmd_stoploss()
+        elif cmd=="/topvolume": _cmd_topvolume()
         else:
             tg_send("📋 AVAILABLE COMMANDS:\n"
                     "━━━━━━━━━━━━━━━━\n"
@@ -5380,6 +5563,7 @@ def check_telegram_commands():
                     "/resethourlystats - Reset hourly data\n"
                     "/forcehourlyanalysis - Force activate analysis\n"
                     "/stoploss - Show stop loss recommendation\n"
+                    "/topvolume - Show top 25 coins\n"
                     "/set KEY VALUE - Set parameter\n"
                     "/report - Generate report\n"
                     "/export - Export all data")
@@ -5693,25 +5877,119 @@ def _cleanup_trend_lock_expired():
 # ===================== SİNYAL DÖNGÜSÜ / MAIN =====================
 
 def auto_init_symbols():
+    """
+    Initialize trading symbols list.
+    Returns all USDT trading pairs, sorted by 24h volume (descending).
+    """
     try:
-        info=requests.get(BINANCE_FAPI+"/fapi/v1/exchangeInfo",timeout=10).json()
-        symbols=[s["symbol"] for s in info["symbols"]
-                 if s.get("quoteAsset")=="USDT" and s.get("status")=="TRADING"]
+        # Get all symbols with 24h ticker data
+        ticker_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        ticker_response = requests.get(ticker_url, timeout=10).json()
+        
+        # Filter USDT pairs and sort by volume
+        usdt_tickers = [
+            t for t in ticker_response
+            if t.get("symbol", "").endswith("USDT")
+        ]
+        
+        # Sort by quoteVolume (USDT volume) descending
+        usdt_tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
+        
+        # Extract symbols
+        symbols = [t["symbol"] for t in usdt_tickers]
+        
+        log(f"[SYMBOLS INIT] Loaded {len(symbols)} USDT pairs, sorted by volume")
+        if len(symbols) > 0:
+            log(f"[SYMBOLS INIT] Top 5 by volume: {symbols[:5]}")
+        
+        return symbols
+        
     except Exception as e:
-        log(f"[INIT SYMBOLS ERR]{e}"); symbols=[]
-    symbols.sort(); return symbols
+        log(f"[INIT SYMBOLS ERR] {e}")
+        # Fallback to exchange info (no volume sorting)
+        try:
+            info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
+            symbols = [
+                s["symbol"] for s in info["symbols"]
+                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+            ]
+            symbols.sort()
+            log(f"[SYMBOLS INIT] Fallback: Loaded {len(symbols)} symbols (unsorted)")
+            return symbols
+        except Exception as e2:
+            log(f"[INIT SYMBOLS FALLBACK ERR] {e2}")
+            return []
+
+def update_top_volume_symbols(all_symbols):
+    """
+    Update the global TOP_VOLUME_SYMBOLS list with top 25 by 24h volume.
+    This list is used exclusively for on-chain strategy.
+    
+    Updates every 6 hours to avoid excessive API calls.
+    """
+    global TOP_VOLUME_SYMBOLS, TOP_VOLUME_LAST_UPDATE
+    
+    now = now_ts_s()
+    
+    # Update every 6 hours (21600 seconds)
+    if now - TOP_VOLUME_LAST_UPDATE < 21600 and TOP_VOLUME_SYMBOLS:
+        return
+    
+    try:
+        log("[TOP VOLUME UPDATE] Fetching 24h volume rankings...")
+        
+        # Get 24h ticker data for volume
+        ticker_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+        ticker_response = requests.get(ticker_url, timeout=15).json()
+        
+        # Create volume map
+        volume_map = {}
+        for t in ticker_response:
+            symbol = t.get("symbol", "")
+            if symbol.endswith("USDT"):
+                volume_map[symbol] = float(t.get("quoteVolume", 0))
+        
+        # Filter to our trading symbols and sort
+        valid_symbols = [s for s in all_symbols if s in volume_map]
+        valid_symbols.sort(key=lambda x: volume_map[x], reverse=True)
+        
+        # Take top 25
+        TOP_VOLUME_SYMBOLS = valid_symbols[:25]
+        TOP_VOLUME_LAST_UPDATE = now
+        
+        log(f"[TOP VOLUME UPDATE] Top 25 coins: {TOP_VOLUME_SYMBOLS[:10]}...")
+        log(f"[TOP VOLUME UPDATE] Top volume: ${volume_map.get(TOP_VOLUME_SYMBOLS[0], 0):,.0f}")
+        
+        # Send Telegram notification
+        top5 = TOP_VOLUME_SYMBOLS[:5]
+        top5_vols = [f"{s}: ${volume_map[s]:,.0f}" for s in top5]
+        tg_send(f"📊 TOP 25 VOLUME UPDATE\n"
+                f"On-chain strategy active for:\n" + "\n".join(top5_vols[:3]) + "\n"
+                f"...and 22 more")
+        
+    except Exception as e:
+        log(f"[TOP VOLUME UPDATE ERR] {e}")
+        # Keep existing list on error
+        if not TOP_VOLUME_SYMBOLS and all_symbols:
+            # First-time fallback: use first 25 from all_symbols
+            TOP_VOLUME_SYMBOLS = all_symbols[:25]
+            log(f"[TOP VOLUME UPDATE] Fallback: Using first 25 symbols")
 
 def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.9.71 aktif — KIVANC removed, Asian/London disabled\n"
-            "📊 10 strategies active (Asian & London disabled) | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
+    tg_send("🚀 EMA ULTRA v15.10.0 aktif — On-chain strategy: Top 25 by volume\n"
+            "📊 11 strategies active | STRICT LIMITS: 3 buy/3 sell ALL strategies\n"
             "🎛️ Use /strategies to see all | /enable, /disable to control\n"
-            "⏱️ Hourly performance tracking enabled")
-    log("[START] EMA ULTRA v15.9.71 - KIVANC removed, Asian & London disabled - STRICT LIMITS: 3/3")
+            "⏱️ Hourly performance tracking enabled\n"
+            "🔥 On-chain: Top 25 coins by 24h volume")
+    log("[START] EMA ULTRA v15.10.0 - On-chain strategy: Top 25 volume")
 
     symbols=auto_init_symbols()
+    
+    # Initialize top volume list
+    update_top_volume_symbols(symbols)
 
     while True:
         try:
@@ -5721,6 +5999,10 @@ def main():
             # bar index
             STATE["bar_index"]=STATE.get("bar_index",0)+1
             bar_i=STATE["bar_index"]
+            
+            # Update top volume list every 6 hours
+            if bar_i % 720 == 0:  # Every 6 hours (30s * 720 = 6h)
+                update_top_volume_symbols(symbols)
 
             # 1) Sinyal tarama
             sigs=run_parallel(symbols,bar_i)
