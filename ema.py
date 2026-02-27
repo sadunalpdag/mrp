@@ -3769,21 +3769,18 @@ def calculate_avg_max_loss_from_history():
             return 0.0
         
         # Collect all max_loss values from closed trades
-        max_losses = []
-        for trade in REAL_CLOSED:
-            max_loss = trade.get("max_loss", 0.0)
-            # Only include actual losses (negative values)
-            if max_loss < 0:
-                max_losses.append(max_loss)
+        max_losses = [trade.get("max_loss", 0.0) for trade in REAL_CLOSED]
+        count_with_loss = sum(1 for v in max_losses if v < 0)
         
-        if not max_losses:
+        if count_with_loss == 0:
             log("[STOP LOSS CALC] No max loss data found in closed trades")
             return 0.0
         
-        # Calculate average
+        # Divide by ALL closed trades (including profitable ones with max_loss=0)
+        # so the average reflects true per-trade drawdown, not just the worst cases
         avg_max_loss = sum(max_losses) / len(max_losses)
         
-        log(f"[STOP LOSS CALC] Analyzed {len(max_losses)} trades with max loss data")
+        log(f"[STOP LOSS CALC] Analyzed {len(max_losses)} trades ({count_with_loss} with loss) for max loss data")
         log(f"[STOP LOSS CALC] Average max loss: ${avg_max_loss:.2f}")
         
         return avg_max_loss
@@ -3825,8 +3822,8 @@ def get_recommended_stop_loss(buffer_pct=1.2):
         else:
             recommended_sl_pct = 0.0
         
-        # Count how many trades were analyzed
-        sample_size = len([t for t in REAL_CLOSED if t.get("max_loss", 0.0) < 0])
+        # Count how many trades were analyzed (total closed trades)
+        sample_size = len(REAL_CLOSED)
         
         return {
             "avg_max_loss_usd": avg_max_loss,
@@ -4409,6 +4406,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 
                 # Update hourly performance statistics
                 update_hourly_stats_from_closed_trade(closed_trade)
+                
+                # Log individual closed trade details (matches check_and_log_real_closed_trades format)
+                pnl_log_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
+                exit_log_str = f"{exit_price}" if exit_price is not None else "N/A"
+                max_profit_log_str = f"{pos_info.get('max_profit', 0.0):.2f}"
+                max_loss_log_str = f"{pos_info.get('max_loss', 0.0):.2f}"
+                log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
+                    f"PnL:{pnl_log_str}% Exit:{exit_log_str} MaxProfit:${max_profit_log_str} MaxLoss:${max_loss_log_str} Reason:{exit_reason}")
                 
                 # Remove from tracker
                 REAL_POSITIONS_TRACKER.pop(sym, None)
