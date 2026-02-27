@@ -4401,7 +4401,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "market_state": pos_info.get("market_state", ""),
                     "closed_by_profit_target": (exit_reason == "PROFIT_TARGET"),
                     "conditions": pos_info.get("conditions", {}),  # 📊 Include strategy condition parameters
-                    "max_profit": pos_info.get("max_profit", 0.0)  # Include maximum profit reached
+                    "max_profit": pos_info.get("max_profit", 0.0),  # Include maximum profit reached
+                    "max_loss": pos_info.get("max_loss", 0.0)  # Include maximum loss (minimum unrealized PnL)
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -4913,10 +4914,12 @@ def auto_report_if_due():
     for fpath in [AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,REAL_CLOSED_FILE,PARAM_FILE,STATE_FILE]:
         try:
             if os.path.exists(fpath) and os.path.getsize(fpath)>20*1024*1024:
-                with open(fpath,"r",encoding="utf-8") as f: raw=f.read()
-                tail=raw[-int(len(raw)*0.2):]
-                with open(fpath,"w",encoding="utf-8") as f: f.write(tail)
-        except: pass
+                with open(fpath,"r",encoding="utf-8") as f: data=json.load(f)
+                if isinstance(data, list) and len(data)>0:
+                    keep=max(1,int(len(data)*0.2))
+                    data=data[-keep:]
+                    with open(fpath,"w",encoding="utf-8") as f: json.dump(data,f,ensure_ascii=False,indent=2)
+        except Exception as e: log(f"[AUTO REPORT TRIM ERR] {fpath}: {e}")
         tg_send_file(fpath, f"📊 AutoBackup {os.path.basename(fpath)}")
     tg_send("🕐 4 saatlik yedek gönderildi.")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
