@@ -4401,7 +4401,8 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "market_state": pos_info.get("market_state", ""),
                     "closed_by_profit_target": (exit_reason == "PROFIT_TARGET"),
                     "conditions": pos_info.get("conditions", {}),  # 📊 Include strategy condition parameters
-                    "max_profit": pos_info.get("max_profit", 0.0)  # Include maximum profit reached
+                    "max_profit": pos_info.get("max_profit", 0.0),  # Include maximum profit reached
+                    "max_loss": pos_info.get("max_loss", 0.0)  # Include maximum loss (minimum unrealized PnL)
                 }
                 
                 REAL_CLOSED.append(closed_trade)
@@ -4906,17 +4907,28 @@ def ai_update_analysis_snapshot():
     AI_ANALYSIS.append(snapshot); safe_save(AI_ANALYSIS_FILE,AI_ANALYSIS)
 
 def auto_report_if_due():
+    global AI_SIGNALS, AI_ANALYSIS, AI_RL, REAL_CLOSED
     now_now=time.time()
     if now_now-STATE.get("last_report",0) < 14400:
         return
     ai_update_analysis_snapshot()
     for fpath in [AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,REAL_CLOSED_FILE,PARAM_FILE,STATE_FILE]:
         try:
-            if os.path.exists(fpath) and os.path.getsize(fpath)>20*1024*1024:
-                with open(fpath,"r",encoding="utf-8") as f: raw=f.read()
-                tail=raw[-int(len(raw)*0.2):]
-                with open(fpath,"w",encoding="utf-8") as f: f.write(tail)
-        except: pass
+            if os.path.exists(fpath) and os.path.getsize(fpath)>10*1024*1024:
+                # Archive the current file with a timestamp and start a fresh one
+                ts=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                base,ext=os.path.splitext(fpath)
+                archive_path=f"{base}_archive_{ts}{ext}"
+                os.rename(fpath, archive_path)
+                log(f"[AUTO REPORT] {os.path.basename(fpath)} exceeded 10MB — archived as {os.path.basename(archive_path)}")
+                tg_send_file(archive_path, f"📦 Archive {os.path.basename(archive_path)}")
+                # Reset the corresponding in-memory list so the new file starts fresh
+                if fpath==AI_SIGNALS_FILE: AI_SIGNALS=[]
+                elif fpath==AI_ANALYSIS_FILE: AI_ANALYSIS=[]
+                elif fpath==AI_RL_FILE: AI_RL=[]
+                elif fpath==REAL_CLOSED_FILE: REAL_CLOSED=[]
+                continue  # Skip sending backup of the (now-archived) file
+        except Exception as e: log(f"[AUTO REPORT ARCHIVE ERR] {fpath}: {e}")
         tg_send_file(fpath, f"📊 AutoBackup {os.path.basename(fpath)}")
     tg_send("🕐 4 saatlik yedek gönderildi.")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
@@ -5564,7 +5576,10 @@ def _cmd_stoploss():
         msg += f"━━━━━━━━━━━━━━━━\n"
         msg += f"📈 Analysis based on {sl_recommendation['sample_size']} closed trades\n\n"
         msg += f"💰 Trade Size: ${sl_recommendation['trade_size_usdt']:.0f}\n"
-        msg += f"📉 Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}\n\n"
+        msg += f"📉 Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}\n"
+        msg += f"   ℹ️ Bu değer, kapanmış her işlemin kapanmadan önce\n"
+        msg += f"   ulaştığı en yüksek negatif PnL'nin ortalamasıdır.\n"
+        msg += f"   (Ortalama maksimum zarar / drawdown)\n\n"
         msg += f"🎯 RECOMMENDED STOP LOSS:\n"
         msg += f"   ${abs(sl_recommendation['recommended_sl_usd']):.2f}\n"
         msg += f"   ({sl_recommendation['recommended_sl_pct']:.2f}% of trade size)\n\n"
