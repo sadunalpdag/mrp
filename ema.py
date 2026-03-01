@@ -3220,19 +3220,23 @@ def check_and_log_real_closed_trades():
                 # Position has closed
                 closed_symbols.append(sym)
                 
-                # Try to get the last trade to find exit price
+                # Try to get the last trade to find exit price and realized PnL
                 exit_price = None
-                pnl = None
+                realized_pnl = None
                 try:
                     trades = _signed_request("GET", "/fapi/v3/userTrades", {
                         "symbol": sym,
                         "limit": 10,
                         "timestamp": now_ts_ms()
                     })
-                    # Find the closing trade (most recent opposite direction trade)
+                    # Find the closing trade (most recent trade for this symbol)
                     for trade in reversed(trades):
                         if trade["symbol"] == sym:
                             exit_price = float(trade["price"])
+                            try:
+                                realized_pnl = float(trade.get("realizedPnl", 0)) if trade.get("realizedPnl") is not None else None
+                            except (ValueError, TypeError):
+                                realized_pnl = None
                             break
                 except:
                     pass
@@ -3250,6 +3254,17 @@ def check_and_log_real_closed_trades():
                 else:
                     pnl_pct = None
                 
+                # Determine exit reason: use realized_pnl if available, else fall back to pnl_pct
+                pnl_for_reason = realized_pnl if realized_pnl is not None else pnl_pct
+                if pnl_for_reason is None:
+                    exit_reason = "UNKNOWN"
+                elif pnl_for_reason > 0:
+                    exit_reason = "TP"
+                elif pnl_for_reason < 0:
+                    exit_reason = "SL"
+                else:
+                    exit_reason = "BREAKEVEN"
+                
                 # Log the closed trade with strategy information
                 closed_trade = {
                     "symbol": sym,
@@ -3259,6 +3274,9 @@ def check_and_log_real_closed_trades():
                     "entry_price": entry_price,
                     "exit_price": exit_price,
                     "pnl_pct": pnl_pct,
+                    "realized_pnl": realized_pnl,
+                    "exit_reason": exit_reason,
+                    "closed_by_profit_target": (exit_reason == "TP"),
                     "power": pos_info.get("power"),
                     "open_time": pos_info.get("open_time"),
                     "close_time": now_local_iso(),
@@ -3277,10 +3295,12 @@ def check_and_log_real_closed_trades():
                 
                 pnl_str = f"{pnl_pct:.2f}" if pnl_pct is not None else "N/A"
                 exit_str = f"{exit_price}" if exit_price is not None else "N/A"
+                realized_str = f"{realized_pnl:.4f}" if realized_pnl is not None else "N/A"
                 max_profit_str = f"{pos_info.get('max_profit', 0.0):.2f}"
                 max_loss_str = f"{pos_info.get('max_loss', 0.0):.2f}"
                 log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
-                    f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str} MaxLoss:${max_loss_str}")
+                    f"PnL:{pnl_str}% RealizedPnL:{realized_str} Exit:{exit_str} "
+                    f"Reason:{exit_reason} MaxProfit:${max_profit_str} MaxLoss:${max_loss_str}")
         
         # Remove closed positions from tracker
         for sym in closed_symbols:
@@ -4402,6 +4422,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     "power": pos_info.get("power"),
                     "open_time": pos_info.get("open_time"),
                     "close_time": now_local_iso(),
+                    "tp_target": pos_info.get("tp_target"),
                     "exit_reason": exit_reason,
                     "market_state": pos_info.get("market_state", ""),
                     "closed_by_profit_target": (exit_reason == "PROFIT_TARGET"),
