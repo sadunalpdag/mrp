@@ -106,9 +106,15 @@ def log(msg):
 def safe_load(p,d):
     try:
         if os.path.exists(p):
+            if os.path.getsize(p) == 0:
+                print(f"[UYARI] {os.path.basename(p)} dosyası bomboş (0 byte)!", flush=True)
+                return d
             with open(p,"r",encoding="utf-8") as f:
                 return json.load(f)
-    except: pass
+    except json.JSONDecodeError as e:
+        print(f"[UYARI] {os.path.basename(p)} geçersiz JSON: {e}", flush=True)
+    except (IOError, OSError) as e:
+        print(f"[UYARI] {os.path.basename(p)} okunamadı: {e}", flush=True)
     return d
 
 def safe_save(p,d):
@@ -3147,6 +3153,8 @@ AI_SIGNALS    = safe_load(AI_SIGNALS_FILE,[])
 AI_ANALYSIS   = safe_load(AI_ANALYSIS_FILE,[])
 AI_RL         = safe_load(AI_RL_FILE,[])
 REAL_CLOSED   = safe_load(REAL_CLOSED_FILE,[])
+if not REAL_CLOSED:
+    print(f"[UYARI] real_closed.json dosyası bomboş veya mevcut değil. Kapalı işlem geçmişi sıfır.", flush=True)
 BALANCE_HISTORY = safe_load(BALANCE_HISTORY_FILE,[])
 HOURLY_STATS  = safe_load(HOURLY_STATS_FILE,{})
 
