@@ -6020,6 +6020,77 @@ def execute_real_trade(sig):
         })
         safe_save(AI_RL_FILE,AI_RL)
         
+        # Detect implicit closure: if there is already a tracked position for this symbol,
+        # the old position must have been closed by TP/SL on Binance before this new signal
+        # fired.  Without this check the tracker overwrite would permanently hide the closure
+        # from check_and_log_real_closed_trades() and the trade would never appear in
+        # real_closed.json.
+        if sym in REAL_POSITIONS_TRACKER:
+            old_pos = REAL_POSITIONS_TRACKER[sym]
+            old_direction = old_pos.get("direction")
+            old_entry_price = safe_float(old_pos.get("entry_price", 0))
+            # Verify the old direction position is actually closed on Binance before logging.
+            # In hedge mode both LONG and SHORT can coexist for the same symbol, so we must
+            # not log a false closure when we are merely adding an opposite-direction hedge.
+            old_still_open = False
+            try:
+                acc_check = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
+                for p_check in acc_check:
+                    if p_check["symbol"] == sym:
+                        chk_amt = float(p_check["positionAmt"])
+                        if old_direction == "UP" and chk_amt > 0:
+                            old_still_open = True
+                            break
+                        elif old_direction == "DOWN" and chk_amt < 0:
+                            old_still_open = True
+                            break
+            except Exception:
+                pass
+            if not old_still_open:
+                # Old position is confirmed closed – retrieve the exit price from trade history
+                exit_price_implicit = None
+                try:
+                    trades_implicit = _signed_request("GET", "/fapi/v3/userTrades", {
+                        "symbol": sym, "limit": 50, "timestamp": now_ts_ms()
+                    })
+                    for trade in reversed(trades_implicit):
+                        exit_price_implicit = float(trade["price"])
+                        break
+                except Exception:
+                    pass
+                if exit_price_implicit and old_entry_price > 0:
+                    exit_price_implicit = safe_float(exit_price_implicit)
+                    if old_direction == "UP":
+                        pnl_pct_implicit = ((exit_price_implicit / old_entry_price) - 1) * 100
+                    else:
+                        pnl_pct_implicit = ((old_entry_price - exit_price_implicit) / old_entry_price) * 100
+                else:
+                    pnl_pct_implicit = None
+                implicit_closed = {
+                    "symbol": sym,
+                    "direction": old_direction,
+                    "strategy": old_pos.get("kind", "UNKNOWN"),
+                    "tag": old_pos.get("tag", ""),
+                    "entry_price": old_entry_price,
+                    "exit_price": exit_price_implicit,
+                    "pnl_pct": pnl_pct_implicit,
+                    "power": old_pos.get("power"),
+                    "open_time": old_pos.get("open_time"),
+                    "close_time": now_local_iso(),
+                    "exit_reason": "TP_OR_SL_HIT",
+                    "market_state": old_pos.get("market_state", ""),
+                    "conditions": old_pos.get("conditions", {}),
+                    "max_profit": old_pos.get("max_profit", 0.0),
+                    "max_loss": old_pos.get("max_loss", 0.0)
+                }
+                REAL_CLOSED.append(implicit_closed)
+                safe_save(REAL_CLOSED_FILE, REAL_CLOSED)
+                update_hourly_stats_from_closed_trade(implicit_closed)
+                pnl_str_impl = f"{pnl_pct_implicit:.2f}" if pnl_pct_implicit is not None else "N/A"
+                log(f"[REAL CLOSED - IMPLICIT] {sym} {old_direction} "
+                    f"Strategy:{old_pos.get('kind','UNKNOWN')} PnL:{pnl_str_impl}% "
+                    f"Exit:{exit_price_implicit} (TP/SL kapandı, yeni sinyal açılıyor)")
+
         # Track this position for later closure detection
         REAL_POSITIONS_TRACKER[sym] = {
             "symbol": sym,
