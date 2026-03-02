@@ -4196,14 +4196,15 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                         # Format quantity according to symbol's lot size requirements
                         amt_formatted = adjust_precision(sym, amt, "qty")
                         
-                        # Use MARKET order with reduceOnly to ensure position closure
+                        # Use MARKET order to close position at best available price
+                        # Note: reduceOnly must NOT be sent when positionSide is LONG/SHORT (hedge mode)
+                        # as Binance returns error -1106 "Parameter 'reduceonly' sent when not required"
                         market_payload = {
                             "symbol": sym,
                             "side": side,
                             "type": "MARKET",
                             "quantity": f"{amt_formatted}",
                             "positionSide": pos_side,
-                            "reduceOnly": "true",  # Prevents error -2022 when closing positions
                             "timestamp": now_ts_ms()
                         }
                         
@@ -4222,27 +4223,27 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             log(f"[CLOSE ALL ERROR] {sym} MARKET order failed: {market_err}")
                             raise
                     
-                    # Error -2022 "ReduceOnly Order is rejected" - retry with MARKET order and reduceOnly flag
+                    # Error -2022 "ReduceOnly Order is rejected" - retry with plain MARKET order
                     elif "-2022" in err_str or "ReduceOnly" in err_str:
-                        log(f"[CLOSE ALL] {sym} ReduceOnly error detected, using MARKET order with reduceOnly flag")
+                        log(f"[CLOSE ALL] {sym} ReduceOnly error detected, using MARKET order to close position")
                         
                         # Format quantity according to symbol's lot size requirements
                         amt_formatted = adjust_precision(sym, amt, "qty")
                         
-                        # Use MARKET order with reduceOnly flag
+                        # Use MARKET order without reduceOnly (positionSide handles close direction)
+                        # Note: reduceOnly must NOT be sent when positionSide is LONG/SHORT (hedge mode)
                         market_payload = {
                             "symbol": sym,
                             "side": side,
                             "type": "MARKET",
                             "quantity": f"{amt_formatted}",
                             "positionSide": pos_side,
-                            "reduceOnly": "true",  # Fix for error -2022
                             "timestamp": now_ts_ms()
                         }
                         
                         try:
                             market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
-                            log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order (reduceOnly)")
+                            log(f"[CLOSE ALL] {sym} {pos_side} closed with MARKET order")
                             closed_symbols.append(sym)
                             direction = "UP" if pos_side == "LONG" else "DOWN"
                             closed_positions_info.append({
@@ -4252,7 +4253,7 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                 "amount": amt
                             })
                         except Exception as market_err:
-                            log(f"[CLOSE ALL ERROR] {sym} MARKET order with reduceOnly failed: {market_err}")
+                            log(f"[CLOSE ALL ERROR] {sym} MARKET order failed: {market_err}")
                             raise
                     
                     # Error -4130 "An open stop or take profit order with GTE and closePosition in the direction is existing" or
@@ -4319,13 +4320,14 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                 # Check if remaining quantity is significant after precision adjustment
                                 remaining_qty_float = float(remaining_qty_formatted)
                                 if remaining_qty_float > 0:
+                                    # Note: reduceOnly must NOT be sent when positionSide is LONG/SHORT (hedge mode)
+                                    # as Binance returns error -1106 "Parameter 'reduceonly' sent when not required"
                                     market_payload = {
                                         "symbol": sym,
                                         "side": side,
                                         "type": "MARKET",
                                         "quantity": f"{remaining_qty_formatted}",
                                         "positionSide": pos_side,
-                                        "reduceOnly": "true",  # Prevents error -2022 when closing positions
                                         "timestamp": now_ts_ms()
                                     }
                                     try:
