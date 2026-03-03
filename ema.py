@@ -5731,6 +5731,15 @@ def _tp_price_from_usd(direction, entry_exec, tp_usd, trade_usd):
     tp_pct = tp_usd / trade_usd
     return (entry_exec*(1+tp_pct) if direction=="UP" else entry_exec*(1-tp_pct)), tp_pct
 
+def _sl_price_from_usd(direction, entry_exec, sl_usd, trade_usd):
+    # Mirrors _tp_price_from_usd but inverts direction (SL is below entry for LONG, above for SHORT)
+    entry_exec = safe_float(entry_exec)
+    sl_usd = safe_float(sl_usd)
+    trade_usd = safe_float(trade_usd)
+    trade_usd = max(trade_usd, 1e-12)
+    sl_pct = sl_usd / trade_usd
+    return (entry_exec*(1-sl_pct) if direction=="UP" else entry_exec*(1+sl_pct)), sl_pct
+
 def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high_usd=2.0):
     try:
         f=get_symbol_filters(sym)
@@ -5786,6 +5795,59 @@ def futures_set_tp_only(sym, direction, qty, entry_exec, tp_low_usd=1.6, tp_high
         return False,None,None
     except Exception as e:
         log(f"[TP ERR]{sym} {e}")
+        return False,None,None
+
+def futures_set_sl_only(sym, direction, qty, entry_exec, sl_low_usd=22, sl_high_usd=26):
+    try:
+        f=get_symbol_filters(sym)
+        minp=f["minPrice"]; maxp=f["maxPrice"]
+        pos_side="LONG" if direction=="UP" else "SHORT"; side="SELL" if direction=="UP" else "BUY"
+        trade_usd=PARAM.get("TRADE_SIZE_USDT",500.0)
+        usd_based = entry_exec>0.2
+
+        def try_once(sl_price_candidate, sl_usd_used=None, sl_pct_used=None):
+            price=round_to_tick(sym,sl_price_candidate)
+            if price<minp: price=round_to_tick(sym,minp)
+            if price>maxp: price=round_to_tick(sym,maxp)
+            stop_str=format_price_by_tick(sym,price)
+            if float(stop_str)<=0:
+                price=round_to_tick(sym,max(minp,1e-12))
+                stop_str=format_price_by_tick(sym,price)
+                if float(stop_str)<=0:
+                    log(f"[SL GUARD] {sym} stop=0 minp jump failed")
+                    return False,None,None
+
+            payload={"symbol":sym,"side":side,"type":"STOP_MARKET","algoType":"CONDITIONAL",
+                     "triggerPrice":stop_str,"workingType":"MARK_PRICE","closePosition":"true",
+                     "positionSide":pos_side,"timestamp":now_ts_ms()}
+
+            try:
+                _signed_request("POST","/fapi/v1/algoOrder",payload)
+                log(f"[SL OK] {sym} STOP_MARKET triggerPrice={stop_str}")
+                return True,sl_usd_used,sl_pct_used
+            except Exception as e:
+                log(f"[SL FAIL] {sym} STOP_MARKET triggerPrice={stop_str} err={e}")
+                return False,None,None
+
+        if usd_based:
+            for sl_usd in [round(x,1) for x in np.arange(sl_low_usd, sl_high_usd+0.001, 0.1)]:
+                sl_price,sl_pct=_sl_price_from_usd(direction,entry_exec,sl_usd,trade_usd)
+                ok,u,p=try_once(sl_price,sl_usd,sl_pct)
+                if ok: return True,u,p
+            for sl_usd in [round(x,2) for x in np.arange(sl_low_usd, sl_high_usd+0.0001, 0.01)]:
+                sl_price,sl_pct=_sl_price_from_usd(direction,entry_exec,sl_usd,trade_usd)
+                ok,u,p=try_once(sl_price,sl_usd,sl_pct)
+                if ok: return True,u,p
+        else:
+            for sl_pct in [round(x,4) for x in np.arange(0.0440, 0.0520+0.0001, 0.0005)]:
+                sl_price = entry_exec*(1-sl_pct if direction=="UP" else 1+sl_pct)
+                ok,u,p=try_once(sl_price,None,sl_pct)
+                if ok: return True,u,p
+
+        log(f"[NO SL] {sym} uygun SL bulunamadı.")
+        return False,None,None
+    except Exception as e:
+        log(f"[SL ERR]{sym} {e}")
         return False,None,None
 
 # ===================== REAL TRADE =====================
@@ -5988,6 +6050,9 @@ def execute_real_trade(sig):
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
             sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
         )
+        sl_ok, sl_usd_used, sl_pct_used = futures_set_sl_only(
+            sym,direction,qty,entry_exec,sl_low_usd=22,sl_high_usd=26
+        )
 
         TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
         log(f"[TRENDLOCK SET] {sym} {direction}")
@@ -5999,21 +6064,25 @@ def execute_real_trade(sig):
             tp_line = (f"TP hedefi:{tp_usd_used:.2f}$" if tp_usd_used is not None
                        else f"TP hedefi:%{(tp_pct_used or 0)*100:.2f}")
             tp_pct_show = (tp_pct_used or (tp_usd_used or 0)/max(PARAM.get('TRADE_SIZE_USDT',500.0),1e-12))*100
-            tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
-                    f"{ms_line}Power:{pwr:.2f}\n"
-                    f"Entry:{entry_exec:.12f}\n"
-                    f"{tp_line} ({tp_pct_show:.3f}%)\n"
-                    f"time:{now_local_iso()}")
         else:
-            tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
-                    f"{ms_line}Power:{pwr:.2f}\n"
-                    f"Entry:{entry_exec:.12f}\n"
-                    f"TP: YOK (USD/% tarama başarısız)\n"
-                    f"time:{now_local_iso()}")
+            tp_line = "TP: YOK (USD/% tarama başarısız)"
+            tp_pct_show = 0.0
+        if sl_ok:
+            sl_line = (f"SL hedefi:{sl_usd_used:.2f}$" if sl_usd_used is not None
+                       else f"SL hedefi:%{(sl_pct_used or 0)*100:.2f}")
+        else:
+            sl_line = "SL: YOK (USD/% tarama başarısız)"
+        tg_send(f"{prefix} {sym} {direction} qty:{qty}\n"
+                f"{ms_line}Power:{pwr:.2f}\n"
+                f"Entry:{entry_exec:.12f}\n"
+                f"{tp_line}{' ('+f'{tp_pct_show:.3f}%'+')' if tp_ok else ''}\n"
+                f"{sl_line}\n"
+                f"time:{now_local_iso()}")
 
         AI_RL.append({
             "time":now_local_iso(),"symbol":sym,"dir":direction,"entry":entry_exec,
             "tp_usd_used":tp_usd_used,"tp_pct_used":tp_pct_used,"tp_ok":tp_ok,
+            "sl_usd_used":sl_usd_used,"sl_pct_used":sl_pct_used,"sl_ok":sl_ok,
             "power":pwr,"born_bar":sig.get("born_bar"),
             "early":bool(sig.get("early",False)),"kind":kind,"tag":sig.get("tag",""),
             "market_state":sig.get("market_state","")
@@ -6101,6 +6170,8 @@ def execute_real_trade(sig):
             "power": pwr,
             "open_time": now_local_iso(),
             "tp_target": tp_usd_used or tp_pct_used,
+            "sl_target": sl_usd_used or sl_pct_used,
+            "sl_ok": sl_ok,
             "market_state": sig.get("market_state", ""),
             "conditions": sig.get("conditions", {}),  # 📊 Store strategy condition parameters
             "max_profit": 0.0,  # Track maximum profit reached
