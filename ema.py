@@ -3637,7 +3637,8 @@ PARAM_DEFAULT={
     # Hourly performance analysis thresholds
     "HOURLY_MIN_TRADES": 20,  # Minimum trades to consider an hour for blocking
     "HOURLY_MIN_WIN_RATE": 40.0,  # Minimum win rate % (below this = block)
-    "HOURLY_MIN_AVG_PNL": -0.5  # Minimum average PnL % (below this = block)
+    "HOURLY_MIN_AVG_PNL": -0.5,  # Minimum average PnL % (below this = block)
+    "ENABLE_STOP_LOSS": False  # Stop loss order placement (disabled)
 }
 PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
 if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
@@ -6050,9 +6051,12 @@ def execute_real_trade(sig):
         tp_ok, tp_usd_used, tp_pct_used = futures_set_tp_only(
             sym,direction,qty,entry_exec,tp_low_usd=1.6,tp_high_usd=2.0
         )
-        sl_ok, sl_usd_used, sl_pct_used = futures_set_sl_only(
-            sym,direction,qty,entry_exec,sl_low_usd=22,sl_high_usd=26
-        )
+        if PARAM.get("ENABLE_STOP_LOSS", False):
+            sl_ok, sl_usd_used, sl_pct_used = futures_set_sl_only(
+                sym,direction,qty,entry_exec,sl_low_usd=22,sl_high_usd=26
+            )
+        else:
+            sl_ok, sl_usd_used, sl_pct_used = False, None, None  # Stop loss disabled
 
         TREND_LOCK[sym]=direction; TREND_LOCK_TIME[sym]=now_ts_s()
         log(f"[TRENDLOCK SET] {sym} {direction}")
@@ -6479,16 +6483,6 @@ def main():
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
             
-            # 3.6) Calculate and log stop loss recommendations periodically
-            # Log every 100 bar cycles (with 30s per cycle = ~50 minutes) to avoid excessive logging
-            if bar_i % 100 == 0:
-                sl_recommendation = get_recommended_stop_loss()
-                if sl_recommendation["sample_size"] > 0:
-                    log(f"[STOP LOSS RECOMMENDATION] Based on {sl_recommendation['sample_size']} trades: "
-                        f"Avg Max Loss: ${sl_recommendation['avg_max_loss_usd']:.2f}, "
-                        f"Recommended SL: ${abs(sl_recommendation['recommended_sl_usd']):.2f} "
-                        f"({sl_recommendation['recommended_sl_pct']:.2f}% of ${sl_recommendation['trade_size_usdt']:.0f} trade size)")
-
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
 
