@@ -3612,23 +3612,24 @@ PARAM_DEFAULT={
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":2000.0,
     "MIN_POWER_THRESHOLD":DEFAULT_MIN_POWER_THRESHOLD,  # Minimum power score to execute trades (power scale: ~50-100, higher = stronger signal)
-    # Strategy enable/disable flags (all enabled by default)
-    "ENABLE_MACD": True,
-    "ENABLE_FVG": True,
-    "ENABLE_CEST": True,
-    "ENABLE_PULLBACK": True,
-    "ENABLE_ORB_FVG": True,
-    "ENABLE_LONDON_BO": False,  # Disabled per user request
-    "ENABLE_NY_REV": True,
-    "ENABLE_ICT_P3": True,
-    "ENABLE_ASIAN_BO": False,  # Disabled per user request
-    "ENABLE_FVG_BREAKER": True,
-    "ENABLE_REENTRY": True,
-    "ENABLE_FVG_MSS": True,
+    # Strategy enable/disable flags (only BOLLINGER_BANDS, REENTRY_4H_5M, FIBONACCI_RETRACEMENT enabled)
+    "ENABLE_MACD": False,
+    "ENABLE_FVG": False,
+    "ENABLE_CEST": False,
+    "ENABLE_PULLBACK": False,
+    "ENABLE_ORB_FVG": False,
+    "ENABLE_LONDON_BO": False,
+    "ENABLE_NY_REV": False,
+    "ENABLE_ICT_P3": False,
+    "ENABLE_ASIAN_BO": False,
+    "ENABLE_FVG_BREAKER": False,
+    "ENABLE_REENTRY": True,   # REENTRY_4H_5M enabled
+    "ENABLE_FVG_MSS": False,
     # NEW: Advanced technical strategies
-    "ENABLE_BB": True,  # Bollinger Bands strategy
-    "ENABLE_STOCH_RSI": True,  # Stochastic RSI strategy
-    "ENABLE_FIB": True,  # Fibonacci retracement strategy
+    "ENABLE_BB": True,        # BOLLINGER_BANDS enabled
+    "ENABLE_STOCH_RSI": False,
+    "ENABLE_FIB": True,       # FIBONACCI_RETRACEMENT enabled
+    "ENABLE_ONCHAIN": False,
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
