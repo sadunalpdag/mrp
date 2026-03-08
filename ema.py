@@ -5,9 +5,9 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import numpy as np
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
+# 📘 EMA ULTRA v15.11.0 — Enhanced Strategies with Advanced Technical Analysis
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (13 strateji - Asian & London disabled):
+#  - Aktif stratejiler (14 strateji - Asian & London disabled):
 #       📈 MACD (EMA20/200 + MACD crossover)
 #       🟩 FVG (Fair Value Gap Break)
 #       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
@@ -21,7 +21,8 @@ import numpy as np
 #       📊 BOLLINGER BANDS (Mean Reversion + Squeeze Breakout)
 #       🔄 STOCHASTIC RSI (Overbought/Oversold with trend filter)
 #       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
-#  - NEW: 3 advanced technical strategies added for better performance
+#       🔁 TFC VWAP RETEST (Trend→Fail→Continue, 1h HTF + 5m VWAP retest + high/low break)
+#  - NEW: TFC strategy — VWAP slope + HTF trend filter, continuation breakout entry
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - PER-STRATEGY LIMITS: Each strategy limited to 3 buy / 3 sell independently
 #  - Strategy enable/disable via Telegram commands
@@ -393,6 +394,69 @@ def calculate_vwap(klines):
         return None
     except:
         return None
+
+
+def calculate_vwap_series(klines):
+    """
+    Calculate a per-bar cumulative VWAP series for the given klines.
+
+    Args:
+        klines: list of klines [[time,open,high,low,close,volume,...],...]
+
+    Returns:
+        list of float VWAP values (same length as klines), or empty list on error.
+    """
+    try:
+        cumulative_pv = 0.0
+        cumulative_vol = 0.0
+        vwap_values = []
+        for k in klines:
+            high = float(k[2])
+            low = float(k[3])
+            close = float(k[4])
+            volume = float(k[5])
+            typical_price = (high + low + close) / 3.0
+            cumulative_pv += typical_price * volume
+            cumulative_vol += volume
+            vwap_values.append(cumulative_pv / cumulative_vol if cumulative_vol > 0 else None)
+        return vwap_values
+    except:
+        return []
+
+
+def calculate_vwap_slope(vwap_series, lookback=5):
+    """
+    Simple VWAP slope: difference between the latest value and the value
+    ``lookback`` bars ago.  A positive result means VWAP is rising, negative
+    means falling.
+
+    Returns:
+        float slope or None if not enough data / missing values.
+    """
+    if len(vwap_series) < lookback + 1:
+        return None
+    current = vwap_series[-1]
+    old = vwap_series[-1 - lookback]
+    if current is None or old is None:
+        return None
+    return current - old
+
+
+def is_vwap_trending(klines, min_slope_abs, lookback=5):
+    """
+    Check whether the 5-bar VWAP slope exceeds ``min_slope_abs``.
+
+    Returns:
+        (trending: bool, slope: float or None)
+    """
+    vwap_series = calculate_vwap_series(klines)
+    slope = calculate_vwap_slope(vwap_series, lookback=lookback)
+    if slope is None:
+        return False, None
+    if abs(slope) < min_slope_abs:
+        return False, slope
+    return True, slope
+
 
 def detect_volume_spike(klines, spike_threshold=1.5):
     """
@@ -3080,6 +3144,189 @@ def build_onchain_3level_signal(sym, kl, bar_i):
     }
 
 
+def build_tfc_signal(sym, kl_1h, bar_i):
+    """
+    TFC (Trend → Fail → Continue) Strategy — VWAP Retest Continuation
+
+    Logic:
+    ──────
+    1. **HTF Trend** (1h): Higher highs & higher lows → BULLISH; lower highs &
+       lower lows → BEARISH.  NEUTRAL → skip.
+    2. **VWAP Slope** (5m bars): VWAP must have a clear slope whose direction
+       matches the HTF trend.  A flat VWAP (slope < min_slope_abs) means a
+       choppy market → skip.
+    3. **Setup** (5m bars):
+       Long  – price crossed above VWAP, pulled back to within ATR of VWAP,
+               then the most recent candle closes above the previous candle's
+               high (continuation breakout).
+       Short – price crossed below VWAP, pulled back to within ATR of VWAP,
+               then the most recent candle closes below the previous candle's
+               low (continuation breakout).
+    4. Entry / SL / TP:
+       Long : entry = c_now, SL = min(vwap, prev_low) - ATR*0.5,
+              TP = entry + 2 * risk (minimum 1:2 RR)
+       Short: entry = c_now, SL = max(vwap, prev_high) + ATR*0.5,
+              TP = entry - 2 * risk
+    """
+    if len(kl_1h) < 10:
+        return None
+
+    # ── 1. HTF trend (1h) ──────────────────────────────────────────────────
+    closes_1h = [float(k[4]) for k in kl_1h]
+    highs_1h  = [float(k[2]) for k in kl_1h]
+    lows_1h   = [float(k[3]) for k in kl_1h]
+
+    high_1 = highs_1h[-1]; high_2 = highs_1h[-2]
+    low_1  = lows_1h[-1];  low_2  = lows_1h[-2]
+
+    if high_1 > high_2 and low_1 > low_2:
+        htf_trend = "BULLISH"
+    elif high_1 < high_2 and low_1 < low_2:
+        htf_trend = "BEARISH"
+    else:
+        return None  # No clear structure
+
+    # ── 2. Fetch 5m klines ─────────────────────────────────────────────────
+    kl_5m = futures_get_klines(sym, "5m", 100)
+    if len(kl_5m) < 20:
+        return None
+
+    closes_5m = [float(k[4]) for k in kl_5m]
+    highs_5m  = [float(k[2]) for k in kl_5m]
+    lows_5m   = [float(k[3]) for k in kl_5m]
+    opens_5m  = [float(k[1]) for k in kl_5m]
+
+    c_now  = closes_5m[-1]
+    c_prev = closes_5m[-2]
+    h_prev = highs_5m[-2]
+    l_prev = lows_5m[-2]
+
+    atr_v = atr_like(highs_5m, lows_5m, closes_5m)[-1]
+    r_val = rsi(closes_5m)[-1]
+
+    # ── 3. VWAP slope filter ───────────────────────────────────────────────
+    # Tunable constants for TFC signal quality
+    # min_slope_abs: at least 0.005% of current price per 5-bar period —
+    #   filters out flat/choppy markets where VWAP has no meaningful direction.
+    MIN_SLOPE_PCT     = 0.00005   # 0.005% of price
+    # RETEST_ATR_MULTIPLIER: how close the previous close must be to VWAP to
+    #   count as a "retest" (within 1.2× ATR).
+    RETEST_ATR_MULT   = 1.2
+    # MIN_VWAP_SIDE_BARS: at least this many of the last 10 bars must be on
+    #   the trend side of VWAP (≥5 out of 10 = 50%) to confirm a true retest.
+    MIN_VWAP_SIDE_BARS = 5
+    # SL_ATR_BUFFER: extra ATR buffer beyond VWAP / prior-candle extreme for SL.
+    SL_ATR_BUFFER     = 0.5
+
+    min_slope_abs = c_now * MIN_SLOPE_PCT
+    vwap_trending, vwap_slope = is_vwap_trending(kl_5m, min_slope_abs=min_slope_abs, lookback=5)
+    if not vwap_trending:
+        return None  # VWAP is flat → choppy market
+
+    # Slope direction must agree with HTF trend
+    if htf_trend == "BULLISH" and (vwap_slope is None or vwap_slope <= 0):
+        return None
+    if htf_trend == "BEARISH" and (vwap_slope is None or vwap_slope >= 0):
+        return None
+
+    # ── 4. Current VWAP value (latest bar) ────────────────────────────────
+    vwap_series = calculate_vwap_series(kl_5m)
+    vwap_now = vwap_series[-1]
+    if vwap_now is None:
+        return None
+
+    # ── 5. Retest detection ────────────────────────────────────────────────
+    # We need evidence that price recently crossed VWAP and then came back.
+    retest_window = closes_5m[-10:]  # last 10 bars
+    vwap_window   = vwap_series[-10:]
+
+    direction = None
+    tag       = None
+
+    if htf_trend == "BULLISH":
+        # Price should be above VWAP overall but retested it recently
+        above_vwap = sum(1 for c, v in zip(retest_window, vwap_window)
+                         if v is not None and c > v)
+        retest_close_to_vwap = abs(c_prev - vwap_now) < atr_v * RETEST_ATR_MULT
+
+        # Continuation breakout: current candle breaks above previous high
+        high_break = c_now > h_prev
+
+        # Extra: current bar is bullish
+        bullish_bar = c_now > opens_5m[-1]
+
+        if above_vwap >= MIN_VWAP_SIDE_BARS and retest_close_to_vwap and high_break and bullish_bar:
+            direction = "UP"
+            tag = "📈 TFC VWAP RETEST BUY"
+
+    else:  # BEARISH
+        below_vwap = sum(1 for c, v in zip(retest_window, vwap_window)
+                         if v is not None and c < v)
+        retest_close_to_vwap = abs(c_prev - vwap_now) < atr_v * RETEST_ATR_MULT
+
+        # Continuation breakout: current candle breaks below previous low
+        low_break = c_now < l_prev
+
+        # Extra: current bar is bearish
+        bearish_bar = c_now < opens_5m[-1]
+
+        if below_vwap >= MIN_VWAP_SIDE_BARS and retest_close_to_vwap and low_break and bearish_bar:
+            direction = "DOWN"
+            tag = "📉 TFC VWAP RETEST SELL"
+
+    if direction is None:
+        return None
+
+    # ── 6. TP / SL calculation ────────────────────────────────────────────
+    if direction == "UP":
+        sl_est = min(vwap_now, l_prev) - atr_v * SL_ATR_BUFFER
+        risk = c_now - sl_est
+        if risk <= 0:
+            return None
+        tp_est = c_now + 2.0 * risk
+    else:
+        sl_est = max(vwap_now, h_prev) + atr_v * SL_ATR_BUFFER
+        risk = sl_est - c_now
+        if risk <= 0:
+            return None
+        tp_est = c_now - 2.0 * risk
+
+    # ── 7. Power score ────────────────────────────────────────────────────
+    pwr = 65.0
+    pwr += (atr_v / c_now) * 150         # volatility bonus
+    pwr += abs(r_val - 50) / 4.0         # RSI extremity bonus
+    if vwap_slope is not None:
+        pwr += min(10.0, abs(vwap_slope) / c_now * 1000)  # strong slope bonus
+    pwr = min(100.0, max(0.0, pwr))
+
+    return {
+        "symbol":    sym,
+        "dir":       direction,
+        "tier":      "TFC",
+        "emoji":     "🔁",
+        "entry":     c_now,
+        "tp":        tp_est,
+        "sl":        sl_est,
+        "power":     pwr,
+        "rsi":       r_val,
+        "atr":       atr_v,
+        "time":      now_local_iso(),
+        "born_bar":  bar_i,
+        "early":     False,
+        "kind":      "TFC_VWAP_RETEST",
+        "tag":       tag,
+        "conditions": {
+            "htf_trend":   htf_trend,
+            "vwap_now":    vwap_now,
+            "vwap_slope":  vwap_slope,
+            "h_prev":      h_prev,
+            "l_prev":      l_prev,
+            "risk":        risk,
+            "rr_ratio":    2.0,
+        },
+    }
+
+
 def scan_symbol(sym,bar_i):
     kl=futures_get_klines(sym,"1h",200)
     if len(kl)<60: return []
@@ -3119,9 +3366,12 @@ def scan_symbol(sym,bar_i):
     # On-Chain 3-Level Strategy (Top 25 volume only)
     s_onchain = build_onchain_3level_signal(sym, kl, bar_i) if PARAM.get("ENABLE_ONCHAIN", True) else None
 
+    # TFC: Trend → Fail → Continue (VWAP retest continuation)
+    s_tfc = build_tfc_signal(sym, kl, bar_i) if PARAM.get("ENABLE_TFC", True) else None
+
     for s in (s_utstc, s_macd, s_fvg, s_cest, s_pull,
               s_orb_fvg, s_london_bo, s_ny_rev, s_ict_p3, s_asian_bo, s_fvg_breaker,
-              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib, s_onchain):
+              s_reentry, s_fvg_mss, s_bb, s_stoch_rsi, s_fib, s_onchain, s_tfc):
         if s: res.append(s)
     
     return res
@@ -3587,6 +3837,7 @@ STATE_DEFAULT={
     "bb_long_blocked":False, "bb_short_blocked":False,
     "stoch_rsi_long_blocked":False, "stoch_rsi_short_blocked":False,
     "fib_long_blocked":False, "fib_short_blocked":False,
+    "tfc_long_blocked":False, "tfc_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0,
@@ -3608,6 +3859,7 @@ PARAM_DEFAULT={
     "MAX_BB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_BB_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Bollinger Bands strategy limits
     "MAX_STOCH_RSI_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_STOCH_RSI_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Stochastic RSI strategy limits
     "MAX_FIB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FIB_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Fibonacci retracement strategy limits
+    "MAX_TFC_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_TFC_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # TFC VWAP Retest strategy limits
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":2000.0,
@@ -3630,6 +3882,8 @@ PARAM_DEFAULT={
     "ENABLE_STOCH_RSI": False,
     "ENABLE_FIB": True,       # FIBONACCI_RETRACEMENT enabled
     "ENABLE_ONCHAIN": False,
+    # TFC: Trend → Fail → Continue VWAP retest strategy
+    "ENABLE_TFC": True,           # TFC_VWAP_RETEST enabled
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
     "CEST_LOOKBACK": 10,  # Bars to look back for patterns
@@ -5284,7 +5538,8 @@ def _cmd_strategies():
             ("BB", "📊 Bollinger Bands"),
             ("STOCH_RSI", "🔄 Stochastic RSI"),
             ("FIB", "📐 Fibonacci Retracement"),
-            ("ONCHAIN", "📊 On-Chain 3-Level (Top 25)")
+            ("ONCHAIN", "📊 On-Chain 3-Level (Top 25)"),
+            ("TFC", "🔁 TFC VWAP Retest")
         ]
         
         msg = "📊 STRATEGY STATUS\n━━━━━━━━━━━━━━━━\n"
@@ -5307,7 +5562,10 @@ def _cmd_strategies():
         msg += f"Short: {PARAM.get('MAX_STOCH_RSI_SELL', 3)}\n"
         msg += f"\n📐 FIB Sub-Limits (within global):\n"
         msg += f"Long: {PARAM.get('MAX_FIB_BUY', 3)}\n"
-        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}"
+        msg += f"Short: {PARAM.get('MAX_FIB_SELL', 3)}\n"
+        msg += f"\n🔁 TFC Sub-Limits (within global):\n"
+        msg += f"Long: {PARAM.get('MAX_TFC_BUY', 3)}\n"
+        msg += f"Short: {PARAM.get('MAX_TFC_SELL', 3)}"
         
         tg_send(msg)
     except Exception as e:
@@ -5324,8 +5582,9 @@ def _cmd_setlimits(args):
                     "  bb_buy, bb_sell - Bollinger Bands sub-limits\n"
                     "  stoch_rsi_buy, stoch_rsi_sell - Stochastic RSI sub-limits\n"
                     "  fib_buy, fib_sell - Fibonacci sub-limits\n"
+                    "  tfc_buy, tfc_sell - TFC VWAP Retest sub-limits\n"
                     "Example: /setlimits buy 50\n"
-                    "Example: /setlimits bb_buy 10")
+                    "Example: /setlimits tfc_buy 5")
             return
         
         limit_type = args[0].lower()
@@ -5385,9 +5644,19 @@ def _cmd_setlimits(args):
             safe_save(PARAM_FILE, PARAM)
             tg_send(f"✅ FIB MAX_SELL limit set to {value} (within global limit)")
             log(f"[SETLIMITS] MAX_FIB_SELL = {value}")
+        elif limit_type == "tfc_buy":
+            PARAM["MAX_TFC_BUY"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ TFC MAX_BUY limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_TFC_BUY = {value}")
+        elif limit_type == "tfc_sell":
+            PARAM["MAX_TFC_SELL"] = value
+            safe_save(PARAM_FILE, PARAM)
+            tg_send(f"✅ TFC MAX_SELL limit set to {value} (within global limit)")
+            log(f"[SETLIMITS] MAX_TFC_SELL = {value}")
         else:
             tg_send(f"❌ Unknown limit type: {limit_type}\n"
-                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell")
+                    "Available: buy, sell, cest_buy, cest_sell, bb_buy, bb_sell, stoch_rsi_buy, stoch_rsi_sell, fib_buy, fib_sell, tfc_buy, tfc_sell")
             return
         
     except ValueError:
