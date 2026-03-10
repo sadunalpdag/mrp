@@ -3540,9 +3540,18 @@ def format_price_by_tick(sym, price_float):
 def futures_get_price(sym):
     try:
         r=requests.get(BINANCE_FAPI+"/fapi/v1/ticker/price",
-                       params={"symbol":sym},timeout=5).json()
-        return float(r["price"])
-    except:
+                       params={"symbol":sym},timeout=5)
+        if r.status_code!=200:
+            log(f"[GET PRICE HTTP] {sym} {r.status_code} {r.text}")
+            return None
+        j=r.json()
+        if "price" not in j:
+            log(f"[GET PRICE BAD JSON] {sym} {j}")
+            return None
+        px=float(j["price"])
+        return px if px>0 else None
+    except Exception as e:
+        log(f"[GET PRICE ERR] {sym} {e}")
         return None
 
 def futures_get_mark_price(sym):
@@ -5884,9 +5893,10 @@ def open_market_position(sym, direction, qty):
         fill = futures_get_price(sym)
         if fill is None or fill <= 0:
             log(f"[PRICE ERR] {sym} could not get valid entry price")
-            fill = 0.0
-    
-    return {"symbol":sym,"dir":direction,"qty":qty,"entry":float(fill),"pos_side":pos_side}
+            fill = None
+
+    entry = float(fill) if fill is not None and fill > 0 else None
+    return {"symbol":sym,"dir":direction,"qty":qty,"entry":entry,"pos_side":pos_side}
 
 def _duplicate_or_locked(sym, direction):
     if TREND_LOCK.get(sym)==direction:
@@ -6204,46 +6214,41 @@ def _cleanup_trend_lock_expired():
 def auto_init_symbols():
     """
     Initialize trading symbols list.
-    Returns all USDT trading pairs, sorted by 24h volume (descending).
+    Only returns USDT-M PERPETUAL symbols with status TRADING, sorted by 24h quoteVolume.
+    Validates against /fapi/v1/exchangeInfo before using ticker data.
     """
     try:
-        # Get all symbols with 24h ticker data
-        ticker_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-        ticker_response = requests.get(ticker_url, timeout=10).json()
-        
-        # Filter USDT pairs and sort by volume
-        usdt_tickers = [
-            t for t in ticker_response
-            if t.get("symbol", "").endswith("USDT")
-        ]
-        
-        # Sort by quoteVolume (USDT volume) descending
-        usdt_tickers.sort(key=lambda x: float(x.get("quoteVolume", 0)), reverse=True)
-        
-        # Extract symbols
-        symbols = [t["symbol"] for t in usdt_tickers]
-        
-        log(f"[SYMBOLS INIT] Loaded {len(symbols)} USDT pairs, sorted by volume")
-        if len(symbols) > 0:
+        # Step 1: build the validated set from exchangeInfo
+        info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
+        valid = {
+            s["symbol"] for s in info.get("symbols", [])
+            if s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+            and s.get("contractType") == "PERPETUAL"
+        }
+
+        # Step 2: fetch 24hr ticker and filter to only valid symbols
+        try:
+            ticker_response = requests.get(
+                BINANCE_FAPI + "/fapi/v1/ticker/24hr", timeout=10
+            ).json()
+            usdt_tickers = [t for t in ticker_response if t.get("symbol") in valid]
+            usdt_tickers.sort(
+                key=lambda x: float(x.get("quoteVolume", 0)), reverse=True
+            )
+            symbols = [t["symbol"] for t in usdt_tickers]
+        except Exception as e:
+            log(f"[INIT SYMBOLS TICKER ERR] {e} — falling back to exchangeInfo set")
+            symbols = sorted(valid)
+
+        log(f"[SYMBOLS INIT] Loaded {len(symbols)} PERPETUAL USDT symbols (TRADING), sorted by volume")
+        if symbols:
             log(f"[SYMBOLS INIT] Top 5 by volume: {symbols[:5]}")
-        
         return symbols
-        
+
     except Exception as e:
         log(f"[INIT SYMBOLS ERR] {e}")
-        # Fallback to exchange info (no volume sorting)
-        try:
-            info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
-            symbols = [
-                s["symbol"] for s in info["symbols"]
-                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
-            ]
-            symbols.sort()
-            log(f"[SYMBOLS INIT] Fallback: Loaded {len(symbols)} symbols (unsorted)")
-            return symbols
-        except Exception as e2:
-            log(f"[INIT SYMBOLS FALLBACK ERR] {e2}")
-            return []
+        return []
 
 def update_top_volume_symbols(all_symbols):
     """
