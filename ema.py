@@ -7,21 +7,11 @@ import numpy as np
 # ==============================================================================
 # 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (13 strateji - Asian & London disabled):
-#       📈 MACD (EMA20/200 + MACD crossover)
-#       🟩 FVG (Fair Value Gap Break)
-#       📘 EMA PULLBACK (EMA200 + EMA9/30 + swing break + MarketState)
-#       🧩 C.E.S.T. (50 MA Double Top/Bottom Strategy - IMPROVED)
-#       🔥 ORB + FVG CONFIRM (Opening Range Breakout + FVG - 09:45-12:00 EST)
-#       🔄 NY REVERSAL (Liquidity Sweep + Reversal - 09:30-11:00 EST)
-#       ⚡ ICT POWER OF 3 (Accumulation-Manipulation-Distribution - 08:30-12:00 EST)
-#       🧱 FVG + BREAKER BLOCK (FVG + Breaker Zone - Session Independent)
-#       🔄 RE-ENTRY (4H reference + 5m entries - Kill Zone optimized)
-#       ⭐ FVG + MSS (Highest Winrate - FVG + Market Structure Shift + OB)
-#       📊 BOLLINGER BANDS (Mean Reversion + Squeeze Breakout)
-#       🔄 STOCHASTIC RSI (Overbought/Oversold with trend filter)
+#  - Aktif stratejiler (sadece Fibonacci):
 #       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
-#  - NEW: 3 advanced technical strategies added for better performance
+#  - Diğer tüm stratejiler devre dışı (only FIBONACCI_RETRACEMENT enabled)
+#  - MIN_POWER_THRESHOLD: 68.0
+#  - TRADE_SIZE_USDT: 750.0
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - PER-STRATEGY LIMITS: Each strategy limited to 3 buy / 3 sell independently
 #  - Strategy enable/disable via Telegram commands
@@ -71,7 +61,7 @@ ALGO_ORDER_TYPES = [
 ]
 
 # Trading Signal Quality Filter
-DEFAULT_MIN_POWER_THRESHOLD = 69.0  # Minimum power score to execute trades (scale: ~50-100)
+DEFAULT_MIN_POWER_THRESHOLD = 68.0  # Minimum power score to execute trades (scale: ~50-100)
 
 # Per-strategy position limits
 DEFAULT_STRATEGY_POSITION_LIMIT = 3  # Maximum positions per strategy per direction
@@ -3602,7 +3592,7 @@ STATE_DEFAULT={
     "avg_max_profit":0.0  # Average of max profits from open positions
 }
 PARAM_DEFAULT={
-    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":500.0,
+    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
     # Per-strategy limits: Each strategy limited to DEFAULT_STRATEGY_POSITION_LIMIT buy/sell independently
     "MAX_MACD_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_MACD_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # MACD strategy limits
     "MAX_FVG_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FVG_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # FVG strategy limits
@@ -3621,7 +3611,7 @@ PARAM_DEFAULT={
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":2000.0,
     "MIN_POWER_THRESHOLD":DEFAULT_MIN_POWER_THRESHOLD,  # Minimum power score to execute trades (power scale: ~50-100, higher = stronger signal)
-    # Strategy enable/disable flags (only BOLLINGER_BANDS, REENTRY_4H_5M, FIBONACCI_RETRACEMENT enabled)
+    # Strategy enable/disable flags (only FIBONACCI_RETRACEMENT enabled)
     "ENABLE_MACD": False,
     "ENABLE_FVG": False,
     "ENABLE_CEST": False,
@@ -3632,10 +3622,10 @@ PARAM_DEFAULT={
     "ENABLE_ICT_P3": False,
     "ENABLE_ASIAN_BO": False,
     "ENABLE_FVG_BREAKER": False,
-    "ENABLE_REENTRY": True,   # REENTRY_4H_5M enabled
+    "ENABLE_REENTRY": False,  # REENTRY_4H_5M disabled
     "ENABLE_FVG_MSS": False,
     # NEW: Advanced technical strategies
-    "ENABLE_BB": True,        # BOLLINGER_BANDS enabled
+    "ENABLE_BB": False,       # BOLLINGER_BANDS disabled
     "ENABLE_STOCH_RSI": False,
     "ENABLE_FIB": True,       # FIBONACCI_RETRACEMENT enabled
     "ENABLE_ONCHAIN": False,
