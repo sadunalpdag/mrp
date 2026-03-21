@@ -6372,7 +6372,24 @@ def execute_sheet_trade(sig):
     direction = sig["dir"]
     entry     = sig["entry"]
     tp_price  = sig.get("tp", 0)
-    order_type = sig.get("order_type", "").upper()
+    order_type = sig.get("order_type", "AUTO").upper()
+
+    # If order type was not specified in the sheet (AUTO), determine it from the
+    # current market price:
+    #   LONG:  entry < market price  → LIMIT  (wait for pullback to entry)
+    #          entry >= market price → STOP_MARKET (breakout above current price)
+    #   SHORT: entry > market price  → LIMIT  (wait for bounce to entry)
+    #          entry <= market price → STOP_MARKET (breakdown below current price)
+    if order_type == "AUTO":
+        market_price = futures_get_price(sym)
+        if not market_price or market_price <= 0:
+            log(f"[SHEET TRADE SKIP] {sym}: could not fetch market price for auto order-type detection")
+            return False
+        if direction == "UP":
+            order_type = "LIMIT" if entry < market_price else "STOP_MARKET"
+        else:  # DOWN / SHORT
+            order_type = "LIMIT" if entry > market_price else "STOP_MARKET"
+        log(f"[SHEET] {sym}: auto order_type={order_type} (entry={entry}, market={market_price}, dir={direction})")
 
     # Only LIMIT and STOP_MARKET are permitted for sheet signals
     if order_type not in ("LIMIT", "STOP_MARKET"):
@@ -6460,7 +6477,9 @@ def fetch_sheet_signals():
         E: Giriş/Entry   (numeric price)
         F: TP            (numeric take-profit price)
         G: Timestamp     (optional — when signal was created, e.g. 2026-03-21 10:00)
-        H: Order type    (required — LIMIT or STOP; rows without a valid type are skipped)
+        H: Order type    (optional — LIMIT or STOP; if blank/missing the bot auto-detects from
+                          current market price: LIMIT when entry is beyond current price in the
+                          favorable direction, STOP_MARKET otherwise)
     """
     try:
         url = (
@@ -6470,7 +6489,7 @@ def fetch_sheet_signals():
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         reader = csv.reader(io.StringIO(resp.text))
-        SHEET_MIN_COLS = 6  # A–F required; G (timestamp) optional; H (order type) required to be processed
+        SHEET_MIN_COLS = 6  # A–F required; G (timestamp) optional; H (order type) optional — auto-detected if missing
         signals = []
         for row_idx, row in enumerate(reader):
             if row_idx == 0:
@@ -6508,16 +6527,21 @@ def fetch_sheet_signals():
                 log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
                 continue
 
-            # Normalise order type — only LIMIT and STOP are accepted; rows without a
-            # valid type are skipped so that accidental blank/MARKET values are never
-            # silently converted to a market order.
+            # Normalise order type.
+            # If H is blank or unrecognised, set "AUTO" — the bot will fetch the current
+            # market price at execution time and decide:
+            #   LONG:  entry < market → LIMIT (pullback entry)
+            #          entry >= market → STOP_MARKET (breakout entry)
+            #   SHORT: entry > market → LIMIT (bounce entry)
+            #          entry <= market → STOP_MARKET (breakdown entry)
             if order_type_str in ("LIMIT",):
                 order_type = "LIMIT"
             elif order_type_str in ("STOP", "STOP_MARKET"):
                 order_type = "STOP_MARKET"
             else:
-                log(f"[SHEET] Row {row_idx}: order type '{order_type_str}' is not LIMIT or STOP, skipping")
-                continue
+                order_type = "AUTO"
+                if order_type_str:
+                    log(f"[SHEET] Row {row_idx}: unrecognised order type '{order_type_str}', will auto-detect from price")
 
             signals.append({
                 "row_idx":     row_idx,
