@@ -8,9 +8,9 @@ import numpy as np
 # ==============================================================================
 # 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler (sadece Fibonacci):
-#       📐 FIBONACCI RETRACEMENT (Trend continuation at key levels)
-#  - Diğer tüm stratejiler devre dışı (only FIBONACCI_RETRACEMENT enabled)
+#  - Aktif stratejiler: tüm stratejiler devre dışı
+#       📐 FIBONACCI RETRACEMENT disabled
+#  - Diğer tüm stratejiler devre dışı (all strategies disabled)
 #  - MIN_POWER_THRESHOLD: 68.0
 #  - TRADE_SIZE_USDT: 750.0
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
@@ -3633,7 +3633,7 @@ PARAM_DEFAULT={
     # NEW: Advanced technical strategies
     "ENABLE_BB": False,       # BOLLINGER_BANDS disabled
     "ENABLE_STOCH_RSI": False,
-    "ENABLE_FIB": True,       # FIBONACCI_RETRACEMENT enabled
+    "ENABLE_FIB": False,      # FIBONACCI_RETRACEMENT disabled
     "ENABLE_ONCHAIN": False,
     # CEST improvements
     "CEST_TOLERANCE": 0.015,  # Double top/bottom price tolerance (1.5%)
@@ -6686,26 +6686,27 @@ def fetch_sheet_signals():
     The bot only READS the sheet — it never writes back to it.
     Returns a list of dicts for rows where column C == '1'.
 
-    Minimum required columns: A (symbol), B (analysis text), C (trigger flag).
+    Minimum required columns: A (timestamp), B (symbol), C (analysis text), D (trigger flag).
 
     Column layout:
-        A: Symbol        (e.g. RDNTUSDT or BTC — USDT suffix is added automatically
+        A: Timestamp     (e.g. "21.03.2026 21:51:18" — skipped, used for reference only)
+        B: Symbol        (e.g. RDNTUSDT or BTC — USDT suffix is added automatically
                           if absent; rows whose symbol contains characters other than
                           A-Z / 0-9 are skipped with a log warning)
-        B: Analysis text — free-form cell containing:
+        C: Analysis text — free-form cell containing:
                Giriş yönü: Short
                Giriş yeri: 0.00623
                TP: 0.00580
                Stoploss: 0.00655   (optional)
            Direction / Entry / TP / SL are parsed from this text.
-           Alternatively, if columns D–F are present and non-empty the bot reads
+           Alternatively, if columns E–G are present and non-empty the bot reads
            them directly (backward-compatible fallback):
-               D: Yön/Direction  (Long / Short)
-               E: Giriş/Entry    (numeric price)
-               F: TP             (numeric take-profit price)
-               G: SL             (numeric stop-loss price, optional)
-               H: Timestamp      (optional)
-        C: Trigger flag  (1 = open trade, anything else = ignore)
+               E: Yön/Direction  (Long / Short)
+               F: Giriş/Entry    (numeric price)
+               G: TP             (numeric take-profit price)
+               H: SL             (numeric stop-loss price, optional)
+               I: Timestamp      (optional)
+        D: Trigger flag  (1 = open trade, anything else = ignore)
 
     Order type is determined automatically from the current market price:
         LONG:  entry < market → LIMIT        (wait for pullback)
@@ -6722,16 +6723,16 @@ def fetch_sheet_signals():
         resp.raise_for_status()
         resp.encoding = 'utf-8'
         reader = csv.reader(io.StringIO(resp.text))
-        SHEET_MIN_COLS = 3  # A (symbol), B (analysis), C (flag) are the only required columns
+        SHEET_MIN_COLS = 4  # A (timestamp), B (symbol), C (analysis), D (flag) are the only required columns
         signals = []
         for row_idx, row in enumerate(reader):
             if row_idx == 0:
                 continue  # skip header
             if len(row) < SHEET_MIN_COLS:
                 continue
-            symbol    = row[0].strip().upper()
-            trade_col = row[1].strip()
-            flag      = row[2].strip()
+            symbol    = row[1].strip().upper()
+            trade_col = row[2].strip()
+            flag      = row[3].strip()
 
             if flag != "1":
                 continue
@@ -6752,21 +6753,21 @@ def fetch_sheet_signals():
                 symbol = symbol + "USDT"
 
             # ── Determine direction / entry / TP / SL ──
-            # Primary: columns D, E, F present and non-empty → read directly.
-            # Fallback: parse from the B-column analysis text.
+            # Primary: columns E, F, G present and non-empty → read directly.
+            # Fallback: parse from the C-column analysis text.
             sl_str  = ""
             signal_time_str = ""
-            if len(row) >= 6 and row[3].strip() and row[4].strip() and row[5].strip():
-                direction = row[3].strip().upper()
-                entry_str = row[4].strip()
-                tp_str    = row[5].strip()
-                sl_str    = row[6].strip() if len(row) > 6 else ""
-                signal_time_str = row[7].strip() if len(row) > 7 else ""
+            if len(row) >= 7 and row[4].strip() and row[5].strip() and row[6].strip():
+                direction = row[4].strip().upper()
+                entry_str = row[5].strip()
+                tp_str    = row[6].strip()
+                sl_str    = row[7].strip() if len(row) > 7 else ""
+                signal_time_str = row[8].strip() if len(row) > 8 else ""
             else:
                 parsed = _parse_b_column(trade_col)
                 if not parsed:
                     preview = trade_col[:120].replace("\n", " ") if trade_col else "(empty)"
-                    log(f"[SHEET] Row {row_idx}: C=1 but could not parse direction/entry/TP from B column, skipping. B col preview: {preview!r}")
+                    log(f"[SHEET] Row {row_idx}: D=1 but could not parse direction/entry/TP from C column, skipping. C col preview: {preview!r}")
                     continue
                 direction = parsed["direction"]
                 entry_str = parsed["entry"]
