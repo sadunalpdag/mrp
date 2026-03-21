@@ -6689,7 +6689,9 @@ def fetch_sheet_signals():
     Minimum required columns: A (symbol), B (analysis text), C (trigger flag).
 
     Column layout:
-        A: Symbol        (e.g. RDNTUSDT)
+        A: Symbol        (e.g. RDNTUSDT or BTC — USDT suffix is added automatically
+                          if absent; rows whose symbol contains characters other than
+                          A-Z / 0-9 are skipped with a log warning)
         B: Analysis text — free-form cell containing:
                Giriş yönü: Short
                Giriş yeri: 0.00623
@@ -6735,6 +6737,19 @@ def fetch_sheet_signals():
                 continue
             if not symbol:
                 continue
+
+            # Validate that the symbol looks like a valid crypto pair (only A-Z / 0-9).
+            # Values such as date strings ("21.03.2026 21:51:18") must be rejected
+            # before they reach the Binance API (which returns -1121 Invalid symbol).
+            if not re.match(r'^[A-Z0-9]+$', symbol):
+                log(f"[SHEET] Row {row_idx}: symbol '{symbol}' contains invalid characters, skipping")
+                continue
+
+            # Binance Futures perpetual pairs always end in USDT.
+            # Auto-append the suffix when the sheet supplies a bare coin name
+            # (e.g. "BTC" → "BTCUSDT") so operators do not have to type it.
+            if not symbol.endswith("USDT"):
+                symbol = symbol + "USDT"
 
             # ── Determine direction / entry / TP / SL ──
             # Primary: columns D, E, F present and non-empty → read directly.
