@@ -6365,7 +6365,8 @@ def execute_sheet_trade(sig):
     Execute a trade originating from the Google Sheets signal list.
     Differences from execute_real_trade():
       - Power check is bypassed (sheet operator takes responsibility).
-      - Only LIMIT and STOP_MARKET entry order types are accepted; MARKET is not allowed.
+      - Order type (LIMIT vs STOP_MARKET) is determined automatically from the current
+        market price: no sheet column is required.
       - Sets TP at the absolute price specified in the sheet.
     """
     sym       = sig["symbol"]
@@ -6477,9 +6478,13 @@ def fetch_sheet_signals():
         E: Giriş/Entry   (numeric price)
         F: TP            (numeric take-profit price)
         G: Timestamp     (optional — when signal was created, e.g. 2026-03-21 10:00)
-        H: Order type    (optional — LIMIT or STOP; if blank/missing the bot auto-detects from
-                          current market price: LIMIT when entry is beyond current price in the
-                          favorable direction, STOP_MARKET otherwise)
+
+    Order type is determined automatically from the current market price at execution time —
+    no column is required for this:
+        LONG:  entry < market → LIMIT  (wait for pullback)
+               entry >= market → STOP_MARKET  (breakout)
+        SHORT: entry > market → LIMIT  (wait for bounce)
+               entry <= market → STOP_MARKET  (breakdown)
     """
     try:
         url = (
@@ -6489,7 +6494,7 @@ def fetch_sheet_signals():
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         reader = csv.reader(io.StringIO(resp.text))
-        SHEET_MIN_COLS = 6  # A–F required; G (timestamp) optional; H (order type) optional — auto-detected if missing
+        SHEET_MIN_COLS = 6  # A–F required; G (timestamp) optional; order type is auto-detected from price
         signals = []
         for row_idx, row in enumerate(reader):
             if row_idx == 0:
@@ -6504,7 +6509,7 @@ def fetch_sheet_signals():
             tp_str    = row[5].strip()
             # Optional columns
             signal_time_str = row[6].strip() if len(row) > 6 else ""
-            order_type_str  = row[7].strip().upper() if len(row) > 7 else ""
+            # Order type is always determined from market price at execution time — no sheet column needed.
 
             if flag != "1":
                 continue
@@ -6527,21 +6532,8 @@ def fetch_sheet_signals():
                 log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
                 continue
 
-            # Normalise order type.
-            # If H is blank or unrecognised, set "AUTO" — the bot will fetch the current
-            # market price at execution time and decide:
-            #   LONG:  entry < market → LIMIT (pullback entry)
-            #          entry >= market → STOP_MARKET (breakout entry)
-            #   SHORT: entry > market → LIMIT (bounce entry)
-            #          entry <= market → STOP_MARKET (breakdown entry)
-            if order_type_str in ("LIMIT",):
-                order_type = "LIMIT"
-            elif order_type_str in ("STOP", "STOP_MARKET"):
-                order_type = "STOP_MARKET"
-            else:
-                order_type = "AUTO"
-                if order_type_str:
-                    log(f"[SHEET] Row {row_idx}: unrecognised order type '{order_type_str}', will auto-detect from price")
+            # Order type is always resolved automatically at execution time.
+            order_type = "AUTO"
 
             signals.append({
                 "row_idx":     row_idx,
@@ -6573,7 +6565,7 @@ def process_sheet_signals():
     Tracking format (SHEET_SIGNALS_FILE) — JSON object:
         { "<sig_id>": {"first_seen": "<iso-ts>", "opened": true|false} }
 
-    sig_id is content-based: symbol|dir|entry|ordertype|timestamp
+    sig_id is content-based: symbol|dir|entry|timestamp
     This makes deduplication stable even when sheet rows are reordered or inserted.
 
     Age guard: signals older than SHEET_SIGNAL_MAX_AGE_HOURS (24 h) are skipped.
@@ -6606,7 +6598,7 @@ def process_sheet_signals():
         # in the sheet does NOT cause the same signal to fire more than once.
         # Use "|" as separator (never appears in symbols, prices, or ISO timestamps).
         ts_tag = (sig.get("signal_time", "") or "").strip() or "nots"
-        sig_id = f"{sig['symbol']}|{sig['dir']}|{sig['entry']}|{sig['order_type']}|{ts_tag}"
+        sig_id = f"{sig['symbol']}|{sig['dir']}|{sig['entry']}|{ts_tag}"
 
         # ── Age check from sheet timestamp column (G) ──
         ts_str = sig.get("signal_time", "")
@@ -6646,8 +6638,7 @@ def process_sheet_signals():
             continue
 
         # ── Execute trade ──
-        log(f"[SHEET] Opening trade: {sig['symbol']} {sig['dir']} entry={sig['entry']} "
-            f"tp={sig['tp']} order_type={sig.get('order_type','')}")
+        log(f"[SHEET] Opening trade: {sig['symbol']} {sig['dir']} entry={sig['entry']} tp={sig['tp']}")
         trade_opened = execute_sheet_trade(sig)
 
         if trade_opened:
