@@ -6612,6 +6612,7 @@ def fetch_sheet_signals():
         )
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
+        resp.encoding = 'utf-8'
         reader = csv.reader(io.StringIO(resp.text))
         SHEET_MIN_COLS = 3  # A (symbol), B (analysis), C (flag) are the only required columns
         signals = []
