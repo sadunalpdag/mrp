@@ -5650,7 +5650,25 @@ def check_telegram_commands():
         if chat_id != str(CHAT_ID):
             continue
         text=msg.get("text","").strip()
-        if not text.startswith("/"): continue
+        if not text.startswith("/"):
+            # Try to parse as a free-form trading signal
+            sig = parse_signal(text)
+            if (sig["coin"] and sig["direction"]
+                    and sig["entry"] is not None and sig["entry"] > 0
+                    and sig["tp"] is not None and sig["tp"] > 0):
+                dir_norm = "UP" if sig["direction"] == "long" else "DOWN"
+                sheet_sig = {
+                    "symbol":     sig["coin"],
+                    "dir":        dir_norm,
+                    "entry":      sig["entry"],
+                    "tp":         sig["tp"],
+                    "sl":         sig.get("sl", 0.0),
+                    "order_type": "AUTO",
+                    "tag":        "TG_SIGNAL",
+                }
+                log(f"[TG_SIGNAL] Parsed signal: {sheet_sig}")
+                execute_sheet_trade(sheet_sig)
+            continue
         parts=text.split(); cmd=parts[0].lower(); args=parts[1:]
         if cmd=="/status": _cmd_status()
         elif cmd=="/report": _cmd_report()
@@ -6571,6 +6589,94 @@ def _parse_b_column(text):
 
     if not all(k in result for k in ("direction", "entry", "tp")):
         return None
+    return result
+
+
+def parse_signal(signal_text: str) -> dict:
+    """
+    Parse a free-form trading signal message (e.g. from Telegram) and return
+    a dict with the extracted fields.
+
+    Supported format (Turkish labels, case-insensitive):
+        2. MAGMAUSDT
+        İşlem: evet
+        Yön: long
+        Giriş: 0.1350
+        TP: 0.1480
+        Stoploss: 0.1290
+
+    Turkish diacritics (ş→s, ö→o, ü→u, ı→i, İ→I) are normalised before
+    matching so that partially-typed labels still match correctly.
+    Numbers may use either '.' or ',' as the decimal separator.
+
+    Returns a dict:
+        {
+            "coin":      str  | None,   # e.g. "MAGMAUSDT"
+            "direction": str  | None,   # "long" or "short"
+            "entry":     float| None,
+            "tp":        float| None,
+        }
+    All required fields must be present for a signal to be considered valid;
+    callers should verify that none of the values are None before acting.
+    """
+    result = {
+        "coin":      None,
+        "direction": None,
+        "entry":     None,
+        "tp":        None,
+    }
+
+    # Normalise Turkish diacritics so that e.g. "Giriş" and "Giris" both match.
+    norm = signal_text.translate(_TURKISH_NORMALIZATION_MAP)
+    _NP  = _B_COL_NUM_PAT  # reuse existing number pattern (handles "," decimals)
+
+    def _num(s: str) -> float:
+        return float(s.replace(",", "."))
+
+    # ── Coin (symbol) ──────────────────────────────────────────────────────────
+    # Match the first occurrence of a token ending in USDT (e.g. "MAGMAUSDT").
+    m = re.search(r"\b([A-Z0-9]+USDT)\b", signal_text, re.IGNORECASE)
+    if m:
+        result["coin"] = m.group(1).upper()
+
+    # ── Direction ──────────────────────────────────────────────────────────────
+    # "Yön: long"  /  "Yon: short"  (after Turkish normalisation → "yon")
+    m = re.search(r'\byonu?\s*:\s*(long|short)\b', norm, re.IGNORECASE)
+    if m:
+        result["direction"] = m.group(1).lower()
+
+    # ── Entry price ────────────────────────────────────────────────────────────
+    # "Giriş: 0.1350"  /  "Giris: 0,1350"  (after normalisation → "giris")
+    # Longer labels ("Giriş yeri:", "Giriş fiyatı:", "Giriş noktası:") take
+    # precedence and are matched first so the short "giris:" variant acts as
+    # a catch-all fallback — identical priority order to _parse_b_column.
+    for pat in (
+        r'giris\s+yeri\s*:\s*(' + _NP + r')',
+        r'giris\s+fiyati\s*:\s*(' + _NP + r')',
+        r'giris\s+noktasi\s*:\s*(' + _NP + r')',
+        r'(?:giris|entry)\s*:\s*(' + _NP + r')',
+    ):
+        m = re.search(pat, norm, re.IGNORECASE)
+        if m:
+            result["entry"] = _num(m.group(1))
+            break
+
+    # ── Take-profit ────────────────────────────────────────────────────────────
+    for pat in (
+        r'\bT/?P\s*:\s*(' + _NP + r')',
+        r'\bhedef\s*:\s*(' + _NP + r')',
+        r'\btake\s*profit\s*:\s*(' + _NP + r')',
+    ):
+        m = re.search(pat, norm, re.IGNORECASE)
+        if m:
+            result["tp"] = _num(m.group(1))
+            break
+
+    # ── Stop-loss (optional) ───────────────────────────────────────────────────
+    m = re.search(r'stop(?:loss)?\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
+    if m:
+        result["sl"] = _num(m.group(1))
+
     return result
 
 
