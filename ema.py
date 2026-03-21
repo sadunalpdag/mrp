@@ -1,7 +1,8 @@
-import os, time, requests, hmac, hashlib, threading, math, json, traceback
+import os, re, time, requests, hmac, hashlib, threading, math, json, traceback, csv, io
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
+from dateutil import parser as _dtparser
 import numpy as np
 
 # ==============================================================================
@@ -34,12 +35,17 @@ LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
 BALANCE_HISTORY_FILE = os.path.join(DATA_DIR,"balance_history.json")
 HOURLY_STATS_FILE = os.path.join(DATA_DIR,"hourly_stats.json")
 POSITIONS_TRACKER_FILE = os.path.join(DATA_DIR,"positions_tracker.json")
+SHEET_SIGNALS_FILE   = os.path.join(DATA_DIR,"sheet_signals_opened.json")
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
 BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 BINANCE_FAPI   = "https://fapi.binance.com"
+
+GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEET_ID",  "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
+GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
+SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
@@ -6022,11 +6028,12 @@ def execute_real_trade(sig):
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
 
-    # 🔒 Check minimum power threshold
-    min_power = PARAM.get("MIN_POWER_THRESHOLD", DEFAULT_MIN_POWER_THRESHOLD)
-    if pwr < min_power:
-        log(f"[LOW POWER] {sym} {kind} power={pwr:.2f} < {min_power:.2f}, skipping trade")
-        return False
+    # 🔒 Check minimum power threshold (skipped for SHEET signals)
+    if kind != "SHEET":
+        min_power = PARAM.get("MIN_POWER_THRESHOLD", DEFAULT_MIN_POWER_THRESHOLD)
+        if pwr < min_power:
+            log(f"[LOW POWER] {sym} {kind} power={pwr:.2f} < {min_power:.2f}, skipping trade")
+            return False
 
     # 🔒 Check if current hour is blocked for trading
     if is_hour_blocked_for_trading():
@@ -6295,6 +6302,426 @@ def update_top_volume_symbols(all_symbols):
             TOP_VOLUME_SYMBOLS = all_symbols[:25]
             log(f"[TOP VOLUME UPDATE] Fallback: Using first 25 symbols")
 
+# ===================== GOOGLE SHEETS SIGNAL READER =====================
+
+def open_limit_position(sym, direction, qty, price):
+    """Place a GTC LIMIT order to open a position at a specific price."""
+    side = "BUY" if direction == "UP" else "SELL"
+    pos_side = "LONG" if direction == "UP" else "SHORT"
+    price_str = format_price_by_tick(sym, round_to_tick(sym, price))
+    res = _signed_request("POST", "/fapi/v1/order", {
+        "symbol": sym, "side": side, "type": "LIMIT",
+        "quantity": f"{qty}", "price": price_str,
+        "timeInForce": "GTC", "positionSide": pos_side, "timestamp": now_ts_ms()
+    })
+    log(f"[LIMIT ORDER] {sym} {direction} price={price_str} qty={qty} orderId={res.get('orderId')}")
+    return {"symbol": sym, "dir": direction, "qty": qty, "entry": price,
+            "pos_side": pos_side, "order_id": res.get("orderId")}
+
+
+def open_stop_market_position(sym, direction, qty, stop_price):
+    """Place a STOP_MARKET order that triggers when price reaches stop_price."""
+    side = "BUY" if direction == "UP" else "SELL"
+    pos_side = "LONG" if direction == "UP" else "SHORT"
+    stop_str = format_price_by_tick(sym, round_to_tick(sym, stop_price))
+    res = _signed_request("POST", "/fapi/v1/order", {
+        "symbol": sym, "side": side, "type": "STOP_MARKET",
+        "quantity": f"{qty}", "stopPrice": stop_str,
+        "positionSide": pos_side, "timestamp": now_ts_ms()
+    })
+    log(f"[STOP_MARKET ORDER] {sym} {direction} stopPrice={stop_str} qty={qty} orderId={res.get('orderId')}")
+    return {"symbol": sym, "dir": direction, "qty": qty, "entry": stop_price,
+            "pos_side": pos_side, "order_id": res.get("orderId")}
+
+
+def futures_set_tp_at_price(sym, direction, tp_price):
+    """Place a TAKE_PROFIT_MARKET algo order at an absolute TP price from the sheet."""
+    try:
+        f = get_symbol_filters(sym)
+        minp = f["minPrice"]; maxp = f["maxPrice"]
+        pos_side = "LONG" if direction == "UP" else "SHORT"
+        side = "SELL" if direction == "UP" else "BUY"
+        price = round_to_tick(sym, tp_price)
+        price = max(float(minp), min(float(maxp), price))
+        stop_str = format_price_by_tick(sym, price)
+        if float(stop_str) <= 0:
+            log(f"[TP AT PRICE ERR] {sym} tp={tp_price} rounds to 0")
+            return False
+        payload = {
+            "symbol": sym, "side": side, "type": "TAKE_PROFIT_MARKET",
+            "algoType": "CONDITIONAL", "triggerPrice": stop_str,
+            "workingType": "MARK_PRICE", "closePosition": "true",
+            "positionSide": pos_side, "timestamp": now_ts_ms()
+        }
+        _signed_request("POST", "/fapi/v1/algoOrder", payload)
+        log(f"[TP AT PRICE OK] {sym} TAKE_PROFIT_MARKET triggerPrice={stop_str}")
+        return True
+    except Exception as e:
+        log(f"[TP AT PRICE ERR] {sym} tp={tp_price} {e}")
+        return False
+
+
+def execute_sheet_trade(sig):
+    """
+    Execute a trade originating from the Google Sheets signal list.
+    Differences from execute_real_trade():
+      - Power check is bypassed (sheet operator takes responsibility).
+      - Stop loss is never placed for sheet signals.
+      - Order type (LIMIT vs STOP_MARKET) is determined automatically from the current
+        market price: no sheet column is required.
+      - Sets TP at the absolute price specified in the sheet.
+    """
+    sym       = sig["symbol"]
+    direction = sig["dir"]
+    entry     = sig["entry"]
+    tp_price  = sig.get("tp", 0)
+    order_type = sig.get("order_type", "AUTO").upper()
+
+    # If order type was not specified in the sheet (AUTO), determine it from the
+    # current market price:
+    #   LONG:  entry < market price  → LIMIT  (wait for pullback to entry)
+    #          entry >= market price → STOP_MARKET (breakout above current price)
+    #   SHORT: entry > market price  → LIMIT  (wait for bounce to entry)
+    #          entry <= market price → STOP_MARKET (breakdown below current price)
+    if order_type == "AUTO":
+        market_price = futures_get_price(sym)
+        if not market_price or market_price <= 0:
+            log(f"[SHEET TRADE SKIP] {sym}: could not fetch market price for auto order-type detection")
+            return False
+        if direction == "UP":
+            order_type = "LIMIT" if entry < market_price else "STOP_MARKET"
+        else:  # DOWN / SHORT
+            order_type = "LIMIT" if entry > market_price else "STOP_MARKET"
+        log(f"[SHEET] {sym}: auto order_type={order_type} (entry={entry}, market={market_price}, dir={direction})")
+
+    # Only LIMIT and STOP_MARKET are permitted for sheet signals
+    if order_type not in ("LIMIT", "STOP_MARKET"):
+        log(f"[SHEET TRADE SKIP] {sym}: order_type '{order_type}' is not LIMIT or STOP_MARKET — skipping")
+        return False
+
+    # Guards: direction limits and duplicate/trend-lock checks still apply
+    if not _can_direction(direction, "SHEET"):
+        return False
+    if _duplicate_or_locked(sym, direction):
+        return False
+
+    qty = calc_order_qty(sym, entry, PARAM["TRADE_SIZE_USDT"])
+    if not qty or qty <= 0:
+        log(f"[SHEET TRADE ERR] {sym} qty calculation failed")
+        return False
+
+    try:
+        if order_type == "LIMIT":
+            opened = open_limit_position(sym, direction, qty, entry)
+            entry_exec = entry  # Fill price equals limit price for TP calculation
+        else:  # STOP_MARKET (already validated above)
+            opened = open_stop_market_position(sym, direction, qty, entry)
+            entry_exec = entry
+
+        # Set TP at the sheet-specified absolute price
+        tp_ok = False
+        if tp_price and tp_price > 0:
+            tp_ok = futures_set_tp_at_price(sym, direction, tp_price)
+        tp_note = f"TP:{tp_price}" if tp_ok else "TP: not set"
+
+        # Stop loss is intentionally disabled for sheet signals
+        sl_note = "SL: disabled"
+
+        TREND_LOCK[sym] = direction
+        TREND_LOCK_TIME[sym] = now_ts_s()
+        log(f"[TRENDLOCK SET] {sym} {direction}")
+
+        tg_send(
+            f"📋 SHEET {sym} {direction} [{order_type}] qty:{qty}\n"
+            f"Entry:{entry_exec}\n"
+            f"{tp_note}\n{sl_note}\n"
+            f"time:{now_local_iso()}"
+        )
+
+        AI_RL.append({
+            "time": now_local_iso(), "symbol": sym, "dir": direction,
+            "entry": entry_exec, "tp_ok": tp_ok, "sl_ok": False,
+            "born_bar": sig.get("born_bar", 0),
+            "early": False, "kind": "SHEET", "tag": sig.get("tag", ""),
+            "order_type": order_type,
+        })
+        safe_save(AI_RL_FILE, AI_RL)
+
+        REAL_POSITIONS_TRACKER[sym] = {
+            "direction": direction, "kind": "SHEET", "entry": entry_exec,
+            "qty": qty, "open_time": now_local_iso(), "order_type": order_type,
+        }
+        save_positions_tracker()
+        return True
+
+    except Exception as e:
+        log(f"[SHEET TRADE ERR] {sym} {e}")
+        log(f"[SHEET TRADE TRACE] {traceback.format_exc()}")
+        return False
+
+
+def _parse_b_column(text):
+    """
+    Parse trading signal fields from a free-text B-column analysis cell.
+
+    Recognised patterns (case-insensitive, Turkish/English):
+        Giriş yönü: Short   → direction
+        Giriş yeri: 0.00623 → entry price
+        TP: 0.00580         → take-profit price
+        Stoploss: 0.00655   → stop-loss price (optional)
+
+    Returns a dict with keys 'direction', 'entry', 'tp', 'sl' (sl may be absent),
+    or None when any of the three required fields is missing.
+    """
+    result = {}
+    # Direction — "Giriş yönü: Short" or just "Long"
+    m = re.search(r'giri[şs]\s+yönü\s*:\s*(\S+)', text, re.IGNORECASE)
+    if m:
+        result["direction"] = m.group(1).strip().upper()
+    # Entry price — "Giriş yeri: 0.00623"
+    m = re.search(r'giri[şs]\s+yeri\s*:\s*([\d.]+)', text, re.IGNORECASE)
+    if m:
+        result["entry"] = m.group(1)
+    # TP — "TP: 0.00580"
+    m = re.search(r'\bTP\s*:\s*([\d.]+)', text, re.IGNORECASE)
+    if m:
+        result["tp"] = m.group(1)
+    # SL — "Stoploss: 0.00655" or "Stop: 0.00655"
+    m = re.search(r'stop(?:loss)?\s*:\s*([\d.]+)', text, re.IGNORECASE)
+    if m:
+        result["sl"] = m.group(1)
+    if not all(k in result for k in ("direction", "entry", "tp")):
+        return None
+    return result
+
+
+def fetch_sheet_signals():
+    """
+    Fetch trading signals from the public Google Sheets spreadsheet (CSV export).
+    The bot only READS the sheet — it never writes back to it.
+    Returns a list of dicts for rows where column C == '1'.
+
+    Minimum required columns: A (symbol), B (analysis text), C (trigger flag).
+
+    Column layout:
+        A: Symbol        (e.g. RDNTUSDT)
+        B: Analysis text — free-form cell containing:
+               Giriş yönü: Short
+               Giriş yeri: 0.00623
+               TP: 0.00580
+               Stoploss: 0.00655   (optional)
+           Direction / Entry / TP / SL are parsed from this text.
+           Alternatively, if columns D–F are present and non-empty the bot reads
+           them directly (backward-compatible fallback):
+               D: Yön/Direction  (Long / Short)
+               E: Giriş/Entry    (numeric price)
+               F: TP             (numeric take-profit price)
+               G: SL             (numeric stop-loss price, optional)
+               H: Timestamp      (optional)
+        C: Trigger flag  (1 = open trade, anything else = ignore)
+
+    Order type is determined automatically from the current market price:
+        LONG:  entry < market → LIMIT        (wait for pullback)
+               entry >= market → STOP_MARKET (breakout)
+        SHORT: entry > market → LIMIT        (wait for bounce)
+               entry <= market → STOP_MARKET (breakdown)
+    """
+    try:
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
+            f"/export?format=csv&gid={GOOGLE_SHEET_GID}"
+        )
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        reader = csv.reader(io.StringIO(resp.text))
+        SHEET_MIN_COLS = 3  # A (symbol), B (analysis), C (flag) are the only required columns
+        signals = []
+        for row_idx, row in enumerate(reader):
+            if row_idx == 0:
+                continue  # skip header
+            if len(row) < SHEET_MIN_COLS:
+                continue
+            symbol    = row[0].strip().upper()
+            trade_col = row[1].strip()
+            flag      = row[2].strip()
+
+            if flag != "1":
+                continue
+            if not symbol:
+                continue
+
+            # ── Determine direction / entry / TP / SL ──
+            # Primary: columns D, E, F present and non-empty → read directly.
+            # Fallback: parse from the B-column analysis text.
+            sl_str  = ""
+            signal_time_str = ""
+            if len(row) >= 6 and row[3].strip() and row[4].strip() and row[5].strip():
+                direction = row[3].strip().upper()
+                entry_str = row[4].strip()
+                tp_str    = row[5].strip()
+                sl_str    = row[6].strip() if len(row) > 6 else ""
+                signal_time_str = row[7].strip() if len(row) > 7 else ""
+            else:
+                parsed = _parse_b_column(trade_col)
+                if not parsed:
+                    log(f"[SHEET] Row {row_idx}: C=1 but could not parse direction/entry/TP from B column, skipping")
+                    continue
+                direction = parsed["direction"]
+                entry_str = parsed["entry"]
+                tp_str    = parsed["tp"]
+                sl_str    = parsed.get("sl", "")
+
+            try:
+                entry = float(entry_str)
+                tp    = float(tp_str)
+            except ValueError:
+                log(f"[SHEET] Row {row_idx}: invalid price values ({entry_str}, {tp_str}), skipping")
+                continue
+
+            # Parse optional SL
+            sl = 0.0
+            if sl_str:
+                try:
+                    sl = float(sl_str)
+                except ValueError:
+                    pass
+
+            # Normalise direction
+            if direction in ("LONG", "L", "BUY", "UP"):
+                dir_norm = "UP"
+            elif direction in ("SHORT", "S", "SELL", "DOWN"):
+                dir_norm = "DOWN"
+            else:
+                log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
+                continue
+
+            # Order type is always resolved automatically at execution time.
+            order_type = "AUTO"
+
+            signals.append({
+                "row_idx":     row_idx,
+                "symbol":      symbol,
+                "trade_col":   trade_col,
+                "dir":         dir_norm,
+                "entry":       entry,
+                "tp":          tp,
+                "sl":          sl,
+                "signal_time": signal_time_str,
+                "order_type":  order_type,
+            })
+
+        log(f"[SHEET] {len(signals)} active signals found (C=1)")
+        return signals
+    except Exception as e:
+        log(f"[SHEET ERR] Failed to fetch signals: {e}")
+        return []
+
+
+def process_sheet_signals():
+    """
+    Process Google Sheets signals: for each row where column C == '1',
+    open a Binance Futures trade exactly once.
+
+    The bot NEVER writes back to the sheet — it only reads via CSV export.
+    Column C == '1' is the sole trigger; any other value means the row is ignored.
+    Each unique signal fires exactly once (1 trade per signal).
+
+    Tracking format (SHEET_SIGNALS_FILE) — JSON object:
+        { "<sig_id>": {"first_seen": "<iso-ts>", "opened": true|false} }
+
+    sig_id is content-based: symbol|dir|entry|timestamp
+    This makes deduplication stable even when sheet rows are reordered or inserted.
+
+    Age guard: signals older than SHEET_SIGNAL_MAX_AGE_HOURS (24 h) are skipped.
+    The age is determined by:
+      1. The optional timestamp column G in the sheet (most reliable, survives restarts).
+      2. The first_seen timestamp recorded in the tracking file (fallback).
+    This means stale rows are never re-opened even after the tracking file is lost.
+    """
+    # ── Load & migrate tracking data ──
+    raw = safe_load(SHEET_SIGNALS_FILE, {})
+    if isinstance(raw, list):
+        # Migrate old flat-list format → new dict format
+        tracking = {sig_id: {"first_seen": None, "opened": True} for sig_id in raw}
+    elif isinstance(raw, dict):
+        tracking = raw
+    else:
+        tracking = {}
+
+    signals = fetch_sheet_signals()
+    if not signals:
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    max_age_sec = SHEET_SIGNAL_MAX_AGE_HOURS * 3600
+    tracking_dirty = False
+    new_opens = 0
+
+    for sig in signals:
+        # Build a stable content-based ID so that row reordering or insertion
+        # in the sheet does NOT cause the same signal to fire more than once.
+        # Use "|" as separator (never appears in symbols, prices, or ISO timestamps).
+        ts_tag = (sig.get("signal_time", "") or "").strip() or "nots"
+        sig_id = f"{sig['symbol']}|{sig['dir']}|{sig['entry']}|{sig['tp']}|{ts_tag}"
+
+        # ── Age check from sheet timestamp column (G) ──
+        ts_str = sig.get("signal_time", "")
+        if ts_str:
+            try:
+                sig_ts = _dtparser.parse(ts_str)
+                if sig_ts.tzinfo is None:
+                    sig_ts = sig_ts.replace(tzinfo=timezone.utc)
+                if (now_utc - sig_ts).total_seconds() > max_age_sec:
+                    log(f"[SHEET] Signal {sig_id} is older than {SHEET_SIGNAL_MAX_AGE_HOURS}h (sheet ts={ts_str}), skipping")
+                    continue
+            except Exception:
+                pass  # Unparseable timestamp — fall through to tracking check
+
+        # ── Age check from tracking first_seen (fallback) ──
+        entry_data = tracking.get(sig_id)
+        if entry_data is None:
+            # First time we see this signal — record first_seen
+            tracking[sig_id] = {"first_seen": now_utc.isoformat(), "opened": False}
+            tracking_dirty = True
+            entry_data = tracking[sig_id]
+        else:
+            fs = entry_data.get("first_seen")
+            if fs:
+                try:
+                    fs_ts = _dtparser.parse(fs)
+                    if fs_ts.tzinfo is None:
+                        fs_ts = fs_ts.replace(tzinfo=timezone.utc)
+                    if (now_utc - fs_ts).total_seconds() > max_age_sec:
+                        log(f"[SHEET] Signal {sig_id} first seen >{SHEET_SIGNAL_MAX_AGE_HOURS}h ago, skipping stale signal")
+                        continue
+                except Exception:
+                    pass
+
+        # ── Already opened ──
+        if entry_data.get("opened"):
+            continue
+
+        # ── Execute trade ──
+        log(f"[SHEET] Opening trade: {sig['symbol']} {sig['dir']} entry={sig['entry']} tp={sig['tp']}")
+        trade_opened = execute_sheet_trade(sig)
+
+        if trade_opened:
+            tracking[sig_id]["opened"] = True
+            tracking_dirty = True
+            safe_save(SHEET_SIGNALS_FILE, tracking)
+            log(f"[SHEET] Trade opened and recorded: {sig_id}")
+            new_opens += 1
+        else:
+            log(f"[SHEET] Trade not opened (blocked or limit reached): {sig_id}")
+
+    if tracking_dirty and not new_opens:
+        # Persist first_seen updates even when no new trades were opened
+        safe_save(SHEET_SIGNALS_FILE, tracking)
+
+    if new_opens:
+        log(f"[SHEET] {new_opens} new sheet signal(s) processed in this iteration")
+
+
 def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
@@ -6478,7 +6905,10 @@ def main():
             
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
-            
+
+            # 3.6) Process Google Sheets signals (column C=1, one-time per signal)
+            process_sheet_signals()
+
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
 

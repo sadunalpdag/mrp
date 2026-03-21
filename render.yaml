@@ -24,6 +24,8 @@ services:
         value: /data/closed_trades.csv
       - key: LOG_FILE
         value: /data/log.txt
+      - key: GOOGLE_SHEET_ID
+        value: 1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI
     disk:
       name: ema-ultra-data
       mountPath: /data
