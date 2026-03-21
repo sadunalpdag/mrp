@@ -31,6 +31,7 @@ AI_SIGNALS_FILE  = os.path.join(DATA_DIR,"ai_signals.json")
 AI_ANALYSIS_FILE = os.path.join(DATA_DIR,"ai_analysis.json")
 AI_RL_FILE       = os.path.join(DATA_DIR,"ai_rl_log.json")
 REAL_CLOSED_FILE = os.path.join(DATA_DIR,"real_closed.json")
+PENDING_SHEET_ORDERS_FILE = os.path.join(DATA_DIR,"pending_sheet_orders.json")
 LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
 BALANCE_HISTORY_FILE = os.path.join(DATA_DIR,"balance_history.json")
 HOURLY_STATS_FILE = os.path.join(DATA_DIR,"hourly_stats.json")
@@ -53,7 +54,9 @@ TREND_LOCK = {}
 TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
+PENDING_SHEET_ORDERS = {}   # Track sheet entry orders that have not yet filled
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
+LAST_PENDING_SHEET_CHECK = 0  # Timestamp of last pending sheet order check
 LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
 TOP_VOLUME_SYMBOLS = []  # Top 25 coins by 24h volume (on-chain strategy filter)
@@ -3653,6 +3656,8 @@ for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
 
 # Load positions tracker from file (restores strategy tracking after restart)
 REAL_POSITIONS_TRACKER.update(safe_load(POSITIONS_TRACKER_FILE, {}))
+# Load pending sheet orders from file (restores unfilled entry orders after restart)
+PENDING_SHEET_ORDERS.update(safe_load(PENDING_SHEET_ORDERS_FILE, {}))
 
 # ===================== HOURLY PERFORMANCE TRACKING =====================
 
@@ -6413,16 +6418,15 @@ def execute_sheet_trade(sig):
     try:
         if order_type == "LIMIT":
             opened = open_limit_position(sym, direction, qty, entry)
-            entry_exec = entry  # Fill price equals limit price for TP calculation
         else:  # STOP_MARKET (already validated above)
             opened = open_stop_market_position(sym, direction, qty, entry)
-            entry_exec = entry
 
-        # Set TP at the sheet-specified absolute price
-        tp_ok = False
-        if tp_price and tp_price > 0:
-            tp_ok = futures_set_tp_at_price(sym, direction, tp_price)
-        tp_note = f"TP:{tp_price}" if tp_ok else "TP: not set"
+        order_id = opened.get("order_id") if opened else None
+        entry_exec = entry
+
+        # TP will be set once the entry order fills (position opens).
+        # Do NOT set TP here — the position does not exist yet.
+        tp_note = f"TP:{tp_price} (pending fill)" if tp_price and tp_price > 0 else "TP: not set"
 
         # Stop loss is intentionally disabled for sheet signals
         sl_note = "SL: disabled"
@@ -6435,29 +6439,144 @@ def execute_sheet_trade(sig):
             f"📋 SHEET {sym} {direction} [{order_type}] qty:{qty}\n"
             f"Entry:{entry_exec}\n"
             f"{tp_note}\n{sl_note}\n"
+            f"Waiting for order fill…\n"
             f"time:{now_local_iso()}"
         )
 
-        AI_RL.append({
-            "time": now_local_iso(), "symbol": sym, "dir": direction,
-            "entry": entry_exec, "tp_ok": tp_ok, "sl_ok": False,
-            "born_bar": sig.get("born_bar", 0),
-            "early": False, "kind": "SHEET", "tag": sig.get("tag", ""),
-            "order_type": order_type,
-        })
-        safe_save(AI_RL_FILE, AI_RL)
-
-        REAL_POSITIONS_TRACKER[sym] = {
-            "direction": direction, "kind": "SHEET", "entry": entry_exec,
-            "qty": qty, "open_time": now_local_iso(), "order_type": order_type,
+        # Track the pending order — TP will be placed when the position opens
+        PENDING_SHEET_ORDERS[sym] = {
+            "order_id": order_id, "direction": direction, "qty": qty,
+            "entry": entry_exec, "tp_price": tp_price if tp_price and tp_price > 0 else 0,
+            "open_time": now_local_iso(), "order_type": order_type,
+            "tag": sig.get("tag", ""), "born_bar": sig.get("born_bar", 0),
         }
-        save_positions_tracker()
+        safe_save(PENDING_SHEET_ORDERS_FILE, PENDING_SHEET_ORDERS)
         return True
 
     except Exception as e:
         log(f"[SHEET TRADE ERR] {sym} {e}")
         log(f"[SHEET TRADE TRACE] {traceback.format_exc()}")
         return False
+
+
+def check_pending_sheet_orders():
+    """
+    Monitor pending SHEET entry orders (LIMIT / STOP_MARKET).
+
+    Called every main-loop iteration.  Throttled internally to once per minute.
+
+    For each symbol tracked in PENDING_SHEET_ORDERS:
+      - Query Binance for an actual open position.
+      - If a matching position exists → order filled:
+          * Place TP at the sheet-specified price.
+          * Move entry into REAL_POSITIONS_TRACKER.
+          * Remove from PENDING_SHEET_ORDERS.
+          * Send Telegram confirmation.
+      - If there is no position AND no open order for that order_id → order was
+        cancelled or expired:
+          * Remove from PENDING_SHEET_ORDERS.
+          * Clear TREND_LOCK so the signal can be re-submitted.
+          * Send Telegram notification.
+    """
+    global LAST_PENDING_SHEET_CHECK
+
+    if not PENDING_SHEET_ORDERS:
+        return
+
+    now = now_ts_s()
+    if now - LAST_PENDING_SHEET_CHECK < 60:
+        return
+    LAST_PENDING_SHEET_CHECK = now
+
+    try:
+        # Fetch all current open positions from Binance once
+        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
+        open_positions = {
+            p["symbol"]: float(p["positionAmt"])
+            for p in acc
+            if float(p["positionAmt"]) != 0
+        }
+    except Exception as e:
+        log(f"[PENDING SHEET CHECK ERR] positionRisk failed: {e}")
+        return
+
+    filled = []
+    cancelled = []
+
+    for sym, pso in list(PENDING_SHEET_ORDERS.items()):
+        direction = pso["direction"]
+        amt = open_positions.get(sym, 0.0)
+        position_open = (direction == "UP" and amt > 0) or (direction == "DOWN" and amt < 0)
+
+        if position_open:
+            filled.append(sym)
+        else:
+            # No open position — check whether the entry order is still pending
+            order_id = pso.get("order_id")
+            order_still_open = False
+            if order_id:
+                try:
+                    open_orders = _signed_request("GET", "/fapi/v1/openOrders",
+                                                  {"symbol": sym, "timestamp": now_ts_ms()})
+                    order_still_open = any(
+                        str(o.get("orderId")) == str(order_id) for o in open_orders
+                    )
+                except Exception as e:
+                    log(f"[PENDING SHEET CHECK ERR] openOrders {sym}: {e}")
+                    order_still_open = True  # Assume still open on error — retry next time
+            if not order_still_open:
+                cancelled.append(sym)
+
+    for sym in filled:
+        pso = PENDING_SHEET_ORDERS.pop(sym)
+        direction = pso["direction"]
+        tp_price  = pso.get("tp_price", 0)
+
+        # Set TP now that the position is open
+        tp_ok = False
+        if tp_price and tp_price > 0:
+            tp_ok = futures_set_tp_at_price(sym, direction, tp_price)
+        tp_note = f"TP:{tp_price}" if tp_ok else "TP: not set"
+
+        # Register in position tracker
+        REAL_POSITIONS_TRACKER[sym] = {
+            "direction": direction, "kind": "SHEET",
+            "entry": pso["entry"], "qty": pso["qty"],
+            "open_time": pso["open_time"], "order_type": pso["order_type"],
+        }
+        save_positions_tracker()
+
+        # Record in AI RL log
+        AI_RL.append({
+            "time": now_local_iso(), "symbol": sym, "dir": direction,
+            "entry": pso["entry"], "tp_ok": tp_ok, "sl_ok": False,
+            "born_bar": pso.get("born_bar", 0),
+            "early": False, "kind": "SHEET", "tag": pso.get("tag", ""),
+            "order_type": pso["order_type"],
+        })
+        safe_save(AI_RL_FILE, AI_RL)
+
+        safe_save(PENDING_SHEET_ORDERS_FILE, PENDING_SHEET_ORDERS)
+        log(f"[SHEET FILLED] {sym} {direction} entry={pso['entry']} {tp_note}")
+        tg_send(
+            f"✅ SHEET FILLED {sym} {direction}\n"
+            f"Entry:{pso['entry']}\n"
+            f"{tp_note}\nSL: disabled\n"
+            f"time:{now_local_iso()}"
+        )
+
+    for sym in cancelled:
+        pso = PENDING_SHEET_ORDERS.pop(sym)
+        # Release trend-lock so the signal can be re-queued if needed
+        TREND_LOCK.pop(sym, None)
+        TREND_LOCK_TIME.pop(sym, None)
+        safe_save(PENDING_SHEET_ORDERS_FILE, PENDING_SHEET_ORDERS)
+        log(f"[SHEET CANCELLED] {sym} order_id={pso.get('order_id')} — removed from pending")
+        tg_send(
+            f"❌ SHEET ORDER CANCELLED {sym} {pso['direction']}\n"
+            f"Entry:{pso['entry']} order was not filled\n"
+            f"time:{now_local_iso()}"
+        )
 
 
 def _parse_b_column(text):
@@ -6908,6 +7027,9 @@ def main():
 
             # 3.6) Process Google Sheets signals (column C=1, one-time per signal)
             process_sheet_signals()
+
+            # 3.7) Check if any pending SHEET entry orders have filled; place TP if so
+            check_pending_sheet_orders()
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
