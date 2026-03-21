@@ -6449,12 +6449,13 @@ def execute_sheet_trade(sig):
 def fetch_sheet_signals():
     """
     Fetch trading signals from the public Google Sheets spreadsheet (CSV export).
+    The bot only READS the sheet — it never writes back to it.
     Returns a list of dicts for rows where column C == '1'.
 
     Expected column layout (1-based, as found in the sheet):
         A: Symbol        (e.g. BRUSDT)
         B: İşlem/Trade   (e.g. Evet/Yes)
-        C: Signal flag   (1 = open trade, anything else = ignore)
+        C: Trigger flag  (1 = open trade, anything else = ignore — never modified by the bot)
         D: Yön/Direction (Long / Short)
         E: Giriş/Entry   (numeric price)
         F: TP            (numeric take-profit price)
@@ -6469,7 +6470,7 @@ def fetch_sheet_signals():
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         reader = csv.reader(io.StringIO(resp.text))
-        SHEET_MIN_COLS = 6  # A–F are required; G (timestamp) and H (order type) are optional
+        SHEET_MIN_COLS = 6  # A–F required; G (timestamp) optional; H (order type) required to be processed
         signals = []
         for row_idx, row in enumerate(reader):
             if row_idx == 0:
@@ -6541,8 +6542,15 @@ def process_sheet_signals():
     Process Google Sheets signals: for each row where column C == '1',
     open a Binance Futures trade exactly once.
 
+    The bot NEVER writes back to the sheet — it only reads via CSV export.
+    Column C == '1' is the sole trigger; any other value means the row is ignored.
+    Each unique signal fires exactly once (1 trade per signal).
+
     Tracking format (SHEET_SIGNALS_FILE) — JSON object:
         { "<sig_id>": {"first_seen": "<iso-ts>", "opened": true|false} }
+
+    sig_id is content-based: symbol|dir|entry|ordertype|timestamp
+    This makes deduplication stable even when sheet rows are reordered or inserted.
 
     Age guard: signals older than SHEET_SIGNAL_MAX_AGE_HOURS (24 h) are skipped.
     The age is determined by:
@@ -6570,7 +6578,11 @@ def process_sheet_signals():
     new_opens = 0
 
     for sig in signals:
-        sig_id = f"{sig['symbol']}_row{sig['row_idx']}"
+        # Build a stable content-based ID so that row reordering or insertion
+        # in the sheet does NOT cause the same signal to fire more than once.
+        # Use "|" as separator (never appears in symbols, prices, or ISO timestamps).
+        ts_tag = (sig.get("signal_time", "") or "").strip() or "nots"
+        sig_id = f"{sig['symbol']}|{sig['dir']}|{sig['entry']}|{sig['order_type']}|{ts_tag}"
 
         # ── Age check from sheet timestamp column (G) ──
         ts_str = sig.get("signal_time", "")
