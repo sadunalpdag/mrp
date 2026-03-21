@@ -6365,14 +6365,19 @@ def execute_sheet_trade(sig):
     Execute a trade originating from the Google Sheets signal list.
     Differences from execute_real_trade():
       - Power check is bypassed (sheet operator takes responsibility).
-      - Supports LIMIT, MARKET and STOP_MARKET entry order types.
+      - Only LIMIT and STOP_MARKET entry order types are accepted; MARKET is not allowed.
       - Sets TP at the absolute price specified in the sheet.
     """
     sym       = sig["symbol"]
     direction = sig["dir"]
     entry     = sig["entry"]
     tp_price  = sig.get("tp", 0)
-    order_type = sig.get("order_type", "MARKET").upper()
+    order_type = sig.get("order_type", "").upper()
+
+    # Only LIMIT and STOP_MARKET are permitted for sheet signals
+    if order_type not in ("LIMIT", "STOP_MARKET"):
+        log(f"[SHEET TRADE SKIP] {sym}: order_type '{order_type}' is not LIMIT or STOP_MARKET — skipping")
+        return False
 
     # Guards: direction limits and duplicate/trend-lock checks still apply
     if not _can_direction(direction, "SHEET"):
@@ -6389,17 +6394,9 @@ def execute_sheet_trade(sig):
         if order_type == "LIMIT":
             opened = open_limit_position(sym, direction, qty, entry)
             entry_exec = entry  # Fill price equals limit price for TP calculation
-        elif order_type in ("STOP", "STOP_MARKET"):
+        else:  # STOP_MARKET (already validated above)
             opened = open_stop_market_position(sym, direction, qty, entry)
             entry_exec = entry
-        else:
-            opened = open_market_position(sym, direction, qty)
-            entry_exec = opened.get("entry")
-            if entry_exec is None or entry_exec <= 0:
-                entry_exec = futures_get_price(sym)
-            if entry_exec is None or entry_exec <= 0:
-                log(f"[SHEET TRADE FAIL] {sym} could not get entry price")
-                return False
 
         # Set TP at the sheet-specified absolute price
         tp_ok = False
@@ -6462,7 +6459,7 @@ def fetch_sheet_signals():
         E: Giriş/Entry   (numeric price)
         F: TP            (numeric take-profit price)
         G: Timestamp     (optional — when signal was created, e.g. 2026-03-21 10:00)
-        H: Order type    (optional — MARKET / LIMIT / STOP, defaults to MARKET)
+        H: Order type    (required — LIMIT or STOP; rows without a valid type are skipped)
     """
     try:
         url = (
@@ -6487,7 +6484,7 @@ def fetch_sheet_signals():
             tp_str    = row[5].strip()
             # Optional columns
             signal_time_str = row[6].strip() if len(row) > 6 else ""
-            order_type_str  = row[7].strip().upper() if len(row) > 7 else "MARKET"
+            order_type_str  = row[7].strip().upper() if len(row) > 7 else ""
 
             if flag != "1":
                 continue
@@ -6510,13 +6507,16 @@ def fetch_sheet_signals():
                 log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
                 continue
 
-            # Normalise order type
+            # Normalise order type — only LIMIT and STOP are accepted; rows without a
+            # valid type are skipped so that accidental blank/MARKET values are never
+            # silently converted to a market order.
             if order_type_str in ("LIMIT",):
                 order_type = "LIMIT"
             elif order_type_str in ("STOP", "STOP_MARKET"):
                 order_type = "STOP_MARKET"
             else:
-                order_type = "MARKET"
+                log(f"[SHEET] Row {row_idx}: order type '{order_type_str}' is not LIMIT or STOP, skipping")
+                continue
 
             signals.append({
                 "row_idx":     row_idx,
@@ -6611,7 +6611,7 @@ def process_sheet_signals():
 
         # ── Execute trade ──
         log(f"[SHEET] Opening trade: {sig['symbol']} {sig['dir']} entry={sig['entry']} "
-            f"tp={sig['tp']} order_type={sig.get('order_type','MARKET')}")
+            f"tp={sig['tp']} order_type={sig.get('order_type','')}")
         trade_opened = execute_sheet_trade(sig)
 
         if trade_opened:
