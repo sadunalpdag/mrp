@@ -2,6 +2,7 @@ import os, time, requests, hmac, hashlib, threading, math, json, traceback, csv,
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
+from dateutil import parser as _dtparser
 import numpy as np
 
 # ==============================================================================
@@ -43,6 +44,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 BINANCE_FAPI   = "https://fapi.binance.com"
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
+SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
@@ -6025,11 +6027,12 @@ def execute_real_trade(sig):
     sym=sig["symbol"]; direction=sig["dir"]; pwr=sig["power"]
     kind=sig.get("kind","")
 
-    # 🔒 Check minimum power threshold
-    min_power = PARAM.get("MIN_POWER_THRESHOLD", DEFAULT_MIN_POWER_THRESHOLD)
-    if pwr < min_power:
-        log(f"[LOW POWER] {sym} {kind} power={pwr:.2f} < {min_power:.2f}, skipping trade")
-        return False
+    # 🔒 Check minimum power threshold (skipped for SHEET signals)
+    if kind != "SHEET":
+        min_power = PARAM.get("MIN_POWER_THRESHOLD", DEFAULT_MIN_POWER_THRESHOLD)
+        if pwr < min_power:
+            log(f"[LOW POWER] {sym} {kind} power={pwr:.2f} < {min_power:.2f}, skipping trade")
+            return False
 
     # 🔒 Check if current hour is blocked for trading
     if is_hour_blocked_for_trading():
@@ -6300,6 +6303,152 @@ def update_top_volume_symbols(all_symbols):
 
 # ===================== GOOGLE SHEETS SIGNAL READER =====================
 
+def open_limit_position(sym, direction, qty, price):
+    """Place a GTC LIMIT order to open a position at a specific price."""
+    side = "BUY" if direction == "UP" else "SELL"
+    pos_side = "LONG" if direction == "UP" else "SHORT"
+    price_str = format_price_by_tick(sym, round_to_tick(sym, price))
+    res = _signed_request("POST", "/fapi/v1/order", {
+        "symbol": sym, "side": side, "type": "LIMIT",
+        "quantity": f"{qty}", "price": price_str,
+        "timeInForce": "GTC", "positionSide": pos_side, "timestamp": now_ts_ms()
+    })
+    log(f"[LIMIT ORDER] {sym} {direction} price={price_str} qty={qty} orderId={res.get('orderId')}")
+    return {"symbol": sym, "dir": direction, "qty": qty, "entry": price,
+            "pos_side": pos_side, "order_id": res.get("orderId")}
+
+
+def open_stop_market_position(sym, direction, qty, stop_price):
+    """Place a STOP_MARKET order that triggers when price reaches stop_price."""
+    side = "BUY" if direction == "UP" else "SELL"
+    pos_side = "LONG" if direction == "UP" else "SHORT"
+    stop_str = format_price_by_tick(sym, round_to_tick(sym, stop_price))
+    res = _signed_request("POST", "/fapi/v1/order", {
+        "symbol": sym, "side": side, "type": "STOP_MARKET",
+        "quantity": f"{qty}", "stopPrice": stop_str,
+        "positionSide": pos_side, "timestamp": now_ts_ms()
+    })
+    log(f"[STOP_MARKET ORDER] {sym} {direction} stopPrice={stop_str} qty={qty} orderId={res.get('orderId')}")
+    return {"symbol": sym, "dir": direction, "qty": qty, "entry": stop_price,
+            "pos_side": pos_side, "order_id": res.get("orderId")}
+
+
+def futures_set_tp_at_price(sym, direction, tp_price):
+    """Place a TAKE_PROFIT_MARKET algo order at an absolute TP price from the sheet."""
+    try:
+        f = get_symbol_filters(sym)
+        minp = f["minPrice"]; maxp = f["maxPrice"]
+        pos_side = "LONG" if direction == "UP" else "SHORT"
+        side = "SELL" if direction == "UP" else "BUY"
+        price = round_to_tick(sym, tp_price)
+        price = max(float(minp), min(float(maxp), price))
+        stop_str = format_price_by_tick(sym, price)
+        if float(stop_str) <= 0:
+            log(f"[TP AT PRICE ERR] {sym} tp={tp_price} rounds to 0")
+            return False
+        payload = {
+            "symbol": sym, "side": side, "type": "TAKE_PROFIT_MARKET",
+            "algoType": "CONDITIONAL", "triggerPrice": stop_str,
+            "workingType": "MARK_PRICE", "closePosition": "true",
+            "positionSide": pos_side, "timestamp": now_ts_ms()
+        }
+        _signed_request("POST", "/fapi/v1/algoOrder", payload)
+        log(f"[TP AT PRICE OK] {sym} TAKE_PROFIT_MARKET triggerPrice={stop_str}")
+        return True
+    except Exception as e:
+        log(f"[TP AT PRICE ERR] {sym} tp={tp_price} {e}")
+        return False
+
+
+def execute_sheet_trade(sig):
+    """
+    Execute a trade originating from the Google Sheets signal list.
+    Differences from execute_real_trade():
+      - Power check is bypassed (sheet operator takes responsibility).
+      - Supports LIMIT, MARKET and STOP_MARKET entry order types.
+      - Sets TP at the absolute price specified in the sheet.
+    """
+    sym       = sig["symbol"]
+    direction = sig["dir"]
+    entry     = sig["entry"]
+    tp_price  = sig.get("tp", 0)
+    order_type = sig.get("order_type", "MARKET").upper()
+
+    # Guards: direction limits and duplicate/trend-lock checks still apply
+    if not _can_direction(direction, "SHEET"):
+        return False
+    if _duplicate_or_locked(sym, direction):
+        return False
+
+    qty = calc_order_qty(sym, entry, PARAM["TRADE_SIZE_USDT"])
+    if not qty or qty <= 0:
+        log(f"[SHEET TRADE ERR] {sym} qty calculation failed")
+        return False
+
+    try:
+        if order_type == "LIMIT":
+            opened = open_limit_position(sym, direction, qty, entry)
+            entry_exec = entry  # Fill price equals limit price for TP calculation
+        elif order_type in ("STOP", "STOP_MARKET"):
+            opened = open_stop_market_position(sym, direction, qty, entry)
+            entry_exec = entry
+        else:
+            opened = open_market_position(sym, direction, qty)
+            entry_exec = opened.get("entry")
+            if entry_exec is None or entry_exec <= 0:
+                entry_exec = futures_get_price(sym)
+            if entry_exec is None or entry_exec <= 0:
+                log(f"[SHEET TRADE FAIL] {sym} could not get entry price")
+                return False
+
+        # Set TP at the sheet-specified absolute price
+        tp_ok = False
+        if tp_price and tp_price > 0:
+            tp_ok = futures_set_tp_at_price(sym, direction, tp_price)
+        tp_note = f"TP:{tp_price}" if tp_ok else "TP: not set"
+
+        # Optional SL
+        sl_ok = False
+        sl_note = "SL: disabled"
+        if PARAM.get("ENABLE_STOP_LOSS", False):
+            sl_ok, sl_usd_used, _ = futures_set_sl_only(
+                sym, direction, qty, entry_exec, sl_low_usd=22, sl_high_usd=26
+            )
+            sl_note = f"SL:{sl_usd_used:.2f}$" if sl_ok else "SL: failed"
+
+        TREND_LOCK[sym] = direction
+        TREND_LOCK_TIME[sym] = now_ts_s()
+        log(f"[TRENDLOCK SET] {sym} {direction}")
+
+        tg_send(
+            f"📋 SHEET {sym} {direction} [{order_type}] qty:{qty}\n"
+            f"Entry:{entry_exec}\n"
+            f"{tp_note}\n{sl_note}\n"
+            f"time:{now_local_iso()}"
+        )
+
+        AI_RL.append({
+            "time": now_local_iso(), "symbol": sym, "dir": direction,
+            "entry": entry_exec, "tp_ok": tp_ok, "sl_ok": sl_ok,
+            "power": sig.get("power", 75.0), "born_bar": sig.get("born_bar", 0),
+            "early": False, "kind": "SHEET", "tag": sig.get("tag", ""),
+            "order_type": order_type,
+        })
+        safe_save(AI_RL_FILE, AI_RL)
+
+        REAL_POSITIONS_TRACKER[sym] = {
+            "direction": direction, "kind": "SHEET", "entry": entry_exec,
+            "qty": qty, "open_time": now_local_iso(), "order_type": order_type,
+        }
+        save_positions_tracker()
+        return True
+
+    except Exception as e:
+        log(f"[SHEET TRADE ERR] {sym} {e}")
+        log(f"[SHEET TRADE TRACE] {traceback.format_exc()}")
+        return False
+
+
 def fetch_sheet_signals():
     """
     Fetch trading signals from the public Google Sheets spreadsheet (CSV export).
@@ -6312,6 +6461,8 @@ def fetch_sheet_signals():
         D: Yön/Direction (Long / Short)
         E: Giriş/Entry   (numeric price)
         F: TP            (numeric take-profit price)
+        G: Timestamp     (optional — when signal was created, e.g. 2026-03-21 10:00)
+        H: Order type    (optional — MARKET / LIMIT / STOP, defaults to MARKET)
     """
     try:
         url = (
@@ -6321,11 +6472,12 @@ def fetch_sheet_signals():
         resp = requests.get(url, timeout=20)
         resp.raise_for_status()
         reader = csv.reader(io.StringIO(resp.text))
+        SHEET_MIN_COLS = 6  # A–F are required; G (timestamp) and H (order type) are optional
         signals = []
         for row_idx, row in enumerate(reader):
             if row_idx == 0:
                 continue  # skip header
-            if len(row) < 6:
+            if len(row) < SHEET_MIN_COLS:
                 continue
             symbol    = row[0].strip().upper()
             trade_col = row[1].strip()
@@ -6333,6 +6485,9 @@ def fetch_sheet_signals():
             direction = row[3].strip().upper()
             entry_str = row[4].strip()
             tp_str    = row[5].strip()
+            # Optional columns
+            signal_time_str = row[6].strip() if len(row) > 6 else ""
+            order_type_str  = row[7].strip().upper() if len(row) > 7 else "MARKET"
 
             if flag != "1":
                 continue
@@ -6355,13 +6510,23 @@ def fetch_sheet_signals():
                 log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
                 continue
 
+            # Normalise order type
+            if order_type_str in ("LIMIT",):
+                order_type = "LIMIT"
+            elif order_type_str in ("STOP", "STOP_MARKET"):
+                order_type = "STOP_MARKET"
+            else:
+                order_type = "MARKET"
+
             signals.append({
-                "row_idx":   row_idx,
-                "symbol":    symbol,
-                "trade_col": trade_col,
-                "dir":       dir_norm,
-                "entry":     entry,
-                "tp":        tp,
+                "row_idx":     row_idx,
+                "symbol":      symbol,
+                "trade_col":   trade_col,
+                "dir":         dir_norm,
+                "entry":       entry,
+                "tp":          tp,
+                "signal_time": signal_time_str,
+                "order_type":  order_type,
             })
 
         log(f"[SHEET] {len(signals)} active signals found (C=1)")
@@ -6374,60 +6539,93 @@ def fetch_sheet_signals():
 def process_sheet_signals():
     """
     Process Google Sheets signals: for each row where column C == '1',
-    open a Binance Futures trade exactly once.  Already-opened signals are
-    stored in SHEET_SIGNALS_FILE so they are never re-triggered, even across
-    restarts.
+    open a Binance Futures trade exactly once.
 
-    A signal is uniquely identified by its symbol + row index in the sheet.
+    Tracking format (SHEET_SIGNALS_FILE) — JSON object:
+        { "<sig_id>": {"first_seen": "<iso-ts>", "opened": true|false} }
+
+    Age guard: signals older than SHEET_SIGNAL_MAX_AGE_HOURS (24 h) are skipped.
+    The age is determined by:
+      1. The optional timestamp column G in the sheet (most reliable, survives restarts).
+      2. The first_seen timestamp recorded in the tracking file (fallback).
+    This means stale rows are never re-opened even after the tracking file is lost.
     """
-    opened_ids: set = set(safe_load(SHEET_SIGNALS_FILE, []))
+    # ── Load & migrate tracking data ──
+    raw = safe_load(SHEET_SIGNALS_FILE, {})
+    if isinstance(raw, list):
+        # Migrate old flat-list format → new dict format
+        tracking = {sig_id: {"first_seen": None, "opened": True} for sig_id in raw}
+    elif isinstance(raw, dict):
+        tracking = raw
+    else:
+        tracking = {}
 
     signals = fetch_sheet_signals()
     if not signals:
         return
 
+    now_utc = datetime.now(timezone.utc)
+    max_age_sec = SHEET_SIGNAL_MAX_AGE_HOURS * 3600
+    tracking_dirty = False
     new_opens = 0
+
     for sig in signals:
         sig_id = f"{sig['symbol']}_row{sig['row_idx']}"
-        if sig_id in opened_ids:
-            continue  # already processed — skip
 
-        symbol    = sig["symbol"]
-        direction = sig["dir"]
-        entry     = sig["entry"]
-        tp        = sig["tp"]
+        # ── Age check from sheet timestamp column (G) ──
+        ts_str = sig.get("signal_time", "")
+        if ts_str:
+            try:
+                sig_ts = _dtparser.parse(ts_str)
+                if sig_ts.tzinfo is None:
+                    sig_ts = sig_ts.replace(tzinfo=timezone.utc)
+                if (now_utc - sig_ts).total_seconds() > max_age_sec:
+                    log(f"[SHEET] Signal {sig_id} is older than {SHEET_SIGNAL_MAX_AGE_HOURS}h (sheet ts={ts_str}), skipping")
+                    continue
+            except Exception:
+                pass  # Unparseable timestamp — fall through to tracking check
 
-        # Build a synthetic signal dict compatible with execute_real_trade()
-        power = 75.0  # fixed power for sheet signals (above default MIN_POWER_THRESHOLD of 68.0)
-        trade_sig = {
-            "symbol":       symbol,
-            "dir":          direction,
-            "tier":         "SHEET",
-            "emoji":        "📋",
-            "entry":        entry,
-            "tp":           tp,
-            "sl":           entry * (0.8 if direction == "UP" else 1.2),
-            "power":        power,
-            "rsi":          50.0,
-            "atr":          0.0,
-            "time":         now_local_iso(),
-            "born_bar":     STATE.get("bar_index", 0),
-            "early":        False,
-            "kind":         "SHEET",
-            "tag":          f"📋 SHEET {'LONG' if direction == 'UP' else 'SHORT'}",
-            "market_state": "",
-        }
+        # ── Age check from tracking first_seen (fallback) ──
+        entry_data = tracking.get(sig_id)
+        if entry_data is None:
+            # First time we see this signal — record first_seen
+            tracking[sig_id] = {"first_seen": now_utc.isoformat(), "opened": False}
+            tracking_dirty = True
+            entry_data = tracking[sig_id]
+        else:
+            fs = entry_data.get("first_seen")
+            if fs:
+                try:
+                    fs_ts = _dtparser.parse(fs)
+                    if fs_ts.tzinfo is None:
+                        fs_ts = fs_ts.replace(tzinfo=timezone.utc)
+                    if (now_utc - fs_ts).total_seconds() > max_age_sec:
+                        log(f"[SHEET] Signal {sig_id} first seen >{SHEET_SIGNAL_MAX_AGE_HOURS}h ago, skipping stale signal")
+                        continue
+                except Exception:
+                    pass
 
-        log(f"[SHEET] Opening trade: {symbol} {direction} entry={entry} tp={tp}")
-        trade_opened = execute_real_trade(trade_sig)
+        # ── Already opened ──
+        if entry_data.get("opened"):
+            continue
+
+        # ── Execute trade ──
+        log(f"[SHEET] Opening trade: {sig['symbol']} {sig['dir']} entry={sig['entry']} "
+            f"tp={sig['tp']} order_type={sig.get('order_type','MARKET')}")
+        trade_opened = execute_sheet_trade(sig)
 
         if trade_opened:
-            opened_ids.add(sig_id)
-            safe_save(SHEET_SIGNALS_FILE, list(opened_ids))
+            tracking[sig_id]["opened"] = True
+            tracking_dirty = True
+            safe_save(SHEET_SIGNALS_FILE, tracking)
             log(f"[SHEET] Trade opened and recorded: {sig_id}")
             new_opens += 1
         else:
             log(f"[SHEET] Trade not opened (blocked or limit reached): {sig_id}")
+
+    if tracking_dirty and not new_opens:
+        # Persist first_seen updates even when no new trades were opened
+        safe_save(SHEET_SIGNALS_FILE, tracking)
 
     if new_opens:
         log(f"[SHEET] {new_opens} new sheet signal(s) processed in this iteration")
