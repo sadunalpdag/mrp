@@ -6361,38 +6361,12 @@ def futures_set_tp_at_price(sym, direction, tp_price):
         return False
 
 
-def futures_set_sl_at_price(sym, direction, sl_price):
-    """Place a STOP_MARKET algo order at an absolute SL price taken from the sheet."""
-    try:
-        f = get_symbol_filters(sym)
-        minp = f["minPrice"]; maxp = f["maxPrice"]
-        pos_side = "LONG" if direction == "UP" else "SHORT"
-        side = "SELL" if direction == "UP" else "BUY"
-        price = round_to_tick(sym, sl_price)
-        price = max(float(minp), min(float(maxp), price))
-        stop_str = format_price_by_tick(sym, price)
-        if float(stop_str) <= 0:
-            log(f"[SL AT PRICE ERR] {sym} sl={sl_price} rounds to 0")
-            return False
-        payload = {
-            "symbol": sym, "side": side, "type": "STOP_MARKET",
-            "algoType": "CONDITIONAL", "triggerPrice": stop_str,
-            "workingType": "MARK_PRICE", "closePosition": "true",
-            "positionSide": pos_side, "timestamp": now_ts_ms(),
-        }
-        _signed_request("POST", "/fapi/v1/algoOrder", payload)
-        log(f"[SL AT PRICE OK] {sym} STOP_MARKET triggerPrice={stop_str}")
-        return True
-    except Exception as e:
-        log(f"[SL AT PRICE ERR] {sym} sl={sl_price} {e}")
-        return False
-
-
 def execute_sheet_trade(sig):
     """
     Execute a trade originating from the Google Sheets signal list.
     Differences from execute_real_trade():
       - Power check is bypassed (sheet operator takes responsibility).
+      - Stop loss is never placed for sheet signals.
       - Order type (LIMIT vs STOP_MARKET) is determined automatically from the current
         market price: no sheet column is required.
       - Sets TP at the absolute price specified in the sheet.
@@ -6450,18 +6424,8 @@ def execute_sheet_trade(sig):
             tp_ok = futures_set_tp_at_price(sym, direction, tp_price)
         tp_note = f"TP:{tp_price}" if tp_ok else "TP: not set"
 
-        # Optional SL — use absolute price from sheet when available, else fall back to %/$ based
-        sl_ok = False
+        # Stop loss is intentionally disabled for sheet signals
         sl_note = "SL: disabled"
-        sl_price_sheet = sig.get("sl", 0)
-        if sl_price_sheet and sl_price_sheet > 0:
-            sl_ok = futures_set_sl_at_price(sym, direction, sl_price_sheet)
-            sl_note = f"SL:{sl_price_sheet}" if sl_ok else "SL: failed"
-        elif PARAM.get("ENABLE_STOP_LOSS", False):
-            sl_ok, sl_usd_used, _ = futures_set_sl_only(
-                sym, direction, qty, entry_exec, sl_low_usd=22, sl_high_usd=26
-            )
-            sl_note = f"SL:{sl_usd_used:.2f}$" if sl_ok else "SL: failed"
 
         TREND_LOCK[sym] = direction
         TREND_LOCK_TIME[sym] = now_ts_s()
@@ -6476,8 +6440,8 @@ def execute_sheet_trade(sig):
 
         AI_RL.append({
             "time": now_local_iso(), "symbol": sym, "dir": direction,
-            "entry": entry_exec, "tp_ok": tp_ok, "sl_ok": sl_ok,
-            "power": sig.get("power", 75.0), "born_bar": sig.get("born_bar", 0),
+            "entry": entry_exec, "tp_ok": tp_ok, "sl_ok": False,
+            "born_bar": sig.get("born_bar", 0),
             "early": False, "kind": "SHEET", "tag": sig.get("tag", ""),
             "order_type": order_type,
         })
