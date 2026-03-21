@@ -6389,7 +6389,11 @@ def execute_sheet_trade(sig):
         market price: no sheet column is required.
       - Sets TP at the absolute price specified in the sheet.
     """
-    sym       = sig["symbol"]
+    # Normalise symbol: strip whitespace, uppercase, ensure USDT suffix so that
+    # every downstream Binance API call receives a properly formatted symbol.
+    sym = sig["symbol"].strip().upper()
+    if not sym.endswith("USDT"):
+        sym += "USDT"
     direction = sig["dir"]
     entry     = sig["entry"]
     tp_price  = sig.get("tp", 0)
@@ -6634,10 +6638,24 @@ def parse_signal(signal_text: str) -> dict:
         return float(s.replace(",", "."))
 
     # ── Coin (symbol) ──────────────────────────────────────────────────────────
-    # Match the first occurrence of a token ending in USDT (e.g. "MAGMAUSDT").
+    # Priority 1: match a token that already ends in USDT (e.g. "MAGMAUSDT").
     m = re.search(r"\b([A-Z0-9]+USDT)\b", signal_text, re.IGNORECASE)
     if m:
         result["coin"] = m.group(1).upper()
+    # Priority 2: no USDT token found — look for a bare ticker (2-12 uppercase
+    # letters/digits) that appears at the very start of the text or right after
+    # a list-number prefix like "2. " or "- ".  "USDT" suffix is appended
+    # automatically so the symbol is valid for Binance Futures.
+    # Keywords that must never be mistaken for a coin ticker are excluded.
+    _EXCLUDED_TICKERS = {"TP", "SL", "LONG", "SHORT", "BUY", "SELL", "UP", "DOWN",
+                         "ENTRY", "GIRIS", "YON", "YONU", "HEDEF", "STOP", "STOPLOSS"}
+    if result["coin"] is None:
+        m = re.search(r'(?:^|\n)\s*(?:\d+[.)]\s*|-\s*)?([A-Za-z][A-Za-z0-9]{1,11})\s*(?:\n|$)',
+                      signal_text, re.MULTILINE)
+        if m:
+            candidate = m.group(1).upper()
+            if candidate not in _EXCLUDED_TICKERS and not candidate.endswith("USDT"):
+                result["coin"] = candidate + "USDT"
 
     # ── Direction ──────────────────────────────────────────────────────────────
     # "Yön: long"  /  "Yon: short"  (after Turkish normalisation → "yon")
