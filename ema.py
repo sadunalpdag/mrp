@@ -1,4 +1,4 @@
-import os, time, requests, hmac, hashlib, threading, math, json, traceback
+import os, time, requests, hmac, hashlib, threading, math, json, traceback, csv, io
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
@@ -34,12 +34,15 @@ LOG_FILE         = os.path.join(DATA_DIR,"log.txt")
 BALANCE_HISTORY_FILE = os.path.join(DATA_DIR,"balance_history.json")
 HOURLY_STATS_FILE = os.path.join(DATA_DIR,"hourly_stats.json")
 POSITIONS_TRACKER_FILE = os.path.join(DATA_DIR,"positions_tracker.json")
+SHEET_SIGNALS_FILE   = os.path.join(DATA_DIR,"sheet_signals_opened.json")
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
 BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 BINANCE_FAPI   = "https://fapi.binance.com"
+
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
 
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
@@ -6295,6 +6298,141 @@ def update_top_volume_symbols(all_symbols):
             TOP_VOLUME_SYMBOLS = all_symbols[:25]
             log(f"[TOP VOLUME UPDATE] Fallback: Using first 25 symbols")
 
+# ===================== GOOGLE SHEETS SIGNAL READER =====================
+
+def fetch_sheet_signals():
+    """
+    Fetch trading signals from the public Google Sheets spreadsheet (CSV export).
+    Returns a list of dicts for rows where column C == '1'.
+
+    Expected column layout (1-based, as found in the sheet):
+        A: Symbol        (e.g. BRUSDT)
+        B: İşlem/Trade   (e.g. Evet/Yes)
+        C: Signal flag   (1 = open trade, anything else = ignore)
+        D: Yön/Direction (Long / Short)
+        E: Giriş/Entry   (numeric price)
+        F: TP            (numeric take-profit price)
+    """
+    try:
+        url = (
+            f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
+            "/export?format=csv&gid=0"
+        )
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        reader = csv.reader(io.StringIO(resp.text))
+        signals = []
+        for row_idx, row in enumerate(reader):
+            if row_idx == 0:
+                continue  # skip header
+            if len(row) < 6:
+                continue
+            symbol    = row[0].strip().upper()
+            trade_col = row[1].strip()
+            flag      = row[2].strip()
+            direction = row[3].strip().upper()
+            entry_str = row[4].strip()
+            tp_str    = row[5].strip()
+
+            if flag != "1":
+                continue
+            if not symbol:
+                continue
+
+            try:
+                entry = float(entry_str)
+                tp    = float(tp_str)
+            except ValueError:
+                log(f"[SHEET] Row {row_idx}: invalid price values ({entry_str}, {tp_str}), skipping")
+                continue
+
+            # Normalise direction
+            if direction in ("LONG", "L", "BUY", "UP"):
+                dir_norm = "UP"
+            elif direction in ("SHORT", "S", "SELL", "DOWN"):
+                dir_norm = "DOWN"
+            else:
+                log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
+                continue
+
+            signals.append({
+                "row_idx":   row_idx,
+                "symbol":    symbol,
+                "trade_col": trade_col,
+                "dir":       dir_norm,
+                "entry":     entry,
+                "tp":        tp,
+            })
+
+        log(f"[SHEET] {len(signals)} active signals found (C=1)")
+        return signals
+    except Exception as e:
+        log(f"[SHEET ERR] Failed to fetch signals: {e}")
+        return []
+
+
+def process_sheet_signals():
+    """
+    Process Google Sheets signals: for each row where column C == '1',
+    open a Binance Futures trade exactly once.  Already-opened signals are
+    stored in SHEET_SIGNALS_FILE so they are never re-triggered, even across
+    restarts.
+
+    A signal is uniquely identified by its symbol + row index in the sheet.
+    """
+    opened_ids: set = set(safe_load(SHEET_SIGNALS_FILE, []))
+
+    signals = fetch_sheet_signals()
+    if not signals:
+        return
+
+    new_opens = 0
+    for sig in signals:
+        sig_id = f"{sig['symbol']}_row{sig['row_idx']}"
+        if sig_id in opened_ids:
+            continue  # already processed — skip
+
+        symbol    = sig["symbol"]
+        direction = sig["dir"]
+        entry     = sig["entry"]
+        tp        = sig["tp"]
+
+        # Build a synthetic signal dict compatible with execute_real_trade()
+        power = 75.0  # fixed power for sheet signals (above default MIN_POWER_THRESHOLD of 68.0)
+        trade_sig = {
+            "symbol":       symbol,
+            "dir":          direction,
+            "tier":         "SHEET",
+            "emoji":        "📋",
+            "entry":        entry,
+            "tp":           tp,
+            "sl":           entry * (0.8 if direction == "UP" else 1.2),
+            "power":        power,
+            "rsi":          50.0,
+            "atr":          0.0,
+            "time":         now_local_iso(),
+            "born_bar":     STATE.get("bar_index", 0),
+            "early":        False,
+            "kind":         "SHEET",
+            "tag":          f"📋 SHEET {'LONG' if direction == 'UP' else 'SHORT'}",
+            "market_state": "",
+        }
+
+        log(f"[SHEET] Opening trade: {symbol} {direction} entry={entry} tp={tp}")
+        trade_opened = execute_real_trade(trade_sig)
+
+        if trade_opened:
+            opened_ids.add(sig_id)
+            safe_save(SHEET_SIGNALS_FILE, list(opened_ids))
+            log(f"[SHEET] Trade opened and recorded: {sig_id}")
+            new_opens += 1
+        else:
+            log(f"[SHEET] Trade not opened (blocked or limit reached): {sig_id}")
+
+    if new_opens:
+        log(f"[SHEET] {new_opens} new sheet signal(s) processed in this iteration")
+
+
 def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
@@ -6478,7 +6616,10 @@ def main():
             
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
-            
+
+            # 3.6) Process Google Sheets signals (column C=1, one-time per signal)
+            process_sheet_signals()
+
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
 
