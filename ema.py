@@ -6460,36 +6460,115 @@ def execute_sheet_trade(sig):
         return False
 
 
+# Translation table for normalising Turkish diacritics before regex matching:
+#   ş/Ş → s/S,  ö/Ö → o/O,  ü/Ü → u/U,  ı/İ → i/I
+# Defined once at module level to avoid repeated object creation.
+_TURKISH_NORMALIZATION_MAP = str.maketrans("şŞöÖüÜıİ", "sSoOuUiI")
+
+# Number pattern used inside _parse_b_column:
+# Matches a number like "0.00623" or "0,00623" (one optional decimal separator).
+_B_COL_NUM_PAT = r"\d+(?:[,.]\d+)?"
+
+
 def _parse_b_column(text):
     """
     Parse trading signal fields from a free-text B-column analysis cell.
 
     Recognised patterns (case-insensitive, Turkish/English):
-        Giriş yönü: Short   → direction
-        Giriş yeri: 0.00623 → entry price
-        TP: 0.00580         → take-profit price
-        Stoploss: 0.00655   → stop-loss price (optional)
+        Giriş yönü: Short        → direction
+        Yönü: Short / Yön: Short → direction (short label)
+        Short / Long / Buy / Sell → direction (standalone keyword fallback)
+        Giriş yeri: 0.00623      → entry price
+        Giriş fiyatı: 0.00623    → entry price (alternative label)
+        Giriş noktası: 0.00623   → entry price (alternative label)
+        Giriş: 0.00623           → entry price (short label)
+        Entry: 0.00623           → entry price (English)
+        TP: 0.00580              → take-profit price
+        T/P: 0.00580             → take-profit (slash variant)
+        Hedef: 0.00580           → take-profit (Turkish "target")
+        Take Profit: 0.00580     → take-profit (English)
+        Stoploss: 0.00655        → stop-loss price (optional)
+
+    Numbers may use either '.' or ',' as the decimal separator
+    (e.g. "0,00623" is treated identically to "0.00623").
 
     Returns a dict with keys 'direction', 'entry', 'tp', 'sl' (sl may be absent),
     or None when any of the three required fields is missing.
     """
+    # Work on a normalised copy for matching so that Turkish diacritics that
+    # are sometimes missing in typed text (e.g. "giris yonu" vs "giriş yönü")
+    # still match correctly.  Numeric values are extracted from this same
+    # normalised string because digits and decimal separators are ASCII and are
+    # unaffected by the translation.
+    norm = text.translate(_TURKISH_NORMALIZATION_MAP)
+    _NP = _B_COL_NUM_PAT
+
+    def _num(s):
+        """Normalise decimal separator: replace comma with dot."""
+        return s.replace(",", ".")
+
     result = {}
-    # Direction — "Giriş yönü: Short" or just "Long"
-    m = re.search(r'giri[şs]\s+yönü\s*:\s*(\S+)', text, re.IGNORECASE)
+
+    # ── Direction ──────────────────────────────────────────────────────────────
+    # 1. "Giriş yönü: Short"  /  "Giris yonu: Short"  (full label)
+    m = re.search(r'giris\s+yonu\s*:\s*(\S+)', norm, re.IGNORECASE)
     if m:
         result["direction"] = m.group(1).strip().upper()
-    # Entry price — "Giriş yeri: 0.00623"
-    m = re.search(r'giri[şs]\s+yeri\s*:\s*([\d.]+)', text, re.IGNORECASE)
+    # 2. "Yönü: Short"  /  "Yön: Short"  (short label without "Giriş" prefix)
+    if "direction" not in result:
+        m = re.search(r'\byonu?\s*:\s*(\S+)', norm, re.IGNORECASE)
+        if m:
+            result["direction"] = m.group(1).strip().upper()
+    # 3. Standalone keyword fallback — "Short", "Long", "Buy", "Sell"
+    #    ("down"/"up" are intentionally excluded as they are too generic and
+    #    could appear in normal analysis prose.)
+    if "direction" not in result:
+        m = re.search(r'\b(short|long|sell|buy)\b', norm, re.IGNORECASE)
+        if m:
+            result["direction"] = m.group(1).strip().upper()
+
+    # ── Entry price ────────────────────────────────────────────────────────────
+    # 1. "Giriş yeri: …"  /  "Giris yeri: …"  (full label)
+    m = re.search(r'giris\s+yeri\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
     if m:
-        result["entry"] = m.group(1)
-    # TP — "TP: 0.00580"
-    m = re.search(r'\bTP\s*:\s*([\d.]+)', text, re.IGNORECASE)
+        result["entry"] = _num(m.group(1))
+    # 2. "Giriş fiyatı: …"  /  "Giris fiyati: …"
+    if "entry" not in result:
+        m = re.search(r'giris\s+fiyati\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
+        if m:
+            result["entry"] = _num(m.group(1))
+    # 3. "Giriş noktası: …"  /  "Giris noktasi: …"
+    if "entry" not in result:
+        m = re.search(r'giris\s+noktasi\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
+        if m:
+            result["entry"] = _num(m.group(1))
+    # 4. Short form "Giriş: …"  /  "Entry: …"  (must come after longer forms)
+    if "entry" not in result:
+        m = re.search(r'(?:giris|entry)\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
+        if m:
+            result["entry"] = _num(m.group(1))
+
+    # ── Take-profit ────────────────────────────────────────────────────────────
+    # 1. "TP: …"  /  "T/P: …"
+    m = re.search(r'\bT/?P\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
     if m:
-        result["tp"] = m.group(1)
-    # SL — "Stoploss: 0.00655" or "Stop: 0.00655"
-    m = re.search(r'stop(?:loss)?\s*:\s*([\d.]+)', text, re.IGNORECASE)
+        result["tp"] = _num(m.group(1))
+    # 2. "Hedef: …"  (Turkish "target")
+    if "tp" not in result:
+        m = re.search(r'\bhedef\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
+        if m:
+            result["tp"] = _num(m.group(1))
+    # 3. "Take Profit: …"  /  "TakeProfit: …"
+    if "tp" not in result:
+        m = re.search(r'\btake\s*profit\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
+        if m:
+            result["tp"] = _num(m.group(1))
+
+    # ── Stop-loss (optional) ───────────────────────────────────────────────────
+    m = re.search(r'stop(?:loss)?\s*:\s*(' + _NP + r')', norm, re.IGNORECASE)
     if m:
-        result["sl"] = m.group(1)
+        result["sl"] = _num(m.group(1))
+
     if not all(k in result for k in ("direction", "entry", "tp")):
         return None
     return result
@@ -6564,7 +6643,8 @@ def fetch_sheet_signals():
             else:
                 parsed = _parse_b_column(trade_col)
                 if not parsed:
-                    log(f"[SHEET] Row {row_idx}: C=1 but could not parse direction/entry/TP from B column, skipping")
+                    preview = trade_col[:120].replace("\n", " ") if trade_col else "(empty)"
+                    log(f"[SHEET] Row {row_idx}: C=1 but could not parse direction/entry/TP from B column, skipping. B col preview: {preview!r}")
                     continue
                 direction = parsed["direction"]
                 entry_str = parsed["entry"]
