@@ -8,4 +8,6 @@ requests>=2.32.0
 python-dateutil>=2.9.0
 pytz>=2024.1
 joblib>=1.4.0
+gspread>=6.0.0
+google-auth>=2.27.0
 
