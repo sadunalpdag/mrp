@@ -6959,8 +6959,7 @@ def detect_support_bounce_pattern(df):
     if after_low.empty:
         return None
 
-    high_idx_local = after_low["high"].idxmax()
-    high_idx = after_low.index[high_idx_local]
+    high_idx = after_low["high"].idxmax()
     swing_high = recent.loc[high_idx, "high"]
 
     impulse_pct = (swing_high - swing_low) / swing_low * 100
