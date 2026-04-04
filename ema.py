@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
 from dateutil import parser as _dtparser
 import numpy as np
+import pandas as pd
 
 # ==============================================================================
 # 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
@@ -42,6 +43,12 @@ CHAT_ID        = os.getenv("CHAT_ID")
 BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 BINANCE_FAPI   = "https://fapi.binance.com"
+
+# Spot scanner (top gainers / support-bounce pattern)
+SPOT_BASE_URL   = "https://api.binance.com"
+SPOT_TOP_N      = 10
+SPOT_INTERVAL   = "15m"
+SPOT_KLINE_LIMIT = 220
 
 GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEET_ID",  "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
@@ -6680,235 +6687,196 @@ def parse_signal(signal_text: str) -> dict:
     return result
 
 
-def fetch_sheet_signals():
+# -----------------------------
+# Spot scanner: top gainers + support-bounce pattern
+# -----------------------------
+
+def get_top_gainers_usdt(top_n=SPOT_TOP_N):
+    url = f"{SPOT_BASE_URL}/api/v3/ticker/24hr"
+    data = requests.get(url, timeout=20).json()
+
+    df = pd.DataFrame(data)
+    df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
+    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
+
+    df = df[df["symbol"].str.endswith("USDT", na=False)]
+
+    exclude_words = ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]
+    for word in exclude_words:
+        df = df[~df["symbol"].str.contains(word, na=False)]
+
+    df = df[df["quoteVolume"] > 1_000_000]
+
+    df = df.sort_values("priceChangePercent", ascending=False).head(top_n)
+    return df[["symbol", "priceChangePercent", "quoteVolume"]].reset_index(drop=True)
+
+
+def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
+    url = f"{SPOT_BASE_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    data = requests.get(url, params=params, timeout=20).json()
+
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "num_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ]
+    df = pd.DataFrame(data, columns=cols)
+
+    numeric_cols = ["open", "high", "low", "close", "volume", "quote_asset_volume"]
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+
+    return df
+
+
+def detect_support_bounce_pattern(df):
     """
-    Fetch trading signals from the public Google Sheets spreadsheet (CSV export).
-    The bot only READS the sheet — it never writes back to it.
-    Returns a list of dicts for rows where column C == '1'.
-
-    Minimum required columns: A (timestamp), B (analysis text), C (trigger flag).
-
-    Column layout:
-        A: Timestamp     (e.g. "21.03.2026 21:51:18" — skipped, used for reference only)
-        B: Analysis text — free-form cell containing the full signal, e.g.:
-               RDNTUSDT
-               Giriş yönü: Short
-               Giriş yeri: 0.00623
-               TP: 0.00580
-               Stoploss: 0.00655   (optional)
-           Symbol, direction, entry, TP and SL are all parsed from this column.
-           Symbol is detected as the first XXXUSDT token in the text; if no USDT
-           token is found a bare coin name can be prefixed with "Sembol:" label.
-        C: Trigger flag  (1 = open trade, anything else = ignore)
-
-    Order type is determined automatically from the current market price:
-        LONG:  entry < market → LIMIT        (wait for pullback)
-               entry >= market → STOP_MARKET (breakout)
-        SHORT: entry > market → LIMIT        (wait for bounce)
-               entry <= market → STOP_MARKET (breakdown)
+    Aranan yapı:
+    1) Önce belirgin yükseliş
+    2) Sonra sağlıklı pullback
+    3) Pullback fib destek bölgesine gelsin
+    4) Son mumlarda bounce teyidi gelsin
     """
-    try:
-        url = (
-            f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}"
-            f"/export?format=csv&gid={GOOGLE_SHEET_GID}"
+    if len(df) < 80:
+        return None
+
+    d = df.copy().reset_index(drop=True)
+    d["vol_ma20"] = d["volume"].rolling(20).mean()
+
+    lookback = 60
+    recent = d.iloc[-lookback:].copy().reset_index(drop=True)
+
+    first_half = recent.iloc[:30]
+    if first_half.empty:
+        return None
+
+    low_idx = first_half["low"].idxmin()
+    swing_low = recent.loc[low_idx, "low"]
+
+    after_low = recent.iloc[low_idx + 1:50]
+    if after_low.empty:
+        return None
+
+    high_idx_local = after_low["high"].idxmax()
+    high_idx = after_low.index[high_idx_local]
+    swing_high = recent.loc[high_idx, "high"]
+
+    impulse_pct = (swing_high - swing_low) / swing_low * 100
+
+    if impulse_pct < 8:
+        return None
+
+    after_high = recent.iloc[high_idx + 1:]
+    if len(after_high) < 5:
+        return None
+
+    pullback_low = after_high["low"].min()
+
+    fib_382 = swing_high - 0.382 * (swing_high - swing_low)
+    fib_500 = swing_high - 0.500 * (swing_high - swing_low)
+    fib_618 = swing_high - 0.618 * (swing_high - swing_low)
+
+    retracement_ratio = (swing_high - pullback_low) / (swing_high - swing_low)
+
+    in_support_zone = fib_618 <= pullback_low <= fib_382
+
+    if not in_support_zone:
+        return None
+
+    if retracement_ratio > 0.72:
+        return None
+
+    last1 = recent.iloc[-1]
+    last2 = recent.iloc[-2]
+
+    bounce_confirmed = (
+        last1["close"] > last1["open"] and
+        last1["close"] > last2["close"] and
+        last1["close"] > pullback_low * 1.02 and
+        (
+            pd.notna(last1["vol_ma20"]) and
+            last1["volume"] >= last1["vol_ma20"] * 1.05
         )
-        resp = requests.get(url, timeout=20)
-        resp.raise_for_status()
-        resp.encoding = 'utf-8'
-        reader = csv.reader(io.StringIO(resp.text))
-        SHEET_MIN_COLS = 3  # A (timestamp), B (analysis), C (flag) are the only required columns
-        signals = []
-        for row_idx, row in enumerate(reader):
-            if row_idx == 0:
-                continue  # skip header
-            if len(row) < SHEET_MIN_COLS:
-                continue
-            trade_col = row[1].strip()   # B column — full analysis text
-            flag      = row[2].strip()   # C column — trigger flag
+    )
 
-            if flag != "1":
-                continue
-            if not trade_col:
-                continue
+    if not bounce_confirmed:
+        return None
 
-            # ── Extract symbol from the B-column text ──
-            # First try to find a token ending in USDT (e.g. "RDNTUSDT").
-            sym_match = re.search(r'\b([A-Z0-9]{2,20}USDT)\b', trade_col, re.IGNORECASE)
-            if sym_match:
-                symbol = sym_match.group(1).upper()
-            else:
-                # Fallback: "Sembol: BTC" / "Coin: BTC" label → append USDT
-                sym_match2 = re.search(r'(?:sembol|coin|symbol)\s*:\s*([A-Z0-9]+)', trade_col, re.IGNORECASE)
-                if sym_match2:
-                    symbol = sym_match2.group(1).upper()
-                    if not symbol.endswith("USDT"):
-                        symbol += "USDT"
-                else:
-                    log(f"[SHEET] Row {row_idx}: could not extract symbol from B column, skipping")
-                    continue
+    support_distance_pct = abs(last1["close"] - fib_500) / fib_500 * 100
 
-            # ── Determine direction / entry / TP / SL — parse from B column ──
-            sl_str  = ""
-            signal_time_str = ""
-            parsed = _parse_b_column(trade_col)
-            if not parsed:
-                preview = trade_col[:120].replace("\n", " ") if trade_col else "(empty)"
-                log(f"[SHEET] Row {row_idx}: C=1 but could not parse direction/entry/TP from B column, skipping. B col preview: {preview!r}")
-                continue
-            direction = parsed["direction"]
-            entry_str = parsed["entry"]
-            tp_str    = parsed["tp"]
-            sl_str    = parsed.get("sl", "")
+    score = 0
+    score += min(40, impulse_pct * 2.5)
+    score += 25 if in_support_zone else 0
+    score += 15 if 0.45 <= retracement_ratio <= 0.65 else 5
+    score += 20 if bounce_confirmed else 0
+    score = round(min(score, 100), 1)
 
-            try:
-                entry = float(entry_str)
-                tp    = float(tp_str)
-            except ValueError:
-                log(f"[SHEET] Row {row_idx}: invalid price values ({entry_str}, {tp_str}), skipping")
-                continue
-
-            # Parse optional SL
-            sl = 0.0
-            if sl_str:
-                try:
-                    sl = float(sl_str)
-                except ValueError:
-                    pass
-
-            # Normalise direction
-            if direction in ("LONG", "L", "BUY", "UP"):
-                dir_norm = "UP"
-            elif direction in ("SHORT", "S", "SELL", "DOWN"):
-                dir_norm = "DOWN"
-            else:
-                log(f"[SHEET] Row {row_idx}: unknown direction '{direction}', skipping")
-                continue
-
-            # Order type is always resolved automatically at execution time.
-            order_type = "AUTO"
-
-            signals.append({
-                "row_idx":     row_idx,
-                "symbol":      symbol,
-                "trade_col":   trade_col,
-                "dir":         dir_norm,
-                "entry":       entry,
-                "tp":          tp,
-                "sl":          sl,
-                "signal_time": signal_time_str,
-                "order_type":  order_type,
-            })
-
-        log(f"[SHEET] {len(signals)} active signals found (C=1)")
-        return signals
-    except Exception as e:
-        log(f"[SHEET ERR] Failed to fetch signals: {e}")
-        return []
+    return {
+        "swing_low": round(float(swing_low), 6),
+        "swing_high": round(float(swing_high), 6),
+        "impulse_pct": round(float(impulse_pct), 2),
+        "pullback_low": round(float(pullback_low), 6),
+        "retracement_ratio": round(float(retracement_ratio), 3),
+        "fib_382": round(float(fib_382), 6),
+        "fib_500": round(float(fib_500), 6),
+        "fib_618": round(float(fib_618), 6),
+        "last_close": round(float(last1["close"]), 6),
+        "support_distance_pct": round(float(support_distance_pct), 2),
+        "score": score,
+        "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE"
+    }
 
 
-def process_sheet_signals():
+SPOT_SCANNER_LAST_RUN = 0  # Track last scan timestamp
+
+
+def scan_top_gainers_and_alert():
     """
-    Process Google Sheets signals: for each row where column C == '1',
-    open a Binance Futures trade exactly once.
-
-    The bot NEVER writes back to the sheet — it only reads via CSV export.
-    Column C == '1' is the sole trigger; any other value means the row is ignored.
-    Each unique signal fires exactly once (1 trade per signal).
-
-    Tracking format (SHEET_SIGNALS_FILE) — JSON object:
-        { "<sig_id>": {"first_seen": "<iso-ts>", "opened": true|false} }
-
-    sig_id is content-based: symbol|dir|entry|timestamp
-    This makes deduplication stable even when sheet rows are reordered or inserted.
-
-    Age guard: signals older than SHEET_SIGNAL_MAX_AGE_HOURS (24 h) are skipped.
-    The age is determined by:
-      1. The optional timestamp column G in the sheet (most reliable, survives restarts).
-      2. The first_seen timestamp recorded in the tracking file (fallback).
-    This means stale rows are never re-opened even after the tracking file is lost.
+    Scan top USDT gainers for the support-bounce pattern and send
+    a Telegram LONG alert for each coin where the pattern is confirmed.
+    Runs at most once every 15 minutes.
     """
-    # ── Load & migrate tracking data ──
-    raw = safe_load(SHEET_SIGNALS_FILE, {})
-    if isinstance(raw, list):
-        # Migrate old flat-list format → new dict format
-        tracking = {sig_id: {"first_seen": None, "opened": True} for sig_id in raw}
-    elif isinstance(raw, dict):
-        tracking = raw
-    else:
-        tracking = {}
-
-    signals = fetch_sheet_signals()
-    if not signals:
+    global SPOT_SCANNER_LAST_RUN
+    now = time.time()
+    if now - SPOT_SCANNER_LAST_RUN < 900:  # 15 minutes
         return
+    SPOT_SCANNER_LAST_RUN = now
 
-    now_utc = datetime.now(timezone.utc)
-    max_age_sec = SHEET_SIGNAL_MAX_AGE_HOURS * 3600
-    tracking_dirty = False
-    new_opens = 0
+    try:
+        top = get_top_gainers_usdt(SPOT_TOP_N)
+        log("[SPOT SCAN] Scanning top gainers for support-bounce pattern...")
 
-    for sig in signals:
-        # Build a stable content-based ID so that row reordering or insertion
-        # in the sheet does NOT cause the same signal to fire more than once.
-        # Use "|" as separator (never appears in symbols, prices, or ISO timestamps).
-        ts_tag = (sig.get("signal_time", "") or "").strip() or "nots"
-        sig_id = f"{sig['symbol']}|{sig['dir']}|{sig['entry']}|{sig['tp']}|{ts_tag}"
-
-        # ── Age check from sheet timestamp column (G) ──
-        ts_str = sig.get("signal_time", "")
-        if ts_str:
+        for _, row in top.iterrows():
+            symbol = row["symbol"]
+            change_24h = round(float(row["priceChangePercent"]), 2)
             try:
-                sig_ts = _dtparser.parse(ts_str)
-                if sig_ts.tzinfo is None:
-                    sig_ts = sig_ts.replace(tzinfo=timezone.utc)
-                if (now_utc - sig_ts).total_seconds() > max_age_sec:
-                    log(f"[SHEET] Signal {sig_id} is older than {SHEET_SIGNAL_MAX_AGE_HOURS}h (sheet ts={ts_str}), skipping")
-                    continue
-            except Exception:
-                pass  # Unparseable timestamp — fall through to tracking check
+                df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+                pattern = detect_support_bounce_pattern(df)
+                if pattern:
+                    msg = (
+                        f"🟢 LONG SİNYALİ — {symbol}\n"
+                        f"📈 24s Değişim: %{change_24h}\n"
+                        f"📐 Pattern: {pattern['pattern']}\n"
+                        f"🔺 Swing High: {pattern['swing_high']}\n"
+                        f"🔻 Swing Low: {pattern['swing_low']}\n"
+                        f"📊 Impulse: %{pattern['impulse_pct']}\n"
+                        f"🎯 Pullback Dip: {pattern['pullback_low']}\n"
+                        f"📉 Retracement: {pattern['retracement_ratio']}\n"
+                        f"Fib 38.2: {pattern['fib_382']} | 50.0: {pattern['fib_500']} | 61.8: {pattern['fib_618']}\n"
+                        f"💰 Son Kapanış: {pattern['last_close']}\n"
+                        f"⭐ Skor: {pattern['score']}/100"
+                    )
+                    tg_send(msg)
+                    log(f"[SPOT SCAN] LONG alert sent for {symbol} (score={pattern['score']})")
+            except Exception as e:
+                log(f"[SPOT SCAN ERR] {symbol}: {e}")
 
-        # ── Age check from tracking first_seen (fallback) ──
-        entry_data = tracking.get(sig_id)
-        if entry_data is None:
-            # First time we see this signal — record first_seen
-            tracking[sig_id] = {"first_seen": now_utc.isoformat(), "opened": False}
-            tracking_dirty = True
-            entry_data = tracking[sig_id]
-        else:
-            fs = entry_data.get("first_seen")
-            if fs:
-                try:
-                    fs_ts = _dtparser.parse(fs)
-                    if fs_ts.tzinfo is None:
-                        fs_ts = fs_ts.replace(tzinfo=timezone.utc)
-                    if (now_utc - fs_ts).total_seconds() > max_age_sec:
-                        log(f"[SHEET] Signal {sig_id} first seen >{SHEET_SIGNAL_MAX_AGE_HOURS}h ago, skipping stale signal")
-                        continue
-                except Exception:
-                    pass
-
-        # ── Already opened ──
-        if entry_data.get("opened"):
-            continue
-
-        # ── Execute trade ──
-        log(f"[SHEET] Opening trade: {sig['symbol']} {sig['dir']} entry={sig['entry']} tp={sig['tp']}")
-        trade_opened = execute_sheet_trade(sig)
-
-        if trade_opened:
-            tracking[sig_id]["opened"] = True
-            tracking_dirty = True
-            safe_save(SHEET_SIGNALS_FILE, tracking)
-            log(f"[SHEET] Trade opened and recorded: {sig_id}")
-            new_opens += 1
-        else:
-            log(f"[SHEET] Trade not opened (blocked or limit reached): {sig_id}")
-
-    if tracking_dirty and not new_opens:
-        # Persist first_seen updates even when no new trades were opened
-        safe_save(SHEET_SIGNALS_FILE, tracking)
-
-    if new_opens:
-        log(f"[SHEET] {new_opens} new sheet signal(s) processed in this iteration")
+    except Exception as e:
+        log(f"[SPOT SCAN ERR] {e}")
 
 
 def main():
@@ -7095,8 +7063,8 @@ def main():
             # 3.5) Check and activate hourly analysis if 2 weeks have passed
             check_and_activate_hourly_analysis()
 
-            # 3.6) Process Google Sheets signals (column C=1, one-time per signal)
-            process_sheet_signals()
+            # 3.6) Scan top gainers for support-bounce pattern and send LONG alerts
+            scan_top_gainers_and_alert()
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
