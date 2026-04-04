@@ -2,6 +2,8 @@ import os, re, time, requests, hmac, hashlib, threading, math, json, traceback, 
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List
 from dateutil import parser as _dtparser
 import numpy as np
 import pandas as pd
@@ -167,6 +169,187 @@ def est_to_utc(est_hour):
     """Convert EST hour to UTC hour (EST = UTC-5)"""
     utc_hour = est_hour + 5
     return utc_hour % 24
+
+
+# ===================== SIGNAL TRACKER =====================
+
+FOLLOWUP_MINUTES = 15          # minutes to wait before evaluating a signal
+FOLLOWUP_KLINE_INTERVAL = "1m" # kline interval used for follow-up analysis
+FOLLOWUP_KLINE_LIMIT = 30      # number of klines to fetch for analysis
+FOLLOWUP_RECENT_CANDLES = 3    # candles used for direction confirmation
+BINANCE_SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
+DEFAULT_LONG_SL_MULTIPLIER  = 0.97  # fallback SL distance for LONG when signal has no SL
+DEFAULT_SHORT_SL_MULTIPLIER = 1.03  # fallback SL distance for SHORT when signal has no SL
+
+
+@dataclass
+class SignalEvent:
+    symbol: str
+    side: str                        # LONG / SHORT
+    signal_time: datetime
+    entry_price: float
+    reference_level: float
+    invalidation_level: float
+    interval: str = FOLLOWUP_KLINE_INTERVAL
+    status: str = "TRACKING"
+    decision: Optional[str] = None
+    notes: List[str] = field(default_factory=list)
+
+
+def _tracker_get_klines(symbol: str, interval: str, limit: int):
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    r = requests.get(BINANCE_SPOT_KLINES_URL, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def _tracker_is_rising(closes: List[float]) -> bool:
+    if len(closes) < 3:
+        return False
+    return closes[-3] < closes[-2] < closes[-1]
+
+
+def _tracker_is_falling(closes: List[float]) -> bool:
+    if len(closes) < 3:
+        return False
+    return closes[-3] > closes[-2] > closes[-1]
+
+
+def evaluate_signal_after_followup(signal: SignalEvent) -> SignalEvent:
+    try:
+        klines = _tracker_get_klines(signal.symbol, signal.interval, FOLLOWUP_KLINE_LIMIT)
+    except Exception as e:
+        signal.status = "FAILED"
+        signal.decision = "DATA_ERROR"
+        signal.notes.append(f"Kline verisi alınamadı: {e}")
+        return signal
+
+    closes = [float(k[4]) for k in klines]
+    highs  = [float(k[2]) for k in klines]
+    lows   = [float(k[3]) for k in klines]
+
+    last_close = closes[-1]
+    recent_closes = closes[-FOLLOWUP_RECENT_CANDLES:]
+
+    signal.notes.append(f"Son kapanış: {last_close}")
+    signal.notes.append(f"Referans seviye: {signal.reference_level}")
+    signal.notes.append(f"İnvalidasyon: {signal.invalidation_level}")
+
+    side = signal.side.upper()
+
+    if side == "LONG":
+        if last_close > signal.reference_level and _tracker_is_rising(recent_closes):
+            signal.status = "CONFIRMED"
+            signal.decision = "CONFIRMED_LONG"
+            signal.notes.append("Fiyat referans üstünde kaldı ve son kapanışlar yükseliyor.")
+        elif last_close < signal.invalidation_level:
+            signal.status = "FAILED"
+            signal.decision = "FAILED_LONG"
+            signal.notes.append("Fiyat invalidation seviyesinin altına indi.")
+        elif last_close < signal.reference_level:
+            signal.status = "FAILED"
+            signal.decision = "WEAK_LONG"
+            signal.notes.append("Fiyat referans üstünde tutunamadı.")
+        else:
+            signal.status = "NEUTRAL"
+            signal.decision = "NEUTRAL_LONG"
+            signal.notes.append("Long yapı tamamen bozulmadı ama güçlü teyit de gelmedi.")
+
+    elif side == "SHORT":
+        if last_close < signal.reference_level and _tracker_is_falling(recent_closes):
+            signal.status = "CONFIRMED"
+            signal.decision = "CONFIRMED_SHORT"
+            signal.notes.append("Fiyat referans altında kaldı ve son kapanışlar düşüyor.")
+        elif last_close > signal.invalidation_level:
+            signal.status = "FAILED"
+            signal.decision = "FAILED_SHORT"
+            signal.notes.append("Fiyat invalidation seviyesinin üstüne çıktı.")
+        elif last_close > signal.reference_level:
+            signal.status = "FAILED"
+            signal.decision = "WEAK_SHORT"
+            signal.notes.append("Fiyat referans altında tutunamadı.")
+        else:
+            signal.status = "NEUTRAL"
+            signal.decision = "NEUTRAL_SHORT"
+            signal.notes.append("Short yapı tamamen bozulmadı ama güçlü teyit de gelmedi.")
+    else:
+        signal.status = "FAILED"
+        signal.decision = "UNKNOWN"
+        signal.notes.append("Signal side tanınmadı.")
+
+    return signal
+
+
+class MultiCoinSignalTracker:
+    def __init__(self, followup_minutes: int = FOLLOWUP_MINUTES):
+        self.followup_minutes = followup_minutes
+        self.active_signals: Dict[str, SignalEvent] = {}
+        self.finished_signals: List[SignalEvent] = []
+
+    def _make_key(self, symbol: str, side: str) -> str:
+        return f"{symbol.upper()}_{side.upper()}"
+
+    def add_signal(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        reference_level: float,
+        invalidation_level: float,
+        interval: str = FOLLOWUP_KLINE_INTERVAL,
+    ):
+        key = self._make_key(symbol, side)
+        if key in self.active_signals:
+            return  # already tracking
+
+        signal = SignalEvent(
+            symbol=symbol.upper(),
+            side=side.upper(),
+            signal_time=datetime.now(timezone.utc),
+            entry_price=entry_price,
+            reference_level=reference_level,
+            invalidation_level=invalidation_level,
+            interval=interval,
+        )
+        self.active_signals[key] = signal
+        log(f"[SIGNAL TRACKER] {signal.symbol} {signal.side} takibe alındı. "
+            f"Entry:{entry_price} Ref:{reference_level} Inv:{invalidation_level}")
+
+    def process_signals(self):
+        if not self.active_signals:
+            return
+
+        finished_keys = []
+        for key, signal in list(self.active_signals.items()):
+            elapsed = datetime.now(timezone.utc) - signal.signal_time
+            if elapsed >= timedelta(minutes=self.followup_minutes):
+                result = evaluate_signal_after_followup(signal)
+                self._send_result(result)
+                self.finished_signals.append(result)
+                finished_keys.append(key)
+
+        for key in finished_keys:
+            del self.active_signals[key]
+
+    @staticmethod
+    def _send_result(signal: SignalEvent):
+        status_emoji = {"CONFIRMED": "✅", "NEUTRAL": "🟡", "FAILED": "❌"}.get(
+            signal.status, "ℹ️"
+        )
+        msg = (
+            f"{status_emoji} FOLLOW-UP SONUCU — {signal.symbol} {signal.side}\n"
+            f"Karar: {signal.decision}\n"
+            f"Entry: {signal.entry_price}\n"
+            f"Referans: {signal.reference_level}\n"
+            f"İnvalidasyon: {signal.invalidation_level}\n"
+        )
+        for note in signal.notes:
+            msg += f"• {note}\n"
+        tg_send(msg)
+        log(f"[SIGNAL TRACKER RESULT] {signal.symbol} {signal.side} → {signal.decision}")
+
+
+SIGNAL_TRACKER = MultiCoinSignalTracker(followup_minutes=FOLLOWUP_MINUTES)
 
 
 # ===================== INDICATORS =====================
@@ -6116,6 +6299,21 @@ def execute_real_trade(sig):
                 f"{sl_line}\n"
                 f"time:{now_local_iso()}")
 
+        # Register with signal tracker for follow-up evaluation
+        tracker_side = "LONG" if direction == "UP" else "SHORT"
+        tracker_ref = sig.get("tp") if sig.get("tp") is not None else entry_exec
+        tracker_inv = sig.get("sl") if sig.get("sl") is not None else (
+            entry_exec * DEFAULT_LONG_SL_MULTIPLIER if direction == "UP"
+            else entry_exec * DEFAULT_SHORT_SL_MULTIPLIER
+        )
+        SIGNAL_TRACKER.add_signal(
+            symbol=sym,
+            side=tracker_side,
+            entry_price=entry_exec,
+            reference_level=float(tracker_ref),
+            invalidation_level=float(tracker_inv),
+        )
+
         AI_RL.append({
             "time":now_local_iso(),"symbol":sym,"dir":direction,"entry":entry_exec,
             "tp_usd_used":tp_usd_used,"tp_pct_used":tp_pct_used,"tp_ok":tp_ok,
@@ -7065,6 +7263,12 @@ def main():
 
             # 3.6) Scan top gainers for support-bounce pattern and send LONG alerts
             scan_top_gainers_and_alert()
+
+            # 3.7) Process signal follow-up evaluations
+            try:
+                SIGNAL_TRACKER.process_signals()
+            except Exception as _st_err:
+                log(f"[SIGNAL TRACKER ERR] {_st_err}")
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
