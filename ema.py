@@ -178,6 +178,8 @@ FOLLOWUP_KLINE_INTERVAL = "1m" # kline interval used for follow-up analysis
 FOLLOWUP_KLINE_LIMIT = 30      # number of klines to fetch for analysis
 FOLLOWUP_RECENT_CANDLES = 3    # candles used for direction confirmation
 BINANCE_SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
+DEFAULT_LONG_SL_MULTIPLIER  = 0.97  # fallback SL distance for LONG when signal has no SL
+DEFAULT_SHORT_SL_MULTIPLIER = 1.03  # fallback SL distance for SHORT when signal has no SL
 
 
 @dataclass
@@ -6299,9 +6301,10 @@ def execute_real_trade(sig):
 
         # Register with signal tracker for follow-up evaluation
         tracker_side = "LONG" if direction == "UP" else "SHORT"
-        tracker_ref = sig.get("tp") or entry_exec
-        tracker_inv = sig.get("sl") or (
-            entry_exec * 0.97 if direction == "UP" else entry_exec * 1.03
+        tracker_ref = sig.get("tp") if sig.get("tp") is not None else entry_exec
+        tracker_inv = sig.get("sl") if sig.get("sl") is not None else (
+            entry_exec * DEFAULT_LONG_SL_MULTIPLIER if direction == "UP"
+            else entry_exec * DEFAULT_SHORT_SL_MULTIPLIER
         )
         SIGNAL_TRACKER.add_signal(
             symbol=sym,
