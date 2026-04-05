@@ -1,4 +1,5 @@
 
+
 import os, re, time, requests, hmac, hashlib, threading, math, json, traceback, csv, io
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -68,6 +69,7 @@ LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
 TOP_VOLUME_SYMBOLS = []  # Top 25 coins by 24h volume (on-chain strategy filter)
 TOP_VOLUME_LAST_UPDATE = 0  # Timestamp of last volume ranking update
+VALID_FUTURES_SYMBOLS: set = set()  # Validated PERPETUAL USDT futures symbols
 getcontext().prec = 28
 
 # Algo order types that should be cancelled before closing positions
@@ -4690,6 +4692,9 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
     for word in exclude_words:
         df = df[~df["symbol"].str.contains(word, na=False)]
 
+    if VALID_FUTURES_SYMBOLS:
+        df = df[df["symbol"].isin(VALID_FUTURES_SYMBOLS)]
+
     df = df[df["quoteVolume"] > 1_000_000]
 
     df = df.sort_values("priceChangePercent", ascending=False).head(top_n)
@@ -4709,6 +4714,9 @@ def get_top_losers_usdt(top_n=10):
     exclude_words = ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]
     for word in exclude_words:
         df = df[~df["symbol"].str.contains(word, na=False)]
+
+    if VALID_FUTURES_SYMBOLS:
+        df = df[df["symbol"].isin(VALID_FUTURES_SYMBOLS)]
 
     df = df[df["quoteVolume"] > 1_000_000]
 
@@ -5212,6 +5220,9 @@ def main():
 
     symbols=auto_init_symbols()
     
+    # Populate validated futures symbols set for scanner filtering
+    VALID_FUTURES_SYMBOLS.update(symbols)
+    
     # Initialize top volume list
     update_top_volume_symbols(symbols)
 
@@ -5421,3 +5432,4 @@ if __name__=="__main__":
     main()
 
                          
+
