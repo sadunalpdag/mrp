@@ -68,6 +68,7 @@ LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
 TOP_VOLUME_SYMBOLS = []  # Top 25 coins by 24h volume (on-chain strategy filter)
 TOP_VOLUME_LAST_UPDATE = 0  # Timestamp of last volume ranking update
+VALID_FUTURES_SYMBOLS: set = set()  # Validated PERPETUAL USDT futures symbols
 getcontext().prec = 28
 
 # Algo order types that should be cancelled before closing positions
