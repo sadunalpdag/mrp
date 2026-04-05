@@ -545,6 +545,494 @@ def fibonacci_levels(high, low):
         '1.0': low
     }
 
+# ===================== IMPROVED FIBONACCI BREAKOUT / FAKE-BREAKOUT ANALYSIS =====================
+
+def detect_pivot_swings(highs, lows, closes, left=3, right=3):
+    """
+    Detect confirmed pivot-based swing highs and lows.
+
+    A pivot high is a bar whose high is strictly greater than the 'left' bars
+    before it AND the 'right' bars after it.  A pivot low is the mirror image.
+    This avoids blindly picking random recent max/min values.
+
+    Args:
+        highs, lows, closes: price arrays (list or array-like)
+        left:  minimum bars to the left that must be lower/higher
+        right: minimum bars to the right that must be lower/higher
+
+    Returns:
+        (swing_highs, swing_lows): two lists of (index, price) tuples
+    """
+    swing_highs, swing_lows = [], []
+    n = len(highs)
+    # We need at least left+right+1 bars and cannot confirm the last `right` bars yet
+    for i in range(left, n - right):
+        # Pivot high
+        is_ph = all(highs[i] > highs[i - j] for j in range(1, left + 1)) and \
+                all(highs[i] > highs[i + j] for j in range(1, right + 1))
+        if is_ph:
+            swing_highs.append((i, highs[i]))
+        # Pivot low
+        is_pl = all(lows[i] < lows[i - j] for j in range(1, left + 1)) and \
+                all(lows[i] < lows[i + j] for j in range(1, right + 1))
+        if is_pl:
+            swing_lows.append((i, lows[i]))
+    return swing_highs, swing_lows
+
+
+def detect_impulse_leg(highs, lows, closes, min_move_pct=1.5, left=3, right=3):
+    """
+    Identify the most recent valid impulse leg before the current price.
+
+    An impulse leg is a significant directional move between a confirmed pivot
+    low and the next confirmed pivot high (bullish) OR between a confirmed pivot
+    high and the next confirmed pivot low (bearish).
+
+    Args:
+        highs, lows, closes: price arrays
+        min_move_pct: minimum % move to qualify as an impulse (default 1.5%)
+        left, right: pivot detection parameters
+
+    Returns:
+        dict with keys:
+            direction: "UP" or "DOWN"
+            start_idx, start_price
+            end_idx, end_price
+            move_pct
+        or None if no valid impulse found
+    """
+    swing_highs, swing_lows = detect_pivot_swings(highs, lows, closes, left, right)
+    if not swing_highs or not swing_lows:
+        return None
+
+    best = None
+    best_move = min_move_pct
+
+    # Bullish impulse: pivot_low → pivot_high (low before high)
+    for (li, lp) in swing_lows:
+        for (hi, hp) in swing_highs:
+            if hi <= li:
+                continue
+            move = (hp - lp) / lp * 100
+            if move > best_move:
+                best_move = move
+                best = {"direction": "UP", "start_idx": li, "start_price": lp,
+                        "end_idx": hi, "end_price": hp, "move_pct": round(move, 2)}
+
+    # Bearish impulse: pivot_high → pivot_low (high before low)
+    for (hi, hp) in swing_highs:
+        for (li, lp) in swing_lows:
+            if li <= hi:
+                continue
+            move = (hp - lp) / hp * 100
+            if move > best_move:
+                best_move = move
+                best = {"direction": "DOWN", "start_idx": hi, "start_price": hp,
+                        "end_idx": li, "end_price": lp, "move_pct": round(move, 2)}
+
+    # If we found a bearish leg that's larger than the bullish one already stored,
+    # best already holds the right value; otherwise keep bullish.
+    return best
+
+
+def check_candle_quality(opens, highs, lows, closes, idx=-1,
+                          min_body_ratio=0.4, max_wick_body_ratio=2.0):
+    """
+    Evaluate the quality of a single candle for breakout confirmation.
+
+    Rules:
+    - body_ratio = |close - open| / (high - low)  must be >= min_body_ratio
+    - wick_body_ratio = (total wick size) / body_size  must be <= max_wick_body_ratio
+    - A doji or spinning-top style candle is rejected.
+
+    Args:
+        opens, highs, lows, closes: price arrays
+        idx: candle index to check (default -1 = last)
+        min_body_ratio: minimum body / total range
+        max_wick_body_ratio: maximum (upper+lower wick) / body
+
+    Returns:
+        (passes: bool, body_ratio: float, wick_body_ratio: float)
+    """
+    try:
+        o, h, l, c = float(opens[idx]), float(highs[idx]), float(lows[idx]), float(closes[idx])
+        total_range = h - l
+        if total_range <= 0:
+            return False, 0.0, float('inf')
+        body = abs(c - o)
+        body_ratio = body / total_range
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        total_wick = upper_wick + lower_wick
+        wick_body_ratio = total_wick / body if body > 0 else float('inf')
+        passes = body_ratio >= min_body_ratio and wick_body_ratio <= max_wick_body_ratio
+        return passes, round(body_ratio, 3), round(wick_body_ratio, 3)
+    except Exception:
+        return False, 0.0, float('inf')
+
+
+def check_retest_confirmation(opens, highs, lows, closes, level, direction,
+                               tolerance_pct=0.003, lookback=5):
+    """
+    Check whether price broke a level and then retested it before continuing.
+
+    Logic:
+    - direction="UP": price must have closed above `level`, then pulled back
+      close to it (within tolerance), then closed above it again.
+    - direction="DOWN": mirror image.
+
+    Args:
+        opens, highs, lows, closes: price arrays (most recent bar = closes[-1])
+        level: the Fibonacci or structure level being tested
+        direction: "UP" or "DOWN"
+        tolerance_pct: how close to the level counts as a retest (0.3% default)
+        lookback: how many bars back to look for the retest sequence
+
+    Returns:
+        (confirmed: bool, retest_idx: int or None)
+    """
+    if len(closes) < lookback + 3:
+        return False, None
+
+    window = closes[-(lookback + 3):]
+    highs_w = highs[-(lookback + 3):]
+    lows_w = lows[-(lookback + 3):]
+    tol = level * tolerance_pct
+
+    if direction == "UP":
+        # Find first bar that closed above level
+        broke_idx = None
+        for i, c in enumerate(window):
+            if c > level:
+                broke_idx = i
+                break
+        if broke_idx is None or broke_idx >= len(window) - 2:
+            return False, None
+        # After break, look for a bar that came back near the level
+        for j in range(broke_idx + 1, len(window) - 1):
+            if lows_w[j] <= level + tol:
+                # Then next bar should close above level
+                if window[j + 1] > level:
+                    return True, -(len(window) - j)
+    else:  # DOWN
+        broke_idx = None
+        for i, c in enumerate(window):
+            if c < level:
+                broke_idx = i
+                break
+        if broke_idx is None or broke_idx >= len(window) - 2:
+            return False, None
+        for j in range(broke_idx + 1, len(window) - 1):
+            if highs_w[j] >= level - tol:
+                if window[j + 1] < level:
+                    return True, -(len(window) - j)
+
+    return False, None
+
+
+def _classify_fib_signal(
+    closes, opens, highs, lows,
+    impulse, fib_lvls, market_state, trend_dir,
+    has_vol_spike, vol_ratio,
+    higher_tf_trend=None,
+):
+    """
+    Internal classifier: given all context, return signal string + confidence.
+
+    Returns:
+        (signal, confidence, reason_parts)
+    """
+    signal = "NO_TRADE"
+    confidence = 0
+    reasons = []
+
+    if impulse is None:
+        return "INVALID", 0, ["No valid impulse leg found"]
+
+    direction = impulse["direction"]
+    current_close = closes[-1]
+
+    # Identify the key Fibonacci levels for this impulse
+    fib_382 = fib_lvls.get("0.382", 0)
+    fib_500 = fib_lvls.get("0.500", 0)
+    fib_618 = fib_lvls.get("0.618", 0)
+    fib_786 = fib_lvls.get("0.786", 0)
+    fib_top = fib_lvls.get("0.0", 0)    # impulse end (0% retracement)
+    fib_bot = fib_lvls.get("1.0", 0)    # impulse start (100% retracement)
+
+    # ── Candle quality ────────────────────────────────────────────────
+    cq_ok, body_ratio, wick_body_ratio = check_candle_quality(opens, highs, lows, closes)
+    if cq_ok:
+        confidence += 15
+        reasons.append(f"Strong candle (body={body_ratio:.0%})")
+    else:
+        reasons.append(f"Weak candle (body={body_ratio:.0%})")
+
+    # ── Volume confirmation ───────────────────────────────────────────
+    if has_vol_spike:
+        confidence += 15
+        reasons.append(f"Volume spike x{vol_ratio:.1f}")
+    else:
+        reasons.append("No volume spike")
+
+    # ── Trend alignment ──────────────────────────────────────────────
+    effective_trend = higher_tf_trend if higher_tf_trend else trend_dir
+    if effective_trend == direction:
+        confidence += 20
+        reasons.append(f"Trend aligned ({effective_trend})")
+    elif effective_trend and effective_trend != direction:
+        confidence -= 10
+        reasons.append(f"Counter-trend ({effective_trend} vs {direction})")
+    else:
+        reasons.append("Trend unclear")
+
+    # ── Market state context ─────────────────────────────────────────
+    if market_state == "STRONG_TREND":
+        # In strong trend, continuation setups are better
+        if effective_trend == direction:
+            confidence += 15
+            reasons.append("Strong trend supports continuation")
+        else:
+            confidence -= 15
+            reasons.append("Strong trend against setup direction")
+    elif market_state == "RANGE":
+        # In range, fake-breakout setups are more important
+        confidence += 5
+        reasons.append("Range market: fake-breakout setups preferred")
+    elif market_state == "PULLBACK":
+        confidence += 10
+        reasons.append("Pullback market: retracement setup possible")
+
+    # ── Price vs. Fibonacci zone ─────────────────────────────────────
+    in_golden_zone = fib_382 >= current_close >= fib_618 if direction == "UP" \
+        else fib_382 <= current_close <= fib_618
+
+    if direction == "UP":
+        # Bullish: price should be retracing into Fibonacci zone after upward impulse
+        if fib_618 <= current_close <= fib_382:
+            confidence += 20
+            reasons.append(f"Price in golden Fib zone (38.2–61.8%)")
+        elif fib_786 <= current_close < fib_618:
+            confidence += 8
+            reasons.append("Price near 78.6% — deep retracement")
+        elif current_close > fib_top:
+            # Price broke above the impulse high — potential continuation or fake breakout
+            if not cq_ok:
+                signal = "BULLISH_FAKE_BREAKOUT"
+                confidence += 5
+                reasons.append("Break above high w/ weak candle → fake breakout risk")
+            elif has_vol_spike:
+                signal = "LONG_CONTINUATION"
+                confidence += 20
+                reasons.append("Clean break above high w/ volume → continuation")
+            else:
+                signal = "NO_TRADE"
+                reasons.append("Break above high but no volume confirmation")
+        elif current_close < fib_bot:
+            # Price broke below impulse low — structure broken
+            signal = "INVALID"
+            reasons.append("Price below impulse low — structure invalid")
+    else:
+        # Bearish: price should be recovering into Fibonacci zone after downward impulse
+        if fib_618 >= current_close >= fib_382 if fib_382 < fib_618 else fib_382 >= current_close >= fib_618:
+            confidence += 20
+            reasons.append("Price in golden Fib zone (38.2–61.8%)")
+        elif current_close < fib_top:
+            # fib_top is the impulse low for DOWN direction (lowest point)
+            if not cq_ok:
+                signal = "BEARISH_FAKE_BREAKOUT"
+                confidence += 5
+                reasons.append("Break below low w/ weak candle → fake breakout risk")
+            elif has_vol_spike:
+                signal = "SHORT_CONTINUATION"
+                confidence += 20
+                reasons.append("Clean break below low w/ volume → continuation")
+            else:
+                signal = "NO_TRADE"
+                reasons.append("Break below low but no volume confirmation")
+        elif current_close > fib_bot:
+            signal = "INVALID"
+            reasons.append("Price above impulse high — structure invalid for SHORT")
+
+    # ── Liquidity sweep check ─────────────────────────────────────────
+    sweep_dir, sweep_level = detect_liquidity_sweep(highs, lows, closes)
+    if sweep_dir == "UP" and direction == "UP":
+        signal = "BULLISH_FAKE_BREAKOUT"
+        confidence += 20
+        reasons.append(f"Liquidity sweep below {sweep_level:.4f} → bullish reversal")
+    elif sweep_dir == "DOWN" and direction == "DOWN":
+        signal = "BEARISH_FAKE_BREAKOUT"
+        confidence += 20
+        reasons.append(f"Liquidity sweep above {sweep_level:.4f} → bearish reversal")
+
+    # ── Assign default signal if still NO_TRADE and in zone ──────────
+    if signal == "NO_TRADE" and in_golden_zone:
+        if direction == "UP":
+            signal = "LONG_CONTINUATION"
+        else:
+            signal = "SHORT_CONTINUATION"
+
+    # Cap and floor confidence
+    confidence = max(0, min(100, confidence))
+
+    return signal, confidence, reasons
+
+
+def analyze_fib_breakout_fakeout(klines, higher_tf_klines=None):
+    """
+    Main signal-only analysis for Fibonacci breakout / fake-breakout setups.
+
+    Integrates:
+    - Pivot-based swing detection (no random max/min)
+    - Impulse leg identification
+    - Fibonacci level calculation
+    - Candle quality filter
+    - Volume confirmation via detect_volume_spike()
+    - Trend filter via check_ema_trend_alignment()
+    - Market state via detect_market_state()
+    - Liquidity sweep via detect_liquidity_sweep()
+    - Optional retest confirmation
+    - Optional higher-timeframe context
+
+    Args:
+        klines:          List of klines [[time, open, high, low, close, volume, ...], ...]
+        higher_tf_klines: Optional list of higher-timeframe klines for HTF context
+
+    Returns:
+        dict with keys:
+            signal          : "LONG_CONTINUATION" | "SHORT_CONTINUATION" |
+                              "BULLISH_FAKE_BREAKOUT" | "BEARISH_FAKE_BREAKOUT" |
+                              "INVALID" | "NO_TRADE"
+            confidence      : int 0-100
+            reason          : human-readable explanation string
+            entry_zone      : [low, high] or None
+            invalidation    : price level or None
+            tp_zone         : [tp1, tp2] or None
+            fib_levels      : dict of Fibonacci levels
+            market_state    : str
+            trend_alignment : "UP" | "DOWN" | None
+    """
+    result = {
+        "signal": "NO_TRADE",
+        "confidence": 0,
+        "reason": "Insufficient data",
+        "entry_zone": None,
+        "invalidation": None,
+        "tp_zone": None,
+        "fib_levels": {},
+        "market_state": "UNKNOWN",
+        "trend_alignment": None,
+    }
+
+    if not klines or len(klines) < 50:
+        return result
+
+    try:
+        opens  = [float(k[1]) for k in klines]
+        highs  = [float(k[2]) for k in klines]
+        lows   = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+    except Exception as e:
+        result["reason"] = f"Kline parse error: {e}"
+        return result
+
+    # ── Market state ──────────────────────────────────────────────────
+    market_state = detect_market_state(closes, highs, lows)
+    result["market_state"] = market_state
+
+    # ── Trend alignment (lower TF) ────────────────────────────────────
+    trend_dir = check_ema_trend_alignment(closes)
+    result["trend_alignment"] = trend_dir
+
+    # ── Higher-timeframe trend ────────────────────────────────────────
+    higher_tf_trend = None
+    if higher_tf_klines and len(higher_tf_klines) >= 50:
+        try:
+            htf_closes = [float(k[4]) for k in higher_tf_klines]
+            higher_tf_trend = check_ema_trend_alignment(htf_closes)
+        except Exception:
+            pass
+
+    # ── Volume spike ──────────────────────────────────────────────────
+    has_vol_spike, vol_ratio = detect_volume_spike(klines)
+
+    # ── Impulse leg detection ─────────────────────────────────────────
+    impulse = detect_impulse_leg(highs, lows, closes)
+    if impulse is None:
+        result["reason"] = "No valid impulse leg detected"
+        result["signal"] = "NO_TRADE"
+        return result
+
+    direction = impulse["direction"]
+    swing_high = impulse["end_price"] if direction == "UP" else impulse["start_price"]
+    swing_low  = impulse["start_price"] if direction == "UP" else impulse["end_price"]
+
+    # ── Fibonacci levels ──────────────────────────────────────────────
+    fib_lvls = fibonacci_levels(swing_high, swing_low)
+    result["fib_levels"] = {k: round(v, 6) for k, v in fib_lvls.items()}
+
+    # ── Retest confirmation (optional quality boost) ──────────────────
+    key_level = fib_lvls.get("0.618") if direction == "UP" else fib_lvls.get("0.382")
+    retest_confirmed, _ = check_retest_confirmation(
+        opens, highs, lows, closes, key_level, direction
+    )
+
+    # ── Classify signal ───────────────────────────────────────────────
+    signal, confidence, reason_parts = _classify_fib_signal(
+        closes, opens, highs, lows,
+        impulse, fib_lvls, market_state, trend_dir,
+        has_vol_spike, vol_ratio,
+        higher_tf_trend=higher_tf_trend,
+    )
+
+    if retest_confirmed:
+        confidence = min(100, confidence + 15)
+        reason_parts.append("Retest of key level confirmed")
+
+    # ── Build entry / invalidation / TP zones ─────────────────────────
+    current_close = closes[-1]
+    atr_vals = atr_like(highs, lows, closes)
+    atr_val  = atr_vals[-1] if atr_vals else 0
+
+    if signal in ("LONG_CONTINUATION", "BULLISH_FAKE_BREAKOUT"):
+        entry_zone   = [round(fib_lvls.get("0.618", current_close), 6),
+                        round(fib_lvls.get("0.500", current_close), 6)]
+        invalidation = round(swing_low - atr_val * 0.5, 6)
+        tp1          = round(swing_high, 6)
+        tp2          = round(swing_high + (swing_high - swing_low) * 0.382, 6)
+        tp_zone      = [tp1, tp2]
+    elif signal in ("SHORT_CONTINUATION", "BEARISH_FAKE_BREAKOUT"):
+        entry_zone   = [round(fib_lvls.get("0.500", current_close), 6),
+                        round(fib_lvls.get("0.382", current_close), 6)]
+        invalidation = round(swing_high + atr_val * 0.5, 6)
+        tp1          = round(swing_low, 6)
+        tp2          = round(swing_low - (swing_high - swing_low) * 0.382, 6)
+        tp_zone      = [tp1, tp2]
+    else:
+        entry_zone   = None
+        invalidation = None
+        tp_zone      = None
+
+    result.update({
+        "signal":         signal,
+        "confidence":     confidence,
+        "reason":         " | ".join(reason_parts),
+        "entry_zone":     entry_zone,
+        "invalidation":   invalidation,
+        "tp_zone":        tp_zone,
+        "trend_alignment": trend_dir,
+        "htf_trend":      higher_tf_trend,
+        "impulse":        {
+            "direction":    direction,
+            "swing_high":   round(swing_high, 6),
+            "swing_low":    round(swing_low, 6),
+            "move_pct":     impulse["move_pct"],
+        },
+        "volume_ratio":   round(vol_ratio, 2),
+        "retest_confirmed": retest_confirmed,
+    })
+    return result
+
 # ===================== VWAP & VOLUME HELPERS =====================
 
 def calculate_vwap(klines):
@@ -4674,14 +5162,527 @@ def parse_signal(signal_text: str) -> dict:
     return result
 
 
+# ==============================================================================
+# ANTI-RATE-LIMIT ARCHITECTURE
+# Provides: BinanceRateLimiter, BinanceRESTManager, SpotMarketCache,
+#           SpotWebSocketManager, SpotScanCoordinator
+# Goal: reduce REST weight usage and prevent -1003 IP ban errors.
+# ==============================================================================
+
+import random as _random
+import websocket as _websocket_lib  # pip install websocket-client
+
+# ── Config constants ─────────────────────────────────────────────────────────
+REST_MIN_INTERVAL_SEC    = 0.12   # Minimum gap between any two REST calls (≈ 8 req/s)
+REST_BAN_COOLDOWN_SEC    = 120    # How long to pause after -1003 / HTTP 429
+REST_MAX_RETRIES         = 3      # Retries per request before giving up
+REST_BACKOFF_BASE_SEC    = 1.0    # Exponential-backoff base
+REST_BACKOFF_MAX_SEC     = 30.0   # Cap on backoff delay
+TICKER_CACHE_TTL_SEC     = 30     # TTL for 24hr ticker snapshot
+KLINE_CACHE_TTL_SEC      = 60     # TTL for kline snapshots
+EXCHANGE_INFO_CACHE_TTL  = 3600   # TTL for exchange-info / symbol filters
+WS_RECONNECT_DELAY_SEC   = 5      # Seconds before reconnecting a dropped WS
+SHORTLIST_SIZE           = 5      # Max symbols for deep analysis per scan cycle
+
+# ── Rate-limiter global state ─────────────────────────────────────────────────
+_rl_lock              = threading.Lock()
+_rl_last_request_ts   = 0.0       # Epoch seconds of last REST call
+_rl_ban_until_ts      = 0.0       # Epoch seconds until which REST is banned
+_rl_spot_scan_banned  = False     # True while spot-scan module is in cooldown
+
+
+class BinanceRateLimiter:
+    """
+    Lightweight rate-limiter that:
+    - enforces a minimum interval between requests
+    - tracks global ban state
+    - implements exponential back-off with jitter
+    """
+
+    @staticmethod
+    def is_banned() -> bool:
+        with _rl_lock:
+            return time.time() < _rl_ban_until_ts
+
+    @staticmethod
+    def set_ban(duration_sec: float = REST_BAN_COOLDOWN_SEC, until_ts: float = None):
+        global _rl_ban_until_ts, _rl_spot_scan_banned
+        with _rl_lock:
+            if until_ts:
+                _rl_ban_until_ts = max(_rl_ban_until_ts, until_ts)
+            else:
+                _rl_ban_until_ts = max(_rl_ban_until_ts, time.time() + duration_sec)
+            _rl_spot_scan_banned = True
+            log(f"[REST COOLDOWN ACTIVE] banned until {datetime.fromtimestamp(_rl_ban_until_ts, tz=timezone.utc).isoformat()}")
+
+    @staticmethod
+    def clear_ban():
+        global _rl_ban_until_ts, _rl_spot_scan_banned
+        with _rl_lock:
+            _rl_ban_until_ts = 0.0
+            _rl_spot_scan_banned = False
+
+    @staticmethod
+    def wait_for_slot():
+        """Block until the minimum inter-request interval has elapsed."""
+        global _rl_last_request_ts
+        with _rl_lock:
+            elapsed = time.time() - _rl_last_request_ts
+            gap = REST_MIN_INTERVAL_SEC - elapsed
+        if gap > 0:
+            time.sleep(gap)
+        with _rl_lock:
+            _rl_last_request_ts = time.time()
+
+    @staticmethod
+    def backoff_sleep(attempt: int):
+        """Exponential back-off with jitter for retry logic."""
+        delay = min(REST_BACKOFF_BASE_SEC * (2 ** attempt), REST_BACKOFF_MAX_SEC)
+        jitter = _random.uniform(0, delay * 0.25)
+        log(f"[RATE LIMIT BACKOFF] attempt {attempt}, sleeping {delay + jitter:.1f}s")
+        time.sleep(delay + jitter)
+
+
+class BinanceRESTManager:
+    """
+    Centralised REST wrapper for Binance public endpoints.
+
+    Features:
+    - Respects BinanceRateLimiter slot before every call
+    - Retries with exponential back-off
+    - Detects -1003 / HTTP 429 and activates global cooldown
+    - Integrates with SpotMarketCache for TTL caching
+    - Does NOT handle authenticated (signed) endpoints — those go through
+      _signed_request() as before
+    """
+
+    def __init__(self, cache: "SpotMarketCache"):
+        self._cache = cache
+
+    def get(self, url: str, params: dict = None, cache_key: str = None,
+            cache_ttl: float = None, timeout: int = 15) -> Optional[dict]:
+        """
+        HTTP GET with caching, retry, and ban detection.
+
+        Args:
+            url:       Full URL
+            params:    Query parameters
+            cache_key: If provided, check cache first; store result on success
+            cache_ttl: TTL for this cache entry (seconds)
+            timeout:   Request timeout in seconds
+
+        Returns:
+            Parsed JSON response or None on failure
+        """
+        # ── Cache hit ──────────────────────────────────────────────────
+        if cache_key and self._cache:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                log(f"[CACHE HIT] {cache_key}")
+                return cached
+            log(f"[CACHE MISS] {cache_key}")
+
+        # ── Global ban check ───────────────────────────────────────────
+        if BinanceRateLimiter.is_banned():
+            log(f"[REST COOLDOWN ACTIVE] skipping GET {url}")
+            return None
+
+        for attempt in range(REST_MAX_RETRIES):
+            try:
+                BinanceRateLimiter.wait_for_slot()
+                r = requests.get(url, params=params, timeout=timeout)
+
+                # ── Ban detection ──────────────────────────────────────
+                if r.status_code == 429:
+                    retry_after = float(r.headers.get("Retry-After", REST_BAN_COOLDOWN_SEC))
+                    log(f"[RATE LIMIT BACKOFF] HTTP 429 — retry after {retry_after}s")
+                    BinanceRateLimiter.set_ban(duration_sec=retry_after)
+                    return None
+
+                if r.status_code == 418:
+                    log("[RATE LIMIT BACKOFF] HTTP 418 — IP auto-banned by Binance")
+                    BinanceRateLimiter.set_ban(duration_sec=REST_BAN_COOLDOWN_SEC * 5)
+                    return None
+
+                if r.status_code != 200:
+                    log(f"[REST ERR] {url} → HTTP {r.status_code}")
+                    BinanceRateLimiter.backoff_sleep(attempt)
+                    continue
+
+                data = r.json()
+
+                # ── -1003 detection ────────────────────────────────────
+                if isinstance(data, dict) and data.get("code") in (-1003, -1015):
+                    msg = data.get("msg", "")
+                    log(f"[REST COOLDOWN ACTIVE] Binance -1003: {msg}")
+                    # Try to parse "banned until" timestamp from the message
+                    ban_until = None
+                    import re as _re
+                    m = _re.search(r"banned until (\d+)", msg)
+                    if m:
+                        ban_until = int(m.group(1)) / 1000.0  # ms → s
+                    BinanceRateLimiter.set_ban(until_ts=ban_until)
+                    return None
+
+                # ── Cache store ────────────────────────────────────────
+                if cache_key and self._cache and cache_ttl:
+                    self._cache.set(cache_key, data, ttl=cache_ttl)
+
+                return data
+
+            except requests.exceptions.Timeout:
+                log(f"[REST ERR] Timeout {url} attempt {attempt}")
+                BinanceRateLimiter.backoff_sleep(attempt)
+            except Exception as e:
+                log(f"[REST ERR] {url} attempt {attempt}: {e}")
+                BinanceRateLimiter.backoff_sleep(attempt)
+
+        log(f"[REST ERR] all {REST_MAX_RETRIES} attempts failed for {url}")
+        return None
+
+
+class SpotMarketCache:
+    """
+    Thread-safe, TTL-based in-memory cache for market data.
+
+    Stores arbitrary JSON-serialisable values keyed by a string.
+    Entries expire after their individual TTL.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._store: Dict[str, dict] = {}  # key → {value, expires_at}
+
+    def get(self, key: str):
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            if time.time() > entry["expires_at"]:
+                del self._store[key]
+                return None
+            return entry["value"]
+
+    def set(self, key: str, value, ttl: float):
+        with self._lock:
+            self._store[key] = {"value": value, "expires_at": time.time() + ttl}
+
+    def invalidate(self, key: str):
+        with self._lock:
+            self._store.pop(key, None)
+
+    def update_ticker(self, symbol: str, ticker_data: dict):
+        """Update a single symbol's ticker entry (from WebSocket stream)."""
+        key = f"ws_ticker_{symbol}"
+        with self._lock:
+            self._store[key] = {"value": ticker_data,
+                                 "expires_at": time.time() + TICKER_CACHE_TTL_SEC}
+
+    def get_all_tickers(self) -> Dict[str, dict]:
+        """Return all cached WebSocket ticker entries (not expired)."""
+        now = time.time()
+        with self._lock:
+            return {
+                k.replace("ws_ticker_", ""): v["value"]
+                for k, v in self._store.items()
+                if k.startswith("ws_ticker_") and v["expires_at"] > now
+            }
+
+
+# Module-level shared instances
+_spot_cache = SpotMarketCache()
+_rest_mgr: Optional["BinanceRESTManager"] = None  # initialised lazily below
+
+
+def _get_rest_mgr() -> "BinanceRESTManager":
+    global _rest_mgr
+    if _rest_mgr is None:
+        _rest_mgr = BinanceRESTManager(_spot_cache)
+    return _rest_mgr
+
+
+class SpotWebSocketManager:
+    """
+    Subscribes to Binance futures 24-hr mini-ticker stream for all symbols
+    and populates SpotMarketCache with live ticker data.
+
+    This eliminates the need for repeated REST ticker calls.
+    The all-market mini-ticker stream is a single connection that updates
+    every second — far cheaper than polling /ticker/24hr via REST.
+    """
+
+    WS_URL = "wss://fstream.binance.com/ws/!miniTicker@arr"
+
+    def __init__(self, cache: SpotMarketCache):
+        self._cache = cache
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._ws = None
+
+    def start(self):
+        """Start the WebSocket listener in a background thread."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True, name="SpotWS")
+        self._thread.start()
+        log("[WS] SpotWebSocketManager started")
+
+    def stop(self):
+        self._running = False
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    def _run(self):
+        while self._running:
+            try:
+                self._ws = _websocket_lib.WebSocketApp(
+                    self.WS_URL,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self._ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as e:
+                log(f"[WS ERR] SpotWebSocketManager: {e}")
+            if self._running:
+                log(f"[WS RECONNECTED] retrying in {WS_RECONNECT_DELAY_SEC}s")
+                time.sleep(WS_RECONNECT_DELAY_SEC)
+
+    def _on_message(self, ws, raw):
+        try:
+            items = json.loads(raw)
+            if not isinstance(items, list):
+                return
+            for t in items:
+                sym = t.get("s", "")
+                if not sym.endswith("USDT"):
+                    continue
+                self._cache.update_ticker(sym, {
+                    "symbol":              sym,
+                    "priceChangePercent":  float(t.get("P", 0)),
+                    "lastPrice":           float(t.get("c", 0)),
+                    "quoteVolume":         float(t.get("q", 0)),
+                    "highPrice":           float(t.get("h", 0)),
+                    "lowPrice":            float(t.get("l", 0)),
+                })
+        except Exception as e:
+            log(f"[WS PARSE ERR] {e}")
+
+    def _on_error(self, ws, error):
+        log(f"[WS ERR] {error}")
+
+    def _on_close(self, ws, code, msg):
+        log(f"[WS] Connection closed ({code}): {msg}")
+
+
+# Module-level WebSocket manager (started by SpotScanCoordinator)
+_spot_ws_mgr: Optional[SpotWebSocketManager] = None
+
+
+class SpotScanCoordinator:
+    """
+    Orchestrates the spot (futures) scanner scan cycle.
+
+    Architecture:
+    - FULL mode:     WebSocket ticker + cached REST fallback
+    - LIMITED mode:  WebSocket only, no extra kline refresh
+    - COOLDOWN mode: skip all REST calls
+
+    Workflow:
+    1. Build candidate list from WebSocket cache (no REST)
+    2. If cache is empty, fall back to a single cached REST ticker call
+    3. Rank by |priceChangePercent| to get shortlist
+    4. Fetch klines ONLY for shortlisted symbols (REST, with caching)
+    5. Run detect_support_bounce_pattern / detect_dead_cat_bounce_pattern
+    """
+
+    MODES = ("FULL", "LIMITED", "COOLDOWN")
+
+    def __init__(self, cache: SpotMarketCache, rest_mgr: BinanceRESTManager,
+                 shortlist_size: int = SHORTLIST_SIZE):
+        self._cache = cache
+        self._rest = rest_mgr
+        self._shortlist_size = shortlist_size
+        self._mode = "FULL"
+        self._last_scan_ts = 0.0
+
+    @property
+    def mode(self):
+        # Auto-detect mode based on rate-limiter state
+        if BinanceRateLimiter.is_banned():
+            return "COOLDOWN"
+        return self._mode
+
+    def _get_all_tickers(self) -> list:
+        """
+        Return ticker list, preferring WebSocket cache then REST fallback.
+        """
+        ws_tickers = self._cache.get_all_tickers()
+        if ws_tickers:
+            log(f"[CACHE HIT] ws_ticker (all, {len(ws_tickers)} symbols)")
+            return list(ws_tickers.values())
+
+        # REST fallback (cached)
+        url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
+        data = self._rest.get(url, cache_key="ticker_24hr",
+                              cache_ttl=TICKER_CACHE_TTL_SEC)
+        if data and isinstance(data, list):
+            return data
+        return []
+
+    def _get_klines_cached(self, symbol: str, interval: str,
+                            limit: int) -> Optional[pd.DataFrame]:
+        """Fetch klines for a symbol, using cache when available."""
+        key = f"klines_{symbol}_{interval}_{limit}"
+        cached = self._cache.get(key)
+        if cached is not None:
+            log(f"[CACHE HIT] klines {symbol}")
+            return cached
+
+        url = f"{BINANCE_FAPI}/fapi/v1/klines"
+        raw = self._rest.get(url, params={"symbol": symbol, "interval": interval,
+                                           "limit": limit},
+                              cache_key=key, cache_ttl=KLINE_CACHE_TTL_SEC)
+        if raw is None or not isinstance(raw, list):
+            return None
+
+        cols = ["open_time","open","high","low","close","volume",
+                "close_time","quote_asset_volume","num_trades",
+                "taker_buy_base","taker_buy_quote","ignore"]
+        df = pd.DataFrame(raw, columns=cols)
+        for c in ["open","high","low","close","volume","quote_asset_volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df["open_time"]  = pd.to_datetime(df["open_time"],  unit="ms")
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+        self._cache.set(key, df, ttl=KLINE_CACHE_TTL_SEC)
+        return df
+
+    def build_shortlist_gainers(self) -> list:
+        """Return top SHORTLIST_SIZE gainers from cache."""
+        tickers = self._get_all_tickers()
+        if not tickers:
+            return []
+
+        excl = {"UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"}
+        filtered = [
+            t for t in tickers
+            if isinstance(t.get("symbol"), str)
+            and t["symbol"].endswith("USDT")
+            and not any(e in t["symbol"] for e in excl)
+            and (not VALID_FUTURES_SYMBOLS or t["symbol"] in VALID_FUTURES_SYMBOLS)
+            and float(t.get("quoteVolume", 0)) > 1_000_000
+        ]
+        filtered.sort(key=lambda t: float(t.get("priceChangePercent", 0)), reverse=True)
+        return filtered[:self._shortlist_size]
+
+    def build_shortlist_losers(self) -> list:
+        """Return top SHORTLIST_SIZE losers from cache."""
+        tickers = self._get_all_tickers()
+        if not tickers:
+            return []
+
+        excl = {"UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"}
+        filtered = [
+            t for t in tickers
+            if isinstance(t.get("symbol"), str)
+            and t["symbol"].endswith("USDT")
+            and not any(e in t["symbol"] for e in excl)
+            and (not VALID_FUTURES_SYMBOLS or t["symbol"] in VALID_FUTURES_SYMBOLS)
+            and float(t.get("quoteVolume", 0)) > 1_000_000
+        ]
+        filtered.sort(key=lambda t: float(t.get("priceChangePercent", 0)))
+        return filtered[:self._shortlist_size]
+
+    def scan(self, interval: str = SPOT_INTERVAL,
+             kline_limit: int = SPOT_KLINE_LIMIT) -> dict:
+        """
+        Run one scan cycle.
+
+        Returns:
+            dict with "gainers" and "losers" lists, each containing dicts
+            with symbol, change_24h, and pattern (if detected).
+        """
+        now = time.time()
+        mode = self.mode
+
+        if mode == "COOLDOWN":
+            log("[SPOT SCAN SKIPPED] REST cooldown active — no scan this cycle")
+            return {"gainers": [], "losers": [], "mode": "COOLDOWN"}
+
+        results = {"gainers": [], "losers": [], "mode": mode}
+
+        # ── Gainers ───────────────────────────────────────────────────
+        for t in self.build_shortlist_gainers():
+            symbol = t["symbol"]
+            change = round(float(t.get("priceChangePercent", 0)), 2)
+            try:
+                df = self._get_klines_cached(symbol, interval, kline_limit)
+                if df is None:
+                    log(f"[SPOT SCAN] {symbol}: kline fetch failed, skipping")
+                    continue
+                pattern = detect_support_bounce_pattern(df)
+                results["gainers"].append({
+                    "symbol":     symbol,
+                    "change_24h": change,
+                    "pattern":    pattern,
+                })
+            except Exception as e:
+                log(f"[SPOT SCAN ERR] {symbol}: {e}")
+
+        # ── Losers ────────────────────────────────────────────────────
+        for t in self.build_shortlist_losers():
+            symbol = t["symbol"]
+            change = round(float(t.get("priceChangePercent", 0)), 2)
+            try:
+                df = self._get_klines_cached(symbol, interval, kline_limit)
+                if df is None:
+                    log(f"[SPOT SCAN LOSER] {symbol}: kline fetch failed, skipping")
+                    continue
+                pattern = detect_dead_cat_bounce_pattern(df)
+                results["losers"].append({
+                    "symbol":     symbol,
+                    "change_24h": change,
+                    "pattern":    pattern,
+                })
+            except Exception as e:
+                log(f"[SPOT SCAN LOSER ERR] {symbol}: {e}")
+
+        self._last_scan_ts = now
+        return results
+
+
+# Module-level coordinator (lazy init)
+_scan_coord: Optional[SpotScanCoordinator] = None
+
+
+def _get_scan_coord() -> SpotScanCoordinator:
+    global _scan_coord, _spot_ws_mgr
+    if _scan_coord is None:
+        _scan_coord = SpotScanCoordinator(_spot_cache, _get_rest_mgr(), SHORTLIST_SIZE)
+    if _spot_ws_mgr is None:
+        try:
+            _spot_ws_mgr = SpotWebSocketManager(_spot_cache)
+            _spot_ws_mgr.start()
+        except Exception as e:
+            log(f"[WS] Could not start SpotWebSocketManager: {e}")
+    return _scan_coord
+
+
+
 # -----------------------------
 # Spot scanner: top gainers + support-bounce pattern
 # -----------------------------
 
 def get_top_gainers_usdt(top_n=SPOT_TOP_N):
+    # Use BinanceRESTManager with TTL cache to avoid duplicate ticker calls
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    data = requests.get(url, timeout=20).json()
-
+    data = _get_rest_mgr().get(url, cache_key="ticker_24hr", cache_ttl=TICKER_CACHE_TTL_SEC)
+    if data is None:
+        return pd.DataFrame(columns=["symbol", "priceChangePercent", "quoteVolume"])
     if not isinstance(data, list):
         raise ValueError(f"Binance API unexpected response: {data}")
 
@@ -4705,9 +5706,11 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
 
 
 def get_top_losers_usdt(top_n=10):
+    # Reuses the same cached ticker call as get_top_gainers_usdt (CACHE HIT expected)
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    data = requests.get(url, timeout=20).json()
-
+    data = _get_rest_mgr().get(url, cache_key="ticker_24hr", cache_ttl=TICKER_CACHE_TTL_SEC)
+    if data is None:
+        return pd.DataFrame(columns=["symbol", "priceChangePercent", "quoteVolume"])
     if not isinstance(data, list):
         raise ValueError(f"Binance API unexpected response: {data}")
 
@@ -4731,9 +5734,15 @@ def get_top_losers_usdt(top_n=10):
 
 
 def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
+    # Route through BinanceRESTManager for rate-limit protection and caching.
+    # Uses futures endpoint (FAPI) — the scanner analyses futures symbols.
+    cache_key = f"klines_{symbol}_{interval}_{limit}"
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    data = requests.get(url, params=params, timeout=20).json()
+    data = _get_rest_mgr().get(url, params=params,
+                               cache_key=cache_key, cache_ttl=KLINE_CACHE_TTL_SEC)
+    if data is None:
+        return None  # caller must handle None
 
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
@@ -5105,6 +6114,10 @@ def scan_top_gainers_and_alert():
     Also scans top 10 losers for the dead-cat-bounce (rejection) pattern
     and sends Telegram SHORT alerts.
     Runs at most once every 15 minutes.
+
+    Uses SpotScanCoordinator for rate-limit-safe, WebSocket-first data fetching.
+    Falls back to cached REST when WebSocket data is unavailable.
+    Skips entirely when REST cooldown is active (-1003 ban).
     """
     global SPOT_SCANNER_LAST_RUN
     now = time.time()
@@ -5116,6 +6129,14 @@ def scan_top_gainers_and_alert():
     check_spot_pattern_followups()
     check_spot_loser_followups()
 
+    coord = _get_scan_coord()
+
+    # ── Skip everything if REST is banned ────────────────────────────
+    if coord.mode == "COOLDOWN":
+        log("[SPOT SCAN SKIPPED] REST cooldown active — skipping this cycle")
+        return
+
+    # ── Gainers ───────────────────────────────────────────────────────
     try:
         top = get_top_gainers_usdt(SPOT_TOP_N)
         coin_list = ", ".join(
@@ -5127,8 +6148,14 @@ def scan_top_gainers_and_alert():
         for _, row in top.iterrows():
             symbol = row["symbol"]
             change_24h = round(float(row["priceChangePercent"]), 2)
+            if BinanceRateLimiter.is_banned():
+                log("[SPOT SCAN SKIPPED] REST cooldown activated mid-scan — aborting gainers loop")
+                break
             try:
                 df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+                if df is None:
+                    log(f"[SPOT SCAN] {symbol}: kline verisi alınamadı, atlanıyor")
+                    continue
                 pattern = detect_support_bounce_pattern(df)
                 if pattern:
                     log(f"[SPOT SCAN] ✅ {symbol} (%{change_24h}) — Pattern bulundu! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Retracement={pattern['retracement_ratio']}")
@@ -5164,7 +6191,12 @@ def scan_top_gainers_and_alert():
     except Exception as e:
         log(f"[SPOT SCAN ERR] {e}")
 
-    # Scan top 10 most declining coins for dead-cat-bounce / rejection SHORT pattern
+    # ── Skip losers scan if REST banned mid-cycle ─────────────────────
+    if BinanceRateLimiter.is_banned():
+        log("[SPOT SCAN SKIPPED] REST cooldown active — skipping losers scan")
+        return
+
+    # ── Losers ────────────────────────────────────────────────────────
     try:
         losers = get_top_losers_usdt(10)
         loser_list = ", ".join(
@@ -5176,8 +6208,14 @@ def scan_top_gainers_and_alert():
         for _, row in losers.iterrows():
             symbol = row["symbol"]
             change_24h = round(float(row["priceChangePercent"]), 2)
+            if BinanceRateLimiter.is_banned():
+                log("[SPOT SCAN SKIPPED] REST cooldown activated mid-scan — aborting losers loop")
+                break
             try:
                 df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+                if df is None:
+                    log(f"[SPOT SCAN LOSER] {symbol}: kline verisi alınamadı, atlanıyor")
+                    continue
                 pattern = detect_dead_cat_bounce_pattern(df)
                 if pattern:
                     log(f"[SPOT SCAN LOSER] ✅ {symbol} (%{change_24h}) — SHORT Pattern! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Recovery={pattern['recovery_ratio']}")
