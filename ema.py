@@ -5364,8 +5364,8 @@ def main():
             if any(batch_opened.values()):
                 update_directional_limits()
             
-            # 3.1) Check and log real closed trades
-            check_and_log_real_closed_trades()
+            # 3.1) Check and log real closed trades (disabled)
+            # check_and_log_real_closed_trades()
             
             # 3.2) Update max profit tracking for open positions
             avg_max_profit = update_max_profit_tracking()
@@ -5380,8 +5380,8 @@ def main():
             # 3.4) Send hourly margin progress log
             send_hourly_margin_log()
             
-            # 3.5) Check and activate hourly analysis if 2 weeks have passed
-            check_and_activate_hourly_analysis()
+            # 3.5) Check and activate hourly analysis if 2 weeks have passed (disabled)
+            # check_and_activate_hourly_analysis()
 
             # 3.6) Scan top gainers for support-bounce pattern and send LONG alerts
             scan_top_gainers_and_alert()
