@@ -5883,11 +5883,13 @@ def detect_support_bounce_pattern(df):
     last1 = recent.iloc[-1]
     last2 = recent.iloc[-2]
     window = recent.iloc[-5:]
-    bounce_candle_count = sum(
-        1 for i in range(1, len(window))
-        if window.iloc[i]["close"] > window.iloc[i]["open"]
-        and window.iloc[i]["close"] > window.iloc[i - 1]["close"]
-    )
+    bounce_candle_count = 0
+    if len(window) >= 2:
+        bounce_candle_count = sum(
+            1 for i in range(1, len(window))
+            if window.iloc[i]["close"] > window.iloc[i]["open"]
+            and window.iloc[i]["close"] > window.iloc[i - 1]["close"]
+        )
     bounce_primary = (
         last1["close"] > last1["open"]
         and last1["close"] > last2["close"]
@@ -6074,11 +6076,13 @@ def detect_dead_cat_bounce_pattern(df):
     last1 = recent.iloc[-1]
     last2 = recent.iloc[-2]
     window = recent.iloc[-5:]
-    rejection_candle_count = sum(
-        1 for i in range(1, len(window))
-        if window.iloc[i]["close"] < window.iloc[i]["open"]
-        and window.iloc[i]["close"] < window.iloc[i - 1]["close"]
-    )
+    rejection_candle_count = 0
+    if len(window) >= 2:
+        rejection_candle_count = sum(
+            1 for i in range(1, len(window))
+            if window.iloc[i]["close"] < window.iloc[i]["open"]
+            and window.iloc[i]["close"] < window.iloc[i - 1]["close"]
+        )
     rejection_primary = (
         last1["close"] < last1["open"]
         and last1["close"] < last2["close"]
