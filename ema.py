@@ -3369,9 +3369,9 @@ def check_and_log_real_closed_trades():
     """
     global REAL_CLOSED, REAL_POSITIONS_TRACKER, LAST_REAL_CLOSE_CHECK
     
-    # Throttle: only check once per minute
+    # Throttle: only check once every 2 minutes
     now = now_ts_s()
-    if now - LAST_REAL_CLOSE_CHECK < 60:
+    if now - LAST_REAL_CLOSE_CHECK < 120:
         return
     LAST_REAL_CLOSE_CHECK = now
     
@@ -3480,9 +3480,9 @@ def update_max_profit_tracking():
     """
     global REAL_POSITIONS_TRACKER, LAST_MAX_PROFIT_UPDATE
     
-    # Throttle: only check every 30 seconds
+    # Throttle: only check every 120 seconds
     now = now_ts_s()
-    if now - LAST_MAX_PROFIT_UPDATE < 30:
+    if now - LAST_MAX_PROFIT_UPDATE < 120:
         # Return last known average from STATE if available
         return STATE.get("avg_max_profit", 0.0)
     
@@ -4169,77 +4169,68 @@ def update_directional_limits():
         "stoch_rsi_long_count": 0, "stoch_rsi_short_count": 0,
         "fib_long_count": 0, "fib_short_count": 0
     }
-    
-    try:
-        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
-        for p in acc:
-            amt = float(p["positionAmt"])
-            sym = p["symbol"]
-            
-            if amt > 0:
-                live["long"][sym] = amt
-                # Only count positions that are tracked
-                if sym in REAL_POSITIONS_TRACKER:
-                    pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
-                    if pos_kind == "MACD":
-                        live["macd_long_count"] += 1
-                    elif pos_kind == "FVG":
-                        live["fvg_long_count"] += 1
-                    elif pos_kind == "EMA_PULLBACK":
-                        live["ema_pullback_long_count"] += 1
-                    elif pos_kind == "CEST":
-                        live["cest_long_count"] += 1
-                    elif pos_kind == "ORB_FVG_CONFIRM":
-                        live["orb_fvg_long_count"] += 1
-                    elif pos_kind == "NY_REVERSAL":
-                        live["ny_reversal_long_count"] += 1
-                    elif pos_kind == "ICT_POWER_OF_3":
-                        live["ict_power_of_3_long_count"] += 1
-                    elif pos_kind == "FVG_BREAKER_BLOCK":
-                        live["fvg_breaker_block_long_count"] += 1
-                    elif pos_kind == "REENTRY_4H_5M":
-                        live["reentry_4h_5m_long_count"] += 1
-                    elif pos_kind == "FVG_MSS_ENTRY":
-                        live["fvg_mss_entry_long_count"] += 1
-                    elif pos_kind == "BOLLINGER_BANDS":
-                        live["bb_long_count"] += 1
-                    elif pos_kind == "STOCHASTIC_RSI":
-                        live["stoch_rsi_long_count"] += 1
-                    elif pos_kind == "FIBONACCI_RETRACEMENT":
-                        live["fib_long_count"] += 1
-            elif amt < 0:
-                live["short"][sym] = abs(amt)
-                # Only count positions that are tracked
-                if sym in REAL_POSITIONS_TRACKER:
-                    pos_kind = REAL_POSITIONS_TRACKER[sym].get("kind")
-                    if pos_kind == "MACD":
-                        live["macd_short_count"] += 1
-                    elif pos_kind == "FVG":
-                        live["fvg_short_count"] += 1
-                    elif pos_kind == "EMA_PULLBACK":
-                        live["ema_pullback_short_count"] += 1
-                    elif pos_kind == "CEST":
-                        live["cest_short_count"] += 1
-                    elif pos_kind == "ORB_FVG_CONFIRM":
-                        live["orb_fvg_short_count"] += 1
-                    elif pos_kind == "NY_REVERSAL":
-                        live["ny_reversal_short_count"] += 1
-                    elif pos_kind == "ICT_POWER_OF_3":
-                        live["ict_power_of_3_short_count"] += 1
-                    elif pos_kind == "FVG_BREAKER_BLOCK":
-                        live["fvg_breaker_block_short_count"] += 1
-                    elif pos_kind == "REENTRY_4H_5M":
-                        live["reentry_4h_5m_short_count"] += 1
-                    elif pos_kind == "FVG_MSS_ENTRY":
-                        live["fvg_mss_entry_short_count"] += 1
-                    elif pos_kind == "BOLLINGER_BANDS":
-                        live["bb_short_count"] += 1
-                    elif pos_kind == "STOCHASTIC_RSI":
-                        live["stoch_rsi_short_count"] += 1
-                    elif pos_kind == "FIBONACCI_RETRACEMENT":
-                        live["fib_short_count"] += 1
-    except Exception as e:
-        log(f"[FETCH POS ERR]{e}")
+
+    # Use local REAL_POSITIONS_TRACKER to count open positions (no Binance API call)
+    for sym, pos_info in REAL_POSITIONS_TRACKER.items():
+        direction = pos_info.get("direction")
+        pos_kind = pos_info.get("kind")
+
+        if direction == "UP":
+            live["long"][sym] = 1
+            if pos_kind == "MACD":
+                live["macd_long_count"] += 1
+            elif pos_kind == "FVG":
+                live["fvg_long_count"] += 1
+            elif pos_kind == "EMA_PULLBACK":
+                live["ema_pullback_long_count"] += 1
+            elif pos_kind == "CEST":
+                live["cest_long_count"] += 1
+            elif pos_kind == "ORB_FVG_CONFIRM":
+                live["orb_fvg_long_count"] += 1
+            elif pos_kind == "NY_REVERSAL":
+                live["ny_reversal_long_count"] += 1
+            elif pos_kind == "ICT_POWER_OF_3":
+                live["ict_power_of_3_long_count"] += 1
+            elif pos_kind == "FVG_BREAKER_BLOCK":
+                live["fvg_breaker_block_long_count"] += 1
+            elif pos_kind == "REENTRY_4H_5M":
+                live["reentry_4h_5m_long_count"] += 1
+            elif pos_kind == "FVG_MSS_ENTRY":
+                live["fvg_mss_entry_long_count"] += 1
+            elif pos_kind == "BOLLINGER_BANDS":
+                live["bb_long_count"] += 1
+            elif pos_kind == "STOCHASTIC_RSI":
+                live["stoch_rsi_long_count"] += 1
+            elif pos_kind == "FIBONACCI_RETRACEMENT":
+                live["fib_long_count"] += 1
+        elif direction == "DOWN":
+            live["short"][sym] = 1
+            if pos_kind == "MACD":
+                live["macd_short_count"] += 1
+            elif pos_kind == "FVG":
+                live["fvg_short_count"] += 1
+            elif pos_kind == "EMA_PULLBACK":
+                live["ema_pullback_short_count"] += 1
+            elif pos_kind == "CEST":
+                live["cest_short_count"] += 1
+            elif pos_kind == "ORB_FVG_CONFIRM":
+                live["orb_fvg_short_count"] += 1
+            elif pos_kind == "NY_REVERSAL":
+                live["ny_reversal_short_count"] += 1
+            elif pos_kind == "ICT_POWER_OF_3":
+                live["ict_power_of_3_short_count"] += 1
+            elif pos_kind == "FVG_BREAKER_BLOCK":
+                live["fvg_breaker_block_short_count"] += 1
+            elif pos_kind == "REENTRY_4H_5M":
+                live["reentry_4h_5m_short_count"] += 1
+            elif pos_kind == "FVG_MSS_ENTRY":
+                live["fvg_mss_entry_short_count"] += 1
+            elif pos_kind == "BOLLINGER_BANDS":
+                live["bb_short_count"] += 1
+            elif pos_kind == "STOCHASTIC_RSI":
+                live["stoch_rsi_short_count"] += 1
+            elif pos_kind == "FIBONACCI_RETRACEMENT":
+                live["fib_short_count"] += 1
 
     # Update blocked states for all strategies
     STATE["macd_long_blocked"] = (live["macd_long_count"] >= PARAM.get("MAX_MACD_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
@@ -4741,9 +4732,9 @@ def check_profit_target():
     """
     global STATE
     
-    # Throttle: only check every 30 seconds
+    # Throttle: only check every 120 seconds
     now = now_ts_s()
-    if now - STATE.get("last_profit_check_ts", 0) < 30:
+    if now - STATE.get("last_profit_check_ts", 0) < 120:
         return
     
     STATE["last_profit_check_ts"] = now
