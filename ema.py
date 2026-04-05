@@ -4682,6 +4682,9 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     data = requests.get(url, timeout=20).json()
 
+    if not isinstance(data, list):
+        raise ValueError(f"Binance API unexpected response: {data}")
+
     df = pd.DataFrame(data)
     df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
     df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
@@ -4704,6 +4707,9 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
 def get_top_losers_usdt(top_n=10):
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     data = requests.get(url, timeout=20).json()
+
+    if not isinstance(data, list):
+        raise ValueError(f"Binance API unexpected response: {data}")
 
     df = pd.DataFrame(data)
     df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
@@ -5432,4 +5438,3 @@ if __name__=="__main__":
     main()
 
                          
-
