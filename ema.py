@@ -4817,6 +4817,82 @@ def detect_support_bounce_pattern(df):
 
 SPOT_SCANNER_LAST_RUN = 0  # Track last scan timestamp
 
+# Follow-up tracking for coins where a pattern was detected.
+# Structure: { symbol: {"detected_ts": float, "remaining": int, "pattern": dict, "change_24h": float} }
+SPOT_PATTERN_FOLLOWUP: Dict[str, dict] = {}
+SPOT_FOLLOWUP_CHECKS = 2  # Number of 15-minute closes to monitor after detection
+
+
+def check_spot_pattern_followups():
+    """
+    For each coin previously detected with a pattern, fetch the latest 15m candles
+    and report whether the setup is still intact or has broken down.
+    Removes coins after SPOT_FOLLOWUP_CHECKS follow-up cycles.
+    """
+    global SPOT_PATTERN_FOLLOWUP
+    if not SPOT_PATTERN_FOLLOWUP:
+        return
+
+    finished = []
+    for symbol, info in list(SPOT_PATTERN_FOLLOWUP.items()):
+        try:
+            df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+            if df is None or len(df) < 5:
+                log(f"[SPOT FOLLOWUP] {symbol}: veri alınamadı, atlanıyor")
+                continue
+
+            last_close = float(df.iloc[-1]["close"])
+            orig = info["pattern"]
+            fib_382 = orig["fib_382"]
+            fib_618 = orig["fib_618"]
+            fib_500 = orig["fib_500"]
+            swing_high = orig["swing_high"]
+            pullback_low = orig["pullback_low"]
+            check_no = SPOT_FOLLOWUP_CHECKS - info["remaining"] + 1  # 1 or 2
+
+            # Determine status
+            if last_close >= swing_high:
+                status = "🚀 Swing High kırıldı! Güçlü yükseliş devam ediyor."
+                emoji = "🟢"
+            elif last_close >= fib_382:
+                status = "✅ Fib 38.2 üzerinde — yapı koruyor."
+                emoji = "🟢"
+            elif last_close >= fib_500:
+                status = "🟡 Fib 38.2 altına düştü, 50.0 üzerinde — dikkatli takip."
+                emoji = "🟡"
+            elif last_close >= fib_618:
+                status = "🟠 Fib 50.0 altına düştü, 61.8 üzerinde — zayıflama var."
+                emoji = "🟠"
+            elif last_close >= pullback_low:
+                status = "🔴 Fib 61.8 altında — destek bölgesinin altı, dikkat!"
+                emoji = "🔴"
+            else:
+                status = "⛔ Pullback dibi kırıldı — pattern geçersiz, setup çöktü."
+                emoji = "⛔"
+
+            change_24h = info.get("change_24h", 0)
+            msg = (
+                f"{emoji} TAKIP #{check_no}/{SPOT_FOLLOWUP_CHECKS} — {symbol}\n"
+                f"📈 24s Değişim: %{change_24h}\n"
+                f"💰 Güncel Kapanış: {last_close}\n"
+                f"📐 Durum: {status}\n"
+                f"Fib 38.2: {fib_382} | 50.0: {fib_500} | 61.8: {fib_618}\n"
+                f"🔺 Swing High: {swing_high} | 🎯 Pullback Dip: {pullback_low}"
+            )
+            tg_send(msg)
+            log(f"[SPOT FOLLOWUP] {symbol} check#{check_no}: last_close={last_close} — {status}")
+
+            info["remaining"] -= 1
+            if info["remaining"] <= 0:
+                finished.append(symbol)
+
+        except Exception as e:
+            log(f"[SPOT FOLLOWUP ERR] {symbol}: {e}")
+
+    for sym in finished:
+        del SPOT_PATTERN_FOLLOWUP[sym]
+        log(f"[SPOT FOLLOWUP] {sym} takipten çıkarıldı (2 kontrol tamamlandı)")
+
 
 def scan_top_gainers_and_alert():
     """
@@ -4829,6 +4905,9 @@ def scan_top_gainers_and_alert():
     if now - SPOT_SCANNER_LAST_RUN < 900:  # 15 minutes
         return
     SPOT_SCANNER_LAST_RUN = now
+
+    # Check follow-ups first so we process the previous scan's tracked coins
+    check_spot_pattern_followups()
 
     try:
         top = get_top_gainers_usdt(SPOT_TOP_N)
@@ -4861,6 +4940,15 @@ def scan_top_gainers_and_alert():
                     )
                     tg_send(msg)
                     log(f"[SPOT SCAN] LONG alert sent for {symbol} (score={pattern['score']})")
+
+                    # Register coin for follow-up over the next 2 × 15-minute closes
+                    SPOT_PATTERN_FOLLOWUP[symbol] = {
+                        "detected_ts": now,
+                        "remaining": SPOT_FOLLOWUP_CHECKS,
+                        "pattern": pattern,
+                        "change_24h": change_24h,
+                    }
+                    log(f"[SPOT SCAN] {symbol} takibe alındı ({SPOT_FOLLOWUP_CHECKS} kontrol)")
                 else:
                     log(f"[SPOT SCAN] ⬜ {symbol} (%{change_24h}) — Pattern yok")
             except Exception as e:
