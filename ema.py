@@ -5774,14 +5774,30 @@ def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
 
 def detect_support_bounce_pattern(df):
     """
-    Aranan yapı:
-    1) Önce belirgin yükseliş
-    2) Sonra sağlıklı pullback
-    3) Pullback fib destek bölgesine gelsin
-    4) Son mumlarda bounce teyidi gelsin
+    Score-based support bounce detection (LONG signal).
+
+    Scoring breakdown:
+      impulse >= 8%          → +20  (>= 5% → +10)
+      fib zone 0.382–0.618   → +20  (0.30–0.70 → +10)
+      retracement <= 0.72    → +10  (<= 0.75   → +5)
+      bounce confirmed       → +25  (2+ bounce candles → +12)
+      volume above average   → +15
+      EMA trend up           → +10
+
+    Signal thresholds:
+      score >= 70 → VALID
+      score >= 55 → WATCHLIST
+      else        → NONE
+
+    Returns dict with signal/score/reasons/metrics plus flat keys for
+    backward-compatible access by follow-up code.
+    Returns None only when there is insufficient data to analyse.
     """
     if len(df) < 80:
         return None
+
+    reasons: list = []
+    score = 0
 
     d = df.copy().reset_index(drop=True)
     d["vol_ma20"] = d["volume"].rolling(20).mean()
@@ -5805,55 +5821,133 @@ def detect_support_bounce_pattern(df):
 
     impulse_pct = (swing_high - swing_low) / swing_low * 100
 
-    if impulse_pct < 8:
-        return None
+    # --- Impulse scoring (relaxed: 8% → 5%) ---
+    impulse_ok = impulse_pct >= 5
+    if impulse_pct >= 8:
+        score += 20
+    elif impulse_pct >= 5:
+        score += 10
+    else:
+        reasons.append("impulse_weak")
 
     after_high = recent.iloc[high_idx + 1:]
-    if len(after_high) < 5:
-        return None
+    if len(after_high) < 3:
+        return {
+            "signal": "NONE",
+            "score": round(score, 1),
+            "reasons": reasons + ["insufficient_data"],
+            "metrics": {"impulse_ok": impulse_ok, "fib_ok": False,
+                        "bounce_ok": False, "volume_ok": False, "ema_ok": False},
+            "swing_low": round(float(swing_low), 6),
+            "swing_high": round(float(swing_high), 6),
+            "impulse_pct": round(float(impulse_pct), 2),
+            "pullback_low": round(float(swing_low), 6),
+            "retracement_ratio": 0.0,
+            "fib_382": 0.0, "fib_500": 0.0, "fib_618": 0.0,
+            "last_close": round(float(recent.iloc[-1]["close"]), 6),
+            "support_distance_pct": 0.0,
+            "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE",
+        }
 
     pullback_low = after_high["low"].min()
 
     fib_382 = swing_high - 0.382 * (swing_high - swing_low)
     fib_500 = swing_high - 0.500 * (swing_high - swing_low)
     fib_618 = swing_high - 0.618 * (swing_high - swing_low)
+    fib_300 = swing_high - 0.300 * (swing_high - swing_low)
+    fib_700 = swing_high - 0.700 * (swing_high - swing_low)
 
     retracement_ratio = (swing_high - pullback_low) / (swing_high - swing_low)
 
-    in_support_zone = fib_618 <= pullback_low <= fib_382
+    # --- Fib zone scoring (relaxed: 0.382–0.618 → 0.30–0.70) ---
+    in_support_zone_strict = fib_618 <= pullback_low <= fib_382
+    in_support_zone_relaxed = fib_700 <= pullback_low <= fib_300
+    fib_ok = in_support_zone_relaxed
+    if in_support_zone_strict:
+        score += 20
+    elif in_support_zone_relaxed:
+        score += 10
+    else:
+        reasons.append("fib_outside_zone")
 
-    if not in_support_zone:
-        return None
+    # --- Retracement ratio scoring (relaxed: 0.72 → 0.75) ---
+    retracement_ok = retracement_ratio <= 0.75
+    if retracement_ratio <= 0.72:
+        score += 10
+    elif retracement_ratio <= 0.75:
+        score += 5
+    else:
+        reasons.append("retracement_too_deep")
 
-    if retracement_ratio > 0.72:
-        return None
-
+    # --- Bounce confirmation: last 3–5 candles (relaxed from last 2) ---
     last1 = recent.iloc[-1]
     last2 = recent.iloc[-2]
-
-    bounce_confirmed = (
-        last1["close"] > last1["open"] and
-        last1["close"] > last2["close"] and
-        last1["close"] > pullback_low * 1.02 and
-        (
-            pd.notna(last1["vol_ma20"]) and
-            last1["volume"] >= last1["vol_ma20"] * 1.05
-        )
+    window = recent.iloc[-5:]
+    bounce_candle_count = sum(
+        1 for i in range(1, len(window))
+        if window.iloc[i]["close"] > window.iloc[i]["open"]
+        and window.iloc[i]["close"] > window.iloc[i - 1]["close"]
     )
+    bounce_primary = (
+        last1["close"] > last1["open"]
+        and last1["close"] > last2["close"]
+        and last1["close"] > pullback_low * 1.01
+    )
+    bounce_ok = bounce_primary or bounce_candle_count >= 2
+    if bounce_primary:
+        score += 25
+    elif bounce_candle_count >= 2:
+        score += 12
+    else:
+        reasons.append("no_bounce_confirmation")
 
-    if not bounce_confirmed:
-        return None
+    # --- Volume scoring (optional: adds score, not required) ---
+    vol_ok = (
+        pd.notna(last1.get("vol_ma20"))
+        and last1["volume"] >= last1["vol_ma20"] * 1.05
+    )
+    if vol_ok:
+        score += 15
+    else:
+        reasons.append("volume_weak")
 
-    support_distance_pct = abs(last1["close"] - fib_500) / fib_500 * 100
+    # --- EMA trend confirmation (optional bonus) ---
+    ema_ok = False
+    try:
+        closes = d["close"]
+        ema20_val = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50_val = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+        ema_ok = float(last1["close"]) > ema20_val and ema20_val > ema50_val
+        if ema_ok:
+            score += 10
+    except Exception:
+        pass
 
-    score = 0
-    score += min(40, impulse_pct * 2.5)
-    score += 25 if in_support_zone else 0
-    score += 15 if 0.45 <= retracement_ratio <= 0.65 else 5
-    score += 20 if bounce_confirmed else 0
     score = round(min(score, 100), 1)
 
+    if score >= 70:
+        signal = "VALID"
+    elif score >= 55:
+        signal = "WATCHLIST"
+    else:
+        signal = "NONE"
+        if not reasons:
+            reasons.append("score_too_low")
+
+    support_distance_pct = abs(float(last1["close"]) - float(fib_500)) / float(fib_500) * 100
+
     return {
+        "signal": signal,
+        "score": score,
+        "reasons": reasons,
+        "metrics": {
+            "impulse_ok": impulse_ok,
+            "fib_ok": fib_ok,
+            "bounce_ok": bounce_ok,
+            "volume_ok": vol_ok,
+            "ema_ok": ema_ok,
+        },
+        # Flat keys preserved for backward-compatible access (follow-up code)
         "swing_low": round(float(swing_low), 6),
         "swing_high": round(float(swing_high), 6),
         "impulse_pct": round(float(impulse_pct), 2),
@@ -5864,20 +5958,36 @@ def detect_support_bounce_pattern(df):
         "fib_618": round(float(fib_618), 6),
         "last_close": round(float(last1["close"]), 6),
         "support_distance_pct": round(float(support_distance_pct), 2),
-        "score": score,
-        "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE"
+        "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE",
     }
 
 
 def detect_dead_cat_bounce_pattern(df):
     """
-    SHORT sinyali için ölü kedi sıçraması / ret paterni:
-    1) Belirgin aşağı dürtü (impulse) — en az %8 düşüş
-    2) Geri toplanma (bounce) Fib %38.2–%61.8 direnç bölgesine kadar
-    3) Direnç bölgesinde ret teyidi (bearish mum + hacim)
+    Score-based dead-cat-bounce / rejection detection (SHORT signal).
+
+    Scoring breakdown:
+      impulse drop >= 8%     → +20  (>= 5% → +10)
+      fib zone 0.382–0.618   → +20  (0.30–0.70 → +10)
+      recovery ratio <= 0.72 → +10  (<= 0.75   → +5)
+      rejection confirmed    → +25  (2+ rejection candles → +12)
+      volume above average   → +15
+      EMA trend down         → +10
+
+    Signal thresholds:
+      score >= 70 → VALID
+      score >= 55 → WATCHLIST
+      else        → NONE
+
+    Returns dict with signal/score/reasons/metrics plus flat keys for
+    backward-compatible access by follow-up code.
+    Returns None only when there is insufficient data to analyse.
     """
     if len(df) < 80:
         return None
+
+    reasons: list = []
+    score = 0
 
     d = df.copy().reset_index(drop=True)
     d["vol_ma20"] = d["volume"].rolling(20).mean()
@@ -5889,7 +5999,7 @@ def detect_dead_cat_bounce_pattern(df):
     if first_half.empty:
         return None
 
-    # Düşüş: önce tepe, sonra dip
+    # Downward impulse: peak then trough
     high_idx = first_half["high"].idxmax()
     swing_high = recent.loc[high_idx, "high"]
 
@@ -5902,55 +6012,133 @@ def detect_dead_cat_bounce_pattern(df):
 
     impulse_pct = (swing_high - swing_low) / swing_high * 100
 
-    if impulse_pct < 8:
-        return None
+    # --- Impulse scoring (relaxed: 8% → 5%) ---
+    impulse_ok = impulse_pct >= 5
+    if impulse_pct >= 8:
+        score += 20
+    elif impulse_pct >= 5:
+        score += 10
+    else:
+        reasons.append("impulse_weak")
 
     after_low = recent.iloc[low_idx + 1:]
-    if len(after_low) < 5:
-        return None
+    if len(after_low) < 3:
+        return {
+            "signal": "NONE",
+            "score": round(score, 1),
+            "reasons": reasons + ["insufficient_data"],
+            "metrics": {"impulse_ok": impulse_ok, "fib_ok": False,
+                        "bounce_ok": False, "volume_ok": False, "ema_ok": False},
+            "swing_high": round(float(swing_high), 6),
+            "swing_low": round(float(swing_low), 6),
+            "impulse_pct": round(float(impulse_pct), 2),
+            "bounce_high": round(float(swing_high), 6),
+            "recovery_ratio": 0.0,
+            "fib_382": 0.0, "fib_500": 0.0, "fib_618": 0.0,
+            "last_close": round(float(recent.iloc[-1]["close"]), 6),
+            "resistance_distance_pct": 0.0,
+            "pattern": "DROP -> FIB RESISTANCE -> REJECTION",
+        }
 
     bounce_high = after_low["high"].max()
 
     fib_382 = swing_low + 0.382 * (swing_high - swing_low)
     fib_500 = swing_low + 0.500 * (swing_high - swing_low)
     fib_618 = swing_low + 0.618 * (swing_high - swing_low)
+    fib_300 = swing_low + 0.300 * (swing_high - swing_low)
+    fib_700 = swing_low + 0.700 * (swing_high - swing_low)
 
     recovery_ratio = (bounce_high - swing_low) / (swing_high - swing_low)
 
-    in_resistance_zone = fib_382 <= bounce_high <= fib_618
+    # --- Fib zone scoring (relaxed: 0.382–0.618 → 0.30–0.70) ---
+    in_resistance_zone_strict = fib_382 <= bounce_high <= fib_618
+    in_resistance_zone_relaxed = fib_300 <= bounce_high <= fib_700
+    fib_ok = in_resistance_zone_relaxed
+    if in_resistance_zone_strict:
+        score += 20
+    elif in_resistance_zone_relaxed:
+        score += 10
+    else:
+        reasons.append("fib_outside_zone")
 
-    if not in_resistance_zone:
-        return None
+    # --- Recovery ratio scoring (relaxed: 0.72 → 0.75) ---
+    retracement_ok = recovery_ratio <= 0.75
+    if recovery_ratio <= 0.72:
+        score += 10
+    elif recovery_ratio <= 0.75:
+        score += 5
+    else:
+        reasons.append("retracement_too_deep")
 
-    if recovery_ratio > 0.72:
-        return None
-
+    # --- Rejection confirmation: last 3–5 candles (relaxed from last 2) ---
     last1 = recent.iloc[-1]
     last2 = recent.iloc[-2]
-
-    rejection_confirmed = (
-        last1["close"] < last1["open"] and
-        last1["close"] < last2["close"] and
-        last1["close"] < bounce_high * 0.99 and
-        (
-            pd.notna(last1["vol_ma20"]) and
-            last1["volume"] >= last1["vol_ma20"] * 1.05
-        )
+    window = recent.iloc[-5:]
+    rejection_candle_count = sum(
+        1 for i in range(1, len(window))
+        if window.iloc[i]["close"] < window.iloc[i]["open"]
+        and window.iloc[i]["close"] < window.iloc[i - 1]["close"]
     )
+    rejection_primary = (
+        last1["close"] < last1["open"]
+        and last1["close"] < last2["close"]
+        and last1["close"] < bounce_high * 0.99
+    )
+    bounce_ok = rejection_primary or rejection_candle_count >= 2
+    if rejection_primary:
+        score += 25
+    elif rejection_candle_count >= 2:
+        score += 12
+    else:
+        reasons.append("no_rejection_confirmation")
 
-    if not rejection_confirmed:
-        return None
+    # --- Volume scoring (optional: adds score, not required) ---
+    vol_ok = (
+        pd.notna(last1.get("vol_ma20"))
+        and last1["volume"] >= last1["vol_ma20"] * 1.05
+    )
+    if vol_ok:
+        score += 15
+    else:
+        reasons.append("volume_weak")
 
-    resistance_distance_pct = abs(last1["close"] - fib_500) / fib_500 * 100
+    # --- EMA trend confirmation (optional bonus) ---
+    ema_ok = False
+    try:
+        closes = d["close"]
+        ema20_val = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50_val = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+        ema_ok = float(last1["close"]) < ema20_val and ema20_val < ema50_val
+        if ema_ok:
+            score += 10
+    except Exception:
+        pass
 
-    score = 0
-    score += min(40, impulse_pct * 2.5)
-    score += 25 if in_resistance_zone else 0
-    score += 15 if 0.45 <= recovery_ratio <= 0.65 else 5
-    score += 20 if rejection_confirmed else 0
     score = round(min(score, 100), 1)
 
+    if score >= 70:
+        signal = "VALID"
+    elif score >= 55:
+        signal = "WATCHLIST"
+    else:
+        signal = "NONE"
+        if not reasons:
+            reasons.append("score_too_low")
+
+    resistance_distance_pct = abs(float(last1["close"]) - float(fib_500)) / float(fib_500) * 100
+
     return {
+        "signal": signal,
+        "score": score,
+        "reasons": reasons,
+        "metrics": {
+            "impulse_ok": impulse_ok,
+            "fib_ok": fib_ok,
+            "bounce_ok": bounce_ok,
+            "volume_ok": vol_ok,
+            "ema_ok": ema_ok,
+        },
+        # Flat keys preserved for backward-compatible access (follow-up code)
         "swing_high": round(float(swing_high), 6),
         "swing_low": round(float(swing_low), 6),
         "impulse_pct": round(float(impulse_pct), 2),
@@ -5961,8 +6149,7 @@ def detect_dead_cat_bounce_pattern(df):
         "fib_618": round(float(fib_618), 6),
         "last_close": round(float(last1["close"]), 6),
         "resistance_distance_pct": round(float(resistance_distance_pct), 2),
-        "score": score,
-        "pattern": "DROP -> FIB RESISTANCE -> REJECTION"
+        "pattern": "DROP -> FIB RESISTANCE -> REJECTION",
     }
 
 
@@ -6168,10 +6355,13 @@ def scan_top_gainers_and_alert():
                     log(f"[SPOT SCAN] {symbol}: kline verisi alınamadı, atlanıyor")
                     continue
                 pattern = detect_support_bounce_pattern(df)
-                if pattern:
-                    log(f"[SPOT SCAN] ✅ {symbol} (%{change_24h}) — Pattern bulundu! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Retracement={pattern['retracement_ratio']}")
+                sig = pattern.get("signal", "NONE") if pattern else "NONE"
+                if sig in ("VALID", "WATCHLIST"):
+                    sig_emoji = "✅" if sig == "VALID" else "👁"
+                    msg_prefix = "🟢 LONG SİNYALİ" if sig == "VALID" else "🟡 WATCHLIST (LONG)"
+                    log(f"[SPOT SCAN] {sig_emoji} {symbol} (%{change_24h}) — {sig}! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Retracement={pattern['retracement_ratio']}")
                     msg = (
-                        f"🟢 LONG SİNYALİ — {symbol}\n"
+                        f"{msg_prefix} — {symbol}\n"
                         f"📈 24s Değişim: %{change_24h}\n"
                         f"📐 Pattern: {pattern['pattern']}\n"
                         f"🔺 Swing High: {pattern['swing_high']}\n"
@@ -6195,6 +6385,17 @@ def scan_top_gainers_and_alert():
                     }
                     log(f"[SPOT SCAN] {symbol} takibe alındı ({SPOT_FOLLOWUP_CHECKS} kontrol)")
                 else:
+                    if pattern:
+                        m = pattern.get("metrics", {})
+                        log(
+                            f"[SCAN DEBUG] {symbol}\n"
+                            f"score={pattern['score']}\n"
+                            f"impulse_ok={m.get('impulse_ok')}\n"
+                            f"fib_ok={m.get('fib_ok')}\n"
+                            f"bounce_ok={m.get('bounce_ok')}\n"
+                            f"volume_ok={m.get('volume_ok')}\n"
+                            f"reasons={','.join(pattern.get('reasons', []))}"
+                        )
                     log(f"[SPOT SCAN] ⬜ {symbol} (%{change_24h}) — Pattern yok")
             except Exception as e:
                 log(f"[SPOT SCAN ERR] {symbol}: {e}")
@@ -6228,10 +6429,13 @@ def scan_top_gainers_and_alert():
                     log(f"[SPOT SCAN LOSER] {symbol}: kline verisi alınamadı, atlanıyor")
                     continue
                 pattern = detect_dead_cat_bounce_pattern(df)
-                if pattern:
-                    log(f"[SPOT SCAN LOSER] ✅ {symbol} (%{change_24h}) — SHORT Pattern! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Recovery={pattern['recovery_ratio']}")
+                sig = pattern.get("signal", "NONE") if pattern else "NONE"
+                if sig in ("VALID", "WATCHLIST"):
+                    sig_emoji = "✅" if sig == "VALID" else "👁"
+                    msg_prefix = "🔴 SHORT SİNYALİ" if sig == "VALID" else "🟡 WATCHLIST (SHORT)"
+                    log(f"[SPOT SCAN LOSER] {sig_emoji} {symbol} (%{change_24h}) — {sig}! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Recovery={pattern['recovery_ratio']}")
                     msg = (
-                        f"🔴 SHORT SİNYALİ — {symbol}\n"
+                        f"{msg_prefix} — {symbol}\n"
                         f"📉 24s Değişim: %{change_24h}\n"
                         f"📐 Pattern: {pattern['pattern']}\n"
                         f"🔺 Swing High: {pattern['swing_high']}\n"
@@ -6254,6 +6458,17 @@ def scan_top_gainers_and_alert():
                     }
                     log(f"[SPOT SCAN LOSER] {symbol} takibe alındı ({SPOT_FOLLOWUP_CHECKS} kontrol)")
                 else:
+                    if pattern:
+                        m = pattern.get("metrics", {})
+                        log(
+                            f"[SCAN DEBUG] {symbol}\n"
+                            f"score={pattern['score']}\n"
+                            f"impulse_ok={m.get('impulse_ok')}\n"
+                            f"fib_ok={m.get('fib_ok')}\n"
+                            f"bounce_ok={m.get('bounce_ok')}\n"
+                            f"volume_ok={m.get('volume_ok')}\n"
+                            f"reasons={','.join(pattern.get('reasons', []))}"
+                        )
                     log(f"[SPOT SCAN LOSER] ⬜ {symbol} (%{change_24h}) — Pattern yok")
             except Exception as e:
                 log(f"[SPOT SCAN LOSER ERR] {symbol}: {e}")
