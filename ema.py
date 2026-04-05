@@ -4977,20 +4977,14 @@ def scan_top_gainers_and_alert():
     except Exception as e:
         log(f"[SPOT SCAN ERR] {e}")
 
-    # Send top 10 most declining coins summary
+    # Log top 10 most declining coins (no Telegram send)
     try:
         losers = get_top_losers_usdt(10)
-        loser_lines = "\n".join(
-            f"{i+1}. {row['symbol']} → %{round(float(row['priceChangePercent']), 2)}"
-            for i, (_, row) in enumerate(losers.iterrows())
-        )
         loser_list = ", ".join(
             f"{row['symbol']}(%{round(float(row['priceChangePercent']), 2)})"
             for _, row in losers.iterrows()
         )
         log(f"[SPOT SCAN] En çok düşen 10 coin: {loser_list}")
-        msg = f"🔴 EN ÇOK DÜŞEN 10 COİN (24s)\n━━━━━━━━━━━━━━━━\n{loser_lines}"
-        tg_send(msg)
     except Exception as e:
         log(f"[SPOT SCAN LOSERS ERR] {e}")
 
