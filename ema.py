@@ -5384,18 +5384,17 @@ def main():
             # 3.1) Check and log real closed trades (disabled)
             # check_and_log_real_closed_trades()
             
-            # 3.2) Update max profit tracking for open positions
-            avg_max_profit = update_max_profit_tracking()
-            # Use rounded comparison to avoid unnecessary saves due to floating point precision
-            if round(avg_max_profit, 2) != round(STATE.get("avg_max_profit", 0.0), 2):
-                STATE["avg_max_profit"] = avg_max_profit
-                safe_save(STATE_FILE, STATE)
+            # 3.2) Update max profit tracking for open positions (disabled - causes Binance 429/418 bans)
+            # avg_max_profit = update_max_profit_tracking()
+            # if round(avg_max_profit, 2) != round(STATE.get("avg_max_profit", 0.0), 2):
+            #     STATE["avg_max_profit"] = avg_max_profit
+            #     safe_save(STATE_FILE, STATE)
             
-            # 3.3) Check profit target (cash out feature)
-            check_profit_target()
+            # 3.3) Check profit target (cash out feature) (disabled - causes Binance 429/418 bans)
+            # check_profit_target()
             
-            # 3.4) Send hourly margin progress log
-            send_hourly_margin_log()
+            # 3.4) Send hourly margin progress log (disabled - causes Binance 429/418 bans)
+            # send_hourly_margin_log()
             
             # 3.5) Check and activate hourly analysis if 2 weeks have passed (disabled)
             # check_and_activate_hourly_analysis()
