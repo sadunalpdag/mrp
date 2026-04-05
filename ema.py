@@ -1199,6 +1199,7 @@ def detect_order_block(highs, lows, closes, opens, direction, lookback=20):
 
 
 def scan_symbol(sym,bar_i):
+    # All futures strategies have been removed (were all disabled). Returns empty.
     return []
 
 def run_parallel(symbols,bar_i):
