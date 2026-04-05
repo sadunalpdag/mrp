@@ -4835,12 +4835,182 @@ def detect_support_bounce_pattern(df):
     }
 
 
+def detect_dead_cat_bounce_pattern(df):
+    """
+    SHORT sinyali için ölü kedi sıçraması / ret paterni:
+    1) Belirgin aşağı dürtü (impulse) — en az %8 düşüş
+    2) Geri toplanma (bounce) Fib %38.2–%61.8 direnç bölgesine kadar
+    3) Direnç bölgesinde ret teyidi (bearish mum + hacim)
+    """
+    if len(df) < 80:
+        return None
+
+    d = df.copy().reset_index(drop=True)
+    d["vol_ma20"] = d["volume"].rolling(20).mean()
+
+    lookback = 60
+    recent = d.iloc[-lookback:].copy().reset_index(drop=True)
+
+    first_half = recent.iloc[:30]
+    if first_half.empty:
+        return None
+
+    # Düşüş: önce tepe, sonra dip
+    high_idx = first_half["high"].idxmax()
+    swing_high = recent.loc[high_idx, "high"]
+
+    after_high = recent.iloc[high_idx + 1:50]
+    if after_high.empty:
+        return None
+
+    low_idx = after_high["low"].idxmin()
+    swing_low = recent.loc[low_idx, "low"]
+
+    impulse_pct = (swing_high - swing_low) / swing_high * 100
+
+    if impulse_pct < 8:
+        return None
+
+    after_low = recent.iloc[low_idx + 1:]
+    if len(after_low) < 5:
+        return None
+
+    bounce_high = after_low["high"].max()
+
+    fib_382 = swing_low + 0.382 * (swing_high - swing_low)
+    fib_500 = swing_low + 0.500 * (swing_high - swing_low)
+    fib_618 = swing_low + 0.618 * (swing_high - swing_low)
+
+    recovery_ratio = (bounce_high - swing_low) / (swing_high - swing_low)
+
+    in_resistance_zone = fib_382 <= bounce_high <= fib_618
+
+    if not in_resistance_zone:
+        return None
+
+    if recovery_ratio > 0.72:
+        return None
+
+    last1 = recent.iloc[-1]
+    last2 = recent.iloc[-2]
+
+    rejection_confirmed = (
+        last1["close"] < last1["open"] and
+        last1["close"] < last2["close"] and
+        last1["close"] < bounce_high * 0.99 and
+        (
+            pd.notna(last1["vol_ma20"]) and
+            last1["volume"] >= last1["vol_ma20"] * 1.05
+        )
+    )
+
+    if not rejection_confirmed:
+        return None
+
+    resistance_distance_pct = abs(last1["close"] - fib_500) / fib_500 * 100
+
+    score = 0
+    score += min(40, impulse_pct * 2.5)
+    score += 25 if in_resistance_zone else 0
+    score += 15 if 0.45 <= recovery_ratio <= 0.65 else 5
+    score += 20 if rejection_confirmed else 0
+    score = round(min(score, 100), 1)
+
+    return {
+        "swing_high": round(float(swing_high), 6),
+        "swing_low": round(float(swing_low), 6),
+        "impulse_pct": round(float(impulse_pct), 2),
+        "bounce_high": round(float(bounce_high), 6),
+        "recovery_ratio": round(float(recovery_ratio), 3),
+        "fib_382": round(float(fib_382), 6),
+        "fib_500": round(float(fib_500), 6),
+        "fib_618": round(float(fib_618), 6),
+        "last_close": round(float(last1["close"]), 6),
+        "resistance_distance_pct": round(float(resistance_distance_pct), 2),
+        "score": score,
+        "pattern": "DROP -> FIB RESISTANCE -> REJECTION"
+    }
+
+
+def check_spot_loser_followups():
+    """
+    For each loser coin previously detected with a dead-cat-bounce pattern,
+    fetch the latest 15m candles and report whether the short setup is intact.
+    Removes coins after SPOT_FOLLOWUP_CHECKS follow-up cycles.
+    """
+    global SPOT_LOSER_FOLLOWUP
+    if not SPOT_LOSER_FOLLOWUP:
+        return
+
+    finished = []
+    for symbol, info in list(SPOT_LOSER_FOLLOWUP.items()):
+        try:
+            df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+            if df is None or len(df) < 5:
+                log(f"[SPOT LOSER FOLLOWUP] {symbol}: veri alınamadı, atlanıyor")
+                continue
+
+            last_close = float(df.iloc[-1]["close"])
+            orig = info["pattern"]
+            fib_382 = orig["fib_382"]
+            fib_500 = orig["fib_500"]
+            fib_618 = orig["fib_618"]
+            swing_low = orig["swing_low"]
+            bounce_high = orig["bounce_high"]
+            check_no = SPOT_FOLLOWUP_CHECKS - info["remaining"] + 1
+
+            if last_close <= swing_low:
+                status = "🔻 Swing Low kırıldı! Güçlü düşüş devam ediyor."
+                emoji = "🔴"
+            elif last_close <= fib_382:
+                status = "✅ Fib 38.2 altında — kısa yapı koruyor."
+                emoji = "🔴"
+            elif last_close <= fib_500:
+                status = "🟡 Fib 38.2 üzerine çıktı, 50.0 altında — dikkatli takip."
+                emoji = "🟡"
+            elif last_close <= fib_618:
+                status = "🟠 Fib 50.0 üzerine çıktı, 61.8 altında — zayıflama var."
+                emoji = "🟠"
+            elif last_close <= bounce_high:
+                status = "🔴 Fib 61.8 üzerinde — direnç bölgesine yakın, dikkat!"
+                emoji = "🔴"
+            else:
+                status = "⛔ Bounce tepe kırıldı — pattern geçersiz, setup çöktü."
+                emoji = "⛔"
+
+            change_24h = info.get("change_24h", 0)
+            msg = (
+                f"{emoji} SHORT TAKİP #{check_no}/{SPOT_FOLLOWUP_CHECKS} — {symbol}\n"
+                f"📉 24s Değişim: %{change_24h}\n"
+                f"💰 Güncel Kapanış: {last_close}\n"
+                f"📐 Durum: {status}\n"
+                f"Fib 38.2: {fib_382} | 50.0: {fib_500} | 61.8: {fib_618}\n"
+                f"🔻 Swing Low: {swing_low} | 🎯 Bounce Tepe: {bounce_high}"
+            )
+            tg_send(msg)
+            log(f"[SPOT LOSER FOLLOWUP] {symbol} check#{check_no}: last_close={last_close} — {status}")
+
+            info["remaining"] -= 1
+            if info["remaining"] <= 0:
+                finished.append(symbol)
+
+        except Exception as e:
+            log(f"[SPOT LOSER FOLLOWUP ERR] {symbol}: {e}")
+
+    for sym in finished:
+        del SPOT_LOSER_FOLLOWUP[sym]
+        log(f"[SPOT LOSER FOLLOWUP] {sym} takipten çıkarıldı ({SPOT_FOLLOWUP_CHECKS} kontrol tamamlandı)")
+
+
 SPOT_SCANNER_LAST_RUN = 0  # Track last scan timestamp
 
 # Follow-up tracking for coins where a pattern was detected.
 # Structure: { symbol: {"detected_ts": float, "remaining": int, "pattern": dict, "change_24h": float} }
 SPOT_PATTERN_FOLLOWUP: Dict[str, dict] = {}
 SPOT_FOLLOWUP_CHECKS = 2  # Number of 15-minute closes to monitor after detection
+
+# Follow-up tracking for loser coins (dead-cat bounce / SHORT pattern).
+SPOT_LOSER_FOLLOWUP: Dict[str, dict] = {}
 
 
 def check_spot_pattern_followups():
@@ -4918,6 +5088,8 @@ def scan_top_gainers_and_alert():
     """
     Scan top USDT gainers for the support-bounce pattern and send
     a Telegram LONG alert for each coin where the pattern is confirmed.
+    Also scans top 10 losers for the dead-cat-bounce (rejection) pattern
+    and sends Telegram SHORT alerts.
     Runs at most once every 15 minutes.
     """
     global SPOT_SCANNER_LAST_RUN
@@ -4928,6 +5100,7 @@ def scan_top_gainers_and_alert():
 
     # Check follow-ups first so we process the previous scan's tracked coins
     check_spot_pattern_followups()
+    check_spot_loser_followups()
 
     try:
         top = get_top_gainers_usdt(SPOT_TOP_N)
@@ -4977,7 +5150,7 @@ def scan_top_gainers_and_alert():
     except Exception as e:
         log(f"[SPOT SCAN ERR] {e}")
 
-    # Log top 10 most declining coins (no Telegram send)
+    # Scan top 10 most declining coins for dead-cat-bounce / rejection SHORT pattern
     try:
         losers = get_top_losers_usdt(10)
         loser_list = ", ".join(
@@ -4985,6 +5158,43 @@ def scan_top_gainers_and_alert():
             for _, row in losers.iterrows()
         )
         log(f"[SPOT SCAN] En çok düşen 10 coin: {loser_list}")
+
+        for _, row in losers.iterrows():
+            symbol = row["symbol"]
+            change_24h = round(float(row["priceChangePercent"]), 2)
+            try:
+                df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+                pattern = detect_dead_cat_bounce_pattern(df)
+                if pattern:
+                    log(f"[SPOT SCAN LOSER] ✅ {symbol} (%{change_24h}) — SHORT Pattern! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Recovery={pattern['recovery_ratio']}")
+                    msg = (
+                        f"🔴 SHORT SİNYALİ — {symbol}\n"
+                        f"📉 24s Değişim: %{change_24h}\n"
+                        f"📐 Pattern: {pattern['pattern']}\n"
+                        f"🔺 Swing High: {pattern['swing_high']}\n"
+                        f"🔻 Swing Low: {pattern['swing_low']}\n"
+                        f"📊 Düşüş: %{pattern['impulse_pct']}\n"
+                        f"🎯 Bounce Tepe: {pattern['bounce_high']}\n"
+                        f"📈 Toparlanma: {pattern['recovery_ratio']}\n"
+                        f"Fib 38.2: {pattern['fib_382']} | 50.0: {pattern['fib_500']} | 61.8: {pattern['fib_618']}\n"
+                        f"💰 Son Kapanış: {pattern['last_close']}\n"
+                        f"⭐ Skor: {pattern['score']}/100"
+                    )
+                    tg_send(msg)
+                    log(f"[SPOT SCAN LOSER] SHORT alert sent for {symbol} (score={pattern['score']})")
+
+                    SPOT_LOSER_FOLLOWUP[symbol] = {
+                        "detected_ts": now,
+                        "remaining": SPOT_FOLLOWUP_CHECKS,
+                        "pattern": pattern,
+                        "change_24h": change_24h,
+                    }
+                    log(f"[SPOT SCAN LOSER] {symbol} takibe alındı ({SPOT_FOLLOWUP_CHECKS} kontrol)")
+                else:
+                    log(f"[SPOT SCAN LOSER] ⬜ {symbol} (%{change_24h}) — Pattern yok")
+            except Exception as e:
+                log(f"[SPOT SCAN LOSER ERR] {symbol}: {e}")
+
     except Exception as e:
         log(f"[SPOT SCAN LOSERS ERR] {e}")
 
