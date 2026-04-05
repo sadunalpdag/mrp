@@ -178,7 +178,7 @@ FOLLOWUP_MINUTES = 15          # minutes to wait before evaluating a signal
 FOLLOWUP_KLINE_INTERVAL = "1m" # kline interval used for follow-up analysis
 FOLLOWUP_KLINE_LIMIT = 30      # number of klines to fetch for analysis
 FOLLOWUP_RECENT_CANDLES = 3    # candles used for direction confirmation
-BINANCE_SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_SPOT_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 DEFAULT_LONG_SL_MULTIPLIER  = 0.97  # fallback SL distance for LONG when signal has no SL
 DEFAULT_SHORT_SL_MULTIPLIER = 1.03  # fallback SL distance for SHORT when signal has no SL
 
@@ -4677,7 +4677,7 @@ def parse_signal(signal_text: str) -> dict:
 # -----------------------------
 
 def get_top_gainers_usdt(top_n=SPOT_TOP_N):
-    url = f"{SPOT_BASE_URL}/api/v3/ticker/24hr"
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     data = requests.get(url, timeout=20).json()
 
     df = pd.DataFrame(data)
@@ -4697,7 +4697,7 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
 
 
 def get_top_losers_usdt(top_n=10):
-    url = f"{SPOT_BASE_URL}/api/v3/ticker/24hr"
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     data = requests.get(url, timeout=20).json()
 
     df = pd.DataFrame(data)
@@ -4717,7 +4717,7 @@ def get_top_losers_usdt(top_n=10):
 
 
 def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
-    url = f"{SPOT_BASE_URL}/api/v3/klines"
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     data = requests.get(url, params=params, timeout=20).json()
 
