@@ -833,8 +833,15 @@ def _classify_fib_signal(
             signal = "INVALID"
             reasons.append("Price below impulse low — structure invalid")
     else:
-        # Bearish: price should be recovering into Fibonacci zone after downward impulse
-        if fib_618 >= current_close >= fib_382 if fib_382 < fib_618 else fib_382 >= current_close >= fib_618:
+        # Bearish: price should be recovering into Fibonacci zone after downward impulse.
+        # For a DOWN impulse, fibonacci_levels() returns:
+        #   0.0  = swing_high (top of impulse, highest price)
+        #   1.0  = swing_low  (bottom of impulse, lowest price)
+        # so fib_382 > fib_618 in absolute terms.
+        fib_zone_low  = min(fib_382, fib_618)
+        fib_zone_high = max(fib_382, fib_618)
+        in_bearish_golden_zone = fib_zone_low <= current_close <= fib_zone_high
+        if in_bearish_golden_zone:
             confidence += 20
             reasons.append("Price in golden Fib zone (38.2–61.8%)")
         elif current_close < fib_top:
@@ -5403,8 +5410,12 @@ def _get_rest_mgr() -> "BinanceRESTManager":
 
 class SpotWebSocketManager:
     """
-    Subscribes to Binance futures 24-hr mini-ticker stream for all symbols
+    Subscribes to the Binance *futures* 24-hr mini-ticker stream for all symbols
     and populates SpotMarketCache with live ticker data.
+
+    Note: the scanner operates on USDT perpetual futures symbols (fstream.binance.com),
+    not the spot market — 'Spot' in the class name refers to the scanner's role of
+    providing real-time price snapshots, not the market type.
 
     This eliminates the need for repeated REST ticker calls.
     The all-market mini-ticker stream is a single connection that updates
