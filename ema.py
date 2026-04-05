@@ -2900,8 +2900,7 @@ def send_hourly_margin_log():
                 if stats:
                     msg += stats
         
-        tg_send(msg)
-        log(f"[HOURLY MARGIN LOG] Sent. Profit: ${current_profit:.2f}, Remaining: ${remaining:.2f}, Est: {estimated_hours:.1f}h" if estimated_hours else f"[HOURLY MARGIN LOG] Sent. Profit: ${current_profit:.2f}, Remaining: ${remaining:.2f}")
+        log(f"[HOURLY MARGIN LOG] Profit: ${current_profit:.2f}, Remaining: ${remaining:.2f}, Est: {estimated_hours:.1f}h" if estimated_hours else f"[HOURLY MARGIN LOG] Profit: ${current_profit:.2f}, Remaining: ${remaining:.2f}")
         
     except Exception as e:
         log(f"[HOURLY MARGIN LOG ERR] {e}")
@@ -2922,15 +2921,15 @@ def heartbeat_and_status_check(_snapshot):
         hb = (f"✅ HEARTBEAT drift={int(drift)}ms ping={ping_ok} key={key_ok}"
               if ping_ok and key_ok and drift<1500 else
               f"⚠️ HEARTBEAT ping={ping_ok} key={key_ok} drift={int(drift)}")
-        tg_send(hb); log(hb)
+        log(hb)
     except Exception as e:
-        tg_send(f"❌ HEARTBEAT {e}"); log(f"[HBERR]{e}")
+        log(f"[HBERR]{e}")
 
     msg=(f"📊 STATUS bar:{STATE.get('bar_index',0)} "
          f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
          f"long_blocked:{STATE.get('long_blocked')} short_blocked:{STATE.get('short_blocked')}\n"
          f"cest_long_blocked:{STATE.get('cest_long_blocked')} cest_short_blocked:{STATE.get('cest_short_blocked')}")
-    tg_send(msg); log(msg)
+    log(msg)
 
 def ai_log_signal(sig):
     AI_SIGNALS.append({
@@ -2983,7 +2982,7 @@ def auto_report_if_due():
                 archive_path=f"{base}_archive_{ts}{ext}"
                 os.rename(fpath, archive_path)
                 log(f"[AUTO REPORT] {os.path.basename(fpath)} exceeded 10MB — archived as {os.path.basename(archive_path)}")
-                tg_send_file(archive_path, f"📦 Archive {os.path.basename(archive_path)}")
+                # tg_send_file(archive_path, f"📦 Archive {os.path.basename(archive_path)}")
                 # Reset the corresponding in-memory list so the new file starts fresh
                 if fpath==AI_SIGNALS_FILE: AI_SIGNALS=[]
                 elif fpath==AI_ANALYSIS_FILE: AI_ANALYSIS=[]
@@ -2991,7 +2990,7 @@ def auto_report_if_due():
                 elif fpath==REAL_CLOSED_FILE: REAL_CLOSED=[]
                 continue  # Skip sending backup of the (now-archived) file
         except Exception as e: log(f"[AUTO REPORT ARCHIVE ERR] {fpath}: {e}")
-        tg_send_file(fpath, f"📊 AutoBackup {os.path.basename(fpath)}")
+        # tg_send_file(fpath, f"📊 AutoBackup {os.path.basename(fpath)}")
     tg_send("🕐 4 saatlik yedek gönderildi.")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
 
@@ -4697,6 +4696,26 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
     return df[["symbol", "priceChangePercent", "quoteVolume"]].reset_index(drop=True)
 
 
+def get_top_losers_usdt(top_n=10):
+    url = f"{SPOT_BASE_URL}/api/v3/ticker/24hr"
+    data = requests.get(url, timeout=20).json()
+
+    df = pd.DataFrame(data)
+    df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
+    df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
+
+    df = df[df["symbol"].str.endswith("USDT", na=False)]
+
+    exclude_words = ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]
+    for word in exclude_words:
+        df = df[~df["symbol"].str.contains(word, na=False)]
+
+    df = df[df["quoteVolume"] > 1_000_000]
+
+    df = df.sort_values("priceChangePercent", ascending=True).head(top_n)
+    return df[["symbol", "priceChangePercent", "quoteVolume"]].reset_index(drop=True)
+
+
 def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
     url = f"{SPOT_BASE_URL}/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -4957,6 +4976,23 @@ def scan_top_gainers_and_alert():
 
     except Exception as e:
         log(f"[SPOT SCAN ERR] {e}")
+
+    # Send top 10 most declining coins summary
+    try:
+        losers = get_top_losers_usdt(10)
+        loser_lines = "\n".join(
+            f"{i+1}. {row['symbol']} → %{round(float(row['priceChangePercent']), 2)}"
+            for i, (_, row) in enumerate(losers.iterrows())
+        )
+        loser_list = ", ".join(
+            f"{row['symbol']}(%{round(float(row['priceChangePercent']), 2)})"
+            for _, row in losers.iterrows()
+        )
+        log(f"[SPOT SCAN] En çok düşen 10 coin: {loser_list}")
+        msg = f"🔴 EN ÇOK DÜŞEN 10 COİN (24s)\n━━━━━━━━━━━━━━━━\n{loser_lines}"
+        tg_send(msg)
+    except Exception as e:
+        log(f"[SPOT SCAN LOSERS ERR] {e}")
 
 
 def main():
