@@ -4691,6 +4691,9 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
     for word in exclude_words:
         df = df[~df["symbol"].str.contains(word, na=False)]
 
+    if VALID_FUTURES_SYMBOLS:
+        df = df[df["symbol"].isin(VALID_FUTURES_SYMBOLS)]
+
     df = df[df["quoteVolume"] > 1_000_000]
 
     df = df.sort_values("priceChangePercent", ascending=False).head(top_n)
@@ -4710,6 +4713,9 @@ def get_top_losers_usdt(top_n=10):
     exclude_words = ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]
     for word in exclude_words:
         df = df[~df["symbol"].str.contains(word, na=False)]
+
+    if VALID_FUTURES_SYMBOLS:
+        df = df[df["symbol"].isin(VALID_FUTURES_SYMBOLS)]
 
     df = df[df["quoteVolume"] > 1_000_000]
 
@@ -5212,6 +5218,9 @@ def main():
     log("[START] EMA ULTRA v15.10.0 - On-chain strategy: Top 25 volume")
 
     symbols=auto_init_symbols()
+    
+    # Populate validated futures symbols set for scanner filtering
+    VALID_FUTURES_SYMBOLS.update(symbols)
     
     # Initialize top volume list
     update_top_volume_symbols(symbols)
