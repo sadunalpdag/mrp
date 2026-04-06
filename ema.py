@@ -95,12 +95,18 @@ ORDER_REOPEN_SETTLEMENT_SEC = 2  # Time to wait after reopening positions
 LIMIT_ORDER_BUFFER_PCT = 0.0015  # 0.15% price buffer to limit slippage while ensuring execution
 MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
 
-# ===================== ENTRY ENGINE =====================
-# Embedded from entry_engine.py
+# ==============================================================================
+# ENTRY ENGINE
+# Professional-grade breakout entry engine (formerly entry_engine.py).
+#
+# Called AFTER a breakout has been confirmed. Responsible only for determining
+# the safest, highest-probability entry point. Does NOT open trades directly.
+#
+# Public API:  evaluate_breakout_entry(klines, direction, breakout_level, ...)
+# ==============================================================================
 
 # ---------------------------------------------------------------------------
-# Inline helpers so this module has zero runtime dependencies on ema.py.
-# These are intentionally self-contained.
+# Inline helpers – self-contained, no external dependencies.
 # ---------------------------------------------------------------------------
 
 def _atr(highs: list, lows: list, closes: list, period: int = 14) -> list:
@@ -150,7 +156,7 @@ def _fibonacci_retracement(swing_low: float, swing_high: float) -> dict:
 
 DEFAULT_OVEREXTENDED_ATR_MULT    = 2.0   # max ATR distance from breakout level
 DEFAULT_OVEREXTENDED_PCT         = 0.03  # max % distance from breakout level (3 %)
-DEFAULT_RETEST_TOLERANCE_PCT     = 0.003 # 0.3 % — how close to level counts as retest
+DEFAULT_RETEST_TOLERANCE_PCT     = 0.017 # 1.7 % — how close to level counts as retest
 DEFAULT_RETEST_LOOKBACK          = 8     # candles to look back for retest
 DEFAULT_MIN_BODY_RATIO           = 0.40  # candle body / total range
 DEFAULT_MAX_WICK_BODY_RATIO      = 2.0   # (upper+lower wick) / body
@@ -201,16 +207,20 @@ def detect_retest(
     window = min(lookback, n)
 
     if direction == "LONG":
-        # Retest: low must reach AT or BELOW the broken level (wicked into support),
-        # and close must hold AT or ABOVE the level (support held).
+        # Retest: low must reach AT or BELOW the broken level (within tolerance),
+        # and close must hold AT or ABOVE the level (support held, within tolerance).
+        upper_touch = level * (1 + tolerance_pct)
+        lower_close = level * (1 - tolerance_pct)
         for i in range(n - 1, n - window - 1, -1):
-            if lows[i] <= level and closes[i] >= level:
+            if lows[i] <= upper_touch and closes[i] >= lower_close:
                 return True, i - n, lows[i]
     else:  # SHORT
-        # Retest: high must reach AT or ABOVE the broken level (wicked into resistance),
-        # and close must hold AT or BELOW the level (resistance held).
+        # Retest: high must reach AT or ABOVE the broken level (within tolerance),
+        # and close must hold AT or BELOW the level (resistance held, within tolerance).
+        lower_touch = level * (1 - tolerance_pct)
+        upper_close = level * (1 + tolerance_pct)
         for i in range(n - 1, n - window - 1, -1):
-            if highs[i] >= level and closes[i] <= level:
+            if highs[i] >= lower_touch and closes[i] <= upper_close:
                 return True, i - n, highs[i]
 
     return False, None, None
@@ -7576,6 +7586,10 @@ def update_symbol_setup_state(symbol: str, df) -> str:
             return new_s
 
         if detect_confirmed_breakout(df, bias, ref, SETUP_CONFIRM_CANDLES):
+            if is_overextended_breakout(df, bias, ref):
+                _setup_transition(symbol, "OVEREXTENDED_NO_ENTRY")
+                _apply_lock_after_setup(symbol, "OVEREXTENDED")
+                return "OVEREXTENDED_NO_ENTRY"
             new_s = "CONFIRMED_LONG" if bias == "LONG" else "CONFIRMED_SHORT"
             _setup_transition(symbol, new_s, {"confirmed": True, "entry_allowed": True})
             return new_s
@@ -7592,6 +7606,10 @@ def update_symbol_setup_state(symbol: str, df) -> str:
     elif state == "RETEST_PENDING":
 
         if detect_retest_acceptance(df, bias, ref, inv):
+            if is_overextended_breakout(df, bias, ref):
+                _setup_transition(symbol, "OVEREXTENDED_NO_ENTRY")
+                _apply_lock_after_setup(symbol, "OVEREXTENDED")
+                return "OVEREXTENDED_NO_ENTRY"
             new_s = "CONFIRMED_LONG" if bias == "LONG" else "CONFIRMED_SHORT"
             _setup_transition(symbol, new_s, {"confirmed": True, "entry_allowed": True,
                                                "retest_confirmed": True})
@@ -8055,7 +8073,7 @@ def process_active_setups():
                     power    = float(entry_decision.get("confidence", pattern.get("score", 70)))
                     entry_type_tag = entry_decision.get("entry_type") or "BREAKOUT_SETUP"
                 else:
-                    # entry_engine unavailable: fall back to original levels
+                    # evaluate_breakout_entry raised an exception: fall back to raw levels
                     entry    = ref
                     sl       = inv
                     tp_price = tp_zone[0] if tp_zone else 0.0
