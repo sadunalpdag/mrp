@@ -128,17 +128,18 @@ def detect_retest(
         return False, None, None
 
     window = min(lookback, n)
-    tol = level * tolerance_pct
 
     if direction == "LONG":
-        # Retest: low of candle came back to within tolerance of level from above
-        for i in range(n - window, n):
-            if lows[i] <= level + tol and closes[i] >= level - tol:
+        # Retest: low must reach AT or BELOW the broken level (wicked into support),
+        # and close must hold AT or ABOVE the level (support held).
+        for i in range(n - 1, n - window - 1, -1):
+            if lows[i] <= level and closes[i] >= level:
                 return True, i - n, lows[i]
     else:  # SHORT
-        # Retest: high of candle came back to within tolerance of level from below
-        for i in range(n - window, n):
-            if highs[i] >= level - tol and closes[i] <= level + tol:
+        # Retest: high must reach AT or ABOVE the broken level (wicked into resistance),
+        # and close must hold AT or BELOW the level (resistance held).
+        for i in range(n - 1, n - window - 1, -1):
+            if highs[i] >= level and closes[i] <= level:
                 return True, i - n, highs[i]
 
     return False, None, None
@@ -305,13 +306,13 @@ def calculate_entry_zone(
         # Primary: just above/at the broken swing low (support retested as resistance)
         primary_low  = breakout_level * 0.999
         primary_high = breakout_level * 1.001
-        # Secondary: 38.2 %–50 % bounce (price bouncing back up into former support)
-        # For SHORT, the impulse went DOWN, so retracement goes UP.
-        # fib["0.382"] and fib["0.500"] are measured from swing_high downward;
-        # for a bearish impulse swap the arguments so we get upward retracement levels.
-        fib_short = _fibonacci_retracement(swing_high, swing_low)  # inverted
-        secondary_low  = fib_short["0.382"]
-        secondary_high = fib_short["0.500"]
+        # Secondary: 38.2 %–50 % bounce from the swing_low toward swing_high.
+        # For a bearish impulse (swing_high → swing_low), a retracement goes UP:
+        #   38.2% bounce = swing_low + 0.382 * (swing_high - swing_low)
+        #   50.0% bounce = swing_low + 0.500 * (swing_high - swing_low)
+        diff = swing_high - swing_low
+        secondary_low  = swing_low + 0.382 * diff
+        secondary_high = swing_low + 0.500 * diff
         entry_zone_low  = min(primary_low, secondary_low)
         entry_zone_high = max(primary_high, secondary_high)
 
@@ -357,12 +358,12 @@ def calculate_stop_loss(
 
     if direction == "LONG":
         if retest_low is not None:
-            sl = min(retest_low, breakout_level) - buffer
+            sl = retest_low - buffer
         else:
             sl = breakout_level - buffer
     else:
         if retest_high is not None:
-            sl = max(retest_high, breakout_level) + buffer
+            sl = retest_high + buffer
         else:
             sl = breakout_level + buffer
 
@@ -507,10 +508,10 @@ def _detect_fake_breakout(
     candles, indicating the breakout had no follow-through.
     """
     n = len(closes)
-    if n < lookback + 2:
+    if n < lookback + 1:
         return False
 
-    window = closes[-(lookback + 2):]
+    window = closes[-lookback:]
 
     # Find first candle that closed beyond the level
     broke_idx = None
@@ -806,11 +807,9 @@ def evaluate_breakout_entry(
     )
 
     # ── Best entry price ──────────────────────────────────────────────
-    if direction == "LONG":
-        best_entry = min(breakout_level * 1.0005, entry_zone_high)
-    else:
-        best_entry = max(breakout_level * 0.9995, entry_zone_low)
-    best_entry = round(best_entry, 6)
+    # For LONG: enter as close to the breakout level as possible (cheapest price).
+    # For SHORT: enter as close to the breakout level as possible (highest price).
+    best_entry = round(breakout_level, 6)
 
     # ── Take profit ───────────────────────────────────────────────────
     tp1, tp2, rr = calculate_take_profit(
