@@ -10,6 +10,7 @@ from typing import Dict, Optional, List
 from dateutil import parser as _dtparser
 import numpy as np
 import pandas as pd
+import entry_engine
 
 # ==============================================================================
 # 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
@@ -6809,23 +6810,87 @@ def process_active_setups():
                 pattern  = setup.get("pattern", {})
                 bias     = setup.get("bias", "")
                 direction = "UP" if bias == "LONG" else "DOWN"
-                entry    = float(setup.get("reference_level", 0))
+                ref      = float(setup.get("reference_level", 0))
                 tp_zone  = setup.get("tp_zone")
-                tp_price = tp_zone[0] if tp_zone else 0.0
                 inv      = float(setup.get("invalidation_level", 0))
+
+                # ── Entry Engine: determine safest entry after confirmed breakout ──
+                entry_decision = None
+                try:
+                    klines_list = (
+                        df[["open_time", "open", "high", "low", "close", "volume"]]
+                        .values.tolist()
+                    )
+                    vol_spike, _ = detect_volume_spike(
+                        [[k[0], k[1], k[2], k[3], k[4], k[5]] for k in klines_list]
+                    )
+                    entry_decision = entry_engine.evaluate_breakout_entry(
+                        klines_list,
+                        direction    = bias,
+                        breakout_level = ref,
+                        swing_low    = float(setup.get("swing_low", 0)) or None,
+                        swing_high   = float(setup.get("swing_high", 0)) or None,
+                        volume_spike = vol_spike,
+                    )
+                    log(f"[ENTRY ENGINE] {symbol} {bias}: "
+                        f"signal={entry_decision['signal']} "
+                        f"type={entry_decision['entry_type']} "
+                        f"confidence={entry_decision['confidence']} "
+                        f"reason={entry_decision['reason']}")
+                except Exception as _ee_err:
+                    log(f"[ENTRY ENGINE ERR] {symbol}: {_ee_err}")
+                    log(f"[ENTRY ENGINE TRACE] {traceback.format_exc()}")
+
+                # ── Gate on entry engine result ────────────────────────────
+                if entry_decision is not None:
+                    ee_signal = entry_decision.get("signal", "")
+
+                    if ee_signal == "FAKE_BREAKOUT":
+                        new_s = "FAKE_BREAKOUT_LONG" if bias == "LONG" else "FAKE_BREAKOUT_SHORT"
+                        _setup_transition(symbol, new_s)
+                        _apply_lock_after_setup(symbol, "FAKE_BREAKOUT")
+                        log(f"[ENTRY ENGINE] {symbol}: fake breakout detected, skipping trade")
+                        continue
+
+                    if ee_signal == "OVEREXTENDED_NO_ENTRY":
+                        _setup_transition(symbol, "OVEREXTENDED_NO_ENTRY")
+                        _apply_lock_after_setup(symbol, "OVEREXTENDED")
+                        log(f"[ENTRY ENGINE] {symbol}: overextended, skipping trade")
+                        continue
+
+                    if ee_signal not in ("ENTRY_READY",):
+                        # WAIT_FOR_RETEST or NO_ENTRY: skip this cycle, try again next loop
+                        log(f"[ENTRY ENGINE] {symbol}: {ee_signal} — waiting for better entry")
+                        continue
+
+                    # ENTRY_READY: use engine-calculated levels
+                    entry    = entry_decision.get("best_entry") or ref
+                    sl       = entry_decision.get("stop_loss") or inv
+                    ee_tp    = entry_decision.get("take_profit") or []
+                    tp_price = ee_tp[0] if ee_tp else (tp_zone[0] if tp_zone else 0.0)
+                    power    = float(entry_decision.get("confidence", pattern.get("score", 70)))
+                    entry_type_tag = entry_decision.get("entry_type") or "BREAKOUT_SETUP"
+                else:
+                    # entry_engine unavailable: fall back to original levels
+                    entry    = ref
+                    sl       = inv
+                    tp_price = tp_zone[0] if tp_zone else 0.0
+                    power    = float(pattern.get("score", 70))
+                    entry_type_tag = "BREAKOUT_SETUP"
 
                 sig = {
                     "symbol":       symbol,
                     "dir":          direction,
-                    "power":        float(pattern.get("score", 70)),
+                    "power":        power,
                     "kind":         "BREAKOUT_SETUP",
-                    "tag":          f"🎯 BREAKOUT_SETUP {bias}",
+                    "tag":          f"🎯 {entry_type_tag} {bias}",
                     "entry":        entry,
                     "tp":           tp_price,
-                    "sl":           inv,
+                    "sl":           sl,
                     "market_state": pattern.get("pattern", ""),
                     "conditions":   {"confirmed": True,
-                                     "retest": setup.get("retest_confirmed", False)},
+                                     "retest": setup.get("retest_confirmed", False),
+                                     "entry_type": entry_type_tag},
                 }
 
                 opened = execute_real_trade(sig)
