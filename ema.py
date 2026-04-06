@@ -6282,6 +6282,21 @@ SETUP_CONFIRM_CANDLES    = 2    # Number of closed 15m candles needed above/belo
 SETUP_OVEREXTEND_PCT     = 0.04 # 4 %: if price moved this far beyond reference, it is overextended
 SETUP_FAKE_BODY_RATIO    = 0.30 # candle body / total range ratio below this → weak (fake breakout risk)
 SETUP_MAX_TRACKING_HOURS = 4    # After this many hours without resolution, mark FAILED and lock
+SETUP_INVALIDATION_BUFFER_PCT = 0.003  # 0.3 % buffer applied to invalidation levels
+SETUP_CLEANUP_MINUTES    = 60   # Minutes after terminal state before removing setup from ACTIVE_SETUPS
+
+
+# ── Shared elapsed-time helper ────────────────────────────────────────────────
+
+def _elapsed_minutes_since(dt_str: str) -> float:
+    """Return minutes elapsed since *dt_str* (ISO-8601).  Returns 9999 on error."""
+    try:
+        dt = datetime.fromisoformat(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+    except Exception:
+        return 9999.0
 
 
 # ── Helper: fetch 15-minute klines for a symbol ──────────────────────────────
@@ -6526,14 +6541,7 @@ def should_unlock_symbol(symbol: str, df) -> bool:
     }
 
     if state in finished_states:
-        last_update_str = setup.get("last_update", "")
-        try:
-            lu = datetime.fromisoformat(last_update_str)
-            elapsed_min = (datetime.now(timezone.utc) - lu.replace(tzinfo=timezone.utc)
-                           if lu.tzinfo is None else
-                           datetime.now(timezone.utc) - lu).total_seconds() / 60.0
-        except Exception:
-            elapsed_min = 9999.0
+        elapsed_min = _elapsed_minutes_since(setup.get("last_update", ""))
 
         if elapsed_min >= 30:
             if detect_new_structure_break(symbol, setup, df):
@@ -6663,14 +6671,7 @@ def update_symbol_setup_state(symbol: str, df) -> str:
         return new_s
 
     # ── Timed-out tracking ─────────────────────────────────────────────────────
-    created_str = setup.get("created_at", "")
-    try:
-        created = datetime.fromisoformat(created_str)
-        age_hours = (datetime.now(timezone.utc) - (
-            created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created
-        )).total_seconds() / 3600.0
-    except Exception:
-        age_hours = 0.0
+    age_hours = _elapsed_minutes_since(setup.get("created_at", "")) / 60.0
 
     if age_hours > SETUP_MAX_TRACKING_HOURS and state in (
             "TRACKING_LONG", "TRACKING_SHORT", "BREAKOUT_PENDING", "RETEST_PENDING"):
@@ -6840,14 +6841,8 @@ def process_active_setups():
                 "FAILED_LONG", "FAILED_SHORT", "OVEREXTENDED_NO_ENTRY", "NO_TRADE",
             }
             if state in cleanup_states:
-                try:
-                    lu = datetime.fromisoformat(setup.get("last_update", ""))
-                    age_min = (datetime.now(timezone.utc) - (
-                        lu.replace(tzinfo=timezone.utc) if lu.tzinfo is None else lu
-                    )).total_seconds() / 60.0
-                except Exception:
-                    age_min = 9999.0
-                if age_min > 60:
+                age_min = _elapsed_minutes_since(setup.get("last_update", ""))
+                if age_min > SETUP_CLEANUP_MINUTES:
                     to_remove.append(symbol)
 
         except Exception as e:
@@ -6879,7 +6874,7 @@ def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: flo
     bounce_high     = float(pattern.get("bounce_high", swing_high))
     reference_level = swing_high if bias == "LONG" else swing_low
     # Invalidation: below pullback_dip for LONG, above bounce_high for SHORT
-    invalidation    = (pullback_low * 0.997) if bias == "LONG" else (bounce_high * 1.003)
+    invalidation    = (pullback_low * (1 - SETUP_INVALIDATION_BUFFER_PCT)) if bias == "LONG" else (bounce_high * (1 + SETUP_INVALIDATION_BUFFER_PCT))
 
     tp_zone = None
     if bias == "LONG" and swing_high > 0 and swing_low > 0:
