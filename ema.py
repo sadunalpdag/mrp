@@ -3012,7 +3012,7 @@ def tier_from_power(p):
 # ===================== GUARDS / HEARTBEAT / REPORT =====================
 
 STATE_DEFAULT={
-    "bar_index":0, "last_report":0, "auto_trade_active":True,
+    "bar_index":0, "last_report":0, "auto_trade_active":False,
     "last_api_check":0, "long_blocked":False, "short_blocked":False,
     "cest_long_blocked":False, "cest_short_blocked":False,
     "bb_long_blocked":False, "bb_short_blocked":False,
