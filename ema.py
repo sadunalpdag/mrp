@@ -95,12 +95,18 @@ ORDER_REOPEN_SETTLEMENT_SEC = 2  # Time to wait after reopening positions
 LIMIT_ORDER_BUFFER_PCT = 0.0015  # 0.15% price buffer to limit slippage while ensuring execution
 MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
 
-# ===================== ENTRY ENGINE =====================
-# Embedded from entry_engine.py
+# ==============================================================================
+# ENTRY ENGINE
+# Professional-grade breakout entry engine (formerly entry_engine.py).
+#
+# Called AFTER a breakout has been confirmed. Responsible only for determining
+# the safest, highest-probability entry point. Does NOT open trades directly.
+#
+# Public API:  evaluate_breakout_entry(klines, direction, breakout_level, ...)
+# ==============================================================================
 
 # ---------------------------------------------------------------------------
-# Inline helpers so this module has zero runtime dependencies on ema.py.
-# These are intentionally self-contained.
+# Inline helpers – self-contained, no external dependencies.
 # ---------------------------------------------------------------------------
 
 def _atr(highs: list, lows: list, closes: list, period: int = 14) -> list:
@@ -8067,7 +8073,7 @@ def process_active_setups():
                     power    = float(entry_decision.get("confidence", pattern.get("score", 70)))
                     entry_type_tag = entry_decision.get("entry_type") or "BREAKOUT_SETUP"
                 else:
-                    # entry_engine unavailable: fall back to original levels
+                    # evaluate_breakout_entry raised an exception: fall back to raw levels
                     entry    = ref
                     sl       = inv
                     tp_price = tp_zone[0] if tp_zone else 0.0
