@@ -20,7 +20,7 @@ import pandas as pd
 #       📐 FIBONACCI RETRACEMENT disabled
 #  - Diğer tüm stratejiler devre dışı (all strategies disabled)
 #  - MIN_POWER_THRESHOLD: 68.0
-#  - TRADE_SIZE_USDT: 750.0
+#  - TRADE_SIZE_USDT: 5.0
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - PER-STRATEGY LIMITS: Each strategy limited to 3 buy / 3 sell independently
 #  - Strategy enable/disable via Telegram commands
@@ -3024,7 +3024,7 @@ STATE_DEFAULT={
     "avg_max_profit":0.0  # Average of max profits from open positions
 }
 PARAM_DEFAULT={
-    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
+    "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":5.0,
     # Per-strategy limits: Each strategy limited to DEFAULT_STRATEGY_POSITION_LIMIT buy/sell independently
     "MAX_MACD_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_MACD_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # MACD strategy limits
     "MAX_FVG_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FVG_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # FVG strategy limits
