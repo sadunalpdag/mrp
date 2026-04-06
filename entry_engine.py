@@ -79,7 +79,7 @@ def _fibonacci_retracement(swing_low: float, swing_high: float) -> dict:
 
 DEFAULT_OVEREXTENDED_ATR_MULT    = 2.0   # max ATR distance from breakout level
 DEFAULT_OVEREXTENDED_PCT         = 0.03  # max % distance from breakout level (3 %)
-DEFAULT_RETEST_TOLERANCE_PCT     = 0.003 # 0.3 % — how close to level counts as retest
+DEFAULT_RETEST_TOLERANCE_PCT     = 0.017 # 1.7 % — how close to level counts as retest
 DEFAULT_RETEST_LOOKBACK          = 8     # candles to look back for retest
 DEFAULT_MIN_BODY_RATIO           = 0.40  # candle body / total range
 DEFAULT_MAX_WICK_BODY_RATIO      = 2.0   # (upper+lower wick) / body
