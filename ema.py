@@ -7093,6 +7093,8 @@ SETUP_STATES = {
     "IDLE",
     "TRACKING_LONG",
     "TRACKING_SHORT",
+    "LONG_PENDING",
+    "SHORT_PENDING",
     "BREAKOUT_PENDING",
     "RETEST_PENDING",
     "CONFIRMED_LONG",
@@ -7101,6 +7103,8 @@ SETUP_STATES = {
     "FAKE_BREAKOUT_SHORT",
     "FAILED_LONG",
     "FAILED_SHORT",
+    "REVERSED_TO_LONG",
+    "REVERSED_TO_SHORT",
     "OVEREXTENDED_NO_ENTRY",
     "WAIT_NEXT_BREAK",
     "NO_TRADE",
@@ -7418,6 +7422,8 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
     emoji_map = {
         "TRACKING_LONG":           "🟡 TRACKING LONG",
         "TRACKING_SHORT":          "🟡 TRACKING SHORT",
+        "LONG_PENDING":            "🟡 LONG PENDING",
+        "SHORT_PENDING":           "🟡 SHORT PENDING",
         "BREAKOUT_PENDING":        "⏳ BREAKOUT PENDING",
         "RETEST_PENDING":          "🔄 RETEST PENDING",
         "CONFIRMED_LONG":          "✅ CONFIRMED LONG",
@@ -7426,6 +7432,8 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         "FAKE_BREAKOUT_SHORT":     "🚫 FAKE BREAKOUT SHORT",
         "FAILED_LONG":             "❌ FAILED LONG",
         "FAILED_SHORT":            "❌ FAILED SHORT",
+        "REVERSED_TO_LONG":        "🔄🟢 REVERSED TO LONG",
+        "REVERSED_TO_SHORT":       "🔄🔴 REVERSED TO SHORT",
         "OVEREXTENDED_NO_ENTRY":   "⚡ OVEREXTENDED – NO ENTRY",
         "WAIT_NEXT_BREAK":         "🔒 WAIT NEXT BREAK",
         "NO_TRADE":                "⛔ NO TRADE",
@@ -7488,6 +7496,23 @@ def update_symbol_setup_state(symbol: str, df) -> str:
         "WAIT_NEXT_BREAK",
         "NO_TRADE",
     }
+
+    # ── Reversal opportunity from failed / fake states ─────────────────────────
+    # Check BEFORE the terminal guard so we can escape failed states via reversal.
+    # Only one reversal per setup is allowed (setup.get("reversal_from") guards replay).
+    reversible = {
+        "FAILED_LONG", "FAILED_SHORT",
+        "FAKE_BREAKOUT_LONG", "FAKE_BREAKOUT_SHORT",
+    }
+    if state in reversible and not setup.get("reversal_from"):
+        if df is not None and len(df) >= 5:
+            if should_reverse_to_short(symbol, df):
+                update_setup_direction(symbol, "SHORT", df)
+                return setup.get("state", "TRACKING_SHORT")
+            if should_reverse_to_long(symbol, df):
+                update_setup_direction(symbol, "LONG", df)
+                return setup.get("state", "TRACKING_LONG")
+
     if state in terminal:
         return state
 
@@ -7586,6 +7611,322 @@ def _apply_lock_after_setup(symbol: str, reason: str):
         "locked_at":   now_local_iso(),
     }
     log(f"[SYMBOL LOCK] {symbol} locked — reason={reason} bias={bias}")
+
+
+# ==============================================================================
+# 🔄 DUAL-DIRECTION ANALYSIS & REVERSAL HELPERS
+# ==============================================================================
+
+def analyze_long_setup(df) -> dict:
+    """
+    Analyze bullish (LONG) setup quality from a 15m klines DataFrame.
+
+    Returns a dict with keys:
+        valid   : bool  – True when signal is VALID or WATCHLIST
+        score   : int   – 0-100 score
+        signal  : str   – "VALID" | "WATCHLIST" | "NONE"
+        pattern : dict  – full pattern dict from detect_support_bounce_pattern
+    """
+    if df is None or len(df) < 20:
+        return {"valid": False, "score": 0, "signal": "NONE", "pattern": {}}
+    try:
+        pattern = detect_support_bounce_pattern(df)
+        if pattern is None:
+            return {"valid": False, "score": 0, "signal": "NONE", "pattern": {}}
+        sig   = pattern.get("signal", "NONE")
+        score = int(pattern.get("score", 0))
+        valid = sig in ("VALID", "WATCHLIST")
+        return {"valid": valid, "score": score, "signal": sig, "pattern": pattern}
+    except Exception as e:
+        log(f"[ANALYZE LONG SETUP ERR]: {e}")
+        return {"valid": False, "score": 0, "signal": "NONE", "pattern": {}}
+
+
+def analyze_short_setup(df) -> dict:
+    """
+    Analyze bearish (SHORT) setup quality from a 15m klines DataFrame.
+
+    Returns a dict with keys:
+        valid   : bool  – True when signal is VALID or WATCHLIST
+        score   : int   – 0-100 score
+        signal  : str   – "VALID" | "WATCHLIST" | "NONE"
+        pattern : dict  – full pattern dict from detect_dead_cat_bounce_pattern
+    """
+    if df is None or len(df) < 20:
+        return {"valid": False, "score": 0, "signal": "NONE", "pattern": {}}
+    try:
+        pattern = detect_dead_cat_bounce_pattern(df)
+        if pattern is None:
+            return {"valid": False, "score": 0, "signal": "NONE", "pattern": {}}
+        sig   = pattern.get("signal", "NONE")
+        score = int(pattern.get("score", 0))
+        valid = sig in ("VALID", "WATCHLIST")
+        return {"valid": valid, "score": score, "signal": sig, "pattern": pattern}
+    except Exception as e:
+        log(f"[ANALYZE SHORT SETUP ERR]: {e}")
+        return {"valid": False, "score": 0, "signal": "NONE", "pattern": {}}
+
+
+def score_long_setup(df) -> int:
+    """Return a 0-100 score for a potential LONG setup from 15m klines."""
+    return analyze_long_setup(df).get("score", 0)
+
+
+def score_short_setup(df) -> int:
+    """Return a 0-100 score for a potential SHORT setup from 15m klines."""
+    return analyze_short_setup(df).get("score", 0)
+
+
+def is_opposite_confirmation_valid(df, current_bias: str,
+                                   ref: float, inv: float) -> bool:
+    """
+    Return True when opposite-direction confirmation exists.
+
+    For LONG bias  → opposite is SHORT:
+        last 2 closed 15m candles must have closed BELOW *ref*,
+        and at least 1 of the last 3 closed candles must be bearish.
+    For SHORT bias → opposite is LONG:
+        last 2 closed 15m candles must have closed ABOVE *ref*,
+        and at least 1 of the last 3 closed candles must be bullish.
+    """
+    if df is None or len(df) < 5:
+        return False
+    try:
+        closed = df.iloc[:-1]          # exclude live candle
+        if len(closed) < 3:
+            return False
+
+        closes = closed["close"].astype(float).tolist()
+        opens  = closed["open"].astype(float).tolist()
+        recent_closes = closes[-2:]    # last 2 closed candles
+        recent_window = list(range(max(0, len(closed) - 3), len(closed)))
+
+        if current_bias == "LONG":
+            direction_closes = sum(1 for c in recent_closes if c < ref)
+            directional_candles = sum(
+                1 for i in recent_window
+                if closes[i] < opens[i]          # bearish body
+            )
+        else:
+            direction_closes = sum(1 for c in recent_closes if c > ref)
+            directional_candles = sum(
+                1 for i in recent_window
+                if closes[i] > opens[i]          # bullish body
+            )
+
+        return direction_closes >= 2 and directional_candles >= 1
+    except Exception as e:
+        log(f"[OPP CONFIRM ERR]: {e}")
+        return False
+
+
+def should_keep_current_bias(symbol: str, df) -> bool:
+    """
+    Return True when the current setup bias still has structural support.
+
+    LONG: last closed candle is above the invalidation level.
+    SHORT: last closed candle is below the invalidation level.
+    Returns True (keep bias) when data is unavailable.
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if not setup:
+        return False
+    bias = setup.get("bias", "")
+    inv  = float(setup.get("invalidation_level", 0))
+
+    if df is None or len(df) < 5:
+        return True
+    try:
+        last_close = float(df.iloc[-2]["close"])   # last closed candle
+        if bias == "LONG":
+            return last_close > inv
+        else:
+            return last_close < inv
+    except Exception:
+        return True
+
+
+def should_reverse_to_short(symbol: str, df) -> bool:
+    """
+    Return True when a LONG-biased setup should reverse to SHORT.
+
+    Conditions (all required):
+    1. Current state is FAILED_LONG or FAKE_BREAKOUT_LONG.
+    2. No prior reversal has already been attempted for this setup.
+    3. Opposite (SHORT) confirmation: ≥2 closed candles below ref AND
+       bearish candle body confirmed.
+    4. SHORT setup score ≥ 30 (non-trivial signal).
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if not setup:
+        return False
+    if setup.get("bias", "") != "LONG":
+        return False
+    if setup.get("state", "") not in ("FAILED_LONG", "FAKE_BREAKOUT_LONG"):
+        return False
+    if setup.get("reversal_from"):   # already reversed once – prevent infinite flip
+        return False
+
+    ref = float(setup.get("reference_level", 0))
+    inv = float(setup.get("invalidation_level", 0))
+
+    if not is_opposite_confirmation_valid(df, "LONG", ref, inv):
+        return False
+
+    return score_short_setup(df) >= 30
+
+
+def should_reverse_to_long(symbol: str, df) -> bool:
+    """
+    Return True when a SHORT-biased setup should reverse to LONG.
+
+    Conditions (all required):
+    1. Current state is FAILED_SHORT or FAKE_BREAKOUT_SHORT.
+    2. No prior reversal has already been attempted for this setup.
+    3. Opposite (LONG) confirmation: ≥2 closed candles above ref AND
+       bullish candle body confirmed.
+    4. LONG setup score ≥ 30 (non-trivial signal).
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if not setup:
+        return False
+    if setup.get("bias", "") != "SHORT":
+        return False
+    if setup.get("state", "") not in ("FAILED_SHORT", "FAKE_BREAKOUT_SHORT"):
+        return False
+    if setup.get("reversal_from"):
+        return False
+
+    ref = float(setup.get("reference_level", 0))
+    inv = float(setup.get("invalidation_level", 0))
+
+    if not is_opposite_confirmation_valid(df, "SHORT", ref, inv):
+        return False
+
+    return score_long_setup(df) >= 30
+
+
+def update_setup_direction(symbol: str, new_bias: str, df) -> bool:
+    """
+    Transition an existing setup from its current bias to *new_bias*.
+
+    This performs an in-place mutation of the ACTIVE_SETUPS entry so the
+    symbol stays under management without creating a brand-new setup
+    (which would be blocked by the symbol lock).
+
+    Steps:
+    1. Run fresh pattern analysis for the new direction.
+    2. Derive new reference and invalidation levels.
+    3. Reset confirmation/trade flags.
+    4. Update SYMBOL_LOCKS to reflect the new direction.
+    5. Send a single Telegram reversal notification.
+    6. Immediately advance state to TRACKING_<new_bias>.
+
+    Returns True on success, False on any error.
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if not setup:
+        return False
+
+    old_bias  = setup.get("bias", "")
+    old_state = setup.get("state", "IDLE")
+    now_str   = now_local_iso()
+
+    # ── Derive new levels from fresh pattern analysis ─────────────────────────
+    long_score  = 0
+    short_score = 0
+    new_pattern = {}
+    new_ref     = 0.0
+    new_inv     = 0.0
+    new_sw_high = float(setup.get("swing_high", 0))
+    new_sw_low  = float(setup.get("swing_low",  0))
+
+    if df is not None and len(df) >= 20:
+        if new_bias == "LONG":
+            analysis    = analyze_long_setup(df)
+            new_pattern = analysis.get("pattern") or {}
+            long_score  = analysis.get("score", 0)
+            short_score = score_short_setup(df)
+        else:
+            analysis    = analyze_short_setup(df)
+            new_pattern = analysis.get("pattern") or {}
+            short_score = analysis.get("score", 0)
+            long_score  = score_long_setup(df)
+
+        if new_pattern:
+            new_sw_high = float(new_pattern.get("swing_high", new_sw_high))
+            new_sw_low  = float(new_pattern.get("swing_low",  new_sw_low))
+
+    # ── Compute reference & invalidation for new direction ────────────────────
+    if new_bias == "LONG":
+        new_ref = new_sw_high
+        pullback = float(new_pattern.get("pullback_low", new_sw_low))
+        new_inv  = pullback * (1 - SETUP_INVALIDATION_BUFFER_PCT)
+    else:
+        new_ref  = new_sw_low
+        bounce_h = float(new_pattern.get("bounce_high", new_sw_high))
+        new_inv  = bounce_h * (1 + SETUP_INVALIDATION_BUFFER_PCT)
+
+    # ── TP zone ───────────────────────────────────────────────────────────────
+    tp_zone = None
+    if new_sw_high > 0 and new_sw_low > 0:
+        if new_bias == "LONG":
+            tp_zone = [round(new_sw_high, 8),
+                       round(new_sw_high + (new_sw_high - new_sw_low) * 0.382, 8)]
+        else:
+            tp_zone = [round(new_sw_low, 8),
+                       round(new_sw_low - (new_sw_high - new_sw_low) * 0.382, 8)]
+
+    # ── Reversal transition state (sent once for the notification) ────────────
+    rev_state     = "REVERSED_TO_LONG" if new_bias == "LONG" else "REVERSED_TO_SHORT"
+    track_state   = "TRACKING_LONG"    if new_bias == "LONG" else "TRACKING_SHORT"
+
+    # ── Mutate the existing setup entry ───────────────────────────────────────
+    setup.update({
+        "state":               rev_state,
+        "last_state":          old_state,
+        "bias":                new_bias,
+        "swing_high":          new_sw_high,
+        "swing_low":           new_sw_low,
+        "reference_level":     new_ref,
+        "invalidation_level":  new_inv,
+        "tp_zone":             tp_zone,
+        "confirmed":           False,
+        "entry_allowed":       False,
+        "trade_opened":        False,
+        "retest_confirmed":    False,
+        "long_score":          long_score,
+        "short_score":         short_score,
+        "pattern":             new_pattern if new_pattern else setup.get("pattern", {}),
+        "reversal_from":       old_bias,
+        "last_transition":     now_str,
+        "last_update":         now_str,
+    })
+
+    # ── Update symbol lock to new direction ───────────────────────────────────
+    SYMBOL_LOCKS[symbol] = {
+        "direction":   new_bias,
+        "reason":      f"REVERSED_FROM_{old_bias}",
+        "lock_active": True,
+        "locked_at":   now_str,
+    }
+
+    # ── Send single reversal Telegram alert ───────────────────────────────────
+    emoji = "🔄🟢" if new_bias == "LONG" else "🔄🔴"
+    tg_send(
+        f"{emoji} REVERSAL — {symbol}\n"
+        f"📛 {old_bias} setup failed → switching to {new_bias} tracking\n"
+        f"📐 New Ref: {new_ref}  |  Inv: {new_inv}\n"
+        f"📊 Long Score: {long_score}  |  Short Score: {short_score}\n"
+        f"⏳ Tracking {new_bias} — confirmation required before any trade\n"
+        f"time: {now_str}"
+    )
+    log(f"[SETUP REVERSAL] {symbol}: {old_bias} → {new_bias} | {old_state} → {rev_state}")
+
+    # ── Immediately advance to TRACKING state ─────────────────────────────────
+    setup["state"]       = track_state
+    setup["last_update"] = now_str
+    return True
 
 
 def should_open_trade_from_setup(symbol: str) -> bool:
@@ -7757,7 +8098,9 @@ def process_active_setups():
         log(f"[SETUP CLEANUP] {sym} setup removed from ACTIVE_SETUPS")
 
 
-def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: float = 0.0):
+def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: float = 0.0,
+                          candidate_source: str = "UNKNOWN",
+                          long_score: int = 0, short_score: int = 0):
     """
     Create a new setup in ACTIVE_SETUPS for *symbol* with the given *bias*
     (``"LONG"`` or ``"SHORT"``) from a detected *pattern* dict.
@@ -7795,6 +8138,9 @@ def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: flo
     ACTIVE_SETUPS[symbol] = {
         "state":               state,
         "bias":                bias,
+        "candidate_source":    candidate_source,
+        "long_score":          long_score,
+        "short_score":         short_score,
         "swing_high":          swing_high,
         "swing_low":           swing_low,
         "reference_level":     reference_level,
@@ -7808,6 +8154,7 @@ def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: flo
         "entry_allowed":       False,
         "trade_opened":        False,
         "retest_confirmed":    False,
+        "reversal_from":       None,
         "pattern":             pattern,
         "change_24h":          change_24h,
         "last_state":          None,
@@ -7825,10 +8172,12 @@ def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: flo
     score = pattern.get("score", 0)
     pat   = pattern.get("pattern", "")
     emoji = "🟢" if bias == "LONG" else "🔴"
+    src_tag = f"  |  Source: {candidate_source}" if candidate_source != "UNKNOWN" else ""
+    score_tag = f"  |  Long: {long_score}  Short: {short_score}" if long_score or short_score else ""
     tg_send(
         f"{emoji} TRACKING {bias} — {symbol}\n"
         f"📐 Pattern: {pat}\n"
-        f"📊 Score: {score}/100  |  24s: %{change_24h}\n"
+        f"📊 Score: {score}/100  |  24s: %{change_24h}{src_tag}{score_tag}\n"
         f"🔺 Swing High: {swing_high}\n"
         f"🔻 Swing Low: {swing_low}\n"
         f"🎯 Reference: {reference_level}  |  Inv: {invalidation}\n"
@@ -7912,15 +8261,19 @@ def check_spot_pattern_followups():
 
 def scan_top_gainers_and_alert():
     """
-    Scan top USDT gainers for the support-bounce pattern and send
-    a Telegram LONG alert for each coin where the pattern is confirmed.
-    Also scans top 10 losers for the dead-cat-bounce (rejection) pattern
-    and sends Telegram SHORT alerts.
-    Runs at most once every 15 minutes.
+    Scan top USDT gainers and losers for breakout setups.
 
-    Uses SpotScanCoordinator for rate-limit-safe, WebSocket-first data fetching.
-    Falls back to cached REST when WebSocket data is unavailable.
-    Skips entirely when REST cooldown is active (-1003 ban).
+    Both gainers AND losers are treated as **volatility/opportunity pools** only.
+    Direction (LONG vs SHORT) is determined by comparing actual pattern scores,
+    not by whether a symbol appeared in the gainers or losers list.
+
+    For each candidate symbol:
+      1. Evaluate LONG setup score  (detect_support_bounce_pattern)
+      2. Evaluate SHORT setup score (detect_dead_cat_bounce_pattern)
+      3. Choose the stronger valid direction; skip if neither qualifies.
+      4. Create setup with candidate_source so context is preserved.
+
+    Runs at most once every 15 minutes.
     """
     global SPOT_SCANNER_LAST_RUN
     now = time.time()
@@ -7939,6 +8292,94 @@ def scan_top_gainers_and_alert():
         log("[SPOT SCAN SKIPPED] REST cooldown active — skipping this cycle")
         return
 
+    def _evaluate_and_create(symbol, change_24h, candidate_source):
+        """
+        Dual-direction evaluation for a single candidate symbol.
+
+        Runs both long and short pattern detection, picks the stronger
+        valid direction, and creates a setup (or logs why it was skipped).
+        Routes the legacy follow-up entry to the correct follow-up dict
+        based on the chosen bias.
+        """
+        try:
+            df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
+            if df is None:
+                log(f"[SPOT SCAN] {symbol}: kline verisi alınamadı, atlanıyor")
+                return
+
+            long_result  = analyze_long_setup(df)
+            short_result = analyze_short_setup(df)
+            ls = long_result.get("score", 0)
+            ss = short_result.get("score", 0)
+            lv = long_result.get("valid", False)
+            sv = short_result.get("valid", False)
+
+            log(f"[SPOT SCAN] {symbol} ({candidate_source} %{change_24h}) "
+                f"long_score={ls} short_score={ss} "
+                f"long_valid={lv} short_valid={sv}")
+
+            # Neither direction qualifies
+            if not lv and not sv:
+                lp = long_result.get("pattern") or {}
+                sp = short_result.get("pattern") or {}
+                for pat in [lp, sp]:
+                    if pat:
+                        m = pat.get("metrics", {})
+                        log(
+                            f"[SCAN DEBUG] {symbol} score={pat.get('score')} "
+                            f"impulse_ok={m.get('impulse_ok')} fib_ok={m.get('fib_ok')} "
+                            f"bounce_ok={m.get('bounce_ok')} volume_ok={m.get('volume_ok')} "
+                            f"reasons={','.join(pat.get('reasons', []))}"
+                        )
+                log(f"[SPOT SCAN] ⬜ {symbol} — valid pattern bulunamadı (long={ls} short={ss})")
+                return
+
+            # Choose the stronger valid direction
+            if lv and sv:
+                if ls >= ss:
+                    bias, chosen_pattern = "LONG",  long_result["pattern"]
+                    log(f"[SPOT SCAN] {symbol} — LONG wins ({ls} vs {ss})")
+                else:
+                    bias, chosen_pattern = "SHORT", short_result["pattern"]
+                    log(f"[SPOT SCAN] {symbol} — SHORT wins ({ss} vs {ls})")
+            elif lv:
+                bias, chosen_pattern = "LONG",  long_result["pattern"]
+                log(f"[SPOT SCAN] {symbol} — only LONG valid (score={ls})")
+            else:
+                bias, chosen_pattern = "SHORT", short_result["pattern"]
+                log(f"[SPOT SCAN] {symbol} — only SHORT valid (score={ss})")
+
+            if should_lock_symbol(symbol, bias):
+                log(f"[SPOT SCAN] {symbol} locked — skipping repeated {bias} signal")
+                return
+
+            created = create_breakout_setup(
+                symbol, bias, chosen_pattern, change_24h,
+                candidate_source=candidate_source,
+                long_score=ls, short_score=ss,
+            )
+
+            if created:
+                sig_emoji = "✅" if chosen_pattern.get("signal") == "VALID" else "👁"
+                log(f"[SPOT SCAN] {sig_emoji} {symbol} — {bias} setup created "
+                    f"(score={chosen_pattern.get('score')}/100 source={candidate_source})")
+                # Register in the appropriate legacy follow-up dict
+                followup_entry = {
+                    "detected_ts": now,
+                    "remaining":   SPOT_FOLLOWUP_CHECKS,
+                    "pattern":     chosen_pattern,
+                    "change_24h":  change_24h,
+                }
+                if bias == "LONG":
+                    SPOT_PATTERN_FOLLOWUP[symbol] = followup_entry
+                else:
+                    SPOT_LOSER_FOLLOWUP[symbol] = followup_entry
+            else:
+                log(f"[SPOT SCAN] {symbol} already has active setup, skipping duplicate {bias} signal")
+
+        except Exception as e:
+            log(f"[SPOT SCAN ERR] {symbol}: {e}")
+
     # ── Gainers ───────────────────────────────────────────────────────
     try:
         top = get_top_gainers_usdt(SPOT_TOP_N)
@@ -7946,60 +8387,17 @@ def scan_top_gainers_and_alert():
             f"{row['symbol']}(%{round(float(row['priceChangePercent']), 2)})"
             for _, row in top.iterrows()
         )
-        log(f"[SPOT SCAN] Taranan coinler: {coin_list}")
+        log(f"[SPOT SCAN] Taranan coinler (GAINERS): {coin_list}")
 
         for _, row in top.iterrows():
-            symbol = row["symbol"]
-            change_24h = round(float(row["priceChangePercent"]), 2)
             if BinanceRateLimiter.is_banned():
                 log("[SPOT SCAN SKIPPED] REST cooldown activated mid-scan — aborting gainers loop")
                 break
-            try:
-                df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
-                if df is None:
-                    log(f"[SPOT SCAN] {symbol}: kline verisi alınamadı, atlanıyor")
-                    continue
-                pattern = detect_support_bounce_pattern(df)
-                sig = pattern.get("signal", "NONE") if pattern else "NONE"
-                if sig in ("VALID", "WATCHLIST"):
-                    sig_emoji = "✅" if sig == "VALID" else "👁"
-                    log(f"[SPOT SCAN] {sig_emoji} {symbol} (%{change_24h}) — {sig}! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Retracement={pattern['retracement_ratio']}")
-
-                    # ── Setup State Machine: replace immediate alert with setup tracking ──
-                    # Only create a setup if the symbol is not already locked/tracked.
-                    # The old SPOT_PATTERN_FOLLOWUP path is preserved as fallback for
-                    # symbols that already have an active setup (so follow-up still runs).
-                    if not should_lock_symbol(symbol, "LONG"):
-                        created = create_breakout_setup(symbol, "LONG", pattern, change_24h)
-                        if created:
-                            # Also register in legacy follow-up so check_spot_pattern_followups
-                            # continues to report intermediate status updates.
-                            SPOT_PATTERN_FOLLOWUP[symbol] = {
-                                "detected_ts": now,
-                                "remaining": SPOT_FOLLOWUP_CHECKS,
-                                "pattern": pattern,
-                                "change_24h": change_24h,
-                            }
-                            log(f"[SPOT SCAN] {symbol} setup created + takibe alındı")
-                        else:
-                            log(f"[SPOT SCAN] {symbol} already has active setup, skipping duplicate LONG signal")
-                    else:
-                        log(f"[SPOT SCAN] {symbol} locked — skipping repeated LONG signal")
-                else:
-                    if pattern:
-                        m = pattern.get("metrics", {})
-                        log(
-                            f"[SCAN DEBUG] {symbol}\n"
-                            f"score={pattern['score']}\n"
-                            f"impulse_ok={m.get('impulse_ok')}\n"
-                            f"fib_ok={m.get('fib_ok')}\n"
-                            f"bounce_ok={m.get('bounce_ok')}\n"
-                            f"volume_ok={m.get('volume_ok')}\n"
-                            f"reasons={','.join(pattern.get('reasons', []))}"
-                        )
-                    log(f"[SPOT SCAN] ⬜ {symbol} (%{change_24h}) — Pattern yok")
-            except Exception as e:
-                log(f"[SPOT SCAN ERR] {symbol}: {e}")
+            _evaluate_and_create(
+                row["symbol"],
+                round(float(row["priceChangePercent"]), 2),
+                "GAINERS",
+            )
 
     except Exception as e:
         log(f"[SPOT SCAN ERR] {e}")
@@ -8016,55 +8414,17 @@ def scan_top_gainers_and_alert():
             f"{row['symbol']}(%{round(float(row['priceChangePercent']), 2)})"
             for _, row in losers.iterrows()
         )
-        log(f"[SPOT SCAN] En çok düşen 10 coin: {loser_list}")
+        log(f"[SPOT SCAN] En çok düşen 10 coin (LOSERS): {loser_list}")
 
         for _, row in losers.iterrows():
-            symbol = row["symbol"]
-            change_24h = round(float(row["priceChangePercent"]), 2)
             if BinanceRateLimiter.is_banned():
                 log("[SPOT SCAN SKIPPED] REST cooldown activated mid-scan — aborting losers loop")
                 break
-            try:
-                df = get_spot_klines(symbol, SPOT_INTERVAL, SPOT_KLINE_LIMIT)
-                if df is None:
-                    log(f"[SPOT SCAN LOSER] {symbol}: kline verisi alınamadı, atlanıyor")
-                    continue
-                pattern = detect_dead_cat_bounce_pattern(df)
-                sig = pattern.get("signal", "NONE") if pattern else "NONE"
-                if sig in ("VALID", "WATCHLIST"):
-                    sig_emoji = "✅" if sig == "VALID" else "👁"
-                    log(f"[SPOT SCAN LOSER] {sig_emoji} {symbol} (%{change_24h}) — {sig}! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Recovery={pattern['recovery_ratio']}")
-
-                    # ── Setup State Machine: replace immediate alert with setup tracking ──
-                    if not should_lock_symbol(symbol, "SHORT"):
-                        created = create_breakout_setup(symbol, "SHORT", pattern, change_24h)
-                        if created:
-                            SPOT_LOSER_FOLLOWUP[symbol] = {
-                                "detected_ts": now,
-                                "remaining": SPOT_FOLLOWUP_CHECKS,
-                                "pattern": pattern,
-                                "change_24h": change_24h,
-                            }
-                            log(f"[SPOT SCAN LOSER] {symbol} SHORT setup created + takibe alındı")
-                        else:
-                            log(f"[SPOT SCAN LOSER] {symbol} already has active setup, skipping duplicate SHORT signal")
-                    else:
-                        log(f"[SPOT SCAN LOSER] {symbol} locked — skipping repeated SHORT signal")
-                else:
-                    if pattern:
-                        m = pattern.get("metrics", {})
-                        log(
-                            f"[SCAN DEBUG] {symbol}\n"
-                            f"score={pattern['score']}\n"
-                            f"impulse_ok={m.get('impulse_ok')}\n"
-                            f"fib_ok={m.get('fib_ok')}\n"
-                            f"bounce_ok={m.get('bounce_ok')}\n"
-                            f"volume_ok={m.get('volume_ok')}\n"
-                            f"reasons={','.join(pattern.get('reasons', []))}"
-                        )
-                    log(f"[SPOT SCAN LOSER] ⬜ {symbol} (%{change_24h}) — Pattern yok")
-            except Exception as e:
-                log(f"[SPOT SCAN LOSER ERR] {symbol}: {e}")
+            _evaluate_and_create(
+                row["symbol"],
+                round(float(row["priceChangePercent"]), 2),
+                "LOSERS",
+            )
 
     except Exception as e:
         log(f"[SPOT SCAN LOSERS ERR] {e}")
