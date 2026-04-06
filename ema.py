@@ -7576,6 +7576,10 @@ def update_symbol_setup_state(symbol: str, df) -> str:
             return new_s
 
         if detect_confirmed_breakout(df, bias, ref, SETUP_CONFIRM_CANDLES):
+            if is_overextended_breakout(df, bias, ref):
+                _setup_transition(symbol, "OVEREXTENDED_NO_ENTRY")
+                _apply_lock_after_setup(symbol, "OVEREXTENDED")
+                return "OVEREXTENDED_NO_ENTRY"
             new_s = "CONFIRMED_LONG" if bias == "LONG" else "CONFIRMED_SHORT"
             _setup_transition(symbol, new_s, {"confirmed": True, "entry_allowed": True})
             return new_s
@@ -7592,6 +7596,10 @@ def update_symbol_setup_state(symbol: str, df) -> str:
     elif state == "RETEST_PENDING":
 
         if detect_retest_acceptance(df, bias, ref, inv):
+            if is_overextended_breakout(df, bias, ref):
+                _setup_transition(symbol, "OVEREXTENDED_NO_ENTRY")
+                _apply_lock_after_setup(symbol, "OVEREXTENDED")
+                return "OVEREXTENDED_NO_ENTRY"
             new_s = "CONFIRMED_LONG" if bias == "LONG" else "CONFIRMED_SHORT"
             _setup_transition(symbol, new_s, {"confirmed": True, "entry_allowed": True,
                                                "retest_confirmed": True})
