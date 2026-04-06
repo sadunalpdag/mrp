@@ -794,7 +794,7 @@ def evaluate_breakout_entry(
         reasons.append("Price not in entry zone, no retest, conditions not met")
 
     # ── Retest anchor for stop loss ────────────────────────────────────
-    retest_low_anchor  = retest_price if (retest_found and direction == "LONG")  else None
+    retest_low_anchor  = retest_price if (retest_found and direction == "LONG") else None
     retest_high_anchor = retest_price if (retest_found and direction == "SHORT") else None
 
     # ── Stop loss ─────────────────────────────────────────────────────
