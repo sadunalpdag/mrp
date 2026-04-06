@@ -6238,6 +6238,709 @@ SPOT_FOLLOWUP_CHECKS = 2  # Number of 15-minute closes to monitor after detectio
 SPOT_LOSER_FOLLOWUP: Dict[str, dict] = {}
 
 
+# ==============================================================================
+# 📐 BREAKOUT SETUP STATE MACHINE
+#
+# Replaces "instant signal → alert" with a multi-stage pipeline:
+#   TRACKING → (BREAKOUT_PENDING | FAKE_BREAKOUT) →
+#   (RETEST_PENDING | OVEREXTENDED_NO_ENTRY) → CONFIRMED → WAIT_NEXT_BREAK
+#
+# Only ONE active setup per symbol at a time.  A symbol is locked after a
+# setup is created and only unlocked when a brand-new swing structure forms.
+# ==============================================================================
+
+# Valid setup states
+SETUP_STATES = {
+    "IDLE",
+    "TRACKING_LONG",
+    "TRACKING_SHORT",
+    "BREAKOUT_PENDING",
+    "RETEST_PENDING",
+    "CONFIRMED_LONG",
+    "CONFIRMED_SHORT",
+    "FAKE_BREAKOUT_LONG",
+    "FAKE_BREAKOUT_SHORT",
+    "FAILED_LONG",
+    "FAILED_SHORT",
+    "OVEREXTENDED_NO_ENTRY",
+    "WAIT_NEXT_BREAK",
+    "NO_TRADE",
+}
+
+# Per-symbol active setup storage
+# { symbol: { state, bias, swing_high, swing_low, reference_level, pullback_dip,
+#             invalidation_level, created_at, last_update, confirmed, locked,
+#             entry_allowed, trade_opened, last_state, pattern } }
+ACTIVE_SETUPS: Dict[str, dict] = {}
+
+# Per-symbol lock storage – prevents repeated signals inside the same structure
+# { symbol: { direction, reason, lock_active } }
+SYMBOL_LOCKS: Dict[str, dict] = {}
+
+# Confirmation thresholds
+SETUP_CONFIRM_CANDLES    = 2    # Number of closed 15m candles needed above/below reference
+SETUP_OVEREXTEND_PCT     = 0.04 # 4 %: if price moved this far beyond reference, it is overextended
+SETUP_FAKE_BODY_RATIO    = 0.30 # candle body / total range ratio below this → weak (fake breakout risk)
+SETUP_MAX_TRACKING_HOURS = 4    # After this many hours without resolution, mark FAILED and lock
+
+
+# ── Helper: fetch 15-minute klines for a symbol ──────────────────────────────
+
+def _setup_get_klines_15m(symbol: str, limit: int = 50):
+    """Return a DataFrame of the latest `limit` 15m candles for *symbol*.
+    Returns None on any error so callers can skip gracefully."""
+    try:
+        df = get_spot_klines(symbol, "15m", limit)
+        return df
+    except Exception as e:
+        log(f"[SETUP KLINES ERR] {symbol}: {e}")
+        return None
+
+
+# ── Core detection helpers ────────────────────────────────────────────────────
+
+def detect_new_structure_break(symbol: str, setup: dict, df) -> bool:
+    """
+    Return True if price has formed a *new* swing structure that is meaningfully
+    beyond the structure captured when the current setup was created.
+
+    For a prior LONG setup  → new structure = new swing HIGH above the old swing_high.
+    For a prior SHORT setup → new structure = new swing LOW  below the old swing_low.
+    Also triggers for opposite-direction setups that have fully invalidated the
+    previous structure.
+    """
+    if df is None or len(df) < 10:
+        return False
+    try:
+        bias       = setup.get("bias", "")
+        swing_high = float(setup.get("swing_high", 0))
+        swing_low  = float(setup.get("swing_low",  0))
+        closes     = df["close"].astype(float).tolist()
+        highs      = df["high"].astype(float).tolist()
+        lows       = df["low"].astype(float).tolist()
+
+        if bias == "LONG":
+            # A new higher swing high beyond the reference level
+            recent_high = max(highs[-10:])
+            return recent_high > swing_high * 1.005  # at least 0.5 % above
+        elif bias == "SHORT":
+            recent_low = min(lows[-10:])
+            return recent_low < swing_low * 0.995
+        # Unknown bias – allow reset
+        return True
+    except Exception as e:
+        log(f"[DETECT STRUCT BREAK ERR] {symbol}: {e}")
+        return False
+
+
+def detect_confirmed_breakout(df, bias: str, reference_level: float,
+                               n_candles: int = SETUP_CONFIRM_CANDLES) -> bool:
+    """
+    Return True only when the last *n_candles* **closed** 15m candles all
+    closed on the correct side of *reference_level*.
+
+    LONG  → all last n candles closed > reference_level
+    SHORT → all last n candles closed < reference_level
+    """
+    if df is None or len(df) < n_candles + 1:
+        return False
+    try:
+        # Use only fully-closed candles (exclude the last live one)
+        closed = df["close"].astype(float).tolist()[:-1]
+        recent = closed[-n_candles:]
+        if len(recent) < n_candles:
+            return False
+        if bias == "LONG":
+            return all(c > reference_level for c in recent)
+        elif bias == "SHORT":
+            return all(c < reference_level for c in recent)
+        return False
+    except Exception as e:
+        log(f"[DETECT CONFIRMED BREAKOUT ERR]: {e}")
+        return False
+
+
+def detect_fake_breakout(df, bias: str, reference_level: float) -> bool:
+    """
+    Detect a fake (failed) breakout using the most recent closed candle:
+
+    LONG fake breakout:
+      - Previous candle closed above reference_level (or had a high above it)
+      - Most-recent closed candle closed BACK BELOW reference_level
+      - OR breakout candle body is weaker than SETUP_FAKE_BODY_RATIO
+
+    SHORT fake breakout: mirror logic.
+    """
+    if df is None or len(df) < 4:
+        return False
+    try:
+        closed = df.iloc[:-1]  # exclude live candle
+        if len(closed) < 3:
+            return False
+
+        last   = closed.iloc[-1]
+        prev   = closed.iloc[-2]
+
+        last_close = float(last["close"])
+        last_open  = float(last["open"])
+        last_high  = float(last["high"])
+        last_low   = float(last["low"])
+        prev_close = float(prev["close"])
+
+        candle_range = last_high - last_low
+        body_size    = abs(last_close - last_open)
+        body_ratio   = (body_size / candle_range) if candle_range > 0 else 0.0
+
+        if bias == "LONG":
+            prev_broke_above = prev_close > reference_level or float(prev["high"]) > reference_level
+            close_back_below = last_close < reference_level
+            weak_body        = (last_high > reference_level and body_ratio < SETUP_FAKE_BODY_RATIO
+                                and last_close < reference_level)
+            return prev_broke_above and (close_back_below or weak_body)
+
+        elif bias == "SHORT":
+            prev_broke_below = prev_close < reference_level or float(prev["low"]) < reference_level
+            close_back_above = last_close > reference_level
+            weak_body        = (last_low < reference_level and body_ratio < SETUP_FAKE_BODY_RATIO
+                                and last_close > reference_level)
+            return prev_broke_below and (close_back_above or weak_body)
+
+        return False
+    except Exception as e:
+        log(f"[DETECT FAKE BREAKOUT ERR]: {e}")
+        return False
+
+
+def detect_retest_acceptance(df, bias: str, reference_level: float,
+                              invalidation_level: float) -> bool:
+    """
+    Detect a healthy pullback-to-retest followed by acceptance.
+
+    LONG: price pulled back toward reference_level from above, then closed
+          back above reference_level (reaction from retest) – and still above
+          invalidation_level.
+    SHORT: mirror logic.
+    """
+    if df is None or len(df) < 5:
+        return False
+    try:
+        closed = df.iloc[:-1]  # exclude live candle
+        if len(closed) < 4:
+            return False
+
+        closes = closed["close"].astype(float).tolist()
+        lows   = closed["low"].astype(float).tolist()
+        highs  = closed["high"].astype(float).tolist()
+
+        last_close  = closes[-1]
+        prev_close  = closes[-2]
+
+        if bias == "LONG":
+            # prev candle dipped toward reference_level (retest) but closed above invalidation
+            dipped_to_ref = lows[-2] <= reference_level * 1.002  # within 0.2% of reference
+            still_valid   = last_close > invalidation_level
+            accepted_back = last_close > reference_level
+            return dipped_to_ref and still_valid and accepted_back
+
+        elif bias == "SHORT":
+            bounced_to_ref = highs[-2] >= reference_level * 0.998
+            still_valid    = last_close < invalidation_level
+            accepted_back  = last_close < reference_level
+            return bounced_to_ref and still_valid and accepted_back
+
+        return False
+    except Exception as e:
+        log(f"[DETECT RETEST ACCEPTANCE ERR]: {e}")
+        return False
+
+
+def is_overextended_breakout(df, bias: str, reference_level: float) -> bool:
+    """
+    Return True when price has moved too far beyond reference_level without
+    pulling back.  Entering such a move chases extended candles.
+
+    Uses the last closed candle close price vs reference_level.
+    """
+    if df is None or len(df) < 2:
+        return False
+    try:
+        closed_price = float(df.iloc[-2]["close"])  # last closed candle
+        if reference_level <= 0:
+            return False
+        if bias == "LONG":
+            move_pct = (closed_price - reference_level) / reference_level
+            return move_pct > SETUP_OVEREXTEND_PCT
+        elif bias == "SHORT":
+            move_pct = (reference_level - closed_price) / reference_level
+            return move_pct > SETUP_OVEREXTEND_PCT
+        return False
+    except Exception as e:
+        log(f"[IS OVEREXTENDED ERR]: {e}")
+        return False
+
+
+def should_lock_symbol(symbol: str, bias: str) -> bool:
+    """
+    Return True when symbol already has an active lock for *bias* direction.
+    Also returns True when a TRACKING/PENDING/CONFIRMED setup already exists.
+    """
+    lock = SYMBOL_LOCKS.get(symbol)
+    if lock and lock.get("lock_active"):
+        return True
+    setup = ACTIVE_SETUPS.get(symbol)
+    if setup:
+        state = setup.get("state", "IDLE")
+        active_states = {
+            "TRACKING_LONG", "TRACKING_SHORT",
+            "BREAKOUT_PENDING",
+            "RETEST_PENDING",
+            "CONFIRMED_LONG", "CONFIRMED_SHORT",
+            "OVEREXTENDED_NO_ENTRY",
+        }
+        if state in active_states:
+            return True
+    return False
+
+
+def should_unlock_symbol(symbol: str, df) -> bool:
+    """
+    Return True when conditions are met to clear the symbol lock and allow a
+    fresh setup.
+
+    Conditions (any of):
+    1. A new meaningful swing structure forms beyond the old setup levels.
+    2. The previous setup has been fully resolved (FAILED / FAKE / WAIT_NEXT_BREAK)
+       AND enough time has passed (≥ 2 × 15m = 30 min).
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if not setup:
+        return True  # no setup → no reason to stay locked
+
+    state = setup.get("state", "IDLE")
+    finished_states = {
+        "FAILED_LONG", "FAILED_SHORT",
+        "FAKE_BREAKOUT_LONG", "FAKE_BREAKOUT_SHORT",
+        "WAIT_NEXT_BREAK",
+        "NO_TRADE",
+        "OVEREXTENDED_NO_ENTRY",
+    }
+
+    if state in finished_states:
+        last_update_str = setup.get("last_update", "")
+        try:
+            lu = datetime.fromisoformat(last_update_str)
+            elapsed_min = (datetime.now(timezone.utc) - lu.replace(tzinfo=timezone.utc)
+                           if lu.tzinfo is None else
+                           datetime.now(timezone.utc) - lu).total_seconds() / 60.0
+        except Exception:
+            elapsed_min = 9999.0
+
+        if elapsed_min >= 30:
+            if detect_new_structure_break(symbol, setup, df):
+                return True
+
+    return False
+
+
+def _setup_transition(symbol: str, new_state: str, extra: dict = None):
+    """
+    Apply a state transition and log it.  Only sends a Telegram notification
+    when the state actually changes.
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if setup is None:
+        return
+
+    old_state = setup.get("state", "IDLE")
+    if old_state == new_state:
+        # No change – update timestamp silently
+        setup["last_update"] = now_local_iso()
+        return
+
+    setup["last_state"] = old_state
+    setup["state"]      = new_state
+    setup["last_update"] = now_local_iso()
+    if extra:
+        setup.update(extra)
+
+    bias     = setup.get("bias", "")
+    ref      = setup.get("reference_level", 0)
+    inv      = setup.get("invalidation_level", 0)
+
+    # Emoji map for state transitions
+    emoji_map = {
+        "TRACKING_LONG":           "🟡 TRACKING LONG",
+        "TRACKING_SHORT":          "🟡 TRACKING SHORT",
+        "BREAKOUT_PENDING":        "⏳ BREAKOUT PENDING",
+        "RETEST_PENDING":          "🔄 RETEST PENDING",
+        "CONFIRMED_LONG":          "✅ CONFIRMED LONG",
+        "CONFIRMED_SHORT":         "✅ CONFIRMED SHORT",
+        "FAKE_BREAKOUT_LONG":      "🚫 FAKE BREAKOUT LONG",
+        "FAKE_BREAKOUT_SHORT":     "🚫 FAKE BREAKOUT SHORT",
+        "FAILED_LONG":             "❌ FAILED LONG",
+        "FAILED_SHORT":            "❌ FAILED SHORT",
+        "OVEREXTENDED_NO_ENTRY":   "⚡ OVEREXTENDED – NO ENTRY",
+        "WAIT_NEXT_BREAK":         "🔒 WAIT NEXT BREAK",
+        "NO_TRADE":                "⛔ NO TRADE",
+    }
+    label = emoji_map.get(new_state, new_state)
+
+    msg = (
+        f"{label} — {symbol}\n"
+        f"Bias: {bias}  |  State: {old_state} → {new_state}\n"
+        f"Ref: {ref}  |  Inv: {inv}\n"
+        f"time: {now_local_iso()}"
+    )
+    tg_send(msg)
+    log(f"[SETUP STATE] {symbol}: {old_state} → {new_state}")
+
+
+def update_symbol_setup_state(symbol: str, df) -> str:
+    """
+    Advance the setup state for *symbol* based on fresh 15m kline data.
+    Returns the new state string.
+
+    State machine transitions:
+      TRACKING_LONG/SHORT
+          → FAKE_BREAKOUT_*    if fake breakout detected
+          → OVEREXTENDED_NO_ENTRY if price ran too far
+          → BREAKOUT_PENDING   if candle closed above/below reference
+          → FAILED_*           if invalidation hit
+          (stays TRACKING if none of the above)
+
+      BREAKOUT_PENDING
+          → CONFIRMED_*        if n_candles closed above/below (confirmation)
+          → RETEST_PENDING     if price accepted break then pulled back but still above inv
+          → FAKE_BREAKOUT_*    if closed back inside
+          → FAILED_*           if invalidation hit
+
+      RETEST_PENDING
+          → CONFIRMED_*        if retest acceptance confirmed
+          → FAILED_*           if invalidation hit
+          (stays RETEST if none of the above)
+
+      CONFIRMED_*/FAILED_*/FAKE_*/OVEREXTENDED/WAIT_NEXT_BREAK
+          → no further transition (terminal or handled by unlock logic)
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if setup is None:
+        return "IDLE"
+
+    state     = setup.get("state", "IDLE")
+    bias      = setup.get("bias", "")
+    ref       = float(setup.get("reference_level", 0))
+    inv       = float(setup.get("invalidation_level", 0))
+    direction = "UP" if bias == "LONG" else "DOWN"
+
+    # Terminal states – nothing to do
+    terminal = {
+        "CONFIRMED_LONG", "CONFIRMED_SHORT",
+        "FAKE_BREAKOUT_LONG", "FAKE_BREAKOUT_SHORT",
+        "FAILED_LONG", "FAILED_SHORT",
+        "OVEREXTENDED_NO_ENTRY",
+        "WAIT_NEXT_BREAK",
+        "NO_TRADE",
+    }
+    if state in terminal:
+        return state
+
+    if df is None or len(df) < 5:
+        return state
+
+    closes = df["close"].astype(float).tolist()
+    lows   = df["low"].astype(float).tolist()
+    highs  = df["high"].astype(float).tolist()
+
+    last_close = float(df.iloc[-2]["close"]) if len(df) >= 2 else closes[-1]  # last closed candle
+
+    # ── Invalidation check (applies to all active tracking states) ────────────
+    inv_hit = (bias == "LONG" and last_close < inv) or (bias == "SHORT" and last_close > inv)
+    if inv_hit and state in ("TRACKING_LONG", "TRACKING_SHORT",
+                              "BREAKOUT_PENDING", "RETEST_PENDING"):
+        new_s = "FAILED_LONG" if bias == "LONG" else "FAILED_SHORT"
+        _setup_transition(symbol, new_s)
+        _apply_lock_after_setup(symbol, "FAILED")
+        return new_s
+
+    # ── Timed-out tracking ─────────────────────────────────────────────────────
+    created_str = setup.get("created_at", "")
+    try:
+        created = datetime.fromisoformat(created_str)
+        age_hours = (datetime.now(timezone.utc) - (
+            created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created
+        )).total_seconds() / 3600.0
+    except Exception:
+        age_hours = 0.0
+
+    if age_hours > SETUP_MAX_TRACKING_HOURS and state in (
+            "TRACKING_LONG", "TRACKING_SHORT", "BREAKOUT_PENDING", "RETEST_PENDING"):
+        new_s = "FAILED_LONG" if bias == "LONG" else "FAILED_SHORT"
+        _setup_transition(symbol, new_s, {"timeout": True})
+        _apply_lock_after_setup(symbol, "TIMEOUT")
+        return new_s
+
+    # ── TRACKING state transitions ────────────────────────────────────────────
+    if state in ("TRACKING_LONG", "TRACKING_SHORT"):
+
+        if detect_fake_breakout(df, bias, ref):
+            new_s = "FAKE_BREAKOUT_LONG" if bias == "LONG" else "FAKE_BREAKOUT_SHORT"
+            _setup_transition(symbol, new_s)
+            _apply_lock_after_setup(symbol, "FAKE_BREAKOUT")
+            return new_s
+
+        if is_overextended_breakout(df, bias, ref):
+            _setup_transition(symbol, "OVEREXTENDED_NO_ENTRY")
+            _apply_lock_after_setup(symbol, "OVEREXTENDED")
+            return "OVEREXTENDED_NO_ENTRY"
+
+        # First candle closed above/below reference → pending confirmation
+        if bias == "LONG" and last_close > ref:
+            _setup_transition(symbol, "BREAKOUT_PENDING")
+            return "BREAKOUT_PENDING"
+        elif bias == "SHORT" and last_close < ref:
+            _setup_transition(symbol, "BREAKOUT_PENDING")
+            return "BREAKOUT_PENDING"
+
+    # ── BREAKOUT_PENDING state transitions ─────────────────────────────────────
+    elif state == "BREAKOUT_PENDING":
+
+        if detect_fake_breakout(df, bias, ref):
+            new_s = "FAKE_BREAKOUT_LONG" if bias == "LONG" else "FAKE_BREAKOUT_SHORT"
+            _setup_transition(symbol, new_s)
+            _apply_lock_after_setup(symbol, "FAKE_BREAKOUT")
+            return new_s
+
+        if detect_confirmed_breakout(df, bias, ref, SETUP_CONFIRM_CANDLES):
+            new_s = "CONFIRMED_LONG" if bias == "LONG" else "CONFIRMED_SHORT"
+            _setup_transition(symbol, new_s, {"confirmed": True, "entry_allowed": True})
+            return new_s
+
+        # Price pulled back after breaking – potential healthy retest
+        if bias == "LONG" and last_close <= ref * 1.001 and last_close > inv:
+            _setup_transition(symbol, "RETEST_PENDING")
+            return "RETEST_PENDING"
+        elif bias == "SHORT" and last_close >= ref * 0.999 and last_close < inv:
+            _setup_transition(symbol, "RETEST_PENDING")
+            return "RETEST_PENDING"
+
+    # ── RETEST_PENDING state transitions ──────────────────────────────────────
+    elif state == "RETEST_PENDING":
+
+        if detect_retest_acceptance(df, bias, ref, inv):
+            new_s = "CONFIRMED_LONG" if bias == "LONG" else "CONFIRMED_SHORT"
+            _setup_transition(symbol, new_s, {"confirmed": True, "entry_allowed": True,
+                                               "retest_confirmed": True})
+            return new_s
+
+    return state
+
+
+def _apply_lock_after_setup(symbol: str, reason: str):
+    """Lock *symbol* after a setup resolves so it waits for new structure."""
+    setup = ACTIVE_SETUPS.get(symbol, {})
+    bias  = setup.get("bias", "UNKNOWN")
+    SYMBOL_LOCKS[symbol] = {
+        "direction":   bias,
+        "reason":      reason,
+        "lock_active": True,
+        "locked_at":   now_local_iso(),
+    }
+    log(f"[SYMBOL LOCK] {symbol} locked — reason={reason} bias={bias}")
+
+
+def should_open_trade_from_setup(symbol: str) -> bool:
+    """
+    Return True when a setup is CONFIRMED and trade has not yet been opened.
+    """
+    setup = ACTIVE_SETUPS.get(symbol)
+    if not setup:
+        return False
+    state = setup.get("state", "")
+    confirmed_states = {"CONFIRMED_LONG", "CONFIRMED_SHORT"}
+    return (
+        state in confirmed_states
+        and setup.get("entry_allowed", False)
+        and not setup.get("trade_opened", False)
+    )
+
+
+# ── Main per-cycle function ───────────────────────────────────────────────────
+
+def process_active_setups():
+    """
+    Called every main-loop cycle (every ~30 s).
+
+    For each symbol in ACTIVE_SETUPS:
+    1. Fetch fresh 15m candles.
+    2. Try to unlock the symbol if conditions are met.
+    3. Advance the setup state machine.
+    4. If CONFIRMED and entry allowed, execute a real trade via execute_real_trade().
+    5. Clean up fully finished setups where trade has been opened or setup was
+       WAIT_NEXT_BREAK for > 60 min.
+    """
+    global ACTIVE_SETUPS, SYMBOL_LOCKS
+
+    if not ACTIVE_SETUPS:
+        return
+
+    to_remove = []
+
+    for symbol, setup in list(ACTIVE_SETUPS.items()):
+        try:
+            df = _setup_get_klines_15m(symbol, limit=50)
+
+            # ── Attempt unlock ─────────────────────────────────────────────
+            if should_unlock_symbol(symbol, df):
+                log(f"[SETUP UNLOCK] {symbol}: new structure detected, clearing lock")
+                SYMBOL_LOCKS.pop(symbol, None)
+                to_remove.append(symbol)
+                tg_send(f"🔓 UNLOCK — {symbol}\n"
+                        f"Yeni yapı oluştu, setup sıfırlanıyor.\n"
+                        f"time: {now_local_iso()}")
+                continue
+
+            # ── Advance state machine ──────────────────────────────────────
+            new_state = update_symbol_setup_state(symbol, df)
+
+            # ── Trigger trade when confirmed ───────────────────────────────
+            if should_open_trade_from_setup(symbol):
+                pattern  = setup.get("pattern", {})
+                bias     = setup.get("bias", "")
+                direction = "UP" if bias == "LONG" else "DOWN"
+                entry    = float(setup.get("reference_level", 0))
+                tp_zone  = setup.get("tp_zone")
+                tp_price = tp_zone[0] if tp_zone else 0.0
+                inv      = float(setup.get("invalidation_level", 0))
+
+                sig = {
+                    "symbol":       symbol,
+                    "dir":          direction,
+                    "power":        float(pattern.get("score", 70)),
+                    "kind":         "BREAKOUT_SETUP",
+                    "tag":          f"🎯 BREAKOUT_SETUP {bias}",
+                    "entry":        entry,
+                    "tp":           tp_price,
+                    "sl":           inv,
+                    "market_state": pattern.get("pattern", ""),
+                    "conditions":   {"confirmed": True,
+                                     "retest": setup.get("retest_confirmed", False)},
+                }
+
+                opened = execute_real_trade(sig)
+                setup["trade_opened"] = True
+                if opened:
+                    log(f"[SETUP TRADE] {symbol} {bias} trade opened from confirmed setup")
+                    _setup_transition(symbol, "WAIT_NEXT_BREAK")
+                    _apply_lock_after_setup(symbol, "TRADE_OPENED")
+
+            # ── Mark WAIT_NEXT_BREAK entries for cleanup after 60 min ──────
+            state = setup.get("state", "")
+            cleanup_states = {
+                "WAIT_NEXT_BREAK", "FAKE_BREAKOUT_LONG", "FAKE_BREAKOUT_SHORT",
+                "FAILED_LONG", "FAILED_SHORT", "OVEREXTENDED_NO_ENTRY", "NO_TRADE",
+            }
+            if state in cleanup_states:
+                try:
+                    lu = datetime.fromisoformat(setup.get("last_update", ""))
+                    age_min = (datetime.now(timezone.utc) - (
+                        lu.replace(tzinfo=timezone.utc) if lu.tzinfo is None else lu
+                    )).total_seconds() / 60.0
+                except Exception:
+                    age_min = 9999.0
+                if age_min > 60:
+                    to_remove.append(symbol)
+
+        except Exception as e:
+            log(f"[PROCESS SETUPS ERR] {symbol}: {e}")
+            log(f"[PROCESS SETUPS TRACE] {traceback.format_exc()}")
+
+    for sym in to_remove:
+        ACTIVE_SETUPS.pop(sym, None)
+        log(f"[SETUP CLEANUP] {sym} setup removed from ACTIVE_SETUPS")
+
+
+def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: float = 0.0):
+    """
+    Create a new setup in ACTIVE_SETUPS for *symbol* with the given *bias*
+    (``"LONG"`` or ``"SHORT"``) from a detected *pattern* dict.
+
+    This is called from ``scan_top_gainers_and_alert()`` in place of the old
+    immediate-alert logic.
+
+    Returns True if setup was created, False if the symbol is already locked.
+    """
+    if should_lock_symbol(symbol, bias):
+        log(f"[SETUP SKIP] {symbol} already locked or has active setup")
+        return False
+
+    swing_high      = float(pattern.get("swing_high", 0))
+    swing_low       = float(pattern.get("swing_low",  0))
+    pullback_low    = float(pattern.get("pullback_low", swing_low))
+    bounce_high     = float(pattern.get("bounce_high", swing_high))
+    reference_level = swing_high if bias == "LONG" else swing_low
+    # Invalidation: below pullback_dip for LONG, above bounce_high for SHORT
+    invalidation    = (pullback_low * 0.997) if bias == "LONG" else (bounce_high * 1.003)
+
+    tp_zone = None
+    if bias == "LONG" and swing_high > 0 and swing_low > 0:
+        tp1 = swing_high
+        tp2 = swing_high + (swing_high - swing_low) * 0.382
+        tp_zone = [round(tp1, 8), round(tp2, 8)]
+    elif bias == "SHORT" and swing_high > 0 and swing_low > 0:
+        tp1 = swing_low
+        tp2 = swing_low - (swing_high - swing_low) * 0.382
+        tp_zone = [round(tp1, 8), round(tp2, 8)]
+
+    state = "TRACKING_LONG" if bias == "LONG" else "TRACKING_SHORT"
+    now_str = now_local_iso()
+
+    ACTIVE_SETUPS[symbol] = {
+        "state":               state,
+        "bias":                bias,
+        "swing_high":          swing_high,
+        "swing_low":           swing_low,
+        "reference_level":     reference_level,
+        "pullback_dip":        pullback_low,
+        "invalidation_level":  invalidation,
+        "tp_zone":             tp_zone,
+        "created_at":          now_str,
+        "last_update":         now_str,
+        "confirmed":           False,
+        "locked":              True,
+        "entry_allowed":       False,
+        "trade_opened":        False,
+        "retest_confirmed":    False,
+        "pattern":             pattern,
+        "change_24h":          change_24h,
+        "last_state":          None,
+    }
+
+    # Lock symbol immediately
+    SYMBOL_LOCKS[symbol] = {
+        "direction":   bias,
+        "reason":      "TRACKING_SETUP",
+        "lock_active": True,
+        "locked_at":   now_str,
+    }
+
+    # Send initial tracking Telegram message
+    score = pattern.get("score", 0)
+    pat   = pattern.get("pattern", "")
+    emoji = "🟢" if bias == "LONG" else "🔴"
+    tg_send(
+        f"{emoji} TRACKING {bias} — {symbol}\n"
+        f"📐 Pattern: {pat}\n"
+        f"📊 Score: {score}/100  |  24s: %{change_24h}\n"
+        f"🔺 Swing High: {swing_high}\n"
+        f"🔻 Swing Low: {swing_low}\n"
+        f"🎯 Reference: {reference_level}  |  Inv: {invalidation}\n"
+        f"⏳ Takipte — teyit bekleniyor\n"
+        f"time: {now_str}"
+    )
+    log(f"[SETUP CREATED] {symbol} {bias} state={state} ref={reference_level} inv={invalidation}")
+    return True
+
+
 def check_spot_pattern_followups():
     """
     For each coin previously detected with a pattern, fetch the latest 15m candles
@@ -6362,32 +7065,28 @@ def scan_top_gainers_and_alert():
                 sig = pattern.get("signal", "NONE") if pattern else "NONE"
                 if sig in ("VALID", "WATCHLIST"):
                     sig_emoji = "✅" if sig == "VALID" else "👁"
-                    msg_prefix = "🟢 LONG SİNYALİ" if sig == "VALID" else "🟡 WATCHLIST (LONG)"
                     log(f"[SPOT SCAN] {sig_emoji} {symbol} (%{change_24h}) — {sig}! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Retracement={pattern['retracement_ratio']}")
-                    msg = (
-                        f"{msg_prefix} — {symbol}\n"
-                        f"📈 24s Değişim: %{change_24h}\n"
-                        f"📐 Pattern: {pattern['pattern']}\n"
-                        f"🔺 Swing High: {pattern['swing_high']}\n"
-                        f"🔻 Swing Low: {pattern['swing_low']}\n"
-                        f"📊 Impulse: %{pattern['impulse_pct']}\n"
-                        f"🎯 Pullback Dip: {pattern['pullback_low']}\n"
-                        f"📉 Retracement: {pattern['retracement_ratio']}\n"
-                        f"Fib 38.2: {pattern['fib_382']} | 50.0: {pattern['fib_500']} | 61.8: {pattern['fib_618']}\n"
-                        f"💰 Son Kapanış: {pattern['last_close']}\n"
-                        f"⭐ Skor: {pattern['score']}/100"
-                    )
-                    tg_send(msg)
-                    log(f"[SPOT SCAN] LONG alert sent for {symbol} (score={pattern['score']})")
 
-                    # Register coin for follow-up over the next 2 × 15-minute closes
-                    SPOT_PATTERN_FOLLOWUP[symbol] = {
-                        "detected_ts": now,
-                        "remaining": SPOT_FOLLOWUP_CHECKS,
-                        "pattern": pattern,
-                        "change_24h": change_24h,
-                    }
-                    log(f"[SPOT SCAN] {symbol} takibe alındı ({SPOT_FOLLOWUP_CHECKS} kontrol)")
+                    # ── Setup State Machine: replace immediate alert with setup tracking ──
+                    # Only create a setup if the symbol is not already locked/tracked.
+                    # The old SPOT_PATTERN_FOLLOWUP path is preserved as fallback for
+                    # symbols that already have an active setup (so follow-up still runs).
+                    if not should_lock_symbol(symbol, "LONG"):
+                        created = create_breakout_setup(symbol, "LONG", pattern, change_24h)
+                        if created:
+                            # Also register in legacy follow-up so check_spot_pattern_followups
+                            # continues to report intermediate status updates.
+                            SPOT_PATTERN_FOLLOWUP[symbol] = {
+                                "detected_ts": now,
+                                "remaining": SPOT_FOLLOWUP_CHECKS,
+                                "pattern": pattern,
+                                "change_24h": change_24h,
+                            }
+                            log(f"[SPOT SCAN] {symbol} setup created + takibe alındı")
+                        else:
+                            log(f"[SPOT SCAN] {symbol} already has active setup, skipping duplicate LONG signal")
+                    else:
+                        log(f"[SPOT SCAN] {symbol} locked — skipping repeated LONG signal")
                 else:
                     if pattern:
                         m = pattern.get("metrics", {})
@@ -6436,31 +7135,23 @@ def scan_top_gainers_and_alert():
                 sig = pattern.get("signal", "NONE") if pattern else "NONE"
                 if sig in ("VALID", "WATCHLIST"):
                     sig_emoji = "✅" if sig == "VALID" else "👁"
-                    msg_prefix = "🔴 SHORT SİNYALİ" if sig == "VALID" else "🟡 WATCHLIST (SHORT)"
                     log(f"[SPOT SCAN LOSER] {sig_emoji} {symbol} (%{change_24h}) — {sig}! Skor={pattern['score']}/100, Impulse=%{pattern['impulse_pct']}, Recovery={pattern['recovery_ratio']}")
-                    msg = (
-                        f"{msg_prefix} — {symbol}\n"
-                        f"📉 24s Değişim: %{change_24h}\n"
-                        f"📐 Pattern: {pattern['pattern']}\n"
-                        f"🔺 Swing High: {pattern['swing_high']}\n"
-                        f"🔻 Swing Low: {pattern['swing_low']}\n"
-                        f"📊 Düşüş: %{pattern['impulse_pct']}\n"
-                        f"🎯 Bounce Tepe: {pattern['bounce_high']}\n"
-                        f"📈 Toparlanma: {pattern['recovery_ratio']}\n"
-                        f"Fib 38.2: {pattern['fib_382']} | 50.0: {pattern['fib_500']} | 61.8: {pattern['fib_618']}\n"
-                        f"💰 Son Kapanış: {pattern['last_close']}\n"
-                        f"⭐ Skor: {pattern['score']}/100"
-                    )
-                    tg_send(msg)
-                    log(f"[SPOT SCAN LOSER] SHORT alert sent for {symbol} (score={pattern['score']})")
 
-                    SPOT_LOSER_FOLLOWUP[symbol] = {
-                        "detected_ts": now,
-                        "remaining": SPOT_FOLLOWUP_CHECKS,
-                        "pattern": pattern,
-                        "change_24h": change_24h,
-                    }
-                    log(f"[SPOT SCAN LOSER] {symbol} takibe alındı ({SPOT_FOLLOWUP_CHECKS} kontrol)")
+                    # ── Setup State Machine: replace immediate alert with setup tracking ──
+                    if not should_lock_symbol(symbol, "SHORT"):
+                        created = create_breakout_setup(symbol, "SHORT", pattern, change_24h)
+                        if created:
+                            SPOT_LOSER_FOLLOWUP[symbol] = {
+                                "detected_ts": now,
+                                "remaining": SPOT_FOLLOWUP_CHECKS,
+                                "pattern": pattern,
+                                "change_24h": change_24h,
+                            }
+                            log(f"[SPOT SCAN LOSER] {symbol} SHORT setup created + takibe alındı")
+                        else:
+                            log(f"[SPOT SCAN LOSER] {symbol} already has active setup, skipping duplicate SHORT signal")
+                    else:
+                        log(f"[SPOT SCAN LOSER] {symbol} locked — skipping repeated SHORT signal")
                 else:
                     if pattern:
                         m = pattern.get("metrics", {})
@@ -6675,6 +7366,13 @@ def main():
                 SIGNAL_TRACKER.process_signals()
             except Exception as _st_err:
                 log(f"[SIGNAL TRACKER ERR] {_st_err}")
+
+            # 3.8) Advance breakout setup state machines and trigger confirmed trades
+            try:
+                process_active_setups()
+            except Exception as _setup_err:
+                log(f"[SETUP STATE ERR] {_setup_err}")
+                log(f"[SETUP STATE TRACE] {traceback.format_exc()}")
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
