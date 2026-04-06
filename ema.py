@@ -201,16 +201,20 @@ def detect_retest(
     window = min(lookback, n)
 
     if direction == "LONG":
-        # Retest: low must reach AT or BELOW the broken level (wicked into support),
-        # and close must hold AT or ABOVE the level (support held).
+        # Retest: low must reach AT or BELOW the broken level (within tolerance),
+        # and close must hold AT or ABOVE the level (support held, within tolerance).
+        upper_touch = level * (1 + tolerance_pct)
+        lower_close = level * (1 - tolerance_pct)
         for i in range(n - 1, n - window - 1, -1):
-            if lows[i] <= level and closes[i] >= level:
+            if lows[i] <= upper_touch and closes[i] >= lower_close:
                 return True, i - n, lows[i]
     else:  # SHORT
-        # Retest: high must reach AT or ABOVE the broken level (wicked into resistance),
-        # and close must hold AT or BELOW the level (resistance held).
+        # Retest: high must reach AT or ABOVE the broken level (within tolerance),
+        # and close must hold AT or BELOW the level (resistance held, within tolerance).
+        lower_touch = level * (1 - tolerance_pct)
+        upper_close = level * (1 + tolerance_pct)
         for i in range(n - 1, n - window - 1, -1):
-            if highs[i] >= level and closes[i] <= level:
+            if highs[i] >= lower_touch and closes[i] <= upper_close:
                 return True, i - n, highs[i]
 
     return False, None, None
