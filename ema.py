@@ -7859,13 +7859,19 @@ def update_setup_direction(symbol: str, new_bias: str, df) -> bool:
 
     # ── Compute reference & invalidation for new direction ────────────────────
     if new_bias == "LONG":
-        new_ref = new_sw_high
-        pullback = float(new_pattern.get("pullback_low", new_sw_low))
-        new_inv  = pullback * (1 - SETUP_INVALIDATION_BUFFER_PCT)
+        new_ref = new_sw_high if new_sw_high > 0 else float(setup.get("swing_high", 0))
+        fallback_pullback = float(setup.get("swing_low", new_sw_low)) if new_sw_low <= 0 else new_sw_low
+        pullback = float(new_pattern.get("pullback_low", fallback_pullback))
+        if pullback <= 0:
+            pullback = fallback_pullback
+        new_inv = pullback * (1 - SETUP_INVALIDATION_BUFFER_PCT)
     else:
-        new_ref  = new_sw_low
-        bounce_h = float(new_pattern.get("bounce_high", new_sw_high))
-        new_inv  = bounce_h * (1 + SETUP_INVALIDATION_BUFFER_PCT)
+        new_ref = new_sw_low if new_sw_low > 0 else float(setup.get("swing_low", 0))
+        fallback_bounce = float(setup.get("swing_high", new_sw_high)) if new_sw_high <= 0 else new_sw_high
+        bounce_h = float(new_pattern.get("bounce_high", fallback_bounce))
+        if bounce_h <= 0:
+            bounce_h = fallback_bounce
+        new_inv = bounce_h * (1 + SETUP_INVALIDATION_BUFFER_PCT)
 
     # ── TP zone ───────────────────────────────────────────────────────────────
     tp_zone = None
@@ -8173,7 +8179,7 @@ def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: flo
     pat   = pattern.get("pattern", "")
     emoji = "🟢" if bias == "LONG" else "🔴"
     src_tag = f"  |  Source: {candidate_source}" if candidate_source != "UNKNOWN" else ""
-    score_tag = f"  |  Long: {long_score}  Short: {short_score}" if long_score or short_score else ""
+    score_tag = f"  |  Long: {long_score}  Short: {short_score}" if long_score is not None and short_score is not None else ""
     tg_send(
         f"{emoji} TRACKING {bias} — {symbol}\n"
         f"📐 Pattern: {pat}\n"
