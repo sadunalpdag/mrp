@@ -3,6 +3,7 @@
 
 
 
+
 import os, re, time, requests, hmac, hashlib, threading, math, json, traceback, csv, io
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1029,6 +1030,7 @@ FOLLOWUP_MINUTES = 15          # minutes to wait before evaluating a signal
 FOLLOWUP_KLINE_INTERVAL = "1m" # kline interval used for follow-up analysis
 FOLLOWUP_KLINE_LIMIT = 30      # number of klines to fetch for analysis
 FOLLOWUP_RECENT_CANDLES = 3    # candles used for direction confirmation
+FOLLOWUP_TOLERANCE = 0.001     # 0.1% tolerance zone around the reference level
 BINANCE_SPOT_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 DEFAULT_LONG_SL_MULTIPLIER  = 0.97  # fallback SL distance for LONG when signal has no SL
 DEFAULT_SHORT_SL_MULTIPLIER = 1.03  # fallback SL distance for SHORT when signal has no SL
@@ -1067,6 +1069,49 @@ def _tracker_is_falling(closes: List[float]) -> bool:
     return closes[-3] > closes[-2] > closes[-1]
 
 
+def compare_with_tolerance(
+    last_close: float,
+    reference_level: float,
+    invalidation_level: float,
+    side: str,
+    tolerance_pct: float = FOLLOWUP_TOLERANCE,
+) -> str:
+    """Return a classification string based on how last_close compares to
+    reference_level and invalidation_level, using a tolerance zone to avoid
+    misclassifications from tiny price differences.
+
+    Returns one of:
+        CONFIRMED_LONG / CONFIRMED_SHORT
+        WEAK_LONG      / WEAK_SHORT
+        FAILED_LONG    / FAILED_SHORT
+        NEUTRAL_ZONE
+    """
+    tolerance = reference_level * tolerance_pct
+    side = side.upper()
+
+    if side == "LONG":
+        if last_close > reference_level + tolerance:
+            return "CONFIRMED_LONG"
+        elif last_close < invalidation_level:
+            return "FAILED_LONG"
+        elif last_close < reference_level - tolerance:
+            return "WEAK_LONG"
+        else:
+            return "NEUTRAL_ZONE"
+
+    elif side == "SHORT":
+        if last_close < reference_level - tolerance:
+            return "CONFIRMED_SHORT"
+        elif last_close > invalidation_level:
+            return "FAILED_SHORT"
+        elif last_close > reference_level + tolerance:
+            return "WEAK_SHORT"
+        else:
+            return "NEUTRAL_ZONE"
+
+    return "NEUTRAL_ZONE"
+
+
 def evaluate_signal_after_followup(signal: SignalEvent) -> SignalEvent:
     try:
         klines = _tracker_get_klines(signal.symbol, signal.interval, FOLLOWUP_KLINE_LIMIT)
@@ -1089,16 +1134,20 @@ def evaluate_signal_after_followup(signal: SignalEvent) -> SignalEvent:
 
     side = signal.side.upper()
 
+    classification = compare_with_tolerance(
+        last_close, signal.reference_level, signal.invalidation_level, side
+    )
+
     if side == "LONG":
-        if last_close > signal.reference_level and _tracker_is_rising(recent_closes):
+        if classification == "CONFIRMED_LONG" and _tracker_is_rising(recent_closes):
             signal.status = "CONFIRMED"
             signal.decision = "CONFIRMED_LONG"
             signal.notes.append("Fiyat referans üstünde kaldı ve son kapanışlar yükseliyor.")
-        elif last_close < signal.invalidation_level:
+        elif classification == "FAILED_LONG":
             signal.status = "FAILED"
             signal.decision = "FAILED_LONG"
             signal.notes.append("Fiyat invalidation seviyesinin altına indi.")
-        elif last_close < signal.reference_level:
+        elif classification == "WEAK_LONG":
             signal.status = "FAILED"
             signal.decision = "WEAK_LONG"
             signal.notes.append("Fiyat referans üstünde tutunamadı.")
@@ -1108,15 +1157,15 @@ def evaluate_signal_after_followup(signal: SignalEvent) -> SignalEvent:
             signal.notes.append("Long yapı tamamen bozulmadı ama güçlü teyit de gelmedi.")
 
     elif side == "SHORT":
-        if last_close < signal.reference_level and _tracker_is_falling(recent_closes):
+        if classification == "CONFIRMED_SHORT" and _tracker_is_falling(recent_closes):
             signal.status = "CONFIRMED"
             signal.decision = "CONFIRMED_SHORT"
             signal.notes.append("Fiyat referans altında kaldı ve son kapanışlar düşüyor.")
-        elif last_close > signal.invalidation_level:
+        elif classification == "FAILED_SHORT":
             signal.status = "FAILED"
             signal.decision = "FAILED_SHORT"
             signal.notes.append("Fiyat invalidation seviyesinin üstüne çıktı.")
-        elif last_close > signal.reference_level:
+        elif classification == "WEAK_SHORT":
             signal.status = "FAILED"
             signal.decision = "WEAK_SHORT"
             signal.notes.append("Fiyat referans altında tutunamadı.")
@@ -8725,3 +8774,5 @@ if __name__=="__main__":
     main()
 
                          
+
+    
