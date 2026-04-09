@@ -7279,6 +7279,34 @@ def detect_fake_breakout(df, bias: str, reference_level: float) -> bool:
         return False
 
 
+def detect_fake_breakdown(df, reference_level: float) -> bool:
+    """
+    Detect a fake (failed) breakdown for a SHORT-tracked symbol.
+
+    A fake breakdown occurs when:
+      - A previous closed candle broke below *reference_level* (its low was
+        below the level or it closed below the level), AND
+      - The most-recent closed candle closed BACK ABOVE *reference_level*
+        (price reclaimed the broken level), OR
+      - The breakdown candle had a weak body (body/range < SETUP_FAKE_BODY_RATIO)
+        AND its close was back above *reference_level*.
+
+    This is the SHORT-direction mirror of ``detect_fake_breakout(df, "LONG", ref)``
+    and is provided as a dedicated helper so callers can use an explicit, readable
+    name when reasoning about short-side reversals.
+
+    Parameters
+    ----------
+    df              : 15m klines DataFrame (most recent row = live candle)
+    reference_level : the swing-low support level that was expected to hold
+
+    Returns
+    -------
+    bool – True when a fake breakdown is confirmed on closed candles.
+    """
+    return detect_fake_breakout(df, "SHORT", reference_level)
+
+
 def detect_retest_acceptance(df, bias: str, reference_level: float,
                               invalidation_level: float) -> bool:
     """
@@ -7557,7 +7585,15 @@ def update_symbol_setup_state(symbol: str, df) -> str:
     # ── TRACKING state transitions ────────────────────────────────────────────
     if state in ("TRACKING_LONG", "TRACKING_SHORT"):
 
-        if detect_fake_breakout(df, bias, ref):
+        # For LONG: detect_fake_breakout checks if price broke above ref then
+        # closed back below (fake long breakout).
+        # For SHORT: detect_fake_breakdown checks if price broke below ref then
+        # closed back above (fake short breakdown / reclaim).
+        fake_signal = (
+            detect_fake_breakout(df, "LONG", ref) if bias == "LONG"
+            else detect_fake_breakdown(df, ref)
+        )
+        if fake_signal:
             new_s = "FAKE_BREAKOUT_LONG" if bias == "LONG" else "FAKE_BREAKOUT_SHORT"
             _setup_transition(symbol, new_s)
             _apply_lock_after_setup(symbol, "FAKE_BREAKOUT")
@@ -7579,7 +7615,11 @@ def update_symbol_setup_state(symbol: str, df) -> str:
     # ── BREAKOUT_PENDING state transitions ─────────────────────────────────────
     elif state == "BREAKOUT_PENDING":
 
-        if detect_fake_breakout(df, bias, ref):
+        fake_signal = (
+            detect_fake_breakout(df, "LONG", ref) if bias == "LONG"
+            else detect_fake_breakdown(df, ref)
+        )
+        if fake_signal:
             new_s = "FAKE_BREAKOUT_LONG" if bias == "LONG" else "FAKE_BREAKOUT_SHORT"
             _setup_transition(symbol, new_s)
             _apply_lock_after_setup(symbol, "FAKE_BREAKOUT")
