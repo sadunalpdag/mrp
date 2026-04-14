@@ -97,6 +97,27 @@ LIMIT_ORDER_BUFFER_PCT = 0.0015  # 0.15% price buffer to limit slippage while en
 MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
 
 # ==============================================================================
+# LONG ENTRY STRATEGY — Configurable thresholds
+# Impulse → Pullback → Support Hold → Bounce
+# ==============================================================================
+LONG_MIN_IMPULSE_PCT        = 6.0    # Minimum bullish impulse move (%)
+LONG_MIN_IMPULSE_PCT_WEAK   = 4.0    # Relaxed impulse threshold (WATCHLIST only)
+LONG_CLEAN_IMPULSE_MIN_BULL = 2      # Min consecutive bullish candles for clean impulse
+LONG_FIB_IDEAL_LOW          = 0.382  # Fibonacci zone lower bound (ideal)
+LONG_FIB_IDEAL_HIGH         = 0.618  # Fibonacci zone upper bound (ideal)
+LONG_FIB_ACCEPT_LOW         = 0.30   # Fibonacci zone lower bound (acceptable)
+LONG_FIB_ACCEPT_HIGH        = 0.70   # Fibonacci zone upper bound (acceptable)
+LONG_MAX_RETRACEMENT        = 0.75   # Hard reject above this retracement
+LONG_SUPPORT_MIN_CLOSES     = 2      # Min candle closes above support for confirmation
+LONG_WICK_SWEEP_RATIO       = 0.40   # Lower wick / total range to qualify as sweep
+LONG_OVEREXTEND_PCT         = 0.03   # Max % distance from support before overextended
+LONG_OVEREXTEND_ATR_MULT    = 2.5    # ATR multiplier for overextension check
+LONG_CONSOLIDATION_WINDOW   = 5      # Candles to check for range compression
+LONG_CONSOLIDATION_ATR_MULT = 0.6    # Consolidation: range < ATR * this value
+LONG_SCORE_VALID            = 70     # Score threshold for VALID signal
+LONG_SCORE_WATCHLIST        = 50     # Score threshold for WATCHLIST signal
+
+# ==============================================================================
 # ENTRY ENGINE
 # Professional-grade breakout entry engine (formerly entry_engine.py).
 #
@@ -2744,6 +2765,26 @@ def check_and_log_real_closed_trades():
                 max_loss_str = f"{pos_info.get('max_loss', 0.0):.2f}"
                 log(f"[REAL CLOSED] {sym} {direction} Strategy:{pos_info.get('kind', 'UNKNOWN')} "
                     f"PnL:{pnl_str}% Exit:{exit_str} MaxProfit:${max_profit_str} MaxLoss:${max_loss_str}")
+
+                # ── Automatic Telegram close notification ─────────────────────
+                try:
+                    _pnl_sign = "+" if (pnl_pct or 0) >= 0 else ""
+                    _pnl_emoji = "✅" if (pnl_pct or 0) >= 0 else "❌"
+                    _dir_emoji = "🟢" if direction == "UP" else "🔴"
+                    _strategy  = pos_info.get("kind", "UNKNOWN")
+                    _tag       = pos_info.get("tag", "")
+                    _entry_p   = safe_float(pos_info.get("entry_price", 0))
+                    tg_send(
+                        f"{_pnl_emoji} TRADE CLOSED — {sym}\n"
+                        f"{_dir_emoji} Direction: {direction}  |  Strategy: {_strategy}\n"
+                        f"💵 Entry: {_entry_p}  →  Exit: {exit_str}\n"
+                        f"📊 PnL: {_pnl_sign}{pnl_str}%\n"
+                        f"📈 Max Profit: ${max_profit_str}  |  Max Loss: ${max_loss_str}\n"
+                        f"{('🏷 ' + _tag + chr(10)) if _tag else ''}"
+                        f"⏰ {now_local_iso()}"
+                    )
+                except Exception as _tg_err:
+                    log(f"[TG CLOSE NOTIFY ERR] {sym}: {_tg_err}")
         
         # Remove closed positions from tracker
         for sym in closed_symbols:
@@ -6670,22 +6711,267 @@ def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
     return df
 
 
+# ==============================================================================
+# 🔍 LONG ENTRY STRATEGY — HELPER FUNCTIONS
+# Impulse → Pullback → Support Hold → Bounce
+# ==============================================================================
+
+def detect_clean_impulse(opens, highs, lows, closes, start_idx: int, end_idx: int,
+                          min_consecutive_bull: int = LONG_CLEAN_IMPULSE_MIN_BULL) -> dict:
+    """
+    Check whether the impulse leg from start_idx to end_idx is a CLEAN move.
+
+    A clean impulse satisfies at least ONE of:
+    1. At least `min_consecutive_bull` consecutive bullish candles within the leg.
+    2. The average candle range of the impulse leg is > 1.5× the average range
+       of the 10 candles BEFORE the leg (range expansion).
+
+    Parameters
+    ----------
+    opens, highs, lows, closes : full price arrays
+    start_idx, end_idx         : start and end index of the impulse leg (inclusive)
+    min_consecutive_bull       : minimum run of bullish candles needed
+
+    Returns
+    -------
+    dict with keys:
+        clean          : bool
+        consecutive_bull : int  – longest consecutive bullish run in the leg
+        range_expansion  : float – ratio of impulse avg range vs pre-impulse avg range
+        reason           : str
+    """
+    if end_idx <= start_idx or end_idx >= len(closes):
+        return {"clean": False, "consecutive_bull": 0, "range_expansion": 0.0,
+                "reason": "invalid indices"}
+
+    leg_opens  = opens[start_idx: end_idx + 1]
+    leg_highs  = highs[start_idx: end_idx + 1]
+    leg_lows   = lows[start_idx: end_idx + 1]
+    leg_closes = closes[start_idx: end_idx + 1]
+
+    # 1. Count consecutive bullish candles in the leg
+    max_run = 0
+    cur_run = 0
+    for i in range(len(leg_closes)):
+        if leg_closes[i] > leg_opens[i]:
+            cur_run += 1
+            max_run = max(max_run, cur_run)
+        else:
+            cur_run = 0
+
+    # 2. Range expansion
+    leg_ranges = [leg_highs[i] - leg_lows[i] for i in range(len(leg_highs))]
+    avg_leg_range = sum(leg_ranges) / len(leg_ranges) if leg_ranges else 0.0
+
+    pre_start = max(0, start_idx - 10)
+    pre_ranges = [highs[i] - lows[i] for i in range(pre_start, start_idx)]
+    avg_pre_range = sum(pre_ranges) / len(pre_ranges) if pre_ranges else avg_leg_range
+
+    range_expansion = (avg_leg_range / avg_pre_range) if avg_pre_range > 0 else 1.0
+
+    consec_ok = max_run >= min_consecutive_bull
+    expansion_ok = range_expansion >= 1.5
+
+    clean = consec_ok or expansion_ok
+    reason_parts = []
+    if consec_ok:
+        reason_parts.append(f"{max_run} consecutive bull candles")
+    if expansion_ok:
+        reason_parts.append(f"range expansion {range_expansion:.2f}×")
+    if not clean:
+        reason_parts.append("choppy impulse")
+
+    return {
+        "clean":           clean,
+        "consecutive_bull": max_run,
+        "range_expansion": round(range_expansion, 2),
+        "reason":          " | ".join(reason_parts) if reason_parts else "no data",
+    }
+
+
+def detect_support_confirmation(opens, highs, lows, closes, support_level: float,
+                                 min_closes_above: int = LONG_SUPPORT_MIN_CLOSES,
+                                 wick_sweep_ratio: float = LONG_WICK_SWEEP_RATIO,
+                                 consol_window: int = LONG_CONSOLIDATION_WINDOW,
+                                 consol_atr_mult: float = LONG_CONSOLIDATION_ATR_MULT) -> dict:
+    """
+    Confirm that price is *holding* the support level.
+
+    Checks THREE sub-conditions (passing ONE is sufficient):
+    1. Multiple closed candles with closes above support_level.
+    2. Long lower wick (liquidity sweep): a candle whose lower wick is ≥
+       `wick_sweep_ratio` of its total range, and whose low dipped through
+       the support level, yet closed above it.
+    3. Range compression (consolidation) near support: the high-low range of
+       the last `consol_window` candles is narrower than ATR * consol_atr_mult.
+
+    Returns
+    -------
+    dict with keys:
+        confirmed    : bool
+        closes_above : int   – number of recent closes above support
+        wick_sweep   : bool  – True when a liquidity-sweep wick was detected
+        consolidation: bool  – True when price is compressing near support
+        score_add    : int   – suggested additional score points (0–15)
+        reason       : str
+    """
+    n = len(closes)
+    if n < 5:
+        return {"confirmed": False, "closes_above": 0, "wick_sweep": False,
+                "consolidation": False, "score_add": 0, "reason": "insufficient data"}
+
+    # 1. Count recent closes above support (last 8 candles)
+    window = min(8, n)
+    closes_above = sum(1 for c in closes[-window:] if c > support_level)
+
+    # 2. Lower wick sweep
+    wick_sweep = False
+    for i in range(-min(5, n), 0):
+        hi = highs[i]; lo = lows[i]; cl = closes[i]; op = opens[i]
+        total_range = hi - lo
+        if total_range <= 0:
+            continue
+        lower_wick = min(op, cl) - lo
+        wick_pct = lower_wick / total_range
+        if lo < support_level and cl > support_level and wick_pct >= wick_sweep_ratio:
+            wick_sweep = True
+            break
+
+    # 3. Consolidation / range compression near support
+    atr_vals = _atr(highs, lows, closes)
+    atr_val = atr_vals[-1] if atr_vals else 0.0
+    recent_high = max(highs[-consol_window:]) if n >= consol_window else max(highs)
+    recent_low  = min(lows[-consol_window:])  if n >= consol_window else min(lows)
+    recent_range = recent_high - recent_low
+    consolidation = (atr_val > 0 and recent_range < atr_val * consol_atr_mult
+                     and closes[-1] > support_level)
+
+    confirmed = closes_above >= min_closes_above or wick_sweep or consolidation
+
+    score_add = 0
+    reasons = []
+    if closes_above >= min_closes_above:
+        score_add += 8
+        reasons.append(f"{closes_above} closes above support")
+    if wick_sweep:
+        score_add += 10
+        reasons.append("lower wick sweep (liquidity grab)")
+    if consolidation:
+        score_add += 7
+        reasons.append("range compression near support")
+
+    return {
+        "confirmed":    confirmed,
+        "closes_above": closes_above,
+        "wick_sweep":   wick_sweep,
+        "consolidation": consolidation,
+        "score_add":    min(score_add, 15),
+        "reason":       " | ".join(reasons) if reasons else "no support confirmation",
+    }
+
+
+def detect_bounce_confirmation(opens, highs, lows, closes, lookback: int = 5) -> dict:
+    """
+    Detect a momentum bounce at the pullback low.
+
+    Confirms at least ONE of:
+    1. Strong bullish candle: close > previous close AND body/range ≥ 40 %.
+    2. Two consecutive higher closes in the last `lookback` candles.
+    3. Bullish engulfing: current candle body engulfs the previous candle body,
+       current close > current open (bullish).
+
+    Returns
+    -------
+    dict with keys:
+        confirmed   : bool
+        strong_bull : bool
+        consec_higher: bool
+        engulfing   : bool
+        score_add   : int (0–25)
+        reason      : str
+    """
+    n = len(closes)
+    if n < 3:
+        return {"confirmed": False, "strong_bull": False, "consec_higher": False,
+                "engulfing": False, "score_add": 0, "reason": "insufficient data"}
+
+    # 1. Strong bullish candle (last closed)
+    strong_bull = False
+    c0, o0, h0, l0 = closes[-1], opens[-1], highs[-1], lows[-1]
+    c1 = closes[-2]
+    total_range = h0 - l0
+    body = abs(c0 - o0)
+    body_ratio = body / total_range if total_range > 0 else 0.0
+    if c0 > o0 and c0 > c1 and body_ratio >= 0.40:
+        strong_bull = True
+
+    # 2. Two consecutive higher closes
+    consec_higher = False
+    window = closes[-lookback:]
+    count = 0
+    for i in range(1, len(window)):
+        if window[i] > window[i - 1]:
+            count += 1
+            if count >= 2:
+                consec_higher = True
+                break
+        else:
+            count = 0
+
+    # 3. Bullish engulfing
+    engulfing = False
+    if n >= 2:
+        c_prev, o_prev = closes[-2], opens[-2]
+        c_curr, o_curr = closes[-1], opens[-1]
+        prev_bearish = c_prev < o_prev
+        curr_bullish = c_curr > o_curr
+        curr_engulfs = o_curr <= c_prev and c_curr >= o_prev
+        if prev_bearish and curr_bullish and curr_engulfs:
+            engulfing = True
+
+    confirmed = strong_bull or consec_higher or engulfing
+
+    score_add = 0
+    reasons = []
+    if engulfing:
+        score_add += 25
+        reasons.append("bullish engulfing")
+    elif strong_bull:
+        score_add += 20
+        reasons.append(f"strong bull candle (body={body_ratio:.0%})")
+    elif consec_higher:
+        score_add += 12
+        reasons.append("two consecutive higher closes")
+
+    return {
+        "confirmed":    confirmed,
+        "strong_bull":  strong_bull,
+        "consec_higher": consec_higher,
+        "engulfing":    engulfing,
+        "score_add":    score_add,
+        "reason":       " | ".join(reasons) if reasons else "no bounce confirmation",
+    }
+
+
 def detect_support_bounce_pattern(df):
     """
     Score-based support bounce detection (LONG signal).
 
-    Scoring breakdown:
-      impulse >= 8%          → +20  (>= 5% → +10)
-      fib zone 0.382–0.618   → +20  (0.30–0.70 → +10)
-      retracement <= 0.72    → +10  (<= 0.75   → +5)
-      bounce confirmed       → +25  (2+ bounce candles → +12)
-      volume above average   → +15
-      EMA trend up           → +10
+    Scoring breakdown (IMPROVED — Impulse → Pullback → Support → Bounce):
+      impulse >= 6%          → +20  (>= 4% → +10, < 4% → reject)
+      clean impulse          → +5   (consecutive bull candles or range expansion)
+      fib zone 0.382–0.618   → +20  (0.30–0.70 → +10, > 0.75 → hard REJECT)
+      retracement <= 0.70    → +10  (<= 0.75   → +5)
+      support confirmation   → +15  (closes above support / wick sweep / consolidation)
+      bounce confirmation    → +25  (engulfing +25, strong bull +20, consec higher +12)
+      volume above average   → +10
+      EMA20 > EMA50 trend    → +10  (below EMA20 → –10 WATCHLIST penalty)
+      overextension check    → disqualify if price too far from support (ATR/%)
 
     Signal thresholds:
-      score >= 70 → VALID
-      score >= 55 → WATCHLIST
-      else        → NONE
+      score >= LONG_SCORE_VALID     → VALID
+      score >= LONG_SCORE_WATCHLIST → WATCHLIST
+      else                          → NONE
 
     Returns dict with signal/score/reasons/metrics plus flat keys for
     backward-compatible access by follow-up code.
@@ -6719,14 +7005,33 @@ def detect_support_bounce_pattern(df):
 
     impulse_pct = (swing_high - swing_low) / swing_low * 100
 
-    # --- Impulse scoring (relaxed: 8% → 5%) ---
-    impulse_ok = impulse_pct >= 5
-    if impulse_pct >= 8:
+    # --- Impulse scoring (tighter: requires ≥ LONG_MIN_IMPULSE_PCT) ---
+    impulse_ok = impulse_pct >= LONG_MIN_IMPULSE_PCT_WEAK
+    if impulse_pct >= LONG_MIN_IMPULSE_PCT:         # ≥ 6 %
         score += 20
-    elif impulse_pct >= 5:
+    elif impulse_pct >= LONG_MIN_IMPULSE_PCT_WEAK:  # ≥ 4 %
         score += 10
     else:
-        reasons.append("impulse_weak")
+        reasons.append("impulse_too_weak")
+
+    # --- Clean impulse check ---
+    clean_impulse_ok = False
+    if impulse_ok:
+        # Convert recent slice to raw lists for helper
+        _opens  = recent["open"].astype(float).tolist()
+        _highs  = recent["high"].astype(float).tolist()
+        _lows   = recent["low"].astype(float).tolist()
+        _closes = recent["close"].astype(float).tolist()
+        # Compute absolute indices in recent for the impulse leg
+        _ci_low_idx  = int(low_idx)
+        _ci_high_idx = int(low_idx) + 1 + int(high_idx)
+        _ci_high_idx = min(_ci_high_idx, len(_closes) - 1)
+        ci = detect_clean_impulse(_opens, _highs, _lows, _closes, _ci_low_idx, _ci_high_idx)
+        clean_impulse_ok = ci["clean"]
+        if clean_impulse_ok:
+            score += 5
+        else:
+            reasons.append("choppy_impulse")
 
     after_high = recent.iloc[high_idx + 1:]
     if len(after_high) < 3:
@@ -6735,7 +7040,9 @@ def detect_support_bounce_pattern(df):
             "score": round(score, 1),
             "reasons": reasons + ["insufficient_data"],
             "metrics": {"impulse_ok": impulse_ok, "fib_ok": False,
-                        "bounce_ok": False, "volume_ok": False, "ema_ok": False},
+                        "bounce_ok": False, "volume_ok": False, "ema_ok": False,
+                        "clean_impulse_ok": clean_impulse_ok,
+                        "support_ok": False, "overextended": False},
             "swing_low": round(float(swing_low), 6),
             "swing_high": round(float(swing_high), 6),
             "impulse_pct": round(float(impulse_pct), 2),
@@ -6744,90 +7051,125 @@ def detect_support_bounce_pattern(df):
             "fib_382": 0.0, "fib_500": 0.0, "fib_618": 0.0,
             "last_close": round(float(recent.iloc[-1]["close"]), 6),
             "support_distance_pct": 0.0,
-            "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE",
+            "pattern": "IMPULSE → PULLBACK → BOUNCE",
         }
 
     pullback_low = after_high["low"].min()
 
-    fib_382 = swing_high - 0.382 * (swing_high - swing_low)
-    fib_500 = swing_high - 0.500 * (swing_high - swing_low)
-    fib_618 = swing_high - 0.618 * (swing_high - swing_low)
-    fib_300 = swing_high - 0.300 * (swing_high - swing_low)
-    fib_700 = swing_high - 0.700 * (swing_high - swing_low)
+    fib_382 = swing_high - LONG_FIB_IDEAL_LOW  * (swing_high - swing_low)
+    fib_500 = swing_high - 0.500               * (swing_high - swing_low)
+    fib_618 = swing_high - LONG_FIB_IDEAL_HIGH * (swing_high - swing_low)
+    fib_accept_lo = swing_high - LONG_FIB_ACCEPT_HIGH * (swing_high - swing_low)
+    fib_accept_hi = swing_high - LONG_FIB_ACCEPT_LOW  * (swing_high - swing_low)
 
     retracement_ratio = (swing_high - pullback_low) / (swing_high - swing_low)
 
-    # --- Fib zone scoring (relaxed: 0.382–0.618 → 0.30–0.70) ---
-    in_support_zone_strict = fib_618 <= pullback_low <= fib_382
-    in_support_zone_relaxed = fib_700 <= pullback_low <= fib_300
-    fib_ok = in_support_zone_relaxed
-    if in_support_zone_strict:
+    # --- Hard reject: retracement > LONG_MAX_RETRACEMENT means structure broken ---
+    if retracement_ratio > LONG_MAX_RETRACEMENT:
+        reasons.append("structure_broken_deep_retracement")
+        score = max(0, score - 30)
+        # Still continue to calculate remaining fields for complete output
+
+    # --- Fib zone scoring (ideal: 0.382–0.618 preferred; acceptable: 0.30–0.70) ---
+    in_support_zone_ideal    = fib_618 <= pullback_low <= fib_382
+    in_support_zone_accept   = fib_accept_lo <= pullback_low <= fib_accept_hi
+    fib_ok = in_support_zone_accept
+    if in_support_zone_ideal:
         score += 20
-    elif in_support_zone_relaxed:
+    elif in_support_zone_accept:
         score += 10
     else:
         reasons.append("fib_outside_zone")
 
-    # --- Retracement ratio scoring (relaxed: 0.72 → 0.75) ---
-    retracement_ok = retracement_ratio <= 0.75
-    if retracement_ratio <= 0.72:
+    # --- Retracement ratio scoring ---
+    retracement_ok = retracement_ratio <= LONG_MAX_RETRACEMENT
+    if retracement_ratio <= LONG_FIB_ACCEPT_HIGH:    # <= 0.70
         score += 10
-    elif retracement_ratio <= 0.75:
+    elif retracement_ratio <= LONG_MAX_RETRACEMENT:  # <= 0.75
         score += 5
     else:
         reasons.append("retracement_too_deep")
 
-    # --- Bounce confirmation: last 3–5 candles (relaxed from last 2) ---
+    # --- Support confirmation using enhanced helper ---
     last1 = recent.iloc[-1]
     last2 = recent.iloc[-2]
-    window = recent.iloc[-5:]
-    bounce_candle_count = 0
-    if len(window) >= 2:
-        bounce_candle_count = sum(
-            1 for i in range(1, len(window))
-            if window.iloc[i]["close"] > window.iloc[i]["open"]
-            and window.iloc[i]["close"] > window.iloc[i - 1]["close"]
-        )
-    bounce_primary = (
-        last1["close"] > last1["open"]
-        and last1["close"] > last2["close"]
-        and last1["close"] > pullback_low * 1.01
+
+    _opens_all  = d["open"].astype(float).tolist()
+    _highs_all  = d["high"].astype(float).tolist()
+    _lows_all   = d["low"].astype(float).tolist()
+    _closes_all = d["close"].astype(float).tolist()
+
+    support_conf = detect_support_confirmation(
+        _opens_all, _highs_all, _lows_all, _closes_all,
+        support_level = float(fib_500),
     )
-    bounce_ok = bounce_primary or bounce_candle_count >= 2
-    if bounce_primary:
-        score += 25
-    elif bounce_candle_count >= 2:
-        score += 12
-    else:
+    support_ok = support_conf["confirmed"]
+    score += support_conf["score_add"]
+    if not support_ok:
+        reasons.append("no_support_confirmation")
+
+    # --- Bounce confirmation using enhanced helper ---
+    bounce_conf = detect_bounce_confirmation(
+        _opens_all, _highs_all, _lows_all, _closes_all
+    )
+    bounce_ok = bounce_conf["confirmed"]
+    score += bounce_conf["score_add"]
+    if not bounce_ok:
         reasons.append("no_bounce_confirmation")
 
-    # --- Volume scoring (optional: adds score, not required) ---
+    # --- Overextension check: price must not be too far from support ---
+    atr_vals  = _atr(_highs_all, _lows_all, _closes_all)
+    atr_val   = atr_vals[-1] if atr_vals else float(_closes_all[-1]) * 0.01
+    last_close_f = float(last1["close"])
+    support_f    = float(fib_500)
+    overextended = False
+    if support_f > 0:
+        pct_dist  = (last_close_f - support_f) / support_f
+        atr_dist  = (last_close_f - support_f) / atr_val if atr_val > 0 else 0.0
+        overextended = (pct_dist > LONG_OVEREXTEND_PCT) or (atr_dist > LONG_OVEREXTEND_ATR_MULT)
+    if overextended:
+        reasons.append("overextended_from_support")
+        score = max(0, score - 20)
+
+    # --- Volume scoring (optional bonus) ---
     vol_ok = (
         pd.notna(last1.get("vol_ma20"))
         and last1["volume"] >= last1["vol_ma20"] * 1.05
     )
     if vol_ok:
-        score += 15
+        score += 10
     else:
         reasons.append("volume_weak")
 
-    # --- EMA trend confirmation (optional bonus) ---
+    # --- EMA trend filter ---
     ema_ok = False
+    ema_below = False
+    ema20_val = ema50_val = None
     try:
-        closes = d["close"]
-        ema20_val = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
-        ema50_val = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
-        ema_ok = float(last1["close"]) > ema20_val and ema20_val > ema50_val
+        closes_series = d["close"]
+        ema20_val = float(closes_series.ewm(span=20, adjust=False).mean().iloc[-1])
+        ema50_val = float(closes_series.ewm(span=50, adjust=False).mean().iloc[-1])
+        ema_ok    = last_close_f > ema20_val and ema20_val > ema50_val
+        ema_below = last_close_f < ema20_val
         if ema_ok:
             score += 10
+        elif ema_below:
+            # Below EMA20 → downgrade to WATCHLIST at most
+            score -= 10
+            reasons.append("below_ema20_watchlist_only")
     except Exception:
         pass
 
-    score = round(min(score, 100), 1)
+    score = round(min(max(score, 0), 100), 1)
 
-    if score >= 70:
+    # Hard REJECT when retracement > MAX and structure is broken
+    if retracement_ratio > LONG_MAX_RETRACEMENT:
+        signal = "NONE"
+        if "structure_broken_deep_retracement" not in reasons:
+            reasons.append("structure_broken_deep_retracement")
+    elif score >= LONG_SCORE_VALID:
         signal = "VALID"
-    elif score >= 55:
+    elif score >= LONG_SCORE_WATCHLIST:
         signal = "WATCHLIST"
     else:
         signal = "NONE"
@@ -6841,11 +7183,14 @@ def detect_support_bounce_pattern(df):
         "score": score,
         "reasons": reasons,
         "metrics": {
-            "impulse_ok": impulse_ok,
-            "fib_ok": fib_ok,
-            "bounce_ok": bounce_ok,
-            "volume_ok": vol_ok,
-            "ema_ok": ema_ok,
+            "impulse_ok":       impulse_ok,
+            "clean_impulse_ok": clean_impulse_ok,
+            "fib_ok":           fib_ok,
+            "support_ok":       support_ok,
+            "bounce_ok":        bounce_ok,
+            "volume_ok":        vol_ok,
+            "ema_ok":           ema_ok,
+            "overextended":     overextended,
         },
         # Flat keys preserved for backward-compatible access (follow-up code)
         "swing_low": round(float(swing_low), 6),
@@ -6858,8 +7203,120 @@ def detect_support_bounce_pattern(df):
         "fib_618": round(float(fib_618), 6),
         "last_close": round(float(last1["close"]), 6),
         "support_distance_pct": round(float(support_distance_pct), 2),
-        "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE",
+        "pattern": "IMPULSE → PULLBACK → BOUNCE",
     }
+
+
+def evaluate_long_entry_signal(df, symbol: str = "") -> dict:
+    """
+    High-level LONG entry evaluator combining all strategy components.
+
+    Returns a structured signal object:
+    {
+        "symbol"  : str,
+        "pattern" : "IMPULSE → PULLBACK → BOUNCE",
+        "state"   : "CONFIRMED_LONG" | "WATCHLIST" | "FAKE_BREAKOUT" | "OVEREXTENDED_NO_ENTRY" | "REJECT",
+        "entry"   : float,   # recommended entry price
+        "support" : float,   # support / invalidation zone top
+        "invalid" : float,   # hard invalidation (stop below here)
+        "score"   : int,     # 0-100
+        "reason"  : str,
+    }
+
+    The state maps to the score as follows:
+      score >= LONG_SCORE_VALID        → CONFIRMED_LONG
+      score >= LONG_SCORE_WATCHLIST    → WATCHLIST
+      overextension detected           → OVEREXTENDED_NO_ENTRY
+      structure broken / score < limit → FAKE_BREAKOUT or REJECT
+    """
+    empty = {
+        "symbol":  symbol,
+        "pattern": "IMPULSE → PULLBACK → BOUNCE",
+        "state":   "REJECT",
+        "entry":   None,
+        "support": None,
+        "invalid": None,
+        "score":   0,
+        "reason":  "insufficient data",
+    }
+
+    if df is None or len(df) < 80:
+        return empty
+
+    try:
+        pattern = detect_support_bounce_pattern(df)
+        if pattern is None:
+            return empty
+
+        sig   = pattern["signal"]
+        score = int(pattern.get("score", 0))
+        reasons = pattern.get("reasons", [])
+        metrics = pattern.get("metrics", {})
+
+        swing_high       = pattern.get("swing_high", 0.0)
+        swing_low        = pattern.get("swing_low", 0.0)
+        fib_500          = pattern.get("fib_500", 0.0)
+        fib_618          = pattern.get("fib_618", 0.0)
+        last_close       = pattern.get("last_close", 0.0)
+        retracement      = pattern.get("retracement_ratio", 0.0)
+
+        # Support level = fib 50 % (mid of expected bounce zone)
+        support = fib_500
+
+        # Invalidation = fib 61.8 with a small buffer below
+        invalid = fib_618 * (1 - SETUP_INVALIDATION_BUFFER_PCT)
+
+        # Recommended entry = current close (assuming bounce already starting)
+        entry = last_close
+
+        # Determine state
+        overextended = metrics.get("overextended", False)
+
+        if overextended:
+            state = "OVEREXTENDED_NO_ENTRY"
+        elif retracement > LONG_MAX_RETRACEMENT:
+            state = "FAKE_BREAKOUT"
+        elif sig == "VALID":
+            state = "CONFIRMED_LONG"
+        elif sig == "WATCHLIST":
+            state = "WATCHLIST"
+        else:
+            state = "REJECT"
+
+        reason_parts = []
+        if sig in ("VALID", "WATCHLIST"):
+            if metrics.get("clean_impulse_ok"):
+                reason_parts.append("clean impulse")
+            if metrics.get("fib_ok"):
+                reason_parts.append("fib pullback zone")
+            if metrics.get("support_ok"):
+                reason_parts.append("support confirmed")
+            if metrics.get("bounce_ok"):
+                reason_parts.append("bounce confirmed")
+            if metrics.get("ema_ok"):
+                reason_parts.append("EMA aligned")
+            if metrics.get("volume_ok"):
+                reason_parts.append("vol spike")
+        else:
+            reason_parts = [r for r in reasons if r]
+
+        reason_str = " | ".join(reason_parts) if reason_parts else sig
+
+        return {
+            "symbol":  symbol,
+            "pattern": "IMPULSE → PULLBACK → BOUNCE",
+            "state":   state,
+            "entry":   round(float(entry), 6) if entry else None,
+            "support": round(float(support), 6) if support else None,
+            "invalid": round(float(invalid), 6) if invalid else None,
+            "score":   score,
+            "reason":  reason_str,
+        }
+
+    except Exception as e:
+        log(f"[EVALUATE LONG ENTRY ERR] {symbol}: {e}")
+        empty["reason"] = str(e)
+        return empty
 
 
 def detect_dead_cat_bounce_pattern(df):
