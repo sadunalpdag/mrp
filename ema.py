@@ -7298,8 +7298,8 @@ def _detect_fake_breakdown_reclaim(window) -> Tuple[bool, float]:
         c_low   = float(candle["low"])
         c_close = float(candle["close"])
         c_open  = float(candle["open"])
-        # Wick pierced below prior_low but body closed above it
-        if c_low < prior_low and c_close > prior_low and c_open > prior_low:
+        # Wick pierced below prior_low but close reclaimed above it
+        if c_low < prior_low and c_close > prior_low:
             reclaim_pct = (c_close - c_low) / c_low * 100 if c_low > 0 else 0.0
             return True, round(reclaim_pct, 2)
         prior_low = min(prior_low, c_low)
@@ -7427,11 +7427,7 @@ def detect_accumulation_pattern(df, symbol: str = "",
     # ── Step 4: Volume stays active at lows ───────────────────────────────────
     window["vol_ma20"] = window["volume"].rolling(20, min_periods=5).mean()
     trough_vol    = float(window.loc[trough_idx_rel, "volume"])
-    trough_vol_ma = (
-        window.loc[trough_idx_rel, "vol_ma20"]
-        if trough_idx_rel in window.index
-        else float("nan")
-    )
+    trough_vol_ma = window.loc[trough_idx_rel, "vol_ma20"]
     if pd.isna(trough_vol_ma) or trough_vol_ma <= 0:
         trough_vol_ma = float(window["volume"].mean()) or 1.0
 
@@ -7493,9 +7489,11 @@ def detect_accumulation_pattern(df, symbol: str = "",
         detected = True
         state    = "ACCUMULATION"
         bias     = "SHORT_EXIT"
-        action   = "NO_SHORT"
-        if reclaim_pct >= 1.0 or _detect_higher_low(window):
-            action = "LOOK_FOR_LONG_CONFIRMATION"
+        action   = (
+            "LOOK_FOR_LONG_CONFIRMATION"
+            if reclaim_pct >= 1.0 or _detect_higher_low(window)
+            else "NO_SHORT"
+        )
     elif score >= 50:
         detected = False
         state    = "NONE"
