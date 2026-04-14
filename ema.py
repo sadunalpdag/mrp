@@ -165,6 +165,7 @@ DEFAULT_FAKE_BREAKOUT_LOOKBACK   = 3     # candles after break to detect quick c
 DEFAULT_RR_TP1                   = 2.0   # risk : reward for TP1
 DEFAULT_RR_TP2                   = 3.0   # risk : reward for TP2
 DEFAULT_DISTRIBUTION_IMPULSE_PCT = 12.0  # minimum pump % to qualify for distribution detection
+DEFAULT_ACCUMULATION_DROP_PCT    = 8.0   # minimum dump % to qualify for accumulation detection
 
 # ---------------------------------------------------------------------------
 # Post-impulse retest-hold validation config
@@ -7271,6 +7272,272 @@ def detect_distribution_pattern(df, symbol: str = "",
 # Distribution scoring threshold below which we suggest short confirmation instead of wait
 DISTRIBUTION_WEAK_SCORE_THRESHOLD = 35
 
+# Accumulation scoring threshold below which we suggest long confirmation instead of wait
+ACCUMULATION_WEAK_SCORE_THRESHOLD = 35
+
+
+# ---------------------------------------------------------------------------
+# Accumulation detection helpers
+# ---------------------------------------------------------------------------
+
+def _detect_fake_breakdown_reclaim(window) -> bool:
+    """
+    Return True if any candle in *window* pierced below the prior candles'
+    running low (wick below) but closed back above that prior low within
+    the same candle (i.e. a wick-down / failed breakdown).
+    """
+    lows   = window["low"].values
+    closes = window["close"].values
+    for i in range(1, len(window)):
+        prior_low = float(lows[:i].min())  # lowest low of all preceding candles
+        if lows[i] < prior_low and closes[i] > prior_low:
+            return True
+    return False
+
+
+def _detect_higher_low(window) -> bool:
+    """
+    Return True if the last local trough is higher than the prior local trough,
+    suggesting a higher-low / dip-defense structure is forming.
+
+    Uses a simple 3-candle pivot: candle[i] is a local low when
+    low[i] < low[i-1] and low[i] < low[i+1].
+    """
+    lows = window["low"].values
+    troughs = [i for i in range(1, len(lows) - 1) if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]]
+    return len(troughs) >= 2 and lows[troughs[-1]] > lows[troughs[-2]]
+
+
+def detect_accumulation_pattern(df, symbol: str = "",
+                                 drop_min_pct: float = DEFAULT_ACCUMULATION_DROP_PCT):
+    """
+    Detect dump → base / MM accumulation / bottom-side absorption structure.
+
+    This is the mirror-opposite of detect_distribution_pattern().
+
+    Scoring breakdown:
+      prior drop >= drop_min_pct (default 8%)  → +25  (>= half threshold → +12)
+      trough candle has meaningful lower wick   → +20  (lower wick > body)
+      volume stays active near lows (> 1.2×avg)→ +20
+      green follow-through: 1-3 candles after
+        trough                                  → +20  (1 candle → +10)
+      recovery from trough >= 3%               → +15  (>= 1.5% → +8)
+      fake breakdown reclaim detected           → bonus +10 (capped at 100)
+      higher-low structure detected             → bonus +10 (capped at 100)
+
+    Signal thresholds:
+      score >= 70 → ACCUMULATION detected
+      score >= 50 → WATCHLIST (weak accumulation warning)
+      else        → NONE
+
+    Returns a dict (never None for data-sufficient frames):
+    {
+        "detected":      bool,
+        "score":         int,
+        "state":         "ACCUMULATION" | "NONE",
+        "bias":          "SHORT_EXIT" | "LONG_BIAS" | "NEUTRAL",
+        "action":        "NO_SHORT" | "WAIT_BOUNCE" | "LOOK_FOR_LONG_CONFIRMATION",
+        "drop_pct":      float,
+        "trough_price":  float,
+        "last_price":    float,
+        "recovery_pct":  float,
+        "wick_ratio":    float,
+        "volume_ratio":  float,
+        "ref_level":     float,
+        "inv_level":     float,
+        "reason":        str,
+    }
+    Returns None when there is insufficient data to analyse.
+    """
+    if df is None or len(df) < 20:
+        return None
+
+    reasons: list = []
+    score = 0
+
+    d = df.copy().reset_index(drop=True)
+    d["vol_ma20"] = d["volume"].rolling(20).mean()
+
+    # ── Look-back window: last 12 candles for structure detection ────────────
+    lookback = min(12, len(d) - 1)
+    window = d.iloc[-(lookback + 1):].copy().reset_index(drop=True)
+
+    if len(window) < 6:
+        return None
+
+    # ── Step 1: Find the swing high and swing low (drop leg) ─────────────────
+    # We look for: recent high → trough within the lookback window
+    high_idx   = window["high"].idxmax()
+    swing_high = float(window.loc[high_idx, "high"])
+
+    # Trough must come AFTER the high
+    after_high = window.iloc[high_idx:]
+    if len(after_high) < 2:
+        return None
+
+    trough_idx_rel = after_high["low"].idxmin()
+    trough_price   = float(window.loc[trough_idx_rel, "low"])
+    trough_candle  = window.loc[trough_idx_rel]
+
+    drop_pct = (swing_high - trough_price) / swing_high * 100 if swing_high > 0 else 0.0
+
+    # ── Step 2: Drop scoring ──────────────────────────────────────────────────
+    half_threshold = drop_min_pct / 2.0
+    if drop_pct >= drop_min_pct:
+        score += 25
+    elif drop_pct >= half_threshold:
+        score += 12
+        reasons.append("drop_below_threshold")
+    else:
+        reasons.append("drop_too_weak")
+
+    # ── Step 3: Lower wick ratio on trough candle ─────────────────────────────
+    trough_open  = float(trough_candle["open"])
+    trough_close = float(trough_candle["close"])
+    trough_high  = float(trough_candle["high"])
+    trough_low   = float(trough_candle["low"])
+
+    candle_range = trough_high - trough_low
+    body_size    = abs(trough_close - trough_open)
+    lower_wick   = min(trough_open, trough_close) - trough_low
+
+    wick_ratio = (lower_wick / body_size) if body_size > 0 else (lower_wick / (candle_range + 1e-12))
+
+    if lower_wick > body_size and candle_range > 0:
+        score += 20
+    elif lower_wick > body_size * 0.5 and candle_range > 0:
+        score += 10
+        reasons.append("wick_moderate")
+    else:
+        reasons.append("wick_small")
+
+    # ── Step 4: Volume stays active near lows ────────────────────────────────
+    window["vol_ma20"] = window["volume"].rolling(20, min_periods=5).mean()
+    trough_vol    = float(trough_candle["volume"])
+    trough_vol_ma = window.loc[trough_idx_rel, "vol_ma20"] if trough_idx_rel in window.index else float("nan")
+    if pd.isna(trough_vol_ma) or trough_vol_ma <= 0:
+        trough_vol_ma = float(window["volume"].mean()) or 1.0
+
+    volume_ratio = trough_vol / trough_vol_ma if trough_vol_ma > 0 else 1.0
+
+    if volume_ratio >= 1.2:
+        score += 20
+    elif volume_ratio >= 0.9:
+        score += 10
+        reasons.append("volume_moderate")
+    else:
+        reasons.append("volume_low")
+
+    # ── Step 5: Green follow-through candles after trough ────────────────────
+    after_trough = window.iloc[trough_idx_rel + 1:trough_idx_rel + 4]  # 1-3 candles
+    green_count  = 0
+    if len(after_trough) > 0:
+        green_count = sum(
+            1 for _, c in after_trough.iterrows()
+            if float(c["close"]) > float(c["open"])
+            and float(c["close"]) > trough_price
+        )
+    if green_count >= 2:
+        score += 20
+    elif green_count == 1:
+        score += 10
+        reasons.append("followthrough_weak")
+    else:
+        reasons.append("no_followthrough")
+
+    # ── Step 6: Recovery from trough ─────────────────────────────────────────
+    last_price   = float(d.iloc[-1]["close"])
+    recovery_pct = (last_price - trough_price) / trough_price * 100 if trough_price > 0 else 0.0
+
+    if recovery_pct >= 3.0:
+        score += 15
+    elif recovery_pct >= 1.5:
+        score += 8
+        reasons.append("recovery_moderate")
+    else:
+        reasons.append("recovery_minimal")
+
+    # ── Step 7: Fake-breakdown reclaim bonus ─────────────────────────────────
+    try:
+        if _detect_fake_breakdown_reclaim(window):
+            score += 10
+            reasons.append("fake_breakdown_reclaim")
+    except Exception:
+        pass
+
+    # ── Step 8: Higher-low structure bonus ───────────────────────────────────
+    try:
+        if _detect_higher_low(window):
+            score += 10
+            reasons.append("higher_low_detected")
+    except Exception:
+        pass
+
+    score = round(min(score, 100), 1)
+
+    # ── Reference and invalidation levels ────────────────────────────────────
+    ref_level = round(float(trough_price) * 1.005, 6)   # just above trough = accumulation base
+    inv_level = round(float(trough_price) * 0.980, 6)   # 2% below trough = invalidation
+
+    # ── Determine signal, state, bias, action ────────────────────────────────
+    if score >= 70:
+        detected = True
+        state    = "ACCUMULATION"
+        bias     = "SHORT_EXIT"
+        action   = "NO_SHORT"
+        if recovery_pct >= 5.0:
+            action = "LOOK_FOR_LONG_CONFIRMATION"
+    elif score >= 50:
+        detected = False
+        state    = "NONE"
+        bias     = "LONG_BIAS"
+        action   = "WAIT_BOUNCE"
+        reasons.append("score_watchlist")
+    else:
+        detected = False
+        state    = "NONE"
+        bias     = "NEUTRAL"
+        action   = "LOOK_FOR_LONG_CONFIRMATION" if score >= ACCUMULATION_WEAK_SCORE_THRESHOLD else "WAIT_BOUNCE"
+        if not reasons:
+            reasons.append("score_too_low")
+
+    reason_str = ", ".join(reasons) if reasons else "all_checks_passed"
+
+    # ── Telegram / log alert when accumulation is confirmed ──────────────────
+    if detected and symbol:
+        msg = (
+            f"🟢 ACCUMULATION DETECTED — {symbol}\n"
+            f"Bias: {bias} | State: BASE → ACCUMULATION\n"
+            f"Ref: {ref_level} | Inv: {inv_level}\n"
+            f"Drop: %{round(drop_pct, 1)} | Recovery: %{round(recovery_pct, 1)}\n"
+            f"WickRatio: {round(wick_ratio, 2)} | VolRatio: {round(volume_ratio, 2)}\n"
+            f"Action: NO_SHORT / LOOK_FOR_LONG_CONFIRMATION\n"
+            f"Score: {score}/100"
+        )
+        tg_send(msg)
+        log(
+            f"[ACCUMULATION] {symbol} score={score} drop={round(drop_pct,1)}% "
+            f"recovery={round(recovery_pct,1)}% wick_ratio={round(wick_ratio,2)} "
+            f"vol_ratio={round(volume_ratio,2)} action={action}"
+        )
+
+    return {
+        "detected":     detected,
+        "score":        score,
+        "state":        state,
+        "bias":         bias,
+        "action":       action,
+        "drop_pct":     round(float(drop_pct), 2),
+        "trough_price": round(float(trough_price), 6),
+        "last_price":   round(float(last_price), 6),
+        "recovery_pct": round(float(recovery_pct), 2),
+        "wick_ratio":   round(float(wick_ratio), 3),
+        "volume_ratio": round(float(volume_ratio), 3),
+        "ref_level":    ref_level,
+        "inv_level":    inv_level,
+        "reason":       reason_str,
+    }
+
 
 def check_spot_loser_followups():
     """
@@ -7385,6 +7652,7 @@ SETUP_STATES = {
     "WAIT_NEXT_BREAK",
     "NO_TRADE",
     "DISTRIBUTION",
+    "ACCUMULATION",
 }
 
 # Per-symbol active setup storage
@@ -7991,6 +8259,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         "WAIT_NEXT_BREAK":         "🔒 WAIT NEXT BREAK",
         "NO_TRADE":                "⛔ NO TRADE",
         "DISTRIBUTION":            "🚫 DISTRIBUTION DETECTED",
+        "ACCUMULATION":            "🟢 ACCUMULATION DETECTED",
     }
     label = emoji_map.get(new_state, new_state)
 
@@ -8050,6 +8319,7 @@ def update_symbol_setup_state(symbol: str, df) -> str:
         "WAIT_NEXT_BREAK",
         "NO_TRADE",
         "DISTRIBUTION",
+        "ACCUMULATION",
     }
 
     # ── Reversal opportunity from failed / fake states ─────────────────────────
@@ -8646,6 +8916,27 @@ def process_active_setups():
                 except Exception as _dist_err:
                     log(f"[DISTRIBUTION CHECK ERR] {symbol}: {_dist_err}")
 
+            # ── Accumulation gate: block SHORT entry when dump→accumulation ──
+            if new_state in ("CONFIRMED_SHORT", "BREAKOUT_PENDING") and setup.get("bias") == "SHORT":
+                try:
+                    accum = detect_accumulation_pattern(df, symbol=symbol)
+                    if accum and accum.get("detected"):
+                        _setup_transition(symbol, "ACCUMULATION", {
+                            "accumulation_score":    accum["score"],
+                            "accumulation_action":   accum["action"],
+                            "accumulation_drop":     accum["drop_pct"],
+                            "accumulation_recovery": accum["recovery_pct"],
+                        })
+                        _apply_lock_after_setup(symbol, "ACCUMULATION")
+                        log(
+                            f"[PROCESS SETUPS] {symbol}: SHORT blocked by ACCUMULATION "
+                            f"(score={accum['score']} drop={accum['drop_pct']}% "
+                            f"recovery={accum['recovery_pct']}%)"
+                        )
+                        continue
+                except Exception as _accum_err:
+                    log(f"[ACCUMULATION CHECK ERR] {symbol}: {_accum_err}")
+
             # ── Trigger trade when confirmed ───────────────────────────────
             if should_open_trade_from_setup(symbol):
                 pattern  = setup.get("pattern", {})
@@ -8746,7 +9037,7 @@ def process_active_setups():
             cleanup_states = {
                 "WAIT_NEXT_BREAK", "FAKE_BREAKOUT_LONG", "FAKE_BREAKOUT_SHORT",
                 "FAILED_LONG", "FAILED_SHORT", "OVEREXTENDED_NO_ENTRY", "NO_TRADE",
-                "DISTRIBUTION",
+                "DISTRIBUTION", "ACCUMULATION",
             }
             if state in cleanup_states:
                 age_min = _elapsed_minutes_since(setup.get("last_update", ""))
@@ -9026,6 +9317,20 @@ def scan_top_gainers_and_alert():
                         return
                 except Exception as _dist_err:
                     log(f"[DISTRIBUTION CHECK ERR] {symbol}: {_dist_err}")
+
+            # ── Accumulation gate: suppress SHORT if dump→accumulation detected ─
+            if bias == "SHORT":
+                try:
+                    accum = detect_accumulation_pattern(df, symbol=symbol)
+                    if accum and accum.get("detected"):
+                        log(
+                            f"[SPOT SCAN] 🟢 {symbol} — SHORT suppressed by ACCUMULATION "
+                            f"(score={accum['score']} drop={accum['drop_pct']}% "
+                            f"recovery={accum['recovery_pct']}% action={accum['action']})"
+                        )
+                        return
+                except Exception as _accum_err:
+                    log(f"[ACCUMULATION CHECK ERR] {symbol}: {_accum_err}")
 
 
             if should_lock_symbol(symbol, bias):
