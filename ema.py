@@ -166,6 +166,14 @@ DEFAULT_RR_TP1                   = 2.0   # risk : reward for TP1
 DEFAULT_RR_TP2                   = 3.0   # risk : reward for TP2
 DEFAULT_DISTRIBUTION_IMPULSE_PCT = 12.0  # minimum pump % to qualify for distribution detection
 
+# ---------------------------------------------------------------------------
+# Post-impulse retest-hold validation config
+# ---------------------------------------------------------------------------
+RETEST_TOLERANCE_PCT        = 0.3   # % band around breakout_level to count as retest touch
+RETEST_MAX_INVALIDATION_PCT = 0.8   # % below breakout_level that invalidates the retest
+RETEST_CONFIRM_CANDLES      = 2     # follow-through candles needed above level after retest
+RETEST_MIN_BOUNCE_PCT       = 0.2   # minimum bounce from retest low to award bounce score
+
 
 # ---------------------------------------------------------------------------
 # Public helper functions
@@ -7609,6 +7617,254 @@ def detect_retest_acceptance(df, bias: str, reference_level: float,
         return False
 
 
+def detect_retest_hold_after_impulse(
+    klines,
+    breakout_level: float,
+    symbol: str = None,
+    tf: str = "15m",
+) -> dict:
+    """
+    Validate whether price returning to a breakout level after an impulse/pump
+    constitutes a genuine retest-and-hold, a failed retest, or is still pending.
+
+    PRECONDITION: An impulse / breakout must already have been detected upstream.
+    This function must NOT be called standalone to generate random retest signals.
+
+    Parameters
+    ----------
+    klines        : list of OHLCV rows [[open_time, open, high, low, close, volume], ...]
+    breakout_level: structural level that was broken (swing high for LONG)
+    symbol        : optional symbol name (for logging / Telegram messages)
+    tf            : timeframe label (informational only, default "15m")
+
+    Returns
+    -------
+    dict:
+        detected       – True only when RETEST_HOLD confirmed
+        state          – "RETEST_HOLD" | "FAILED_RETEST" | "RETEST_PENDING" | "NONE"
+        action         – "CONFIRM_LONG" | "WAIT" | "NO_ENTRY"
+        breakout_level – the level passed in (float)
+        retest_low     – lowest low of the retest candidate candle (float | None)
+        retest_close   – close of the retest candidate candle (float | None)
+        tolerance_pct  – RETEST_TOLERANCE_PCT value used
+        bounce_pct     – % bounce from retest low to current close (float)
+        hold_score     – composite hold-quality score 0–100
+        valid          – True when hold_score >= 70
+        reason         – human-readable explanation string
+
+    Scoring breakdown (max 100):
+        +20 candle low touched tolerance band
+        +25 close came back above breakout_level
+        +15 lower wick / rejection candle (doji or wick >= 50 % of body)
+        +20 all next RETEST_CONFIRM_CANDLES candles closed above retest close
+             (partial credit +10 if at least one follow-through candle closed higher)
+        +20 bounce from retest low >= RETEST_MIN_BOUNCE_PCT %
+    """
+    _sym = symbol or "UNKNOWN"
+    _null = {
+        "detected":       False,
+        "state":          "NONE",
+        "action":         "NO_ENTRY",
+        "breakout_level": round(float(breakout_level), 8),
+        "retest_low":     None,
+        "retest_close":   None,
+        "tolerance_pct":  RETEST_TOLERANCE_PCT,
+        "bounce_pct":     0.0,
+        "hold_score":     0,
+        "valid":          False,
+        "reason":         "Insufficient data",
+    }
+
+    if not klines or len(klines) < 5 or breakout_level <= 0:
+        return _null
+
+    try:
+        # ── Parse OHLCV from kline rows ───────────────────────────────────────
+        opens  = [float(k[1]) for k in klines]
+        highs  = [float(k[2]) for k in klines]
+        lows   = [float(k[3]) for k in klines]
+        closes = [float(k[4]) for k in klines]
+
+        # Exclude the live (still-forming) candle
+        if len(closes) >= 2:
+            opens  = opens[:-1]
+            highs  = highs[:-1]
+            lows   = lows[:-1]
+            closes = closes[:-1]
+
+        if len(closes) < 4:
+            return {**_null, "reason": "Not enough closed candles"}
+
+        # ── Tolerance band around breakout level ──────────────────────────────
+        upper_band         = breakout_level * (1 + RETEST_TOLERANCE_PCT / 100)
+        lower_band         = breakout_level * (1 - RETEST_TOLERANCE_PCT / 100)
+        invalidation_level = breakout_level * (1 - RETEST_MAX_INVALIDATION_PCT / 100)
+
+        # ── Search recent closed candles for a retest candidate ───────────────
+        # A retest candidate is a candle whose low entered the tolerance band
+        # (or whose close is still within the band) after a breakout above.
+        lookback  = min(10, len(closes))
+        retest_idx   = None
+        retest_low   = None
+        retest_close = None
+
+        for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1) - 1, -1):
+            c = closes[i]
+            l = lows[i]
+            # Candle touched tolerance band from above: low <= upper_band AND
+            # either low or close is still within or above the lower_band.
+            touched_band = l <= upper_band and (l >= lower_band or c >= lower_band)
+            if touched_band:
+                retest_idx   = i
+                retest_low   = l
+                retest_close = c
+                break
+
+        if retest_idx is None:
+            return {**_null, "reason": "No retest candidate found within lookback"}
+
+        # ── Invalidation check: price sank too far below breakout level ───────
+        if retest_low < invalidation_level:
+            bounce_pct = 0.0
+            if retest_low > 0:
+                bounce_pct = (retest_close - retest_low) / retest_low * 100
+
+            msg = (
+                f"🚫 FAILED RETEST — {_sym}\n"
+                f"Breakout: {breakout_level}\n"
+                f"Retest Low: {retest_low}\n"
+                f"State: RETEST_PENDING → FAILED_RETEST\n"
+                f"Action: NO_ENTRY\n"
+                f"Reason: Price lost breakout level and failed to reclaim it."
+            )
+            log(
+                f"[RETEST HOLD] {_sym} {tf}: FAILED_RETEST "
+                f"breakout={breakout_level} retest_low={retest_low} "
+                f"invalidation={round(invalidation_level, 8)}"
+            )
+            try:
+                tg_send(msg)
+            except Exception:
+                pass
+            return {
+                "detected":       False,
+                "state":          "FAILED_RETEST",
+                "action":         "NO_ENTRY",
+                "breakout_level": round(float(breakout_level), 8),
+                "retest_low":     round(float(retest_low), 8),
+                "retest_close":   round(float(retest_close), 8),
+                "tolerance_pct":  RETEST_TOLERANCE_PCT,
+                "bounce_pct":     round(bounce_pct, 4),
+                "hold_score":     0,
+                "valid":          False,
+                "reason":         "Price lost breakout level and failed to reclaim it.",
+            }
+
+        # ── Composite hold-quality scoring ────────────────────────────────────
+        score         = 0
+        score_reasons = []
+
+        # +20: candle low touched the tolerance band (from above)
+        if lower_band <= retest_low <= upper_band:
+            score += 20
+            score_reasons.append("band_touch")
+
+        # +25: retest candle closed back above breakout_level
+        if retest_close >= breakout_level:
+            score += 25
+            score_reasons.append("close_above_level")
+
+        # +15: lower wick / rejection candle (lower wick >= 50 % of body,
+        #       or doji/spinning-top with meaningful lower wick)
+        o = opens[retest_idx]
+        c = closes[retest_idx]
+        l = lows[retest_idx]
+        body       = abs(c - o)
+        lower_wick = min(o, c) - l
+        if lower_wick > 0 and (body == 0 or lower_wick >= body * 0.5):
+            score += 15
+            score_reasons.append("lower_wick_rejection")
+
+        # +20: next RETEST_CONFIRM_CANDLES candles all closed above retest close
+        follow_start   = retest_idx + 1
+        follow_end     = min(retest_idx + 1 + RETEST_CONFIRM_CANDLES, len(closes))
+        follow_candles = closes[follow_start:follow_end]
+        if follow_candles:
+            if all(fc > retest_close for fc in follow_candles):
+                score += 20
+                score_reasons.append("follow_through")
+            elif any(fc > retest_close for fc in follow_candles):
+                score += 10
+                score_reasons.append("partial_follow_through")
+
+        # +20: bounce from retest low to current close >= RETEST_MIN_BOUNCE_PCT %
+        bounce_pct = 0.0
+        if retest_low and retest_low > 0:
+            bounce_pct = (closes[-1] - retest_low) / retest_low * 100
+        if bounce_pct >= RETEST_MIN_BOUNCE_PCT:
+            score += 20
+            score_reasons.append("bounce_confirmed")
+
+        # ── Determine outcome ─────────────────────────────────────────────────
+        if score >= 70:
+            state    = "RETEST_HOLD"
+            action   = "CONFIRM_LONG"
+            detected = True
+            valid    = True
+            reason   = "Breakout level retested and held within tolerance band."
+            msg = (
+                f"✅ RETEST HOLD — {_sym}\n"
+                f"Breakout: {breakout_level}\n"
+                f"Retest Low: {retest_low}\n"
+                f"Bounce: {round(bounce_pct, 2)}%\n"
+                f"State: RETEST_PENDING → RETEST_HOLD\n"
+                f"Action: CONFIRM_LONG\n"
+                f"Reason: {reason}"
+            )
+            log(
+                f"[RETEST HOLD] ✅ {_sym} {tf}: RETEST_HOLD "
+                f"score={score} bounce={round(bounce_pct, 2)}% "
+                f"breakout={breakout_level} retest_low={retest_low} "
+                f"reasons={score_reasons}"
+            )
+            try:
+                tg_send(msg)
+            except Exception:
+                pass
+        else:
+            state    = "RETEST_PENDING"
+            action   = "WAIT"
+            detected = False
+            valid    = False
+            reason   = (
+                f"Retest candidate found but hold score insufficient "
+                f"(score={score}/100, need 70). Criteria met: {score_reasons}"
+            )
+            log(
+                f"[RETEST HOLD] ⏳ {_sym} {tf}: RETEST_PENDING "
+                f"score={score}/100 breakout={breakout_level} "
+                f"retest_low={retest_low} reasons={score_reasons}"
+            )
+
+        return {
+            "detected":       detected,
+            "state":          state,
+            "action":         action,
+            "breakout_level": round(float(breakout_level), 8),
+            "retest_low":     round(float(retest_low), 8),
+            "retest_close":   round(float(retest_close), 8),
+            "tolerance_pct":  RETEST_TOLERANCE_PCT,
+            "bounce_pct":     round(bounce_pct, 4),
+            "hold_score":     score,
+            "valid":          valid,
+            "reason":         reason,
+        }
+
+    except Exception as e:
+        log(f"[RETEST HOLD ERR] {_sym}: {e}")
+        return {**_null, "reason": f"Exception: {e}"}
+
+
 def is_overextended_breakout(df, bias: str, reference_level: float) -> bool:
     """
     Return True when price has moved too far beyond reference_level without
@@ -8307,6 +8563,67 @@ def process_active_setups():
 
             # ── Advance state machine ──────────────────────────────────────
             new_state = update_symbol_setup_state(symbol, df)
+
+            # ── Retest hold validation (post-impulse) ─────────────────────
+            # When price has pulled back to the breakout level after an impulse,
+            # run the detailed retest-hold scorer.  Entry stays blocked until
+            # either RETEST_HOLD (score >= 70) or the existing retest_acceptance
+            # logic (in update_symbol_setup_state) confirms the break.
+            # A FAILED_RETEST routes into the FAKE_BREAKOUT flow to cancel the long.
+            if new_state == "RETEST_PENDING" and setup.get("bias") == "LONG":
+                try:
+                    klines_list = (
+                        df[["open_time", "open", "high", "low", "close", "volume"]]
+                        .values.tolist()
+                    )
+                    ref_level = float(setup.get("reference_level", 0))
+                    rth = detect_retest_hold_after_impulse(
+                        klines_list,
+                        breakout_level=ref_level,
+                        symbol=symbol,
+                        tf="15m",
+                    )
+                    rth_state = rth.get("state", "NONE")
+
+                    if rth_state == "RETEST_HOLD":
+                        # Retest held — open entry permission
+                        _setup_transition(
+                            symbol,
+                            "CONFIRMED_LONG",
+                            {
+                                "confirmed":       True,
+                                "entry_allowed":   True,
+                                "retest_confirmed": True,
+                                "retest_hold":     rth,
+                            },
+                        )
+                        new_state = setup.get("state", "CONFIRMED_LONG")
+                        log(
+                            f"[PROCESS SETUPS] {symbol}: RETEST_HOLD confirmed "
+                            f"(score={rth['hold_score']} bounce={rth['bounce_pct']}%) "
+                            f"→ CONFIRMED_LONG"
+                        )
+
+                    elif rth_state == "FAILED_RETEST":
+                        # Retest failed — cancel long, link to fake-breakout flow
+                        new_s = "FAKE_BREAKOUT_LONG"
+                        _setup_transition(
+                            symbol,
+                            new_s,
+                            {"failed_retest": True, "retest_data": rth},
+                        )
+                        _apply_lock_after_setup(symbol, "FAILED_RETEST")
+                        new_state = new_s
+                        log(
+                            f"[PROCESS SETUPS] {symbol}: FAILED_RETEST "
+                            f"(retest_low={rth['retest_low']}) → {new_s}"
+                        )
+                        continue
+
+                    # RETEST_PENDING or NONE: keep waiting — entry stays blocked
+
+                except Exception as _rth_err:
+                    log(f"[RETEST HOLD ERR] {symbol}: {_rth_err}")
 
             # ── Distribution gate: block LONG entry when pump→distribution ──
             if new_state in ("CONFIRMED_LONG", "BREAKOUT_PENDING") and setup.get("bias") == "LONG":
