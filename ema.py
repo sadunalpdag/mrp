@@ -189,7 +189,11 @@ def detect_distribution_pattern(
     peak_close      = closes[peak_idx]
     peak_body       = abs(peak_close - peak_open)
     peak_upper_wick = peak_price - max(peak_open, peak_close)
-    wick_ratio      = (peak_upper_wick / peak_body) if peak_body > 0 else float("inf")
+    # A doji (zero-body) candle is treated as an extreme wick — use None to signal
+    # "unmeasurable" and handle it explicitly below rather than propagating infinity.
+    wick_ratio: float | None = (
+        round(peak_upper_wick / peak_body, 2) if peak_body > 0 else None
+    )
 
     # ── Step 4: Volume spike at the peak candle ───────────────────────────
     vol_start  = max(0, scan_start - volume_avg_lookback)
@@ -223,9 +227,15 @@ def detect_distribution_pattern(
         )
 
     # Upper-wick ratio — weight 20
-    if wick_ratio >= min_wick_ratio:
+    wick_qualifies = wick_ratio is not None and wick_ratio >= min_wick_ratio
+    if wick_qualifies:
         score += 20
         reasons_met.append(f"WickRatio {wick_ratio:.1f}")
+    elif wick_ratio is None:
+        # Doji peak candle: zero body implies entire range is wick — counts as extreme wick
+        score += 20
+        reasons_met.append("WickRatio N/A (doji peak — full wick)")
+        wick_qualifies = True
     else:
         reasons_missed.append(f"Wick too small (ratio={wick_ratio:.1f})")
 
@@ -254,7 +264,7 @@ def detect_distribution_pattern(
     # Require: impulse qualifies AND at least 2 of the 4 secondary conditions.
     impulse_ok   = impulse_pct >= min_impulse_pct
     secondary_ok = sum([
-        wick_ratio >= min_wick_ratio,
+        wick_qualifies,
         volume_ratio >= min_volume_ratio,
         has_follow_through,
         rejection_pct >= min_rejection_pct,
@@ -300,7 +310,7 @@ def detect_distribution_pattern(
             "  Bias: %s | State: %s \u2192 DISTRIBUTION\n"
             "  Peak: %.5f | Last: %.5f\n"
             "  Impulse: %%%.1f | Rejection: %%%.1f\n"
-            "  WickRatio: %.1f | VolRatio: %.1f\n"
+            "  WickRatio: %s | VolRatio: %.1f\n"
             "  Action: %s",
             sym_tag,
             bias,
@@ -309,7 +319,7 @@ def detect_distribution_pattern(
             last_price,
             impulse_pct * 100,
             rejection_pct * 100,
-            wick_ratio if wick_ratio != float("inf") else 0.0,
+            f"{wick_ratio:.1f}" if wick_ratio is not None else "N/A",
             volume_ratio,
             action_log,
         )
@@ -324,7 +334,7 @@ def detect_distribution_pattern(
         "peak_price":    round(peak_price, 6),
         "last_price":    round(last_price, 6),
         "rejection_pct": round(rejection_pct, 4),
-        "wick_ratio":    round(wick_ratio, 2) if wick_ratio != float("inf") else None,
+        "wick_ratio":    wick_ratio,
         "volume_ratio":  round(volume_ratio, 2),
         "reason":        reason,
     }
