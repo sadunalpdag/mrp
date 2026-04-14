@@ -7282,15 +7282,15 @@ ACCUMULATION_WEAK_SCORE_THRESHOLD = 35
 
 def _detect_fake_breakdown_reclaim(window) -> bool:
     """
-    Return True if any candle in *window* broke below the session low
-    but closed back above it within the same or the next candle
-    (i.e. a wick-down / failed breakdown).
+    Return True if any candle in *window* pierced below the prior candles'
+    running low (wick below) but closed back above that prior low within
+    the same candle (i.e. a wick-down / failed breakdown).
     """
-    lows = window["low"].values
+    lows   = window["low"].values
     closes = window["close"].values
-    session_low = float(window["low"].min())
-    for i in range(len(window)):
-        if lows[i] < session_low * 0.999 and closes[i] > session_low:
+    for i in range(1, len(window)):
+        prior_low = float(lows[:i].min())  # lowest low of all preceding candles
+        if lows[i] < prior_low and closes[i] > prior_low:
             return True
     return False
 
