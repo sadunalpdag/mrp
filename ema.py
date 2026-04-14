@@ -7552,7 +7552,7 @@ def detect_accumulation_pattern(df, symbol: str = "",
     }
 
 
-
+def check_spot_loser_followups():
     """
     For each loser coin previously detected with a dead-cat-bounce pattern,
     fetch the latest 15m candles and report whether the short setup is intact.
