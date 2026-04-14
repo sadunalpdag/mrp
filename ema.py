@@ -7308,6 +7308,68 @@ def _detect_higher_low(window) -> bool:
     return len(troughs) >= 2 and lows[troughs[-1]] > lows[troughs[-2]]
 
 
+def _detect_lower_high_lower_low(window) -> bool:
+    """
+    Return True if the window shows a bearish descending structure where BOTH
+    the most recent swing high is lower than the prior swing high AND the most
+    recent swing low is lower than the prior swing low.
+
+    When both conditions hold simultaneously the market is in a downtrend, not
+    accumulation.
+    """
+    highs = window["high"].values
+    lows  = window["low"].values
+
+    swing_highs = [i for i in range(1, len(highs) - 1)
+                   if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]]
+    swing_lows  = [i for i in range(1, len(lows)  - 1)
+                   if lows[i]  < lows[i - 1]  and lows[i]  < lows[i + 1]]
+
+    lower_high = len(swing_highs) >= 2 and highs[swing_highs[-1]] < highs[swing_highs[-2]]
+    lower_low  = len(swing_lows)  >= 2 and lows[swing_lows[-1]]   < lows[swing_lows[-2]]
+
+    return lower_high and lower_low
+
+
+def _detect_continuous_rejection(window, min_candles: int = 3) -> bool:
+    """
+    Return True if at least *min_candles* of the last 5 candles show
+    significant upper-wick rejection (upper wick > body * 1.5), indicating
+    that price is being continuously pushed back down and not accumulating.
+    """
+    recent = window.iloc[-5:] if len(window) >= 5 else window
+    rejection_count = 0
+    for _, c in recent.iterrows():
+        o      = float(c["open"])
+        h      = float(c["high"])
+        lo     = float(c["low"])
+        cl     = float(c["close"])
+        body        = abs(cl - o)
+        upper_wick  = h - max(o, cl)
+        candle_range = h - lo
+        if candle_range > 0 and upper_wick > body * 1.5:
+            rejection_count += 1
+    return rejection_count >= min_candles
+
+
+def _detect_base_formed(window, max_range_pct: float = 3.0) -> bool:
+    """
+    Return True if the last 4 candles have consolidated in a tight range
+    (high-low range <= *max_range_pct* % of mid-price), indicating that a
+    base has formed as a prerequisite for accumulation.
+    """
+    recent = window.iloc[-4:] if len(window) >= 4 else window
+    if len(recent) < 2:
+        return False
+    recent_high = float(recent["high"].max())
+    recent_low  = float(recent["low"].min())
+    mid = (recent_high + recent_low) / 2.0
+    if mid <= 0:
+        return False
+    range_pct = (recent_high - recent_low) / mid * 100
+    return range_pct <= max_range_pct
+
+
 def detect_accumulation_pattern(df, symbol: str = "",
                                  drop_min_pct: float = DEFAULT_ACCUMULATION_DROP_PCT):
     """
@@ -7381,6 +7443,44 @@ def detect_accumulation_pattern(df, symbol: str = "",
 
     drop_pct = (swing_high - trough_price) / swing_high * 100 if swing_high > 0 else 0.0
 
+    # Pre-compute price metrics used both in hard blocks and later in the flow
+    last_price   = float(d.iloc[-1]["close"])
+    recovery_pct = (last_price - trough_price) / trough_price * 100 if trough_price > 0 else 0.0
+    ref_level    = round(float(trough_price) * 1.005, 6)   # just above trough = accumulation base
+    inv_level    = round(float(trough_price) * 0.980, 6)   # 2% below trough = invalidation
+
+    # ── HARD BLOCKS: conditions that unconditionally prevent accumulation ──────
+    def _no_accum(reason_str: str) -> dict:
+        return {
+            "detected":     False,
+            "score":        0,
+            "state":        "NONE",
+            "bias":         "NEUTRAL",
+            "action":       "WAIT_BOUNCE",
+            "drop_pct":     round(float(drop_pct), 2),
+            "trough_price": round(float(trough_price), 6),
+            "last_price":   round(float(last_price), 6),
+            "recovery_pct": round(float(recovery_pct), 2),
+            "wick_ratio":   0.0,
+            "volume_ratio": 0.0,
+            "ref_level":    ref_level,
+            "inv_level":    inv_level,
+            "reason":       reason_str,
+        }
+
+    if _detect_lower_high_lower_low(window):
+        return _no_accum("hard_block:lower_high_and_lower_low")
+
+    if _detect_continuous_rejection(window):
+        return _no_accum("hard_block:continuous_rejection")
+
+    if not _detect_base_formed(window):
+        return _no_accum("hard_block:no_base_formed")
+
+    if not _detect_higher_low(window):
+        return _no_accum("hard_block:no_higher_low")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # ── Step 2: Drop scoring ──────────────────────────────────────────────────
     half_threshold = drop_min_pct / 2.0
     if drop_pct >= drop_min_pct:
@@ -7446,9 +7546,7 @@ def detect_accumulation_pattern(df, symbol: str = "",
         reasons.append("no_followthrough")
 
     # ── Step 6: Recovery from trough ─────────────────────────────────────────
-    last_price   = float(d.iloc[-1]["close"])
-    recovery_pct = (last_price - trough_price) / trough_price * 100 if trough_price > 0 else 0.0
-
+    # last_price and recovery_pct already computed above (before hard blocks)
     if recovery_pct >= 3.0:
         score += 15
     elif recovery_pct >= 1.5:
@@ -7475,9 +7573,7 @@ def detect_accumulation_pattern(df, symbol: str = "",
 
     score = round(min(score, 100), 1)
 
-    # ── Reference and invalidation levels ────────────────────────────────────
-    ref_level = round(float(trough_price) * 1.005, 6)   # just above trough = accumulation base
-    inv_level = round(float(trough_price) * 0.980, 6)   # 2% below trough = invalidation
+    # ref_level and inv_level already computed above (before hard blocks)
 
     # ── Determine signal, state, bias, action ────────────────────────────────
     if score >= 70:
