@@ -7153,9 +7153,10 @@ def detect_distribution_pattern(df, symbol: str = "",
         reasons.append("wick_small")
 
     # ── Step 4: Volume spike at/near peak ────────────────────────────────────
-    # Use peak candle's volume vs 20-bar rolling average
+    # Use peak candle's volume vs 20-bar rolling average computed on the window
+    window["vol_ma20"] = window["volume"].rolling(20, min_periods=5).mean()
     peak_vol     = float(peak_candle["volume"])
-    peak_vol_ma  = d["vol_ma20"].iloc[peak_idx_rel] if peak_idx_rel < len(d) else float("nan")
+    peak_vol_ma  = window.loc[peak_idx_rel, "vol_ma20"] if peak_idx_rel in window.index else float("nan")
     if pd.isna(peak_vol_ma) or peak_vol_ma <= 0:
         # Fallback: compare against mean of full window
         peak_vol_ma = float(window["volume"].mean()) or 1.0
@@ -7219,7 +7220,7 @@ def detect_distribution_pattern(df, symbol: str = "",
         detected = False
         state    = "NONE"
         bias     = "NEUTRAL"
-        action   = "LOOK_FOR_SHORT_CONFIRMATION" if score >= 35 else "WAIT_PULLBACK"
+        action   = "LOOK_FOR_SHORT_CONFIRMATION" if score >= DISTRIBUTION_WEAK_SCORE_THRESHOLD else "WAIT_PULLBACK"
         if not reasons:
             reasons.append("score_too_low")
 
@@ -7259,7 +7260,11 @@ def detect_distribution_pattern(df, symbol: str = "",
     }
 
 
+# Distribution scoring threshold below which we suggest short confirmation instead of wait
+DISTRIBUTION_WEAK_SCORE_THRESHOLD = 35
 
+
+def check_spot_loser_followups():
     """
     For each loser coin previously detected with a dead-cat-bounce pattern,
     fetch the latest 15m candles and report whether the short setup is intact.
