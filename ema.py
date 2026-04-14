@@ -102,7 +102,7 @@ MIN_FILL_THRESHOLD = 0.95  # Minimum 95% fill before using MARKET order fallback
 # ==============================================================================
 LONG_MIN_IMPULSE_PCT        = 6.0    # Minimum bullish impulse move (%)
 LONG_MIN_IMPULSE_PCT_WEAK   = 4.0    # Relaxed impulse threshold (WATCHLIST only)
-LONG_CLEAN_IMPULSE_MIN_BULL = 2      # Min consecutive bullish candles for clean impulse
+LONG_CLEAN_IMPULSE_MIN_BULLISH = 2   # Min consecutive bullish candles for clean impulse
 LONG_FIB_IDEAL_LOW          = 0.382  # Fibonacci zone lower bound (ideal)
 LONG_FIB_IDEAL_HIGH         = 0.618  # Fibonacci zone upper bound (ideal)
 LONG_FIB_ACCEPT_LOW         = 0.30   # Fibonacci zone lower bound (acceptable)
@@ -116,6 +116,9 @@ LONG_CONSOLIDATION_WINDOW   = 5      # Candles to check for range compression
 LONG_CONSOLIDATION_ATR_MULT = 0.6    # Consolidation: range < ATR * this value
 LONG_SCORE_VALID            = 70     # Score threshold for VALID signal
 LONG_SCORE_WATCHLIST        = 50     # Score threshold for WATCHLIST signal
+LONG_DEEP_RETRACEMENT_PENALTY = 30   # Score penalty for retracement > LONG_MAX_RETRACEMENT
+LONG_OVEREXTENSION_PENALTY  = 20     # Score penalty when price is overextended from support
+LONG_EMA_BELOW_PENALTY      = 10     # Score penalty when price is below EMA20
 
 # ==============================================================================
 # ENTRY ENGINE
@@ -2780,8 +2783,8 @@ def check_and_log_real_closed_trades():
                         f"💵 Entry: {_entry_p}  →  Exit: {exit_str}\n"
                         f"📊 PnL: {_pnl_sign}{pnl_str}%\n"
                         f"📈 Max Profit: ${max_profit_str}  |  Max Loss: ${max_loss_str}\n"
-                        f"{('🏷 ' + _tag + chr(10)) if _tag else ''}"
-                        f"⏰ {now_local_iso()}"
+                        + (f"🏷 {_tag}\n" if _tag else "")
+                        + f"⏰ {now_local_iso()}"
                     )
                 except Exception as _tg_err:
                     log(f"[TG CLOSE NOTIFY ERR] {sym}: {_tg_err}")
@@ -6717,7 +6720,7 @@ def get_spot_klines(symbol, interval=SPOT_INTERVAL, limit=SPOT_KLINE_LIMIT):
 # ==============================================================================
 
 def detect_clean_impulse(opens, highs, lows, closes, start_idx: int, end_idx: int,
-                          min_consecutive_bull: int = LONG_CLEAN_IMPULSE_MIN_BULL) -> dict:
+                          min_consecutive_bull: int = LONG_CLEAN_IMPULSE_MIN_BULLISH) -> dict:
     """
     Check whether the impulse leg from start_idx to end_idx is a CLEAN move.
 
@@ -6740,7 +6743,7 @@ def detect_clean_impulse(opens, highs, lows, closes, start_idx: int, end_idx: in
         range_expansion  : float – ratio of impulse avg range vs pre-impulse avg range
         reason           : str
     """
-    if end_idx <= start_idx or end_idx >= len(closes):
+    if end_idx > len(closes) - 1 or end_idx <= start_idx:
         return {"clean": False, "consecutive_bull": 0, "range_expansion": 0.0,
                 "reason": "invalid indices"}
 
@@ -7022,10 +7025,11 @@ def detect_support_bounce_pattern(df):
         _highs  = recent["high"].astype(float).tolist()
         _lows   = recent["low"].astype(float).tolist()
         _closes = recent["close"].astype(float).tolist()
-        # Compute absolute indices in recent for the impulse leg
+        # Compute absolute indices in recent for the impulse leg.
+        # Both low_idx and high_idx are labels in 'recent' (which had reset_index applied),
+        # so they directly correspond to positional indices in _closes.
         _ci_low_idx  = int(low_idx)
-        _ci_high_idx = int(low_idx) + 1 + int(high_idx)
-        _ci_high_idx = min(_ci_high_idx, len(_closes) - 1)
+        _ci_high_idx = min(int(high_idx), len(_closes) - 1)
         ci = detect_clean_impulse(_opens, _highs, _lows, _closes, _ci_low_idx, _ci_high_idx)
         clean_impulse_ok = ci["clean"]
         if clean_impulse_ok:
@@ -7067,7 +7071,7 @@ def detect_support_bounce_pattern(df):
     # --- Hard reject: retracement > LONG_MAX_RETRACEMENT means structure broken ---
     if retracement_ratio > LONG_MAX_RETRACEMENT:
         reasons.append("structure_broken_deep_retracement")
-        score = max(0, score - 30)
+        score = max(0, score - LONG_DEEP_RETRACEMENT_PENALTY)
         # Still continue to calculate remaining fields for complete output
 
     # --- Fib zone scoring (ideal: 0.382–0.618 preferred; acceptable: 0.30–0.70) ---
@@ -7129,7 +7133,7 @@ def detect_support_bounce_pattern(df):
         overextended = (pct_dist > LONG_OVEREXTEND_PCT) or (atr_dist > LONG_OVEREXTEND_ATR_MULT)
     if overextended:
         reasons.append("overextended_from_support")
-        score = max(0, score - 20)
+        score = max(0, score - LONG_OVEREXTENSION_PENALTY)
 
     # --- Volume scoring (optional bonus) ---
     vol_ok = (
@@ -7155,7 +7159,7 @@ def detect_support_bounce_pattern(df):
             score += 10
         elif ema_below:
             # Below EMA20 → downgrade to WATCHLIST at most
-            score -= 10
+            score -= LONG_EMA_BELOW_PENALTY
             reasons.append("below_ema20_watchlist_only")
     except Exception:
         pass
