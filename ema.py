@@ -164,6 +164,7 @@ DEFAULT_MAX_WICK_BODY_RATIO      = 2.0   # (upper+lower wick) / body
 DEFAULT_FAKE_BREAKOUT_LOOKBACK   = 3     # candles after break to detect quick close-back
 DEFAULT_RR_TP1                   = 2.0   # risk : reward for TP1
 DEFAULT_RR_TP2                   = 3.0   # risk : reward for TP2
+DEFAULT_DISTRIBUTION_IMPULSE_PCT = 12.0  # minimum pump % to qualify for distribution detection
 
 
 # ---------------------------------------------------------------------------
@@ -7055,6 +7056,214 @@ def detect_dead_cat_bounce_pattern(df):
     }
 
 
+def detect_distribution_pattern(df, symbol: str = "",
+                                 impulse_min_pct: float = DEFAULT_DISTRIBUTION_IMPULSE_PCT):
+    """
+    Detect pump → blow-off top / MM distribution / exit liquidity structure.
+
+    Scoring breakdown:
+      impulse >= impulse_min_pct (default 12%)  → +25  (>= half threshold → +12)
+      peak candle has meaningful upper wick       → +20  (upper wick > body)
+      volume spike at peak (> 1.5× avg)          → +20
+      red follow-through: 1-3 candles after peak → +20  (1 candle → +10)
+      rejection from peak >= 5%                  → +15  (>= 3% → +8)
+
+    Signal thresholds:
+      score >= 70 → DISTRIBUTION detected
+      score >= 50 → WATCHLIST (weak distribution warning)
+      else        → NONE
+
+    Returns a dict (never None for data-sufficient frames):
+    {
+        "detected":      bool,
+        "score":         int,
+        "state":         "DISTRIBUTION" | "NONE",
+        "bias":          "LONG_EXIT" | "SHORT_BIAS" | "NEUTRAL",
+        "action":        "NO_LONG" | "WAIT_PULLBACK" | "LOOK_FOR_SHORT_CONFIRMATION",
+        "impulse_pct":   float,
+        "peak_price":    float,
+        "last_price":    float,
+        "rejection_pct": float,
+        "wick_ratio":    float,
+        "volume_ratio":  float,
+        "reason":        str,
+    }
+    Returns None when there is insufficient data to analyse.
+    """
+    if df is None or len(df) < 20:
+        return None
+
+    reasons: list = []
+    score = 0
+
+    d = df.copy().reset_index(drop=True)
+    d["vol_ma20"] = d["volume"].rolling(20).mean()
+
+    # ── Look-back window: last 12 candles for structure detection ────────────
+    lookback = min(12, len(d) - 1)
+    window = d.iloc[-(lookback + 1):].copy().reset_index(drop=True)
+
+    if len(window) < 6:
+        return None
+
+    # ── Step 1: Find the swing low and swing high (impulse leg) ──────────────
+    # We look for: recent low → peak within the lookback window
+    low_idx  = window["low"].idxmin()
+    swing_low = float(window.loc[low_idx, "low"])
+
+    # Peak must come AFTER the low
+    after_low = window.iloc[low_idx:]
+    if len(after_low) < 2:
+        return None
+
+    peak_idx_rel  = after_low["high"].idxmax()
+    peak_price    = float(window.loc[peak_idx_rel, "high"])
+    peak_candle   = window.loc[peak_idx_rel]
+
+    impulse_pct = (peak_price - swing_low) / swing_low * 100 if swing_low > 0 else 0.0
+
+    # ── Step 2: Impulse scoring ───────────────────────────────────────────────
+    half_threshold = impulse_min_pct / 2.0
+    if impulse_pct >= impulse_min_pct:
+        score += 25
+    elif impulse_pct >= half_threshold:
+        score += 12
+        reasons.append("impulse_below_threshold")
+    else:
+        reasons.append("impulse_too_weak")
+
+    # ── Step 3: Upper wick ratio on peak candle ───────────────────────────────
+    peak_open  = float(peak_candle["open"])
+    peak_close = float(peak_candle["close"])
+    peak_high  = float(peak_candle["high"])
+    peak_low   = float(peak_candle["low"])
+
+    candle_range = peak_high - peak_low
+    body_size    = abs(peak_close - peak_open)
+    upper_wick   = peak_high - max(peak_open, peak_close)
+
+    wick_ratio = (upper_wick / body_size) if body_size > 0 else (upper_wick / (candle_range + 1e-12))
+
+    if upper_wick > body_size and candle_range > 0:
+        score += 20
+    elif upper_wick > body_size * 0.5 and candle_range > 0:
+        score += 10
+        reasons.append("wick_moderate")
+    else:
+        reasons.append("wick_small")
+
+    # ── Step 4: Volume spike at/near peak ────────────────────────────────────
+    # Use peak candle's volume vs 20-bar rolling average computed on the window
+    window["vol_ma20"] = window["volume"].rolling(20, min_periods=5).mean()
+    peak_vol     = float(peak_candle["volume"])
+    peak_vol_ma  = window.loc[peak_idx_rel, "vol_ma20"] if peak_idx_rel in window.index else float("nan")
+    if pd.isna(peak_vol_ma) or peak_vol_ma <= 0:
+        # Fallback: compare against mean of full window
+        peak_vol_ma = float(window["volume"].mean()) or 1.0
+
+    volume_ratio = peak_vol / peak_vol_ma if peak_vol_ma > 0 else 1.0
+
+    if volume_ratio >= 1.5:
+        score += 20
+    elif volume_ratio >= 1.2:
+        score += 10
+        reasons.append("volume_moderate")
+    else:
+        reasons.append("volume_no_spike")
+
+    # ── Step 5: Red follow-through candles after peak ─────────────────────────
+    after_peak = window.iloc[peak_idx_rel + 1:peak_idx_rel + 4]  # 1-3 candles
+    red_count  = 0
+    if len(after_peak) > 0:
+        red_count = sum(
+            1 for _, c in after_peak.iterrows()
+            if float(c["close"]) < float(c["open"])
+            and float(c["close"]) < peak_price
+        )
+    if red_count >= 2:
+        score += 20
+    elif red_count == 1:
+        score += 10
+        reasons.append("followthrough_weak")
+    else:
+        reasons.append("no_followthrough")
+
+    # ── Step 6: Rejection from peak ──────────────────────────────────────────
+    last_price    = float(d.iloc[-1]["close"])
+    rejection_pct = (peak_price - last_price) / peak_price * 100 if peak_price > 0 else 0.0
+
+    if rejection_pct >= 5.0:
+        score += 15
+    elif rejection_pct >= 3.0:
+        score += 8
+        reasons.append("rejection_moderate")
+    else:
+        reasons.append("rejection_minimal")
+
+    score = round(min(score, 100), 1)
+
+    # ── Determine signal, state, bias, action ─────────────────────────────────
+    if score >= 70:
+        detected = True
+        state    = "DISTRIBUTION"
+        bias     = "LONG_EXIT"
+        action   = "NO_LONG"
+        if rejection_pct >= 8.0:
+            action = "LOOK_FOR_SHORT_CONFIRMATION"
+    elif score >= 50:
+        detected = False
+        state    = "NONE"
+        bias     = "SHORT_BIAS"
+        action   = "WAIT_PULLBACK"
+        reasons.append("score_watchlist")
+    else:
+        detected = False
+        state    = "NONE"
+        bias     = "NEUTRAL"
+        action   = "LOOK_FOR_SHORT_CONFIRMATION" if score >= DISTRIBUTION_WEAK_SCORE_THRESHOLD else "WAIT_PULLBACK"
+        if not reasons:
+            reasons.append("score_too_low")
+
+    reason_str = ", ".join(reasons) if reasons else "all_checks_passed"
+
+    # ── Telegram / log alert when distribution is confirmed ──────────────────
+    if detected and symbol:
+        msg = (
+            f"🚫 DISTRIBUTION DETECTED — {symbol}\n"
+            f"Bias: {bias} | State: OVEREXTENDED → DISTRIBUTION\n"
+            f"Peak: {round(peak_price, 6)} | Last: {round(last_price, 6)}\n"
+            f"Impulse: %{round(impulse_pct, 1)} | Rejection: %{round(rejection_pct, 1)}\n"
+            f"WickRatio: {round(wick_ratio, 2)} | VolRatio: {round(volume_ratio, 2)}\n"
+            f"Action: NO_LONG / LOOK_FOR_SHORT_CONFIRMATION\n"
+            f"Score: {score}/100"
+        )
+        tg_send(msg)
+        log(
+            f"[DISTRIBUTION] {symbol} score={score} impulse={round(impulse_pct,1)}% "
+            f"rejection={round(rejection_pct,1)}% wick_ratio={round(wick_ratio,2)} "
+            f"vol_ratio={round(volume_ratio,2)} action={action}"
+        )
+
+    return {
+        "detected":      detected,
+        "score":         score,
+        "state":         state,
+        "bias":          bias,
+        "action":        action,
+        "impulse_pct":   round(float(impulse_pct), 2),
+        "peak_price":    round(float(peak_price), 6),
+        "last_price":    round(float(last_price), 6),
+        "rejection_pct": round(float(rejection_pct), 2),
+        "wick_ratio":    round(float(wick_ratio), 3),
+        "volume_ratio":  round(float(volume_ratio), 3),
+        "reason":        reason_str,
+    }
+
+
+# Distribution scoring threshold below which we suggest short confirmation instead of wait
+DISTRIBUTION_WEAK_SCORE_THRESHOLD = 35
+
+
 def check_spot_loser_followups():
     """
     For each loser coin previously detected with a dead-cat-bounce pattern,
@@ -7167,6 +7376,7 @@ SETUP_STATES = {
     "OVEREXTENDED_NO_ENTRY",
     "WAIT_NEXT_BREAK",
     "NO_TRADE",
+    "DISTRIBUTION",
 }
 
 # Per-symbol active setup storage
@@ -7524,6 +7734,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         "OVEREXTENDED_NO_ENTRY":   "⚡ OVEREXTENDED – NO ENTRY",
         "WAIT_NEXT_BREAK":         "🔒 WAIT NEXT BREAK",
         "NO_TRADE":                "⛔ NO TRADE",
+        "DISTRIBUTION":            "🚫 DISTRIBUTION DETECTED",
     }
     label = emoji_map.get(new_state, new_state)
 
@@ -7582,6 +7793,7 @@ def update_symbol_setup_state(symbol: str, df) -> str:
         "OVEREXTENDED_NO_ENTRY",
         "WAIT_NEXT_BREAK",
         "NO_TRADE",
+        "DISTRIBUTION",
     }
 
     # ── Reversal opportunity from failed / fake states ─────────────────────────
@@ -8096,6 +8308,27 @@ def process_active_setups():
             # ── Advance state machine ──────────────────────────────────────
             new_state = update_symbol_setup_state(symbol, df)
 
+            # ── Distribution gate: block LONG entry when pump→distribution ──
+            if new_state in ("CONFIRMED_LONG", "BREAKOUT_PENDING") and setup.get("bias") == "LONG":
+                try:
+                    dist = detect_distribution_pattern(df, symbol=symbol)
+                    if dist and dist.get("detected"):
+                        _setup_transition(symbol, "DISTRIBUTION", {
+                            "distribution_score":     dist["score"],
+                            "distribution_action":    dist["action"],
+                            "distribution_impulse":   dist["impulse_pct"],
+                            "distribution_rejection": dist["rejection_pct"],
+                        })
+                        _apply_lock_after_setup(symbol, "DISTRIBUTION")
+                        log(
+                            f"[PROCESS SETUPS] {symbol}: LONG blocked by DISTRIBUTION "
+                            f"(score={dist['score']} impulse={dist['impulse_pct']}% "
+                            f"rejection={dist['rejection_pct']}%)"
+                        )
+                        continue
+                except Exception as _dist_err:
+                    log(f"[DISTRIBUTION CHECK ERR] {symbol}: {_dist_err}")
+
             # ── Trigger trade when confirmed ───────────────────────────────
             if should_open_trade_from_setup(symbol):
                 pattern  = setup.get("pattern", {})
@@ -8196,6 +8429,7 @@ def process_active_setups():
             cleanup_states = {
                 "WAIT_NEXT_BREAK", "FAKE_BREAKOUT_LONG", "FAKE_BREAKOUT_SHORT",
                 "FAILED_LONG", "FAILED_SHORT", "OVEREXTENDED_NO_ENTRY", "NO_TRADE",
+                "DISTRIBUTION",
             }
             if state in cleanup_states:
                 age_min = _elapsed_minutes_since(setup.get("last_update", ""))
@@ -8461,6 +8695,21 @@ def scan_top_gainers_and_alert():
             else:
                 bias, chosen_pattern = "SHORT", short_result["pattern"]
                 log(f"[SPOT SCAN] {symbol} — only SHORT valid (score={ss})")
+
+            # ── Distribution gate: suppress LONG if pump→distribution detected ─
+            if bias == "LONG":
+                try:
+                    dist = detect_distribution_pattern(df, symbol=symbol)
+                    if dist and dist.get("detected"):
+                        log(
+                            f"[SPOT SCAN] 🚫 {symbol} — LONG suppressed by DISTRIBUTION "
+                            f"(score={dist['score']} impulse={dist['impulse_pct']}% "
+                            f"rejection={dist['rejection_pct']}% action={dist['action']})"
+                        )
+                        return
+                except Exception as _dist_err:
+                    log(f"[DISTRIBUTION CHECK ERR] {symbol}: {_dist_err}")
+
 
             if should_lock_symbol(symbol, bias):
                 log(f"[SPOT SCAN] {symbol} locked — skipping repeated {bias} signal")
