@@ -3538,7 +3538,7 @@ def update_directional_limits():
         STATE["bb_short_blocked"], STATE["stoch_rsi_short_blocked"], STATE["fib_short_blocked"]
     ])
     
-    STATE["auto_trade_active"] = not (all_long_blocked and all_short_blocked)
+    STATE["auto_trade_active"] = False
     safe_save(STATE_FILE, STATE)
     return live
 
