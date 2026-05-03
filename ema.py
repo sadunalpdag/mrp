@@ -4400,7 +4400,7 @@ def heartbeat_and_status_check(_snapshot):
 
 def ai_log_signal(sig):
     AI_SIGNALS.append({
-        "time":now_local_iso(),"symbol":sig["symbol"],"dir":sig["dir"],"tier":sig["tier"],
+        "time":now_local_iso(),"symbol":sig["symbol"],"dir":sig["dir"],"tier":sig.get("tier",""),
         "chg24h":sig.get("chg24h"),"power":sig["power"],"rsi":sig.get("rsi"),"atr":sig.get("atr"),
         "tp":sig["tp"],"sl":sig["sl"],"entry":sig["entry"],"born_bar":sig.get("born_bar"),
         "early":bool(sig.get("early",False)),"kind":sig.get("kind",""),"tag":sig.get("tag",""),
