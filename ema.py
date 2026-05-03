@@ -8427,7 +8427,8 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         f"Ref: {ref}  |  Inv: {inv}\n"
         f"time: {now_local_iso()}"
     )
-    tg_send(msg)
+    if new_state == "CONFIRMED_LONG":
+        tg_send(msg)
     log(f"[SETUP STATE] {symbol}: {old_state} → {new_state}")
 
 
@@ -9281,22 +9282,23 @@ def create_breakout_setup(symbol: str, bias: str, pattern: dict, change_24h: flo
         "locked_at":   now_str,
     }
 
-    # Send initial tracking Telegram message
+    # Send initial tracking Telegram message (only for LONG bias)
     score = pattern.get("score", 0)
     pat   = pattern.get("pattern", "")
     emoji = "🟢" if bias == "LONG" else "🔴"
     src_tag = f"  |  Source: {candidate_source}" if candidate_source != "UNKNOWN" else ""
     score_tag = f"  |  Long: {long_score}  Short: {short_score}" if long_score is not None and short_score is not None else ""
-    tg_send(
-        f"{emoji} TRACKING {bias} — {symbol}\n"
-        f"📐 Pattern: {pat}\n"
-        f"📊 Score: {score}/100  |  24s: %{change_24h}{src_tag}{score_tag}\n"
-        f"🔺 Swing High: {swing_high}\n"
-        f"🔻 Swing Low: {swing_low}\n"
-        f"🎯 Reference: {reference_level}  |  Inv: {invalidation}\n"
-        f"⏳ Takipte — teyit bekleniyor\n"
-        f"time: {now_str}"
-    )
+    if bias == "LONG":
+        tg_send(
+            f"{emoji} TRACKING {bias} — {symbol}\n"
+            f"📐 Pattern: {pat}\n"
+            f"📊 Score: {score}/100  |  24s: %{change_24h}{src_tag}{score_tag}\n"
+            f"🔺 Swing High: {swing_high}\n"
+            f"🔻 Swing Low: {swing_low}\n"
+            f"🎯 Reference: {reference_level}  |  Inv: {invalidation}\n"
+            f"⏳ Takipte — teyit bekleniyor\n"
+            f"time: {now_str}"
+        )
     log(f"[SETUP CREATED] {symbol} {bias} state={state} ref={reference_level} inv={invalidation}")
     return True
 
