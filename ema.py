@@ -7297,18 +7297,8 @@ def detect_distribution_pattern(df, symbol: str = "",
 
     reason_str = ", ".join(reasons) if reasons else "all_checks_passed"
 
-    # ── Telegram / log alert when distribution is confirmed ──────────────────
+    # ── Log alert when distribution is confirmed ─────────────────────────────
     if detected and symbol:
-        msg = (
-            f"🚫 DISTRIBUTION DETECTED — {symbol}\n"
-            f"Bias: {bias} | State: OVEREXTENDED → DISTRIBUTION\n"
-            f"Peak: {round(peak_price, 6)} | Last: {round(last_price, 6)}\n"
-            f"Impulse: %{round(impulse_pct, 1)} | Rejection: %{round(rejection_pct, 1)}\n"
-            f"WickRatio: {round(wick_ratio, 2)} | VolRatio: {round(volume_ratio, 2)}\n"
-            f"Action: NO_LONG / LOOK_FOR_SHORT_CONFIRMATION\n"
-            f"Score: {score}/100"
-        )
-        tg_send(msg)
         log(
             f"[DISTRIBUTION] {symbol} score={score} impulse={round(impulse_pct,1)}% "
             f"rejection={round(rejection_pct,1)}% wick_ratio={round(wick_ratio,2)} "
@@ -7661,18 +7651,8 @@ def detect_accumulation_pattern(df, symbol: str = "",
 
     reason_str = ", ".join(reasons) if reasons else "all_checks_passed"
 
-    # ── Telegram / log alert when accumulation is confirmed ──────────────────
+    # ── Log alert when accumulation is confirmed ──────────────────────────────
     if detected and symbol:
-        msg = (
-            f"🟢 ACCUMULATION DETECTED — {symbol}\n"
-            f"Bias: {bias} | State: BASE → ACCUMULATION\n"
-            f"Ref: {ref_level} | Inv: {inv_level}\n"
-            f"Drop: %{round(drop_pct, 1)} | Recovery: %{round(recovery_pct, 1)}\n"
-            f"WickRatio: {round(wick_ratio, 2)} | VolRatio: {round(volume_ratio, 2)}\n"
-            f"Action: NO_SHORT / LOOK_FOR_LONG_CONFIRMATION\n"
-            f"Score: {score}/100"
-        )
-        tg_send(msg)
         log(
             f"[ACCUMULATION] {symbol} score={score} drop={round(drop_pct,1)}% "
             f"recovery={round(recovery_pct,1)}% wick_ratio={round(wick_ratio,2)} "
