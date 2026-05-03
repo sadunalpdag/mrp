@@ -15,15 +15,16 @@ import numpy as np
 import pandas as pd
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.10.0 — Enhanced Strategies with Advanced Technical Analysis
+# 📘 EMA ULTRA v15.11.0 — Fibonacci Only (LONG) Mode
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif stratejiler: tüm stratejiler devre dışı
-#       📐 FIBONACCI RETRACEMENT disabled
-#  - Diğer tüm stratejiler devre dışı (all strategies disabled)
+#  - Aktif strateji: SADECE 📐 FIBONACCI RETRACEMENT (LONG only)
+#  - Diğer tüm stratejiler devre dışı (all other strategies disabled)
 #  - MIN_POWER_THRESHOLD: 68.0
 #  - TRADE_SIZE_USDT: 750.0
+#  - FIBONACCI: Maks 3 LONG pozisyon, SHORT tamamen kapalı (MAX_FIB_SELL=0)
+#  - Tarama: Top 25 vadeli işlem sembolü (hacime göre)
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
-#  - PER-STRATEGY LIMITS: Each strategy limited to 3 buy / 3 sell independently
+#  - PER-STRATEGY LIMITS: Fibonacci max 3 long / 0 short
 #  - Strategy enable/disable via Telegram commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
 #  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
@@ -2603,8 +2604,70 @@ def detect_order_block(highs, lows, closes, opens, direction, lookback=20):
 
 
 
-def scan_symbol(sym,bar_i):
-    return []
+def scan_symbol(sym, bar_i):
+    """
+    Fibonacci Retracement strategy scanner — LONG only.
+
+    Runs analyze_fib_breakout_fakeout() on the symbol's 15m klines and returns
+    a LONG signal when a LONG_CONTINUATION or BULLISH_FAKE_BREAKOUT is detected.
+    Only runs for symbols in the TOP_VOLUME_SYMBOLS list (top 25 by volume).
+    """
+    sigs = []
+    try:
+        # Only scan top-volume futures symbols to limit API calls
+        if not TOP_VOLUME_SYMBOLS or sym not in TOP_VOLUME_SYMBOLS:
+            return sigs
+
+        # Respect enable/disable flag
+        if not PARAM.get("ENABLE_FIB", True):
+            return sigs
+
+        # Skip if LONG limit already reached
+        if STATE.get("fib_long_blocked", False):
+            return sigs
+
+        # Fetch 15m klines
+        klines = futures_get_klines(sym, "15m", 100)
+        if not klines or len(klines) < 50:
+            return sigs
+
+        # Run Fibonacci analysis
+        result = analyze_fib_breakout_fakeout(klines)
+        signal = result.get("signal", "NO_TRADE")
+
+        # Only LONG signals
+        if signal not in ("LONG_CONTINUATION", "BULLISH_FAKE_BREAKOUT"):
+            return sigs
+
+        confidence = float(result.get("confidence", 0))
+        entry_zone = result.get("entry_zone")
+        tp_zone = result.get("tp_zone")
+        invalidation = result.get("invalidation")
+
+        if not entry_zone or len(entry_zone) < 2:
+            return sigs
+
+        entry = (float(entry_zone[0]) + float(entry_zone[1])) / 2
+        tp = float(tp_zone[0]) if tp_zone and len(tp_zone) > 0 else 0.0
+        sl = float(invalidation) if invalidation else 0.0
+
+        sig = {
+            "symbol":       sym,
+            "dir":          "UP",
+            "power":        confidence,
+            "kind":         "FIBONACCI_RETRACEMENT",
+            "tag":          "📐 FIB LONG",
+            "entry":        entry,
+            "tp":           tp,
+            "sl":           sl,
+            "market_state": result.get("market_state", ""),
+            "born_bar":     bar_i,
+        }
+        sigs.append(sig)
+        log(f"[FIB SIGNAL] {sym} LONG confidence={confidence:.0f} signal={signal}")
+    except Exception as e:
+        log(f"[FIB SCAN ERR] {sym}: {e}")
+    return sigs
 
 def run_parallel(symbols,bar_i):
     out=[]
@@ -3096,7 +3159,7 @@ PARAM_DEFAULT={
     "MAX_FVG_MSS_ENTRY_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FVG_MSS_ENTRY_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # FVG MSS strategy limits
     "MAX_BB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_BB_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Bollinger Bands strategy limits
     "MAX_STOCH_RSI_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_STOCH_RSI_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Stochastic RSI strategy limits
-    "MAX_FIB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FIB_SELL":DEFAULT_STRATEGY_POSITION_LIMIT,  # Fibonacci retracement strategy limits
+    "MAX_FIB_BUY":DEFAULT_STRATEGY_POSITION_LIMIT, "MAX_FIB_SELL":0,  # Fibonacci retracement: max 3 long, 0 short (LONG only)
     "ANGLE_MIN":0.00002, "FAST_EMA_PERIOD":3, "SLOW_EMA_PERIOD":7,
     "ATR_SPIKE_RATIO":0.03, "SCALP_APPROVE_BARS":0,
     "PROFIT_TARGET_USD":2000.0,
@@ -9513,12 +9576,12 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.10.0 active — On-chain strategy: Top 25 by volume\n"
-            "📊 13 strategies active | PER-STRATEGY LIMITS: 3 buy/3 sell per strategy\n"
-            "🎛️ Use /strategies to see all\n"
-            "⏱️ Hourly performance tracking enabled\n"
-            "🔥 On-chain: Top 25 coins by 24h volume")
-    log("[START] EMA ULTRA v15.10.0 - On-chain strategy: Top 25 volume")
+    tg_send("🚀 EMA ULTRA v15.11.0 active — Fibonacci LONG only mode\n"
+            "📐 Aktif strateji: FIBONACCI RETRACEMENT (LONG only)\n"
+            "💰 Trade size: $750 | Maks 3 long pozisyon\n"
+            "🔎 Tarama: Top 25 vadeli işlem sembolü (hacime göre)\n"
+            "🎛️ Use /strategies to see all")
+    log("[START] EMA ULTRA v15.11.0 - Fibonacci LONG only, $750 per trade, max 3 positions")
 
     symbols=auto_init_symbols()
     
