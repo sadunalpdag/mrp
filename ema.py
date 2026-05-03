@@ -1244,11 +1244,11 @@ class MultiCoinSignalTracker:
 
     @staticmethod
     def _send_result(signal: SignalEvent):
-        status_emoji = {"CONFIRMED": "✅", "NEUTRAL": "🟡", "FAILED": "❌"}.get(
-            signal.status, "ℹ️"
-        )
+        log(f"[SIGNAL TRACKER RESULT] {signal.symbol} {signal.side} → {signal.decision}")
+        if signal.decision != "CONFIRMED_LONG":
+            return
         msg = (
-            f"{status_emoji} FOLLOW-UP SONUCU — {signal.symbol} {signal.side}\n"
+            f"✅ FOLLOW-UP SONUCU — {signal.symbol} {signal.side}\n"
             f"Karar: {signal.decision}\n"
             f"Entry: {signal.entry_price}\n"
             f"Referans: {signal.reference_level}\n"
@@ -1257,7 +1257,6 @@ class MultiCoinSignalTracker:
         for note in signal.notes:
             msg += f"• {note}\n"
         tg_send(msg)
-        log(f"[SIGNAL TRACKER RESULT] {signal.symbol} {signal.side} → {signal.decision}")
 
 
 SIGNAL_TRACKER = MultiCoinSignalTracker(followup_minutes=FOLLOWUP_MINUTES)
