@@ -7732,7 +7732,6 @@ def check_spot_loser_followups():
                 f"Fib 38.2: {fib_382} | 50.0: {fib_500} | 61.8: {fib_618}\n"
                 f"🔻 Swing Low: {swing_low} | 🎯 Bounce Tepe: {bounce_high}"
             )
-            tg_send(msg)
             log(f"[SPOT LOSER FOLLOWUP] {symbol} check#{check_no}: last_close={last_close} — {status}")
 
             info["remaining"] -= 1
@@ -8148,10 +8147,6 @@ def detect_retest_hold_after_impulse(
                 f"breakout={breakout_level} retest_low={retest_low} "
                 f"invalidation={round(invalidation_level, 8)}"
             )
-            try:
-                tg_send(msg)
-            except Exception:
-                pass
             return {
                 "detected":       False,
                 "state":          "FAILED_RETEST",
@@ -8234,7 +8229,7 @@ def detect_retest_hold_after_impulse(
                 f"reasons={score_reasons}"
             )
             try:
-                tg_send(msg)
+                pass  # Suppressed: only CONFIRMED_LONG is sent to Telegram
             except Exception:
                 pass
         else:
@@ -8901,16 +8896,7 @@ def update_setup_direction(symbol: str, new_bias: str, df) -> bool:
         "locked_at":   now_str,
     }
 
-    # ── Send single reversal Telegram alert ───────────────────────────────────
-    emoji = "🔄🟢" if new_bias == "LONG" else "🔄🔴"
-    tg_send(
-        f"{emoji} REVERSAL — {symbol}\n"
-        f"📛 {old_bias} setup failed → switching to {new_bias} tracking\n"
-        f"📐 New Ref: {new_ref}  |  Inv: {new_inv}\n"
-        f"📊 Long Score: {long_score}  |  Short Score: {short_score}\n"
-        f"⏳ Tracking {new_bias} — confirmation required before any trade\n"
-        f"time: {now_str}"
-    )
+    # ── Reversal alert suppressed: only CONFIRMED_LONG is sent to Telegram ───────
     log(f"[SETUP REVERSAL] {symbol}: {old_bias} → {new_bias} | {old_state} → {rev_state}")
 
     # ── Immediately advance to TRACKING state ─────────────────────────────────
@@ -9322,7 +9308,6 @@ def check_spot_pattern_followups():
                 f"Fib 38.2: {fib_382} | 50.0: {fib_500} | 61.8: {fib_618}\n"
                 f"🔺 Swing High: {swing_high} | 🎯 Pullback Dip: {pullback_low}"
             )
-            tg_send(msg)
             log(f"[SPOT FOLLOWUP] {symbol} check#{check_no}: last_close={last_close} — {status}")
 
             info["remaining"] -= 1
@@ -9770,3 +9755,4 @@ if __name__=="__main__":
                          
 
     
+
