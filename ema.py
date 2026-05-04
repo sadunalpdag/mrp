@@ -55,7 +55,7 @@ BINANCE_FAPI   = "https://fapi.binance.com"
 
 # Spot scanner (top gainers / support-bounce pattern)
 SPOT_BASE_URL   = "https://api.binance.com"
-SPOT_TOP_N      = 10
+SPOT_TOP_N      =22
 SPOT_INTERVAL   = "15m"
 SPOT_KLINE_LIMIT = 220
 
