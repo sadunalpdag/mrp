@@ -5115,6 +5115,7 @@ def _cmd_virtual_stats():
         tg_send(f"❌ /virtual_stats error: {e}")
 
 
+def check_telegram_commands():
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
     if not updates: return
