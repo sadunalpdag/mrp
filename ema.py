@@ -180,6 +180,8 @@ RETEST_TOLERANCE_PCT        = 0.3   # % band around breakout_level to count as r
 RETEST_MAX_INVALIDATION_PCT = 0.8   # % below breakout_level that invalidates the retest
 RETEST_CONFIRM_CANDLES      = 2     # follow-through candles needed above level after retest
 RETEST_MIN_BOUNCE_PCT       = 0.2   # minimum bounce from retest low to award bounce score
+BEST_ENTRY_TOLERANCE_PCT    = 0.3   # % below/above breakout_level for toleranced best_entry
+DEEP_PULLBACK_PCT           = 1.0   # % below breakout_level that triggers WAIT_RECLAIM
 
 
 # ---------------------------------------------------------------------------
@@ -905,9 +907,13 @@ def evaluate_breakout_entry(
     )
 
     # ── Best entry price ──────────────────────────────────────────────
-    # For LONG: enter as close to the breakout level as possible (cheapest price).
-    # For SHORT: enter as close to the breakout level as possible (highest price).
-    best_entry = round(breakout_level, 6)
+    # For LONG: enter slightly below the breakout level to account for retest wicks.
+    # For SHORT: enter slightly above the breakout level for the same reason.
+    _entry_tolerance = BEST_ENTRY_TOLERANCE_PCT / 100
+    if direction == "LONG":
+        best_entry = round(breakout_level * (1 - _entry_tolerance), 6)
+    else:
+        best_entry = round(breakout_level * (1 + _entry_tolerance), 6)
 
     # ── Take profit ───────────────────────────────────────────────────
     tp1, tp2, rr = calculate_take_profit(
@@ -8598,27 +8604,42 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                 current_price = float(klines_list[-1][4])
             confidence = entry_result.get("confidence", 0)
             reason = entry_result.get("reason", "")
-            if entry_level:
-                created = create_virtual_long(
-                    symbol=symbol,
-                    entry_level=entry_level,
-                    current_price=current_price,
-                    confidence=confidence,
-                    reason=reason,
-                    setup_data={k: v for k, v in setup.items()
-                                if isinstance(v, (str, int, float, bool, type(None)))},
-                )
-                if created:
-                    tp_level = round(float(entry_level) * 1.006, 8)
+            if entry_level and current_price:
+                breakout_ref = float(ref)
+                pullback_pct = (breakout_ref - current_price) / breakout_ref * 100
+                if pullback_pct > DEEP_PULLBACK_PCT:
+                    # Price has sunk too far below the breakout level — wait for reclaim
                     tg_send(
-                        f"🎯 VIRTUAL ENTRY PLAN — {symbol}\n"
-                        f"Direction: LONG\n"
-                        f"Entry Level: {entry_level}\n"
-                        f"TP +0.6%: {tp_level}\n"
-                        f"Confidence: {confidence}/100\n"
-                        f"Reason: {reason}\n"
-                        f"Status: Entry bekleniyor"
+                        f"⚠️ WAIT RECLAIM — {symbol}\n"
+                        f"Breakout Level: {breakout_ref}\n"
+                        f"Best Entry: {entry_level} (toleranslı)\n"
+                        f"Current Price: {current_price} ({pullback_pct:.2f}% below)\n"
+                        f"Fiyat kırılım seviyesi {breakout_ref} üstünde 15m kapanış "
+                        f"yapmadan sanal işlem açılmayacak.\n"
+                        f"Confidence: {confidence}/100"
                     )
+                else:
+                    created = create_virtual_long(
+                        symbol=symbol,
+                        entry_level=entry_level,
+                        current_price=current_price,
+                        confidence=confidence,
+                        reason=reason,
+                        setup_data={k: v for k, v in setup.items()
+                                    if isinstance(v, (str, int, float, bool, type(None)))},
+                    )
+                    if created:
+                        tp_level = round(float(entry_level) * 1.006, 8)
+                        tg_send(
+                            f"🎯 VIRTUAL ENTRY PLAN — {symbol}\n"
+                            f"Direction: LONG\n"
+                            f"Breakout Level: {breakout_ref}\n"
+                            f"Best Entry: {entry_level} (toleranslı, -%{BEST_ENTRY_TOLERANCE_PCT})\n"
+                            f"TP +0.6%: {tp_level}\n"
+                            f"Confidence: {confidence}/100\n"
+                            f"Reason: {reason}\n"
+                            f"Status: Entry bekleniyor"
+                        )
         except Exception as _ve_err:
             log(f"[VIRTUAL ENTRY ERROR] {symbol}: {_ve_err}")
     log(f"[SETUP STATE] {symbol}: {old_state} → {new_state}")
