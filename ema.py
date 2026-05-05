@@ -8403,6 +8403,19 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         f"time: {now_local_iso()}"
     )
     if new_state == "CONFIRMED_LONG":
+        tp_zone   = setup.get("tp_zone")
+        retest_ok = setup.get("retest_confirmed", False)
+        entry_note = "Retest onaylı — tam kırılım seviyesine girilebilir" if retest_ok else "Kırılım seviyesine pullback'te girilebilir"
+        msg += (
+            f"\n\n📌 ÖNERİLEN GİRİŞ BİLGİSİ\n"
+            f"🎯 Entry Zone : {ref}\n"
+            f"🛑 Stop Loss  : {inv}\n"
+        )
+        if tp_zone and len(tp_zone) >= 1:
+            msg += f"💰 TP1        : {tp_zone[0]}\n"
+        if tp_zone and len(tp_zone) >= 2:
+            msg += f"💰 TP2        : {tp_zone[1]}\n"
+        msg += f"ℹ️ {entry_note}"
         tg_send(msg)
     log(f"[SETUP STATE] {symbol}: {old_state} → {new_state}")
 
