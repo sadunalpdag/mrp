@@ -13,6 +13,12 @@ from typing import Dict, Optional, List, Tuple
 from dateutil import parser as _dtparser
 import numpy as np
 import pandas as pd
+from virtual_entry_tracker import (
+    create_virtual_long,
+    update_virtual_trades,
+    cleanup_old_trades,
+    analyze_virtual_trades,
+)
 
 # ==============================================================================
 # 📘 EMA ULTRA v15.11.0 — Fibonacci Only (LONG) Mode
@@ -5086,7 +5092,29 @@ def _cmd_topvolume():
     except Exception as e:
         tg_send(f"❌ /topvolume error: {e}")
 
-def check_telegram_commands():
+
+def _cmd_virtual_stats():
+    """Show virtual entry tracker statistics"""
+    try:
+        stats = analyze_virtual_trades()
+        if stats.get("total", 0) == 0:
+            tg_send(f"📊 Virtual Entry Stats\n{stats.get('message', 'Yeterli veri yok')}")
+            return
+        tg_send(
+            f"📊 Virtual Entry Stats\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"Total: {stats['total']}\n"
+            f"TP Closed: {stats.get('closed_count')}\n"
+            f"Open/Waiting: {stats.get('open_count')}\n"
+            f"TP Success: %{stats.get('tp_success_rate')}\n"
+            f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
+            f"Best Confidence: {stats.get('best_confidence_min')}\n"
+            f"Decision: {stats.get('recommendation')}"
+        )
+    except Exception as e:
+        tg_send(f"❌ /virtual_stats error: {e}")
+
+
     if not BOT_TOKEN or not CHAT_ID: return
     updates=_tg_get_updates()
     if not updates: return
@@ -5134,6 +5162,7 @@ def check_telegram_commands():
         elif cmd=="/forcehourlyanalysis": _cmd_forcehourlyanalysis()
         elif cmd=="/stoploss": _cmd_stoploss()
         elif cmd=="/topvolume": _cmd_topvolume()
+        elif cmd=="/virtual_stats": _cmd_virtual_stats()
         else:
             tg_send("📋 AVAILABLE COMMANDS:\n"
                     "━━━━━━━━━━━━━━━━\n"
@@ -5150,6 +5179,7 @@ def check_telegram_commands():
                     "/forcehourlyanalysis - Force activate analysis\n"
                     "/stoploss - Show stop loss recommendation\n"
                     "/topvolume - Show top 25 coins\n"
+                    "/virtual_stats - Virtual entry tracker stats\n"
                     "/set KEY VALUE - Set parameter\n"
                     "/report - Generate report\n"
                     "/export - Export all data")
@@ -8404,6 +8434,48 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
     )
     if new_state == "CONFIRMED_LONG":
         tg_send(msg)
+        try:
+            klines_list = futures_get_klines(symbol, "15m", 120)
+            vol_spike, _ = detect_volume_spike(
+                [[k[0], k[1], k[2], k[3], k[4], k[5]] for k in klines_list]
+            ) if klines_list else (False, 0)
+            entry_result = evaluate_breakout_entry(
+                klines_list,
+                direction="LONG",
+                breakout_level=float(ref),
+                swing_low=float(setup.get("swing_low", 0)) or None,
+                swing_high=float(setup.get("swing_high", 0)) or None,
+                volume_spike=vol_spike,
+            )
+            entry_level = entry_result.get("best_entry")
+            current_price = entry_result.get("_debug", {}).get("current_close")
+            if current_price is None and klines_list:
+                current_price = float(klines_list[-1][4])
+            confidence = entry_result.get("confidence", 0)
+            reason = entry_result.get("reason", "")
+            if entry_level:
+                created = create_virtual_long(
+                    symbol=symbol,
+                    entry_level=entry_level,
+                    current_price=current_price,
+                    confidence=confidence,
+                    reason=reason,
+                    setup_data={k: v for k, v in setup.items()
+                                if isinstance(v, (str, int, float, bool, type(None)))},
+                )
+                if created:
+                    tp_level = round(float(entry_level) * 1.006, 8)
+                    tg_send(
+                        f"🎯 VIRTUAL ENTRY PLAN — {symbol}\n"
+                        f"Direction: LONG\n"
+                        f"Entry Level: {entry_level}\n"
+                        f"TP +0.6%: {tp_level}\n"
+                        f"Confidence: {confidence}/100\n"
+                        f"Reason: {reason}\n"
+                        f"Status: Entry bekleniyor"
+                    )
+        except Exception as _ve_err:
+            log(f"[VIRTUAL ENTRY ERROR] {symbol}: {_ve_err}")
     log(f"[SETUP STATE] {symbol}: {old_state} → {new_state}")
 
 
@@ -8945,6 +9017,13 @@ def process_active_setups():
     for symbol, setup in list(ACTIVE_SETUPS.items()):
         try:
             df = _setup_get_klines_15m(symbol, limit=50)
+
+            # ── Update virtual trade tracking ───────────────────────────────
+            if df is not None and len(df) > 0:
+                try:
+                    update_virtual_trades(symbol, float(df.iloc[-1]["close"]))
+                except Exception as _vt_err:
+                    log(f"[VIRTUAL TRACK ERROR] {symbol}: {_vt_err}")
 
             # ── Attempt unlock ─────────────────────────────────────────────
             if should_unlock_symbol(symbol, df):
@@ -9723,6 +9802,12 @@ def main():
             except Exception as _setup_err:
                 log(f"[SETUP STATE ERR] {_setup_err}")
                 log(f"[SETUP STATE TRACE] {traceback.format_exc()}")
+
+            # 3.9) Clean up old virtual entry trades (>15 days)
+            try:
+                cleanup_old_trades()
+            except Exception as _cleanup_err:
+                log(f"[VIRTUAL CLEANUP ERR] {_cleanup_err}")
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
