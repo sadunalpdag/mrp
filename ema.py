@@ -8634,7 +8634,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                             f"🎯 VIRTUAL ENTRY PLAN — {symbol}\n"
                             f"Direction: LONG\n"
                             f"Breakout Level: {breakout_ref}\n"
-                            f"Best Entry: {entry_level} (toleranslı, -%{BEST_ENTRY_TOLERANCE_PCT})\n"
+                            f"Best Entry: {entry_level} (toleranslı, -{BEST_ENTRY_TOLERANCE_PCT}%)\n"
                             f"TP +0.6%: {tp_level}\n"
                             f"Confidence: {confidence}/100\n"
                             f"Reason: {reason}\n"
