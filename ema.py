@@ -1044,18 +1044,19 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
     for t in data:
         if t["symbol"] == symbol and t["status"] in ("WAIT_ENTRY", "OPEN"):
             return False
+    now_iso = _vt_now_iso()
     trade = {
         "id": f"{symbol}_{int(time.time())}",
         "symbol": symbol,
         "direction": "LONG",
-        "status": "WAIT_ENTRY",
+        "status": "OPEN",
         "entry_level": float(entry_level),
         "tp_level": round(float(entry_level) * (1 + TP_PCT), 8),
         "current_price_at_signal": float(current_price) if current_price else 0.0,
         "confidence": confidence,
         "reason": reason,
-        "created_at": _vt_now_iso(),
-        "entry_hit_at": None,
+        "created_at": now_iso,
+        "entry_hit_at": now_iso,
         "closed_at": None,
         "close_minutes": None,
         "max_profit_pct": 0.0,
@@ -8581,27 +8582,13 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         tg_send(msg)
         try:
             klines_list = futures_get_klines(symbol, "15m", 120)
-            vol_spike, _ = detect_volume_spike(
-                [[k[0], k[1], k[2], k[3], k[4], k[5]] for k in klines_list]
-            ) if klines_list else (False, 0)
-            entry_result = evaluate_breakout_entry(
-                klines_list,
-                direction="LONG",
-                breakout_level=float(ref),
-                swing_low=float(setup.get("swing_low", 0)) or None,
-                swing_high=float(setup.get("swing_high", 0)) or None,
-                volume_spike=vol_spike,
-            )
-            entry_level = entry_result.get("best_entry")
-            current_price = entry_result.get("_debug", {}).get("current_close")
-            if current_price is None and klines_list:
-                current_price = float(klines_list[-1][4])
-            confidence = entry_result.get("confidence", 0)
-            reason = entry_result.get("reason", "")
-            if entry_level:
+            current_price = float(klines_list[-1][4]) if klines_list else None
+            if current_price:
+                confidence = 70
+                reason = "CONFIRMED_LONG signal — immediate entry at current price"
                 created = create_virtual_long(
                     symbol=symbol,
-                    entry_level=entry_level,
+                    entry_level=current_price,
                     current_price=current_price,
                     confidence=confidence,
                     reason=reason,
@@ -8609,15 +8596,13 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                                 if isinstance(v, (str, int, float, bool, type(None)))},
                 )
                 if created:
-                    tp_level = round(float(entry_level) * 1.006, 8)
+                    tp_level = round(float(current_price) * 1.006, 8)
                     tg_send(
-                        f"🎯 VIRTUAL ENTRY PLAN — {symbol}\n"
+                        f"🎯 VIRTUAL ENTRY — {symbol}\n"
                         f"Direction: LONG\n"
-                        f"Entry Level: {entry_level}\n"
+                        f"Entry: {current_price}\n"
                         f"TP +0.6%: {tp_level}\n"
-                        f"Confidence: {confidence}/100\n"
-                        f"Reason: {reason}\n"
-                        f"Status: Entry bekleniyor"
+                        f"Status: Açıldı"
                     )
         except Exception as _ve_err:
             log(f"[VIRTUAL ENTRY ERROR] {symbol}: {_ve_err}")
@@ -9175,9 +9160,6 @@ def process_active_setups():
                 log(f"[SETUP UNLOCK] {symbol}: new structure detected, clearing lock")
                 SYMBOL_LOCKS.pop(symbol, None)
                 to_remove.append(symbol)
-                tg_send(f"🔓 UNLOCK — {symbol}\n"
-                        f"Yeni yapı oluştu, setup sıfırlanıyor.\n"
-                        f"time: {now_local_iso()}")
                 continue
 
             # ── Advance state machine ──────────────────────────────────────
