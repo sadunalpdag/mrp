@@ -1047,9 +1047,9 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
             return False
     now_iso = _vt_now_iso()
     sd = setup_data or {}
-    breakout_level = float(
-        sd.get("breakout_level") or sd.get("reference_level") or entry_level
-    )
+    bl = sd.get("breakout_level")
+    rl = sd.get("reference_level")
+    breakout_level = float(bl if bl is not None else (rl if rl is not None else entry_level))
     retest_done = bool(sd.get("retest_confirmed", False))
     fake_breakout = bool(sd.get("fake_breakout", False))
     trade = {
@@ -1162,7 +1162,9 @@ def analyze_virtual_trades():
         return {"total": 0, "message": "Yeterli veri yok"}
     avg_close = None
     if closed:
-        avg_close = sum(t["close_minutes"] for t in closed if t.get("close_minutes")) / len(closed)
+        valid_minutes = [t["close_minutes"] for t in closed if t.get("close_minutes") is not None]
+        if valid_minutes:
+            avg_close = sum(valid_minutes) / len(valid_minutes)
     per_breakout = []
     for t in data:
         per_breakout.append({
@@ -1171,7 +1173,7 @@ def analyze_virtual_trades():
             "breakout_level":   t.get("breakout_level"),
             "entry_level":      t.get("entry_level"),
             "max_drawdown_pct": t.get("max_drawdown_pct"),
-            "tp_hit_time":      t.get("tp_hit_time") or t.get("closed_at"),
+            "tp_hit_time":      t.get("tp_hit_time"),
             "fake_breakout":    t.get("fake_breakout", False),
             "retest_done":      t.get("retest_done", False),
             "status":           t.get("status"),
