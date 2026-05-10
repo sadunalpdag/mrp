@@ -47,6 +47,7 @@ HOURLY_STATS_FILE = os.path.join(DATA_DIR,"hourly_stats.json")
 POSITIONS_TRACKER_FILE = os.path.join(DATA_DIR,"positions_tracker.json")
 SHEET_SIGNALS_FILE   = os.path.join(DATA_DIR,"sheet_signals_opened.json")
 VIRTUAL_FILE         = os.path.join(DATA_DIR,"virtual_entry_trades.json")
+BREAKOUT_STATS_FILE  = os.path.join(DATA_DIR,"breakout_stats.json")
 
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
@@ -1045,11 +1046,18 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
         if t["symbol"] == symbol and t["status"] in ("WAIT_ENTRY", "OPEN"):
             return False
     now_iso = _vt_now_iso()
+    sd = setup_data or {}
+    breakout_level = float(
+        sd.get("breakout_level") or sd.get("reference_level") or entry_level
+    )
+    retest_done = bool(sd.get("retest_confirmed", False))
+    fake_breakout = bool(sd.get("fake_breakout", False))
     trade = {
         "id": f"{symbol}_{int(time.time())}",
         "symbol": symbol,
         "direction": "LONG",
         "status": "OPEN",
+        "breakout_level": round(breakout_level, 8),
         "entry_level": float(entry_level),
         "tp_level": round(float(entry_level) * (1 + TP_PCT), 8),
         "current_price_at_signal": float(current_price) if current_price else 0.0,
@@ -1057,11 +1065,14 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
         "reason": reason,
         "created_at": now_iso,
         "entry_hit_at": now_iso,
+        "tp_hit_time": None,
         "closed_at": None,
         "close_minutes": None,
         "max_profit_pct": 0.0,
         "max_drawdown_pct": 0.0,
-        "setup": setup_data or {},
+        "fake_breakout": fake_breakout,
+        "retest_done": retest_done,
+        "setup": sd,
     }
     data.append(trade)
     save_virtual_trades(data)
@@ -1090,6 +1101,7 @@ def update_virtual_trades(symbol, last_price):
             if price >= tp:
                 t["status"] = "TP_CLOSED"
                 t["closed_at"] = _vt_now_iso()
+                t["tp_hit_time"] = t["closed_at"]
                 start = datetime.fromisoformat(t["entry_hit_at"])
                 end = datetime.fromisoformat(t["closed_at"])
                 t["close_minutes"] = round((end - start).total_seconds() / 60, 2)
@@ -1129,24 +1141,55 @@ def _make_entry_recommendation(data):
         return "Zayıf. Confirmed LONG tek başına yeterli değil, ekstra filtre gerekli."
 
 
+def save_breakout_stats(stats: dict):
+    """Persist breakout analysis stats to BREAKOUT_STATS_FILE."""
+    try:
+        os.makedirs(os.path.dirname(BREAKOUT_STATS_FILE), exist_ok=True)
+        stats_with_ts = dict(stats)
+        stats_with_ts["updated_at"] = _vt_now_iso()
+        with open(BREAKOUT_STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(stats_with_ts, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log(f"[BREAKOUT STATS SAVE ERR] {e}")
+
+
 def analyze_virtual_trades():
     data = load_virtual_trades()
     closed = [t for t in data if t["status"] == "TP_CLOSED"]
-    open_trades = [t for t in data if t["status"] in ("WAIT_ENTRY", "OPEN")]
+    open_trades = [t for t in data if t["status"] == "OPEN"]
+    waiting_trades = [t for t in data if t["status"] == "WAIT_ENTRY"]
     if not data:
         return {"total": 0, "message": "Yeterli veri yok"}
     avg_close = None
     if closed:
-        avg_close = sum(t["close_minutes"] for t in closed) / len(closed)
-    return {
+        avg_close = sum(t["close_minutes"] for t in closed if t.get("close_minutes")) / len(closed)
+    per_breakout = []
+    for t in data:
+        per_breakout.append({
+            "id":               t.get("id"),
+            "symbol":           t.get("symbol"),
+            "breakout_level":   t.get("breakout_level"),
+            "entry_level":      t.get("entry_level"),
+            "max_drawdown_pct": t.get("max_drawdown_pct"),
+            "tp_hit_time":      t.get("tp_hit_time") or t.get("closed_at"),
+            "fake_breakout":    t.get("fake_breakout", False),
+            "retest_done":      t.get("retest_done", False),
+            "status":           t.get("status"),
+            "created_at":       t.get("created_at"),
+        })
+    stats = {
         "total": len(data),
         "closed_count": len(closed),
         "open_count": len(open_trades),
+        "waiting_count": len(waiting_trades),
         "tp_success_rate": round(len(closed) / len(data) * 100, 2),
         "avg_close_minutes": round(avg_close, 2) if avg_close else None,
         "best_confidence_min": _find_best_confidence_threshold(data),
         "recommendation": _make_entry_recommendation(data),
+        "breakouts": per_breakout,
     }
+    save_breakout_stats(stats)
+    return stats
 
 # ===================== TIME-BASED UTILITIES =====================
 
@@ -4610,6 +4653,24 @@ def auto_report_if_due():
         except Exception as e: log(f"[AUTO REPORT ARCHIVE ERR] {fpath}: {e}")
         # tg_send_file(fpath, f"📊 AutoBackup {os.path.basename(fpath)}")
     tg_send("🕐 4 saatlik yedek gönderildi.")
+    # Send virtual entry / breakout stats summary
+    try:
+        stats = analyze_virtual_trades()
+        if stats.get("total", 0) > 0:
+            tg_send(
+                f"📊 Breakout Tracker — 4h Rapor\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"Total: {stats['total']}\n"
+                f"TP Closed: {stats.get('closed_count')}\n"
+                f"Open: {stats.get('open_count')}\n"
+                f"Waiting Entry: {stats.get('waiting_count')}\n"
+                f"TP Success: %{stats.get('tp_success_rate')}\n"
+                f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
+                f"Best Confidence: {stats.get('best_confidence_min')}\n"
+                f"Decision: {stats.get('recommendation')}"
+            )
+    except Exception as _vs_err:
+        log(f"[AUTO REPORT VIRTUAL STATS ERR] {_vs_err}")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
 
 # ===================== TELEGRAM KOMUTLARI =====================
@@ -5250,7 +5311,8 @@ def _cmd_virtual_stats():
             f"━━━━━━━━━━━━━━━━\n"
             f"Total: {stats['total']}\n"
             f"TP Closed: {stats.get('closed_count')}\n"
-            f"Open/Waiting: {stats.get('open_count')}\n"
+            f"Open: {stats.get('open_count')}\n"
+            f"Waiting Entry: {stats.get('waiting_count')}\n"
             f"TP Success: %{stats.get('tp_success_rate')}\n"
             f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
             f"Best Confidence: {stats.get('best_confidence_min')}\n"
