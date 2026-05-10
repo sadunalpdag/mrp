@@ -52,6 +52,10 @@ BREAKOUT_STATS_FILE  = os.path.join(DATA_DIR,"breakout_stats.json")
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
 TP_PCT         = 0.006
+VIRTUAL_FAST_TP_MINUTES = 60
+VIRTUAL_STUCK_HOURS = 6
+RUNNER_MIN_MOVE_PCT = 0.01
+RUNNER_MAX_PULLBACK_PCT = 0.003
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -1010,6 +1014,39 @@ def _vt_now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _vt_safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _vt_minutes_between(start_iso, end_dt=None):
+    if not start_iso:
+        return None
+    try:
+        start = datetime.fromisoformat(start_iso)
+        end = end_dt or datetime.now(timezone.utc)
+        return round((end - start).total_seconds() / 60, 2)
+    except Exception:
+        return None
+
+
+def _classify_runner(trade):
+    max_after_signal = _vt_safe_float(trade.get("max_after_signal_pct"), 0.0)
+    pullback = _vt_safe_float(trade.get("pullback_after_signal_pct"), 0.0)
+    volume_ratio = _vt_safe_float(trade.get("volume_ratio"), 0.0)
+    body_ratio = _vt_safe_float(trade.get("body_ratio"), 0.0)
+    if (
+        max_after_signal >= RUNNER_MIN_MOVE_PCT
+        and pullback <= RUNNER_MAX_PULLBACK_PCT
+        and volume_ratio >= 1.8
+        and body_ratio >= 0.6
+    ):
+        return "MOMENTUM_RUNNER"
+    return "MISSED_RUNNER"
+
+
 def load_virtual_trades():
     if not os.path.exists(VIRTUAL_FILE):
         return []
@@ -1052,24 +1089,45 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
     breakout_level = float(bl if bl is not None else (rl if rl is not None else entry_level))
     retest_done = bool(sd.get("retest_confirmed", False))
     fake_breakout = bool(sd.get("fake_breakout", False))
+    signal_price = float(current_price) if current_price else float(entry_level)
+    breakout_distance_pct = 0.0
+    if breakout_level > 0:
+        breakout_distance_pct = ((signal_price - breakout_level) / breakout_level) * 100.0
     trade = {
         "id": f"{symbol}_{int(time.time())}",
         "symbol": symbol,
         "direction": "LONG",
-        "status": "OPEN",
+        "status": "WAIT_ENTRY",
+        "aftermath_label": None,
         "breakout_level": round(breakout_level, 8),
         "entry_level": float(entry_level),
         "tp_level": round(float(entry_level) * (1 + TP_PCT), 8),
-        "current_price_at_signal": float(current_price) if current_price else 0.0,
+        "signal_price": signal_price,
+        "current_price_at_signal": signal_price,
         "confidence": confidence,
         "reason": reason,
+        "signal_time": now_iso,
         "created_at": now_iso,
-        "entry_hit_at": now_iso,
+        "entry_hit_at": None,
+        "entry_touched": False,
+        "entry_delay_minutes": None,
+        "age_hours": 0.0,
         "tp_hit_time": None,
+        "tp_hit": False,
+        "tp_hit_minutes": None,
         "closed_at": None,
         "close_minutes": None,
+        "floating_pnl_pct": 0.0,
         "max_profit_pct": 0.0,
         "max_drawdown_pct": 0.0,
+        "max_after_signal_pct": 0.0,
+        "pullback_after_signal_pct": 0.0,
+        "tp_missed_by_pct": None,
+        "price_back_to_entry": False,
+        "close_reason": None,
+        "breakout_distance_pct": round(breakout_distance_pct, 4),
+        "volume_ratio": _vt_safe_float(sd.get("volume_ratio"), 0.0),
+        "body_ratio": _vt_safe_float(sd.get("body_ratio"), 0.0),
         "fake_breakout": fake_breakout,
         "retest_done": retest_done,
         "setup": sd,
@@ -1082,15 +1140,46 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
 def update_virtual_trades(symbol, last_price):
     data = load_virtual_trades()
     changed = False
+    now_dt = datetime.now(timezone.utc)
     for t in data:
         if t["symbol"] != symbol:
             continue
+        if t.get("status") in ("TP_CLOSED", "MISSED_RUNNER", "ENTRY_NOT_TOUCHED_AND_FAILED", "FAKE_BREAKOUT", "OVEREXTENDED_LOSS"):
+            continue
         price = float(last_price)
         if t["status"] == "WAIT_ENTRY":
-            if price <= float(t["entry_level"]):
+            signal_price = _vt_safe_float(t.get("signal_price") or t.get("current_price_at_signal"), t.get("entry_level"))
+            entry = _vt_safe_float(t.get("entry_level"), 0.0)
+            tp = _vt_safe_float(t.get("tp_level"), entry * (1 + TP_PCT))
+            if signal_price > 0:
+                move_from_signal = (price - signal_price) / signal_price
+                t["max_after_signal_pct"] = max(_vt_safe_float(t.get("max_after_signal_pct"), 0.0), move_from_signal)
+                peak = _vt_safe_float(t.get("max_after_signal_pct"), 0.0)
+                t["pullback_after_signal_pct"] = max(_vt_safe_float(t.get("pullback_after_signal_pct"), 0.0), max(0.0, peak - move_from_signal))
+
+            t["age_hours"] = round((_vt_minutes_between(t.get("signal_time") or t.get("created_at"), now_dt) or 0.0) / 60.0, 2)
+
+            if price <= entry:
                 t["status"] = "OPEN"
                 t["entry_hit_at"] = _vt_now_iso()
+                t["entry_touched"] = True
+                t["entry_delay_minutes"] = _vt_minutes_between(t.get("signal_time") or t.get("created_at"), now_dt)
                 changed = True
+            elif price >= tp:
+                t["status"] = "MISSED_RUNNER"
+                t["aftermath_label"] = _classify_runner(t)
+                t["closed_at"] = _vt_now_iso()
+                t["close_reason"] = "ENTRY_NOT_TOUCHED_PRICE_RAN"
+                changed = True
+            else:
+                inv = _vt_safe_float((t.get("setup") or {}).get("invalidation_level"), 0.0)
+                age_hours = _vt_safe_float(t.get("age_hours"), 0.0)
+                if inv > 0 and age_hours >= VIRTUAL_STUCK_HOURS and price < inv:
+                    t["status"] = "ENTRY_NOT_TOUCHED_AND_FAILED"
+                    t["aftermath_label"] = "ENTRY_NOT_TOUCHED_AND_FAILED"
+                    t["closed_at"] = _vt_now_iso()
+                    t["close_reason"] = "INVALIDATED_BEFORE_ENTRY"
+                    changed = True
         elif t["status"] == "OPEN":
             entry = float(t["entry_level"])
             tp = float(t["tp_level"])
@@ -1098,13 +1187,34 @@ def update_virtual_trades(symbol, last_price):
             t["max_profit_pct"] = max(float(t.get("max_profit_pct", 0)), profit_pct)
             drawdown_pct = (price - entry) / entry
             t["max_drawdown_pct"] = min(float(t.get("max_drawdown_pct", 0)), drawdown_pct)
+            t["floating_pnl_pct"] = profit_pct
+            age_mins = _vt_minutes_between(t.get("entry_hit_at") or t.get("created_at"), now_dt)
+            t["age_hours"] = round((age_mins or 0.0) / 60.0, 2)
+            if float(t.get("max_profit_pct", 0)) > 0 and price <= entry:
+                t["price_back_to_entry"] = True
+            t["tp_missed_by_pct"] = round(max(0.0, TP_PCT - float(t.get("max_profit_pct", 0))) * 100, 4)
             if price >= tp:
                 t["status"] = "TP_CLOSED"
                 t["closed_at"] = _vt_now_iso()
                 t["tp_hit_time"] = t["closed_at"]
-                start = datetime.fromisoformat(t["entry_hit_at"])
-                end = datetime.fromisoformat(t["closed_at"])
-                t["close_minutes"] = round((end - start).total_seconds() / 60, 2)
+                t["tp_hit"] = True
+                close_minutes = _vt_minutes_between(t.get("entry_hit_at") or t.get("created_at"))
+                t["close_minutes"] = close_minutes
+                t["tp_hit_minutes"] = t["close_minutes"]
+                if t["close_minutes"] is not None and t["close_minutes"] <= VIRTUAL_FAST_TP_MINUTES:
+                    t["aftermath_label"] = "TP_FAST_WIN"
+                else:
+                    t["aftermath_label"] = "TP_SLOW_WIN"
+                t["close_reason"] = "TP_REACHED"
+                changed = True
+            else:
+                age_hours = _vt_safe_float(t.get("age_hours"), 0.0)
+                if age_hours >= VIRTUAL_STUCK_HOURS:
+                    t["aftermath_label"] = "LONG_STUCK_TRADE"
+                    if t.get("fake_breakout"):
+                        t["aftermath_label"] = "FAKE_BREAKOUT"
+                    if float(t.get("max_drawdown_pct", 0)) <= -0.01:
+                        t["aftermath_label"] = "OVEREXTENDED_LOSS"
                 changed = True
     if changed:
         save_virtual_trades(data)
@@ -1129,10 +1239,18 @@ def _find_best_confidence_threshold(data):
 
 
 def _make_entry_recommendation(data):
-    closed = [t for t in data if t["status"] == "TP_CLOSED"]
+    closed = [t for t in data if t.get("status") == "TP_CLOSED"]
     if len(data) < 20:
         return "Henüz karar için az veri var. En az 20 sanal işlem beklenmeli."
     success_rate = len(closed) / len(data)
+    label_counts = {}
+    for t in data:
+        lb = t.get("aftermath_label") or t.get("status") or "UNKNOWN"
+        label_counts[lb] = label_counts.get(lb, 0) + 1
+    runner_count = label_counts.get("MISSED_RUNNER", 0) + label_counts.get("MOMENTUM_RUNNER", 0)
+    runner_rate = runner_count / len(data) if data else 0
+    if runner_rate >= 0.64:
+        return "Runner oranı yüksek. Güçlü hacim/body koşullarında retest beklemek yerine chase entry düşünülebilir."
     if success_rate >= 0.65:
         return "Entry sistemi güçlü. Confirmed LONG sonrası entry level kullanılabilir."
     elif success_rate >= 0.45:
@@ -1155,11 +1273,16 @@ def save_breakout_stats(stats: dict):
 
 def analyze_virtual_trades():
     data = load_virtual_trades()
-    closed = [t for t in data if t["status"] == "TP_CLOSED"]
-    open_trades = [t for t in data if t["status"] == "OPEN"]
-    waiting_trades = [t for t in data if t["status"] == "WAIT_ENTRY"]
+    closed = [t for t in data if t.get("status") == "TP_CLOSED"]
+    open_trades = [t for t in data if t.get("status") == "OPEN"]
+    waiting_trades = [t for t in data if t.get("status") == "WAIT_ENTRY"]
+    resolved_trades = [t for t in data if t.get("status") in ("TP_CLOSED", "MISSED_RUNNER", "ENTRY_NOT_TOUCHED_AND_FAILED", "FAKE_BREAKOUT", "OVEREXTENDED_LOSS")]
     if not data:
         return {"total": 0, "message": "Yeterli veri yok"}
+    label_counts = {}
+    for t in data:
+        lb = t.get("aftermath_label") or t.get("status") or "UNKNOWN"
+        label_counts[lb] = label_counts.get(lb, 0) + 1
     avg_close = None
     if closed:
         valid_minutes = [t["close_minutes"] for t in closed if t.get("close_minutes") is not None]
@@ -1173,19 +1296,25 @@ def analyze_virtual_trades():
             "breakout_level":   t.get("breakout_level"),
             "entry_level":      t.get("entry_level"),
             "max_drawdown_pct": t.get("max_drawdown_pct"),
+            "max_profit_pct":   t.get("max_profit_pct"),
+            "entry_touched":    t.get("entry_touched", False),
+            "entry_delay_minutes": t.get("entry_delay_minutes"),
             "tp_hit_time":      t.get("tp_hit_time"),
             "fake_breakout":    t.get("fake_breakout", False),
             "retest_done":      t.get("retest_done", False),
+            "aftermath_label":  t.get("aftermath_label"),
             "status":           t.get("status"),
             "created_at":       t.get("created_at"),
         })
     stats = {
         "total": len(data),
         "closed_count": len(closed),
+        "resolved_count": len(resolved_trades),
         "open_count": len(open_trades),
         "waiting_count": len(waiting_trades),
         "tp_success_rate": round(len(closed) / len(data) * 100, 2),
         "avg_close_minutes": round(avg_close, 2) if avg_close else None,
+        "label_counts": label_counts,
         "best_confidence_min": _find_best_confidence_threshold(data),
         "recommendation": _make_entry_recommendation(data),
         "breakouts": per_breakout,
@@ -4664,10 +4793,12 @@ def auto_report_if_due():
                 f"━━━━━━━━━━━━━━━━\n"
                 f"Total: {stats['total']}\n"
                 f"TP Closed: {stats.get('closed_count')}\n"
+                f"Resolved: {stats.get('resolved_count')}\n"
                 f"Open: {stats.get('open_count')}\n"
                 f"Waiting Entry: {stats.get('waiting_count')}\n"
                 f"TP Success: %{stats.get('tp_success_rate')}\n"
                 f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
+                f"Labels: {stats.get('label_counts')}\n"
                 f"Best Confidence: {stats.get('best_confidence_min')}\n"
                 f"Decision: {stats.get('recommendation')}"
             )
@@ -5313,10 +5444,12 @@ def _cmd_virtual_stats():
             f"━━━━━━━━━━━━━━━━\n"
             f"Total: {stats['total']}\n"
             f"TP Closed: {stats.get('closed_count')}\n"
+            f"Resolved: {stats.get('resolved_count')}\n"
             f"Open: {stats.get('open_count')}\n"
             f"Waiting Entry: {stats.get('waiting_count')}\n"
             f"TP Success: %{stats.get('tp_success_rate')}\n"
             f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
+            f"Labels: {stats.get('label_counts')}\n"
             f"Best Confidence: {stats.get('best_confidence_min')}\n"
             f"Decision: {stats.get('recommendation')}"
         )
