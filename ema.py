@@ -3060,18 +3060,23 @@ def update_max_profit_tracking():
 
 # ===================== TELEGRAM HELPERS =====================
 
-def tg_send(t):
+def tg_send(t, log_error=False):
     if not BOT_TOKEN or not CHAT_ID:
         return False
     try:
-        response = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id":CHAT_ID,"text":t},
             timeout=10
-        )
-        response.raise_for_status()
+        ).raise_for_status()
         return True
-    except:
+    except requests.RequestException as e:
+        if log_error:
+            log(f"[TG SEND ERR] {e}")
+        return False
+    except Exception as e:
+        if log_error:
+            log(f"[TG SEND ERR] {e}")
         return False
 
 def tg_send_file(p, cap):
@@ -9742,7 +9747,8 @@ def main():
             "📐 Aktif strateji: FIBONACCI RETRACEMENT (LONG only)\n"
             "💰 Trade size: $750 | Maks 3 long pozisyon\n"
             "🔎 Tarama: Top 25 vadeli işlem sembolü (hacime göre)\n"
-            "🎛️ Use /strategies to see all"
+            "🎛️ Use /strategies to see all",
+            log_error=True
         )
         if startup_message_sent:
             STATE["initial_deploy_message_sent"] = True
