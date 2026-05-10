@@ -3061,14 +3061,18 @@ def update_max_profit_tracking():
 # ===================== TELEGRAM HELPERS =====================
 
 def tg_send(t):
-    if not BOT_TOKEN or not CHAT_ID: return
+    if not BOT_TOKEN or not CHAT_ID:
+        return False
     try:
-        requests.post(
+        response = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id":CHAT_ID,"text":t},
             timeout=10
         )
-    except: pass
+        response.raise_for_status()
+        return True
+    except:
+        return False
 
 def tg_send_file(p, cap):
     if not BOT_TOKEN or not CHAT_ID or not os.path.exists(p): return
@@ -3292,7 +3296,7 @@ STATE_DEFAULT={
     "fib_long_blocked":False, "fib_short_blocked":False,
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
-    "last_hourly_margin_log":0,
+    "last_hourly_margin_log":0, "initial_deploy_message_sent":False,
     "avg_max_profit":0.0  # Average of max profits from open positions
 }
 PARAM_DEFAULT={
@@ -9732,11 +9736,19 @@ def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
     
-    tg_send("🚀 EMA ULTRA v15.11.0 active — Fibonacci LONG only mode\n"
+    if not STATE.get("initial_deploy_message_sent"):
+        startup_message_sent = tg_send(
+            "🚀 EMA ULTRA v15.11.0 active — Fibonacci LONG only mode\n"
             "📐 Aktif strateji: FIBONACCI RETRACEMENT (LONG only)\n"
             "💰 Trade size: $750 | Maks 3 long pozisyon\n"
             "🔎 Tarama: Top 25 vadeli işlem sembolü (hacime göre)\n"
-            "🎛️ Use /strategies to see all")
+            "🎛️ Use /strategies to see all"
+        )
+        if startup_message_sent:
+            STATE["initial_deploy_message_sent"] = True
+            safe_save(STATE_FILE, STATE)
+        else:
+            log("[STARTUP MSG WARN] Initial deploy message could not be sent; will retry on next restart")
     log("[START] EMA ULTRA v15.11.0 - Fibonacci LONG only, $750 per trade, max 3 positions")
 
     symbols=auto_init_symbols()
