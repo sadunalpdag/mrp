@@ -56,6 +56,11 @@ VIRTUAL_FAST_TP_MINUTES = 60
 VIRTUAL_STUCK_HOURS = 6
 RUNNER_MIN_MOVE_PCT = 0.01
 RUNNER_MAX_PULLBACK_PCT = 0.003
+RUNNER_MIN_VOLUME_RATIO = 1.8
+RUNNER_MIN_BODY_RATIO = 0.6
+RUNNER_HIGH_RATE_THRESHOLD = 0.64
+WAIT_ENTRY_INVALIDATION_BUFFER_PCT = 0.001
+OVEREXTENDED_DRAWDOWN_PCT = -0.01
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -1017,7 +1022,7 @@ def _vt_now_iso():
 def _vt_safe_float(value, default=0.0):
     try:
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return float(default)
 
 
@@ -1028,7 +1033,7 @@ def _vt_minutes_between(start_iso, end_dt=None):
         start = datetime.fromisoformat(start_iso)
         end = end_dt or datetime.now(timezone.utc)
         return round((end - start).total_seconds() / 60, 2)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -1040,8 +1045,8 @@ def _classify_runner(trade):
     if (
         max_after_signal >= RUNNER_MIN_MOVE_PCT
         and pullback <= RUNNER_MAX_PULLBACK_PCT
-        and volume_ratio >= 1.8
-        and body_ratio >= 0.6
+        and volume_ratio >= RUNNER_MIN_VOLUME_RATIO
+        and body_ratio >= RUNNER_MIN_BODY_RATIO
     ):
         return "MOMENTUM_RUNNER"
     return "MISSED_RUNNER"
@@ -1092,7 +1097,7 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
     signal_price = float(current_price) if current_price else float(entry_level)
     breakout_distance_pct = 0.0
     if breakout_level > 0:
-        breakout_distance_pct = ((signal_price - breakout_level) / breakout_level) * 100.0
+        breakout_distance_pct = ((signal_price - breakout_level) / breakout_level)
     trade = {
         "id": f"{symbol}_{int(time.time())}",
         "symbol": symbol,
@@ -1122,6 +1127,8 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
         "max_drawdown_pct": 0.0,
         "max_after_signal_pct": 0.0,
         "pullback_after_signal_pct": 0.0,
+        "peak_after_signal_price": signal_price,
+        "trough_after_peak_price": signal_price,
         "tp_missed_by_pct": None,
         "price_back_to_entry": False,
         "close_reason": None,
@@ -1152,10 +1159,20 @@ def update_virtual_trades(symbol, last_price):
             entry = _vt_safe_float(t.get("entry_level"), 0.0)
             tp = _vt_safe_float(t.get("tp_level"), entry * (1 + TP_PCT))
             if signal_price > 0:
-                move_from_signal = (price - signal_price) / signal_price
-                t["max_after_signal_pct"] = max(_vt_safe_float(t.get("max_after_signal_pct"), 0.0), move_from_signal)
-                peak = _vt_safe_float(t.get("max_after_signal_pct"), 0.0)
-                t["pullback_after_signal_pct"] = max(_vt_safe_float(t.get("pullback_after_signal_pct"), 0.0), max(0.0, peak - move_from_signal))
+                peak_price = _vt_safe_float(t.get("peak_after_signal_price"), signal_price)
+                trough_after_peak = _vt_safe_float(t.get("trough_after_peak_price"), peak_price)
+                if price > peak_price:
+                    peak_price = price
+                    trough_after_peak = price
+                else:
+                    trough_after_peak = min(trough_after_peak, price)
+                t["peak_after_signal_price"] = peak_price
+                t["trough_after_peak_price"] = trough_after_peak
+                t["max_after_signal_pct"] = max(0.0, (peak_price - signal_price) / signal_price)
+                if peak_price > 0:
+                    t["pullback_after_signal_pct"] = max(0.0, (peak_price - trough_after_peak) / peak_price)
+                else:
+                    t["pullback_after_signal_pct"] = 0.0
 
             t["age_hours"] = round((_vt_minutes_between(t.get("signal_time") or t.get("created_at"), now_dt) or 0.0) / 60.0, 2)
 
@@ -1174,7 +1191,8 @@ def update_virtual_trades(symbol, last_price):
             else:
                 inv = _vt_safe_float((t.get("setup") or {}).get("invalidation_level"), 0.0)
                 age_hours = _vt_safe_float(t.get("age_hours"), 0.0)
-                if inv > 0 and age_hours >= VIRTUAL_STUCK_HOURS and price < inv:
+                inv_break = inv * (1 - WAIT_ENTRY_INVALIDATION_BUFFER_PCT)
+                if inv > 0 and age_hours >= VIRTUAL_STUCK_HOURS and price < inv_break:
                     t["status"] = "ENTRY_NOT_TOUCHED_AND_FAILED"
                     t["aftermath_label"] = "ENTRY_NOT_TOUCHED_AND_FAILED"
                     t["closed_at"] = _vt_now_iso()
@@ -1192,7 +1210,7 @@ def update_virtual_trades(symbol, last_price):
             t["age_hours"] = round((age_mins or 0.0) / 60.0, 2)
             if float(t.get("max_profit_pct", 0)) > 0 and price <= entry:
                 t["price_back_to_entry"] = True
-            t["tp_missed_by_pct"] = round(max(0.0, TP_PCT - float(t.get("max_profit_pct", 0))) * 100, 4)
+            t["tp_missed_by_pct"] = round(max(0.0, TP_PCT - float(t.get("max_profit_pct", 0))), 6)
             if price >= tp:
                 t["status"] = "TP_CLOSED"
                 t["closed_at"] = _vt_now_iso()
@@ -1203,8 +1221,10 @@ def update_virtual_trades(symbol, last_price):
                 t["tp_hit_minutes"] = t["close_minutes"]
                 if t["close_minutes"] is not None and t["close_minutes"] <= VIRTUAL_FAST_TP_MINUTES:
                     t["aftermath_label"] = "TP_FAST_WIN"
-                else:
+                elif t["close_minutes"] is not None:
                     t["aftermath_label"] = "TP_SLOW_WIN"
+                else:
+                    t["aftermath_label"] = "TP_WIN_TIMING_UNKNOWN"
                 t["close_reason"] = "TP_REACHED"
                 changed = True
             else:
@@ -1213,7 +1233,7 @@ def update_virtual_trades(symbol, last_price):
                     t["aftermath_label"] = "LONG_STUCK_TRADE"
                     if t.get("fake_breakout"):
                         t["aftermath_label"] = "FAKE_BREAKOUT"
-                    if float(t.get("max_drawdown_pct", 0)) <= -0.01:
+                    if float(t.get("max_drawdown_pct", 0)) <= OVEREXTENDED_DRAWDOWN_PCT:
                         t["aftermath_label"] = "OVEREXTENDED_LOSS"
                 changed = True
     if changed:
@@ -1249,7 +1269,7 @@ def _make_entry_recommendation(data):
         label_counts[lb] = label_counts.get(lb, 0) + 1
     runner_count = label_counts.get("MISSED_RUNNER", 0) + label_counts.get("MOMENTUM_RUNNER", 0)
     runner_rate = runner_count / len(data) if data else 0
-    if runner_rate >= 0.64:
+    if runner_rate >= RUNNER_HIGH_RATE_THRESHOLD:
         return "Runner oranı yüksek. Güçlü hacim/body koşullarında retest beklemek yerine chase entry düşünülebilir."
     if success_rate >= 0.65:
         return "Entry sistemi güçlü. Confirmed LONG sonrası entry level kullanılabilir."
