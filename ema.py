@@ -3070,10 +3070,6 @@ def tg_send(t, log_error=False):
             timeout=10
         ).raise_for_status()
         return True
-    except requests.RequestException as e:
-        if log_error:
-            log(f"[TG SEND ERR] {e}")
-        return False
     except Exception as e:
         if log_error:
             log(f"[TG SEND ERR] {e}")
