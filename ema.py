@@ -1119,27 +1119,28 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
         confidence=confidence, reason=reason_imm, setup_data=sd1,
     )
 
-    # Leg 2 — retest (65 %): target entry at fib_382 pullback if available,
-    # else 0.5 % below current price
+    # Leg 2 — retest (65%): target entry at fib_382 pullback if available,
+    # else 0.5% below current price
     ref = float(setup.get("reference_level") or setup.get("swing_high") or current_price)
     swing_low = float(setup.get("swing_low") or current_price * 0.95)
     fib_382 = ref - 0.382 * (ref - swing_low)
-    retest_entry = round(float(fib_382) if fib_382 > 0 else current_price * 0.995, 8)
+    # Use fib_382 only if it's actually below the current price (a proper pullback target)
+    retest_entry = round(float(fib_382) if fib_382 < current_price else current_price * 0.995, 8)
 
     reason_ret = (f"HYBRID_RETEST (momentum_score={momentum_score}) "
                   f"65% entry at fib38.2 retest")
     sd2 = {**sd, "hybrid_leg": "RETEST_65PCT",
            "momentum_score": momentum_score, "hybrid_entry_pct": 65}
-    # Only create retest leg if immediate leg was created (no duplicate for same symbol)
+    # If the immediate leg was not created, the symbol already has an active virtual trade
+    # — skip both legs entirely.
     created2 = False
     if not created1:
-        # symbol already has open trade — skip both legs
         log(f"[HYBRID ENTRY] {symbol} — skipped (active virtual trade already exists)")
         return
 
-    # create_virtual_long blocks duplicate for same symbol, so retest leg is stored
-    # with a modified reason and flag; the dedup check will block it if immediate was opened.
-    # We add it as a separate record with status WAIT_ENTRY and lower entry_level.
+    # The retest leg is appended directly (bypassing create_virtual_long which would
+    # reject it as a duplicate since the immediate leg is now WAIT_ENTRY/OPEN for the
+    # same symbol).  It targets a lower entry price so it can co-exist as a separate record.
     data = load_virtual_trades()
     now_iso = _vt_now_iso()
     sd2_full = sd2.copy()
@@ -9256,8 +9257,8 @@ def calc_momentum_score(df, pattern: dict) -> int:
         # --- trend_acceleration (0-25): avg close change last 3 bars vs prior 3 ---
         if len(d) >= 7:
             closes = d["close"].values
-            recent_avg  = (closes[-1] - closes[-4]) / max(abs(closes[-4]), 1e-12) if closes[-4] != 0 else 0
-            prior_avg   = (closes[-4] - closes[-7]) / max(abs(closes[-7]), 1e-12) if closes[-7] != 0 else 0
+            recent_avg  = (closes[-1] - closes[-4]) / max(abs(closes[-4]), 1e-12)
+            prior_avg   = (closes[-4] - closes[-7]) / max(abs(closes[-7]), 1e-12)
             accel = recent_avg - prior_avg
             if accel > 0.01:
                 trend_acceleration = 25
