@@ -1130,8 +1130,6 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
                   f"65% entry at fib38.2 retest")
     sd2 = {**sd, "hybrid_leg": "RETEST_65PCT",
            "momentum_score": momentum_score, "hybrid_entry_pct": 65}
-    # Use a unique symbol key for the retest leg so both can coexist
-    _symbol_retest = symbol  # same symbol; create_virtual_long deduplicates on status
     # Only create retest leg if immediate leg was created (no duplicate for same symbol)
     created2 = False
     if not created1:
@@ -1204,6 +1202,7 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
 
 
 
+def create_virtual_long(symbol, entry_level, current_price, confidence, reason, setup_data=None):
     data = load_virtual_trades()
     for t in data:
         if t["symbol"] == symbol and t["status"] in ("WAIT_ENTRY", "OPEN"):
@@ -9293,6 +9292,7 @@ def calc_momentum_score(df, pattern: dict) -> int:
         return 0
 
 
+def analyze_long_setup(df) -> dict:
     """
     Analyze bullish (LONG) setup quality from a 15m klines DataFrame.
 
