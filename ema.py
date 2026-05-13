@@ -70,7 +70,8 @@ BINANCE_FAPI   = "https://fapi.binance.com"
 
 # Spot scanner (top gainers / support-bounce pattern)
 SPOT_BASE_URL   = "https://api.binance.com"
-SPOT_TOP_N      =22
+SPOT_TOP_N      = 30
+MAX_CHANGE_PCT  = 15.0   # Coins with |24h change| > this are skipped
 SPOT_INTERVAL   = "15m"
 SPOT_KLINE_LIMIT = 220
 
@@ -1013,6 +1014,17 @@ def save_positions_tracker():
 def now_local_iso():
     return (datetime.now(timezone.utc)+timedelta(hours=3)).replace(microsecond=0).isoformat()
 
+
+def is_tr_quiet_hours() -> bool:
+    """
+    Return True when TR time (UTC+3) is in the real-trade quiet window:
+    15:00 – 05:00 (i.e., hour >= 15 OR hour < 5).
+    During this window real trades are skipped entirely; virtual trades
+    still run but without Telegram notifications.
+    """
+    tr_hour = (datetime.now(timezone.utc) + timedelta(hours=3)).hour
+    return tr_hour >= 15 or tr_hour < 5
+
 # ===================== VIRTUAL ENTRY TRACKER =====================
 
 def _vt_now_iso():
@@ -1080,6 +1092,115 @@ def cleanup_old_trades():
         except Exception:
             cleaned.append(t)
     save_virtual_trades(cleaned)
+
+
+def _create_hybrid_virtual_entries(symbol: str, current_price: float,
+                                    confidence: int, setup: dict,
+                                    momentum_score: int):
+    """
+    Hybrid Entry: 35% immediate + 65% retest virtual positions.
+
+    Opened only in virtual mode (no real trade).  The two legs are stored
+    separately in the virtual trades JSON with 'hybrid_leg' metadata so the
+    AI can later evaluate which leg performed better.
+
+    Logs to Telegram (unless quiet hours) with a clear summary.
+    """
+    sd = {k: v for k, v in setup.items()
+          if isinstance(v, (str, int, float, bool, type(None)))}
+
+    # Leg 1 — immediate (35 %)
+    reason_imm = (f"HYBRID_IMMEDIATE (momentum_score={momentum_score}) "
+                  f"35% entry at market price")
+    sd1 = {**sd, "hybrid_leg": "IMMEDIATE_35PCT",
+           "momentum_score": momentum_score, "hybrid_entry_pct": 35}
+    created1 = create_virtual_long(
+        symbol=symbol, entry_level=current_price, current_price=current_price,
+        confidence=confidence, reason=reason_imm, setup_data=sd1,
+    )
+
+    # Leg 2 — retest (65%): target entry at fib_382 pullback if available,
+    # else 0.5% below current price
+    ref = float(setup.get("reference_level") or setup.get("swing_high") or current_price)
+    swing_low = float(setup.get("swing_low") or current_price * 0.95)
+    fib_382 = ref - 0.382 * (ref - swing_low)
+    # Use fib_382 only if it's actually below the current price (a proper pullback target)
+    retest_entry = round(float(fib_382) if fib_382 < current_price else current_price * 0.995, 8)
+
+    reason_ret = (f"HYBRID_RETEST (momentum_score={momentum_score}) "
+                  f"65% entry at fib38.2 retest")
+    sd2 = {**sd, "hybrid_leg": "RETEST_65PCT",
+           "momentum_score": momentum_score, "hybrid_entry_pct": 65}
+    # If the immediate leg was not created, the symbol already has an active virtual trade
+    # — skip both legs entirely.
+    created2 = False
+    if not created1:
+        log(f"[HYBRID ENTRY] {symbol} — skipped (active virtual trade already exists)")
+        return
+
+    # The retest leg is appended directly (bypassing create_virtual_long which would
+    # reject it as a duplicate since the immediate leg is now WAIT_ENTRY/OPEN for the
+    # same symbol).  It targets a lower entry price so it can co-exist as a separate record.
+    data = load_virtual_trades()
+    now_iso = _vt_now_iso()
+    sd2_full = sd2.copy()
+    breakout_level = float(sd2.get("breakout_level") or
+                           sd2.get("reference_level") or current_price)
+    breakout_dist = (current_price - breakout_level) / breakout_level if breakout_level > 0 else 0.0
+    retest_trade = {
+        "id": f"{symbol}_hyb_ret_{int(time.time())}",
+        "symbol": symbol,
+        "direction": "LONG",
+        "status": "WAIT_ENTRY",
+        "aftermath_label": None,
+        "breakout_level": round(breakout_level, 8),
+        "entry_level": retest_entry,
+        "tp_level": round(retest_entry * (1 + TP_PCT), 8),
+        "signal_price": current_price,
+        "current_price_at_signal": current_price,
+        "confidence": confidence,
+        "reason": reason_ret,
+        "signal_time": now_iso,
+        "created_at": now_iso,
+        "entry_hit_at": None, "entry_touched": False,
+        "entry_delay_minutes": None, "age_hours": 0.0,
+        "tp_hit_time": None, "tp_hit": False, "tp_hit_minutes": None,
+        "closed_at": None, "close_minutes": None,
+        "floating_pnl_pct": 0.0, "max_profit_pct": 0.0,
+        "max_drawdown_pct": 0.0, "max_after_signal_pct": 0.0,
+        "pullback_after_signal_pct": 0.0,
+        "peak_after_signal_price": current_price,
+        "trough_after_peak_price": current_price,
+        "tp_missed_by_pct": None,
+        "price_back_to_entry": False,
+        "close_reason": None,
+        "breakout_distance_pct": round(breakout_dist, 4),
+        "volume_ratio": _vt_safe_float(sd2.get("volume_ratio"), 0.0),
+        "body_ratio": _vt_safe_float(sd2.get("body_ratio"), 0.0),
+        "fake_breakout": bool(sd2.get("fake_breakout", False)),
+        "retest_done": bool(sd2.get("retest_confirmed", False)),
+        "setup": sd2_full,
+    }
+    data.append(retest_trade)
+    save_virtual_trades(data)
+    created2 = True
+
+    log(f"[HYBRID ENTRY] {symbol} — leg1(imm)={created1} leg2(ret)={created2} "
+        f"momentum={momentum_score} imm_entry={current_price} ret_entry={retest_entry}")
+
+    if not is_tr_quiet_hours():
+        tp1 = round(current_price * (1 + TP_PCT), 8)
+        tp2 = round(retest_entry * (1 + TP_PCT), 8)
+        tg_send(
+            f"⚡ HYBRID VIRTUAL ENTRY — {symbol}\n"
+            f"Momentum Score: {momentum_score}/100\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🟢 35% Immediate  | Entry: {current_price} | TP: {tp1}\n"
+            f"🔵 65% Retest     | Entry: {retest_entry} | TP: {tp2}\n"
+            f"  (retest @ fib38.2 pullback)\n"
+            f"time: {now_local_iso()}"
+        )
+
 
 
 def create_virtual_long(symbol, entry_level, current_price, confidence, reason, setup_data=None):
@@ -3487,7 +3608,8 @@ STATE_DEFAULT={
     "tg_update_offset":0,
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0,
-    "avg_max_profit":0.0  # Average of max profits from open positions
+    "avg_max_profit":0.0,  # Average of max profits from open positions
+    "last_virtual_json_send": 0  # Timestamp of last virtual trades JSON Telegram send
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
@@ -4826,6 +4948,31 @@ def auto_report_if_due():
         log(f"[AUTO REPORT VIRTUAL STATS ERR] {_vs_err}")
     STATE["last_report"]=now_now; safe_save(STATE_FILE,STATE)
 
+
+VIRTUAL_JSON_SEND_INTERVAL = 43200  # 12 hours
+
+def send_virtual_json_if_due():
+    """Send the virtual trades JSON file to Telegram every 12 hours."""
+    now_now = time.time()
+    if now_now - STATE.get("last_virtual_json_send", 0) < VIRTUAL_JSON_SEND_INTERVAL:
+        return
+    try:
+        if os.path.exists(VIRTUAL_FILE) and os.path.getsize(VIRTUAL_FILE) > 5:
+            tg_send_file(
+                VIRTUAL_FILE,
+                f"🤖 Virtual Trades JSON — 12h rapor\n"
+                f"time: {now_local_iso()}\n"
+                f"Bu dosyayı yapay zekaya atarak en iyi işlemleri analiz edebilirsiniz."
+            )
+            log("[VIRTUAL JSON SEND] virtual_entry_trades.json Telegram'a gönderildi")
+        else:
+            log("[VIRTUAL JSON SEND] Dosya mevcut değil veya boş, atlandı")
+    except Exception as e:
+        log(f"[VIRTUAL JSON SEND ERR] {e}")
+    STATE["last_virtual_json_send"] = now_now
+    safe_save(STATE_FILE, STATE)
+
+
 # ===================== TELEGRAM KOMUTLARI =====================
 
 def _tg_get_updates():
@@ -5892,6 +6039,11 @@ def execute_real_trade(sig):
 
     # 🔒 Check if current hour is blocked for trading
     if is_hour_blocked_for_trading():
+        return False
+
+    # 🌙 TR quiet window (15:00–05:00): skip real trades entirely
+    if is_tr_quiet_hours():
+        log(f"[QUIET HOURS] {sym} {kind} — TR saati gece saatleri (15:00-05:00), gerçek işlem atlandı")
         return False
 
     # 🔒 Duplicate / Direction limits
@@ -7074,6 +7226,9 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
         df = df[df["symbol"].isin(VALID_FUTURES_SYMBOLS)]
 
     df = df[df["quoteVolume"] > 1_000_000]
+
+    # Filter out overextended coins (>15% 24h change in either direction)
+    df = df[df["priceChangePercent"].abs() <= MAX_CHANGE_PCT]
 
     df = df.sort_values("priceChangePercent", ascending=False).head(top_n)
     return df[["symbol", "priceChangePercent", "quoteVolume"]].reset_index(drop=True)
@@ -8796,31 +8951,55 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         f"time: {now_local_iso()}"
     )
     if new_state == "CONFIRMED_LONG":
-        tg_send(msg)
+        if not is_tr_quiet_hours():
+            tg_send(msg)
         try:
             klines_list = futures_get_klines(symbol, "15m", 120)
             current_price = float(klines_list[-1][4]) if klines_list else None
             if current_price:
                 confidence = 70
                 reason = "CONFIRMED_LONG signal — immediate entry at current price"
-                created = create_virtual_long(
-                    symbol=symbol,
-                    entry_level=current_price,
-                    current_price=current_price,
-                    confidence=confidence,
-                    reason=reason,
-                    setup_data={k: v for k, v in setup.items()
-                                if isinstance(v, (str, int, float, bool, type(None)))},
-                )
-                if created:
-                    tp_level = round(float(current_price) * 1.006, 8)
-                    tg_send(
-                        f"🎯 VIRTUAL ENTRY — {symbol}\n"
-                        f"Direction: LONG\n"
-                        f"Entry: {current_price}\n"
-                        f"TP +0.6%: {tp_level}\n"
-                        f"Status: Açıldı"
+
+                # --- Momentum score & hybrid entry decision ---
+                try:
+                    df_kl = pd.DataFrame(
+                        klines_list,
+                        columns=["open_time","open","high","low","close","volume",
+                                 "close_time","quote_vol","trades","taker_buy_base",
+                                 "taker_buy_quote","ignore"]
                     )
+                    for col in ("open","high","low","close","volume"):
+                        df_kl[col] = pd.to_numeric(df_kl[col], errors="coerce")
+                    pattern_for_score = {k: v for k, v in setup.items()
+                                         if isinstance(v, (str, int, float, bool, type(None)))}
+                    m_score = calc_momentum_score(df_kl, pattern_for_score)
+                except Exception:
+                    m_score = 0
+
+                use_hybrid = m_score > MOMENTUM_IMMEDIATE_THRESHOLD
+
+                if use_hybrid:
+                    # Hybrid mode: 35% immediate + 65% retest virtual positions
+                    _create_hybrid_virtual_entries(symbol, current_price, confidence, setup, m_score)
+                else:
+                    created = create_virtual_long(
+                        symbol=symbol,
+                        entry_level=current_price,
+                        current_price=current_price,
+                        confidence=confidence,
+                        reason=reason,
+                        setup_data={k: v for k, v in setup.items()
+                                    if isinstance(v, (str, int, float, bool, type(None)))},
+                    )
+                    if created and not is_tr_quiet_hours():
+                        tp_level = round(float(current_price) * 1.006, 8)
+                        tg_send(
+                            f"🎯 VIRTUAL ENTRY — {symbol}\n"
+                            f"Direction: LONG\n"
+                            f"Entry: {current_price}\n"
+                            f"TP +0.6%: {tp_level}\n"
+                            f"Status: Açıldı"
+                        )
         except Exception as _ve_err:
             log(f"[VIRTUAL ENTRY ERROR] {symbol}: {_ve_err}")
     log(f"[SETUP STATE] {symbol}: {old_state} → {new_state}")
@@ -9014,6 +9193,105 @@ def _apply_lock_after_setup(symbol: str, reason: str):
 # ==============================================================================
 # 🔄 DUAL-DIRECTION ANALYSIS & REVERSAL HELPERS
 # ==============================================================================
+
+# ---------------------------------------------------------------------------
+# Momentum Continuation Score
+# ---------------------------------------------------------------------------
+MOMENTUM_IMMEDIATE_THRESHOLD = 85  # score above this triggers partial immediate entry
+
+def calc_momentum_score(df, pattern: dict) -> int:
+    """
+    Momentum continuation score (0-100).
+
+    Components:
+      volume_score       (0-30): recent volume vs 20-bar MA
+      body_strength      (0-25): latest candle body ratio
+      trend_acceleration (0-25): last-3-bars close acceleration vs prior 3 bars
+      shallow_pullback   (0-20): retracement ratio — shallower is better
+
+    Returns an integer 0-100.  If score > MOMENTUM_IMMEDIATE_THRESHOLD the
+    caller may use a hybrid partial-immediate entry.
+    """
+    try:
+        if df is None or len(df) < 10:
+            return 0
+
+        d = df.copy().reset_index(drop=True)
+        last = d.iloc[-1]
+
+        # --- volume_score (0-30) ---
+        vol_ma = d["volume"].rolling(20).mean().iloc[-1]
+        if pd.notna(vol_ma) and vol_ma > 0:
+            vol_ratio = float(last["volume"]) / float(vol_ma)
+            if vol_ratio >= 2.5:
+                volume_score = 30
+            elif vol_ratio >= 2.0:
+                volume_score = 25
+            elif vol_ratio >= 1.5:
+                volume_score = 18
+            elif vol_ratio >= 1.1:
+                volume_score = 10
+            else:
+                volume_score = 0
+        else:
+            volume_score = 0
+
+        # --- body_strength (0-25) ---
+        h = float(last["high"]); l = float(last["low"])
+        o = float(last["open"]); c = float(last["close"])
+        total_range = h - l
+        body = abs(c - o)
+        if total_range > 0:
+            br = body / total_range
+            if br >= 0.75:
+                body_strength = 25
+            elif br >= 0.60:
+                body_strength = 18
+            elif br >= 0.45:
+                body_strength = 10
+            else:
+                body_strength = 0
+        else:
+            body_strength = 0
+
+        # --- trend_acceleration (0-25): avg close change last 3 bars vs prior 3 ---
+        if len(d) >= 7:
+            closes = d["close"].values
+            recent_avg  = (closes[-1] - closes[-4]) / max(abs(closes[-4]), 1e-12)
+            prior_avg   = (closes[-4] - closes[-7]) / max(abs(closes[-7]), 1e-12)
+            accel = recent_avg - prior_avg
+            if accel > 0.01:
+                trend_acceleration = 25
+            elif accel > 0.005:
+                trend_acceleration = 18
+            elif accel > 0.001:
+                trend_acceleration = 10
+            elif accel > 0:
+                trend_acceleration = 5
+            else:
+                trend_acceleration = 0
+        else:
+            trend_acceleration = 0
+
+        # --- shallow_pullback (0-20): from pattern retracement_ratio ---
+        retracement = float(pattern.get("retracement_ratio", 0.5)) if pattern else 0.5
+        if retracement <= 0.30:
+            shallow_pullback_score = 20
+        elif retracement <= 0.40:
+            shallow_pullback_score = 15
+        elif retracement <= 0.50:
+            shallow_pullback_score = 10
+        elif retracement <= 0.618:
+            shallow_pullback_score = 5
+        else:
+            shallow_pullback_score = 0
+
+        total = volume_score + body_strength + trend_acceleration + shallow_pullback_score
+        return min(int(total), 100)
+    except Exception as _me:
+        log(f"[MOMENTUM SCORE ERR] {_me}")
+        return 0
+
 
 def analyze_long_setup(df) -> dict:
     """
@@ -10155,6 +10433,9 @@ def main():
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
+
+            # 4b) 12 saatlik virtual trades JSON gönderimi
+            send_virtual_json_if_due()
 
             # 5) Heartbeat (10 dk)
             heartbeat_and_status_check({})
