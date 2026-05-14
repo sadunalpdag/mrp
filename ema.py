@@ -172,8 +172,8 @@ def _fibonacci_retracement(swing_low: float, swing_high: float) -> dict:
 # Configuration defaults (callers can override via kwargs)
 # ---------------------------------------------------------------------------
 
-DEFAULT_OVEREXTENDED_ATR_MULT    = 2.0   # max ATR distance from breakout level
-DEFAULT_OVEREXTENDED_PCT         = 0.03  # max % distance from breakout level (3 %)
+DEFAULT_OVEREXTENDED_ATR_MULT    = 2.6   # max ATR distance from breakout level
+DEFAULT_OVEREXTENDED_PCT         = 0.05  # max % distance from breakout level (5 %)
 DEFAULT_RETEST_TOLERANCE_PCT     = 0.017 # 1.7 % — how close to level counts as retest
 DEFAULT_RETEST_LOOKBACK          = 8     # candles to look back for retest
 DEFAULT_MIN_BODY_RATIO           = 0.40  # candle body / total range
@@ -1038,6 +1038,78 @@ def _vt_safe_float(value, default=0.0):
         return float(default)
 
 
+def _extract_setup_quality_metrics(setup_data: Optional[dict]) -> Tuple[float, float]:
+    """
+    Extract volume_ratio and body_ratio robustly from setup payloads.
+
+    Supports both flat setup keys and nested pattern/metrics structures.
+    """
+    sd = setup_data if isinstance(setup_data, dict) else {}
+    pattern = sd.get("pattern") if isinstance(sd.get("pattern"), dict) else {}
+    metrics = sd.get("metrics") if isinstance(sd.get("metrics"), dict) else {}
+
+    def _pick(*vals, default=0.0):
+        for v in vals:
+            try:
+                fv = float(v)
+                if np.isfinite(fv):
+                    return fv
+            except (TypeError, ValueError):
+                continue
+        return float(default)
+
+    volume_ratio = _pick(
+        sd.get("volume_ratio"),
+        sd.get("vol_ratio"),
+        pattern.get("volume_ratio"),
+        pattern.get("vol_ratio"),
+        metrics.get("volume_ratio"),
+        default=0.0,
+    )
+    body_ratio = _pick(
+        sd.get("body_ratio"),
+        sd.get("candle_body_ratio"),
+        pattern.get("body_ratio"),
+        pattern.get("candle_body_ratio"),
+        metrics.get("body_ratio"),
+        default=0.0,
+    )
+    return max(0.0, volume_ratio), max(0.0, body_ratio)
+
+
+def _momentum_tp_pct(momentum_score: int) -> float:
+    """
+    Dynamic virtual TP sizing by momentum.
+    """
+    s = int(_vt_safe_float(momentum_score, 0))
+    if s >= 90:
+        return 0.012
+    if s >= 80:
+        return 0.010
+    if s >= 70:
+        return 0.008
+    return TP_PCT
+
+
+def _build_virtual_setup_context(setup: dict, momentum_score: int = 0) -> dict:
+    """
+    Build a flat setup payload for virtual-entry persistence/tracking.
+    """
+    sd = {k: v for k, v in (setup or {}).items()
+          if isinstance(v, (str, int, float, bool, type(None)))}
+    pattern = setup.get("pattern") if isinstance(setup, dict) and isinstance(setup.get("pattern"), dict) else {}
+    metrics = pattern.get("metrics") if isinstance(pattern.get("metrics"), dict) else {}
+
+    volume_ratio, body_ratio = _extract_setup_quality_metrics({"pattern": pattern, "metrics": metrics, **sd})
+    sd["volume_ratio"] = round(volume_ratio, 4)
+    sd["body_ratio"] = round(body_ratio, 4)
+    if "retracement_ratio" in pattern:
+        sd["retracement_ratio"] = _vt_safe_float(pattern.get("retracement_ratio"), sd.get("retracement_ratio", 0.0))
+    if momentum_score:
+        sd["momentum_score"] = int(momentum_score)
+    return sd
+
+
 def _vt_minutes_between(start_iso, end_dt=None):
     if not start_iso:
         return None
@@ -1106,8 +1178,8 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
 
     Logs to Telegram (unless quiet hours) with a clear summary.
     """
-    sd = {k: v for k, v in setup.items()
-          if isinstance(v, (str, int, float, bool, type(None)))}
+    sd = _build_virtual_setup_context(setup, momentum_score=momentum_score)
+    dyn_tp_pct = _momentum_tp_pct(momentum_score)
 
     # Leg 1 — immediate (35 %)
     reason_imm = (f"HYBRID_IMMEDIATE (momentum_score={momentum_score}) "
@@ -1155,7 +1227,8 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
         "aftermath_label": None,
         "breakout_level": round(breakout_level, 8),
         "entry_level": retest_entry,
-        "tp_level": round(retest_entry * (1 + TP_PCT), 8),
+         "tp_level": round(retest_entry * (1 + dyn_tp_pct), 8),
+         "tp_pct": dyn_tp_pct,
         "signal_price": current_price,
         "current_price_at_signal": current_price,
         "confidence": confidence,
@@ -1175,8 +1248,8 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
         "price_back_to_entry": False,
         "close_reason": None,
         "breakout_distance_pct": round(breakout_dist, 4),
-        "volume_ratio": _vt_safe_float(sd2.get("volume_ratio"), 0.0),
-        "body_ratio": _vt_safe_float(sd2.get("body_ratio"), 0.0),
+        "volume_ratio": _extract_setup_quality_metrics(sd2)[0],
+        "body_ratio": _extract_setup_quality_metrics(sd2)[1],
         "fake_breakout": bool(sd2.get("fake_breakout", False)),
         "retest_done": bool(sd2.get("retest_confirmed", False)),
         "setup": sd2_full,
@@ -1189,14 +1262,16 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
         f"momentum={momentum_score} imm_entry={current_price} ret_entry={retest_entry}")
 
     if not is_tr_quiet_hours():
-        tp1 = round(current_price * (1 + TP_PCT), 8)
-        tp2 = round(retest_entry * (1 + TP_PCT), 8)
+        tp1 = round(current_price * (1 + dyn_tp_pct), 8)
+        tp2 = round(retest_entry * (1 + dyn_tp_pct), 8)
+        tp_pct_show = round(dyn_tp_pct * 100, 2)
         tg_send(
             f"⚡ HYBRID VIRTUAL ENTRY — {symbol}\n"
             f"Momentum Score: {momentum_score}/100\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"🟢 35% Immediate  | Entry: {current_price} | TP: {tp1}\n"
             f"🔵 65% Retest     | Entry: {retest_entry} | TP: {tp2}\n"
+            f"🎯 Dynamic TP: +%{tp_pct_show}\n"
             f"  (retest @ fib38.2 pullback)\n"
             f"time: {now_local_iso()}"
         )
@@ -1219,6 +1294,8 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
     breakout_distance_pct = 0.0
     if breakout_level > 0:
         breakout_distance_pct = ((signal_price - breakout_level) / breakout_level)
+    volume_ratio, body_ratio = _extract_setup_quality_metrics(sd)
+    dyn_tp_pct = _momentum_tp_pct(_vt_safe_float(sd.get("momentum_score"), 0))
     trade = {
         "id": f"{symbol}_{int(time.time())}",
         "symbol": symbol,
@@ -1227,7 +1304,8 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
         "aftermath_label": None,
         "breakout_level": round(breakout_level, 8),
         "entry_level": float(entry_level),
-        "tp_level": round(float(entry_level) * (1 + TP_PCT), 8),
+        "tp_level": round(float(entry_level) * (1 + dyn_tp_pct), 8),
+        "tp_pct": dyn_tp_pct,
         "signal_price": signal_price,
         "current_price_at_signal": signal_price,
         "confidence": confidence,
@@ -1254,8 +1332,8 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
         "price_back_to_entry": False,
         "close_reason": None,
         "breakout_distance_pct": round(breakout_distance_pct, 4),
-        "volume_ratio": _vt_safe_float(sd.get("volume_ratio"), 0.0),
-        "body_ratio": _vt_safe_float(sd.get("body_ratio"), 0.0),
+        "volume_ratio": volume_ratio,
+        "body_ratio": body_ratio,
         "fake_breakout": fake_breakout,
         "retest_done": retest_done,
         "setup": sd,
@@ -7350,6 +7428,12 @@ def detect_support_bounce_pattern(df):
 
     after_high = recent.iloc[high_idx + 1:]
     if len(after_high) < 3:
+        last_c = recent.iloc[-1]
+        c_range = float(last_c["high"]) - float(last_c["low"])
+        c_body = abs(float(last_c["close"]) - float(last_c["open"]))
+        body_ratio = (c_body / c_range) if c_range > 0 else 0.0
+        vol_ma = float(last_c["vol_ma20"]) if pd.notna(last_c.get("vol_ma20")) and float(last_c["vol_ma20"]) > 0 else 0.0
+        volume_ratio = (float(last_c["volume"]) / vol_ma) if vol_ma > 0 else 0.0
         return {
             "signal": "NONE",
             "score": round(score, 1),
@@ -7364,6 +7448,8 @@ def detect_support_bounce_pattern(df):
             "fib_382": 0.0, "fib_500": 0.0, "fib_618": 0.0,
             "last_close": round(float(recent.iloc[-1]["close"]), 6),
             "support_distance_pct": 0.0,
+            "volume_ratio": round(float(volume_ratio), 3),
+            "body_ratio": round(float(body_ratio), 3),
             "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE",
         }
 
@@ -7455,6 +7541,11 @@ def detect_support_bounce_pattern(df):
             reasons.append("score_too_low")
 
     support_distance_pct = abs(float(last1["close"]) - float(fib_500)) / float(fib_500) * 100
+    c_range = float(last1["high"]) - float(last1["low"])
+    c_body = abs(float(last1["close"]) - float(last1["open"]))
+    body_ratio = (c_body / c_range) if c_range > 0 else 0.0
+    vol_ma = float(last1["vol_ma20"]) if pd.notna(last1.get("vol_ma20")) and float(last1["vol_ma20"]) > 0 else 0.0
+    volume_ratio = (float(last1["volume"]) / vol_ma) if vol_ma > 0 else 0.0
 
     return {
         "signal": signal,
@@ -7478,6 +7569,8 @@ def detect_support_bounce_pattern(df):
         "fib_618": round(float(fib_618), 6),
         "last_close": round(float(last1["close"]), 6),
         "support_distance_pct": round(float(support_distance_pct), 2),
+        "volume_ratio": round(float(volume_ratio), 3),
+        "body_ratio": round(float(body_ratio), 3),
         "pattern": "IMPULSE -> FIB SUPPORT -> BOUNCE",
     }
 
@@ -7543,6 +7636,12 @@ def detect_dead_cat_bounce_pattern(df):
 
     after_low = recent.iloc[low_idx + 1:]
     if len(after_low) < 3:
+        last_c = recent.iloc[-1]
+        c_range = float(last_c["high"]) - float(last_c["low"])
+        c_body = abs(float(last_c["close"]) - float(last_c["open"]))
+        body_ratio = (c_body / c_range) if c_range > 0 else 0.0
+        vol_ma = float(last_c["vol_ma20"]) if pd.notna(last_c.get("vol_ma20")) and float(last_c["vol_ma20"]) > 0 else 0.0
+        volume_ratio = (float(last_c["volume"]) / vol_ma) if vol_ma > 0 else 0.0
         return {
             "signal": "NONE",
             "score": round(score, 1),
@@ -7557,6 +7656,8 @@ def detect_dead_cat_bounce_pattern(df):
             "fib_382": 0.0, "fib_500": 0.0, "fib_618": 0.0,
             "last_close": round(float(recent.iloc[-1]["close"]), 6),
             "resistance_distance_pct": 0.0,
+            "volume_ratio": round(float(volume_ratio), 3),
+            "body_ratio": round(float(body_ratio), 3),
             "pattern": "DROP -> FIB RESISTANCE -> REJECTION",
         }
 
@@ -7648,6 +7749,11 @@ def detect_dead_cat_bounce_pattern(df):
             reasons.append("score_too_low")
 
     resistance_distance_pct = abs(float(last1["close"]) - float(fib_500)) / float(fib_500) * 100
+    c_range = float(last1["high"]) - float(last1["low"])
+    c_body = abs(float(last1["close"]) - float(last1["open"]))
+    body_ratio = (c_body / c_range) if c_range > 0 else 0.0
+    vol_ma = float(last1["vol_ma20"]) if pd.notna(last1.get("vol_ma20")) and float(last1["vol_ma20"]) > 0 else 0.0
+    volume_ratio = (float(last1["volume"]) / vol_ma) if vol_ma > 0 else 0.0
 
     return {
         "signal": signal,
@@ -7671,6 +7777,8 @@ def detect_dead_cat_bounce_pattern(df):
         "fib_618": round(float(fib_618), 6),
         "last_close": round(float(last1["close"]), 6),
         "resistance_distance_pct": round(float(resistance_distance_pct), 2),
+        "volume_ratio": round(float(volume_ratio), 3),
+        "body_ratio": round(float(body_ratio), 3),
         "pattern": "DROP -> FIB RESISTANCE -> REJECTION",
     }
 
@@ -8970,34 +9078,34 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                     )
                     for col in ("open","high","low","close","volume"):
                         df_kl[col] = pd.to_numeric(df_kl[col], errors="coerce")
-                    pattern_for_score = {k: v for k, v in setup.items()
-                                         if isinstance(v, (str, int, float, bool, type(None)))}
+                    pattern_for_score = _build_virtual_setup_context(setup)
                     m_score = calc_momentum_score(df_kl, pattern_for_score)
                 except Exception:
                     m_score = 0
 
-                use_hybrid = m_score > MOMENTUM_IMMEDIATE_THRESHOLD
+                use_hybrid = m_score >= MOMENTUM_IMMEDIATE_THRESHOLD
 
                 if use_hybrid:
                     # Hybrid mode: 35% immediate + 65% retest virtual positions
                     _create_hybrid_virtual_entries(symbol, current_price, confidence, setup, m_score)
                 else:
+                    setup_ctx = _build_virtual_setup_context(setup, momentum_score=m_score)
                     created = create_virtual_long(
                         symbol=symbol,
                         entry_level=current_price,
                         current_price=current_price,
                         confidence=confidence,
                         reason=reason,
-                        setup_data={k: v for k, v in setup.items()
-                                    if isinstance(v, (str, int, float, bool, type(None)))},
+                        setup_data=setup_ctx,
                     )
                     if created and not is_tr_quiet_hours():
-                        tp_level = round(float(current_price) * 1.006, 8)
+                        tp_pct = _momentum_tp_pct(m_score)
+                        tp_level = round(float(current_price) * (1 + tp_pct), 8)
                         tg_send(
                             f"🎯 VIRTUAL ENTRY — {symbol}\n"
                             f"Direction: LONG\n"
                             f"Entry: {current_price}\n"
-                            f"TP +0.6%: {tp_level}\n"
+                            f"TP +%{round(tp_pct*100, 2)}: {tp_level}\n"
                             f"Status: Açıldı"
                         )
         except Exception as _ve_err:
@@ -9197,7 +9305,7 @@ def _apply_lock_after_setup(symbol: str, reason: str):
 # ---------------------------------------------------------------------------
 # Momentum Continuation Score
 # ---------------------------------------------------------------------------
-MOMENTUM_IMMEDIATE_THRESHOLD = 85  # score above this triggers partial immediate entry
+MOMENTUM_IMMEDIATE_THRESHOLD = 70  # score at/above this triggers hybrid immediate+retest entry
 
 def calc_momentum_score(df, pattern: dict) -> int:
     """
