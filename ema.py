@@ -1021,7 +1021,7 @@ def is_tr_quiet_hours() -> bool:
 
     The former TR 15:00–05:00 suppression is intentionally disabled, so the
     bot now keeps signals and trades active for all hours while callers can
-    continue using the same helper.
+    continue using the same helper. Always returns False.
     """
     return False
 
@@ -1043,6 +1043,7 @@ def _extract_setup_quality_metrics(setup_data: Optional[dict]) -> Tuple[float, f
     Extract volume_ratio and body_ratio robustly from setup payloads.
 
     Supports both flat setup keys and nested pattern/metrics structures.
+    Returns (volume_ratio, body_ratio), both clamped to >= 0.0.
     """
     sd = setup_data if isinstance(setup_data, dict) else {}
     pattern = sd.get("pattern") if isinstance(sd.get("pattern"), dict) else {}
@@ -1080,6 +1081,9 @@ def _extract_setup_quality_metrics(setup_data: Optional[dict]) -> Tuple[float, f
 def _momentum_tp_pct(momentum_score: int) -> float:
     """
     Dynamic virtual TP sizing by momentum.
+
+    Returns TP percentage in [TP_PCT, 0.012] by tier:
+    >=90 -> 1.2%, >=80 -> 1.0%, >=70 -> 0.8%, else default TP_PCT (0.6%).
     """
     s = int(_vt_safe_float(momentum_score, 0))
     if s >= 90:
@@ -1094,13 +1098,17 @@ def _momentum_tp_pct(momentum_score: int) -> float:
 def _build_virtual_setup_context(setup: dict, momentum_score: int = 0) -> dict:
     """
     Build a flat setup payload for virtual-entry persistence/tracking.
+
+    Expected setup structure is ACTIVE_SETUPS[symbol]-like (may include nested
+    "pattern" and pattern-level "metrics"). This helper extracts scalar fields,
+    flattens key quality metrics (volume_ratio/body_ratio), and adds
+    momentum_score only when momentum_score > 0.
     """
     sd = {k: v for k, v in (setup or {}).items()
           if isinstance(v, (str, int, float, bool, type(None)))}
     pattern = setup.get("pattern") if isinstance(setup, dict) and isinstance(setup.get("pattern"), dict) else {}
-    metrics = pattern.get("metrics") if isinstance(pattern.get("metrics"), dict) else {}
 
-    volume_ratio, body_ratio = _extract_setup_quality_metrics({"pattern": pattern, "metrics": metrics, **sd})
+    volume_ratio, body_ratio = _extract_setup_quality_metrics(setup)
     sd["volume_ratio"] = round(volume_ratio, 4)
     sd["body_ratio"] = round(body_ratio, 4)
     if "retracement_ratio" in pattern:
@@ -1271,7 +1279,7 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
             f"━━━━━━━━━━━━━━━━\n"
             f"🟢 35% Immediate  | Entry: {current_price} | TP: {tp1}\n"
             f"🔵 65% Retest     | Entry: {retest_entry} | TP: {tp2}\n"
-            f"🎯 Dynamic TP: +%{tp_pct_show}\n"
+            f"🎯 Dynamic TP: +{tp_pct_show}%\n"
             f"  (retest @ fib38.2 pullback)\n"
             f"time: {now_local_iso()}"
         )
@@ -9083,6 +9091,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                 except Exception:
                     m_score = 0
 
+                # Include threshold score in hybrid mode (>=70 triggers hybrid entry).
                 use_hybrid = m_score >= MOMENTUM_IMMEDIATE_THRESHOLD
 
                 if use_hybrid:
@@ -9105,7 +9114,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                             f"🎯 VIRTUAL ENTRY — {symbol}\n"
                             f"Direction: LONG\n"
                             f"Entry: {current_price}\n"
-                            f"TP +%{round(tp_pct*100, 2)}: {tp_level}\n"
+                            f"TP +{round(tp_pct*100, 2)}%: {tp_level}\n"
                             f"Status: Açıldı"
                         )
         except Exception as _ve_err:
@@ -9317,7 +9326,7 @@ def calc_momentum_score(df, pattern: dict) -> int:
       trend_acceleration (0-25): last-3-bars close acceleration vs prior 3 bars
       shallow_pullback   (0-20): retracement ratio — shallower is better
 
-    Returns an integer 0-100.  If score > MOMENTUM_IMMEDIATE_THRESHOLD the
+    Returns an integer 0-100. If score >= MOMENTUM_IMMEDIATE_THRESHOLD the
     caller may use a hybrid partial-immediate entry.
     """
     try:
