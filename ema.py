@@ -1017,8 +1017,11 @@ def now_local_iso():
 
 def is_tr_quiet_hours() -> bool:
     """
-    Quiet-hours suppression is disabled, so signals and trades stay active
-    for all TR hours.
+    Legacy quiet-hours hook.
+
+    The former TR 15:00–05:00 suppression is intentionally disabled, so the
+    bot now keeps signals and trades active for all hours while callers can
+    continue using the same helper.
     """
     return False
 
