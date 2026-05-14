@@ -1017,13 +1017,10 @@ def now_local_iso():
 
 def is_tr_quiet_hours() -> bool:
     """
-    Return True when TR time (UTC+3) is in the real-trade quiet window:
-    15:00 – 05:00 (i.e., hour >= 15 OR hour < 5).
-    During this window real trades are skipped entirely; virtual trades
-    still run but without Telegram notifications.
+    Quiet-hours suppression is disabled, so signals and trades stay active
+    for all TR hours.
     """
-    tr_hour = (datetime.now(timezone.utc) + timedelta(hours=3)).hour
-    return tr_hour >= 15 or tr_hour < 5
+    return False
 
 # ===================== VIRTUAL ENTRY TRACKER =====================
 
