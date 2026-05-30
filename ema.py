@@ -82,7 +82,6 @@ REAL_TRADE_ACTIVE_WINDOWS_UTC = [
     (1020, 1259),  # 17:00–20:59
     (1380, 1425),  # 23:00–23:45
 ]
-REAL_TRADE_ACTIVE_EXACT_MINUTES_UTC = set()
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -1819,8 +1818,6 @@ def get_current_utc_minute_of_day():
 
 def is_real_trade_active_window_now() -> bool:
     minute = get_current_utc_minute_of_day()
-    if minute in REAL_TRADE_ACTIVE_EXACT_MINUTES_UTC:
-        return True
     for start_min, end_min in REAL_TRADE_ACTIVE_WINDOWS_UTC:
         if start_min <= minute <= end_min:
             return True
