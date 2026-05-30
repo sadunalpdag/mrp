@@ -1827,10 +1827,6 @@ def is_real_trade_active_window_now() -> bool:
     return False
 
 
-def should_suppress_signal_now() -> bool:
-    return not is_real_trade_active_window_now()
-
-
 def get_real_window_warning_note() -> str:
     if is_real_trade_active_window_now():
         return ""
