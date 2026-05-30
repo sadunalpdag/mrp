@@ -74,18 +74,15 @@ EMA_SLOPE_LOOKBACK_CANDLES = 5
 WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
 
 # Real-trade active UTC windows:
-# 03:00–04:59, 06:00, 06:45, 09:00–11:59, 17:00–20:59, 23:00, 23:45
+# 03:00–04:59, 06:00–06:45, 09:00–11:59, 17:00–20:59, 23:00–23:45
 REAL_TRADE_ACTIVE_WINDOWS_UTC = [
     (180, 299),    # 03:00–04:59
+    (360, 405),    # 06:00–06:45
     (540, 719),    # 09:00–11:59
     (1020, 1259),  # 17:00–20:59
+    (1380, 1425),  # 23:00–23:45
 ]
-REAL_TRADE_ACTIVE_EXACT_MINUTES_UTC = {
-    360,   # 06:00
-    405,   # 06:45
-    1380,  # 23:00
-    1425,  # 23:45
-}
+REAL_TRADE_ACTIVE_EXACT_MINUTES_UTC = set()
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -1504,20 +1501,19 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
     log(f"[HYBRID ENTRY] {symbol} — leg1(imm)={created1} leg2(ret)={created2} "
         f"momentum={momentum_score} imm_entry={current_price} ret_entry={retest_entry}")
 
-    if not should_suppress_signal_now():
-        tp1 = round(current_price * (1 + dyn_tp_pct), 8)
-        tp2 = round(retest_entry * (1 + dyn_tp_pct), 8)
-        tp_pct_show = round(dyn_tp_pct * 100, 2)
-        tg_send(
-            f"⚡ HYBRID VIRTUAL ENTRY — {symbol}\n"
-            f"Momentum Score: {momentum_score}/100\n"
-            f"━━━━━━━━━━━━━━━━\n"
-            f"🟢 35% Immediate  | Entry: {current_price} | TP: {tp1}\n"
-            f"🔵 65% Retest     | Entry: {retest_entry} | TP: {tp2}\n"
-            f"🎯 Dynamic TP: +{tp_pct_show}%\n"
-            f"  (retest @ fib38.2 pullback)\n"
-            f"time: {now_local_iso()}"
-        )
+    tp1 = round(current_price * (1 + dyn_tp_pct), 8)
+    tp2 = round(retest_entry * (1 + dyn_tp_pct), 8)
+    tp_pct_show = round(dyn_tp_pct * 100, 2)
+    tg_send(
+        f"⚡ HYBRID VIRTUAL ENTRY — {symbol}\n"
+        f"Momentum Score: {momentum_score}/100\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"🟢 35% Immediate  | Entry: {current_price} | TP: {tp1}\n"
+        f"🔵 65% Retest     | Entry: {retest_entry} | TP: {tp2}\n"
+        f"🎯 Dynamic TP: +{tp_pct_show}%\n"
+        f"  (retest @ fib38.2 pullback)\n"
+        f"time: {now_local_iso()}{get_real_window_warning_note()}"
+    )
 
 
 
@@ -1833,6 +1829,12 @@ def is_real_trade_active_window_now() -> bool:
 
 def should_suppress_signal_now() -> bool:
     return not is_real_trade_active_window_now()
+
+
+def get_real_window_warning_note() -> str:
+    if is_real_trade_active_window_now():
+        return ""
+    return "\n⚠️ TEHLİKELİ BÖLGE: Sinyal aktif işlem saatleri dışında üretildi."
 
 
 def is_in_time_window(start_hour, end_hour):
@@ -9383,8 +9385,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         f"time: {now_local_iso()}"
     )
     if new_state == "CONFIRMED_LONG":
-        if not should_suppress_signal_now():
-            tg_send(msg)
+        tg_send(f"{msg}{get_real_window_warning_note()}")
         try:
             klines_list = futures_get_klines(symbol, "15m", 120)
             current_price = float(klines_list[-1][4]) if klines_list else None
@@ -9438,7 +9439,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                         setup_data=setup_ctx,
                         pre_signal_record=pre_signal_record,
                     )
-                    if created and not should_suppress_signal_now():
+                    if created:
                         tp_pct = _momentum_tp_pct(m_score)
                         tp_level = round(float(current_price) * (1 + tp_pct), 8)
                         tg_send(
@@ -9446,7 +9447,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                             f"Direction: LONG\n"
                             f"Entry: {current_price}\n"
                             f"TP +{round(tp_pct*100, 2)}%: {tp_level}\n"
-                            f"Status: Açıldı"
+                            f"Status: Açıldı{get_real_window_warning_note()}"
                         )
         except Exception as _ve_err:
             log(f"[VIRTUAL ENTRY ERROR] {symbol}: {_ve_err}")
