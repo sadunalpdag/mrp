@@ -73,14 +73,14 @@ BTC_DIRECTION_DOWN_THRESHOLD_PCT = -0.2
 EMA_SLOPE_LOOKBACK_CANDLES = 5
 WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
 
-# Real-trade active UTC windows:
-# 03:00–04:59, 06:00–06:45, 09:00–11:59, 17:00–20:59, 23:00–23:45
+# Real-trade active UTC windows (converted from TR/UTC+3):
+# 00:00–01:59, 03:00–03:45, 06:00–08:59, 14:00–17:59, 20:00–20:45
 REAL_TRADE_ACTIVE_WINDOWS_UTC = [
-    (180, 299),    # 03:00–04:59
-    (360, 405),    # 06:00–06:45
-    (540, 719),    # 09:00–11:59
-    (1020, 1259),  # 17:00–20:59
-    (1380, 1425),  # 23:00–23:45
+    (0, 119),      # 00:00–01:59
+    (180, 225),    # 03:00–03:45
+    (360, 539),    # 06:00–08:59
+    (840, 1079),   # 14:00–17:59
+    (1200, 1245),  # 20:00–20:45
 ]
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
