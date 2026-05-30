@@ -48,6 +48,7 @@ POSITIONS_TRACKER_FILE = os.path.join(DATA_DIR,"positions_tracker.json")
 SHEET_SIGNALS_FILE   = os.path.join(DATA_DIR,"sheet_signals_opened.json")
 VIRTUAL_FILE         = os.path.join(DATA_DIR,"virtual_entry_trades.json")
 BREAKOUT_STATS_FILE  = os.path.join(DATA_DIR,"breakout_stats.json")
+PRE_SIGNAL_CONTEXT_FILE = os.path.join(DATA_DIR, "pre_signal_context.json")
 
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
@@ -61,6 +62,30 @@ RUNNER_MIN_BODY_RATIO = 0.6
 RUNNER_HIGH_RATE_THRESHOLD = 0.64
 WAIT_ENTRY_INVALIDATION_BUFFER_PCT = 0.001
 OVEREXTENDED_DRAWDOWN_PCT = -0.01
+PRE_SIGNAL_CONTEXT_HOURS = 4
+PRE_SIGNAL_INTERVAL = "15m"
+PRE_SIGNAL_CANDLE_COUNT = 16
+PRE_SIGNAL_CONTEXT_LOG_ONLY = True
+BREAKOUT_FILTER_NOTE = "0.30/2.00/0.15/0.75 eşikleri şu an log-only; optimum henüz doğrulanmadı."
+BTC_REFERENCE_SYMBOL = "BTCUSDT"
+BTC_DIRECTION_UP_THRESHOLD_PCT = 0.2
+BTC_DIRECTION_DOWN_THRESHOLD_PCT = -0.2
+EMA_SLOPE_LOOKBACK_CANDLES = 5
+WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
+
+# Real-trade active UTC windows:
+# 03:00–04:59, 06:00, 06:45, 09:00–11:59, 17:00–20:59, 23:00, 23:45
+REAL_TRADE_ACTIVE_WINDOWS_UTC = [
+    (180, 299),    # 03:00–04:59
+    (540, 719),    # 09:00–11:59
+    (1020, 1259),  # 17:00–20:59
+]
+REAL_TRADE_ACTIVE_EXACT_MINUTES_UTC = {
+    360,   # 06:00
+    405,   # 06:45
+    1380,  # 23:00
+    1425,  # 23:45
+}
 
 BOT_TOKEN      = os.getenv("BOT_TOKEN")
 CHAT_ID        = os.getenv("CHAT_ID")
@@ -1129,6 +1154,213 @@ def _vt_minutes_between(start_iso, end_dt=None):
         return None
 
 
+def _safe_pct_change(start_val: float, end_val: float) -> float:
+    start = _vt_safe_float(start_val, 0.0)
+    end = _vt_safe_float(end_val, 0.0)
+    if abs(start) < 1e-12:
+        return 0.0
+    return ((end - start) / start) * 100.0
+
+
+def load_pre_signal_context():
+    if not os.path.exists(PRE_SIGNAL_CONTEXT_FILE):
+        return []
+    try:
+        with open(PRE_SIGNAL_CONTEXT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_pre_signal_context(data):
+    os.makedirs(os.path.dirname(PRE_SIGNAL_CONTEXT_FILE), exist_ok=True)
+    with open(PRE_SIGNAL_CONTEXT_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def append_pre_signal_context(record: dict):
+    data = load_pre_signal_context()
+    data.append(record)
+    # keep recent history only
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    cleaned = []
+    for item in data:
+        ts = item.get("signal_time")
+        try:
+            if datetime.fromisoformat(ts) >= cutoff:
+                cleaned.append(item)
+        except Exception:
+            log(f"[PRE SIGNAL CONTEXT CLEANUP] invalid signal_time '{ts}', dropped record: {item.get('symbol')}")
+    save_pre_signal_context(cleaned)
+
+
+def _compute_trend_age(closes: List[float], direction: str = "LONG") -> int:
+    if not closes or len(closes) < 2:
+        return 0
+    age = 1
+    cmp_long = direction.upper() == "LONG"
+    for i in range(len(closes) - 1, 0, -1):
+        if (cmp_long and closes[i] >= closes[i - 1]) or (not cmp_long and closes[i] <= closes[i - 1]):
+            age += 1
+        else:
+            break
+    return age
+
+
+def _compute_volume_acceleration(volume_ratios: List[float]) -> float:
+    if len(volume_ratios) < 4:
+        return 0.0
+    diffs = np.diff(np.array(volume_ratios, dtype=float))
+    if len(diffs) < 2:
+        return 0.0
+    accel = np.diff(diffs)
+    return float(np.mean(accel)) if len(accel) > 0 else 0.0
+
+
+def _fetch_btc_context() -> dict:
+    out = {
+        "btc_15m_change_pct": None,
+        "btc_1h_change_pct": None,
+        "btc_4h_change_pct": None,
+        "btc_market_direction": "UNKNOWN",
+    }
+    try:
+        kl = futures_get_klines(BTC_REFERENCE_SYMBOL, PRE_SIGNAL_INTERVAL, PRE_SIGNAL_CANDLE_COUNT + 1)
+        if not kl or len(kl) < 5:
+            return out
+        closes = [float(k[4]) for k in kl]
+        out["btc_15m_change_pct"] = round(_safe_pct_change(closes[-2], closes[-1]), 4)
+        out["btc_1h_change_pct"] = round(_safe_pct_change(closes[-5], closes[-1]), 4) if len(closes) >= 5 else None
+        out["btc_4h_change_pct"] = round(_safe_pct_change(closes[0], closes[-1]), 4)
+        if out["btc_4h_change_pct"] is not None:
+            if out["btc_4h_change_pct"] > BTC_DIRECTION_UP_THRESHOLD_PCT:
+                out["btc_market_direction"] = "UP"
+            elif out["btc_4h_change_pct"] < BTC_DIRECTION_DOWN_THRESHOLD_PCT:
+                out["btc_market_direction"] = "DOWN"
+            else:
+                out["btc_market_direction"] = "FLAT"
+    except Exception as _btc_err:
+        log(f"[PRE SIGNAL BTC CONTEXT ERR] {_btc_err}")
+    return out
+
+
+def build_pre_signal_context(symbol: str, direction: str, setup: dict, klines_15m: List[list], signal_price: float, signal_time_iso: str) -> dict:
+    candles = klines_15m[-PRE_SIGNAL_CANDLE_COUNT:] if klines_15m else []
+    if len(candles) < PRE_SIGNAL_CANDLE_COUNT:
+        return {}
+    try:
+        opens = [float(k[1]) for k in candles]
+        highs = [float(k[2]) for k in candles]
+        lows = [float(k[3]) for k in candles]
+        closes = [float(k[4]) for k in candles]
+        volumes = [float(k[5]) for k in candles]
+        ranges = [max(h - l, 1e-12) for h, l in zip(highs, lows)]
+        body_ratios = [abs(c - o) / r for o, c, r in zip(opens, closes, ranges)]
+
+        vol_series = pd.Series(volumes)
+        vol_ma = vol_series.rolling(window=8, min_periods=1).mean()
+        volume_ratios = (vol_series / vol_ma.replace(0, np.nan)).fillna(0.0).tolist()
+
+        atr_vals = atr_like(highs, lows, closes, period=14)
+        ema_fast_vals = ema(closes, 9)
+        ema_slow_vals = ema(closes, 21)
+        rsi_vals = rsi(closes, period=14)
+
+        highest_high = max(highs)
+        lowest_low = min(lows)
+        range_pct = ((highest_high - lowest_low) / lowest_low * 100.0) if lowest_low > 0 else 0.0
+        trend_created_at = setup.get("created_at")
+        hours_to_breakout = None
+        try:
+            if trend_created_at:
+                created_dt = datetime.fromisoformat(trend_created_at)
+                signal_dt = datetime.fromisoformat(signal_time_iso)
+                hours_to_breakout = round(max(0.0, (signal_dt - created_dt).total_seconds() / 3600.0), 4)
+        except Exception:
+            hours_to_breakout = None
+
+        breakout_level = _vt_safe_float(
+            setup.get("reference_level", (setup.get("pattern") or {}).get("swing_high", 0.0)),
+            0.0,
+        )
+        breakout_distance_pct = 0.0
+        if breakout_level > 0:
+            breakout_distance_pct = ((float(signal_price) - breakout_level) / breakout_level) * 100.0
+
+        pre_4h = {
+            "candles_15m": [
+                {
+                    "open_time": int(k[0]),
+                    "open": round(float(k[1]), 8),
+                    "high": round(float(k[2]), 8),
+                    "low": round(float(k[3]), 8),
+                    "close": round(float(k[4]), 8),
+                    "volume": round(float(k[5]), 4),
+                    "volume_ratio": round(float(vr), 4),
+                    "body_ratio": round(float(br), 4),
+                }
+                for k, vr, br in zip(candles, volume_ratios, body_ratios)
+            ],
+            "price_change_4h_pct": round(_safe_pct_change(closes[0], closes[-1]), 4),
+            "volume_change_4h_pct": round(_safe_pct_change(volumes[0], volumes[-1]), 4),
+            "avg_volume_ratio": round(float(np.mean(volume_ratios)), 4),
+            "max_volume_ratio": round(float(np.max(volume_ratios)), 4),
+            "avg_body_ratio": round(float(np.mean(body_ratios)), 4),
+            "max_body_ratio": round(float(np.max(body_ratios)), 4),
+            "atr_change_pct": round(_safe_pct_change(atr_vals[0], atr_vals[-1]), 4),
+            "ema_fast_slope": round(_safe_pct_change(ema_fast_vals[max(0, len(ema_fast_vals) - EMA_SLOPE_LOOKBACK_CANDLES)], ema_fast_vals[-1]), 4),
+            "ema_slow_slope": round(_safe_pct_change(ema_slow_vals[max(0, len(ema_slow_vals) - EMA_SLOPE_LOOKBACK_CANDLES)], ema_slow_vals[-1]), 4),
+            "rsi_start": round(float(rsi_vals[0]), 4),
+            "rsi_end": round(float(rsi_vals[-1]), 4),
+            "rsi_change": round(float(rsi_vals[-1] - rsi_vals[0]), 4),
+            "highest_high": round(float(highest_high), 8),
+            "lowest_low": round(float(lowest_low), 8),
+            "range_pct": round(float(range_pct), 4),
+            "hours_to_breakout": hours_to_breakout,
+            "compression_score": round(max(0.0, 100.0 - range_pct), 4),
+            "volume_acceleration": round(_compute_volume_acceleration(volume_ratios), 6),
+            "whale_candle_count": int(sum(1 for br in body_ratios if br > WHALE_CANDLE_BODY_RATIO_THRESHOLD)),
+            "breakout_distance_pct": round(float(breakout_distance_pct), 4),
+            "trend_age": _compute_trend_age(closes, direction=direction),
+            "atr_now": round(float(atr_vals[-1]), 8),
+            "atr_1h_ago": round(float(atr_vals[-5]), 8) if len(atr_vals) >= 5 else None,
+            "atr_2h_ago": round(float(atr_vals[-9]), 8) if len(atr_vals) >= 9 else None,
+            "volume_ratio_series": [round(float(v), 4) for v in volume_ratios],
+            "body_ratio_series": [round(float(v), 4) for v in body_ratios],
+        }
+        pre_4h.update(_fetch_btc_context())
+        btc_1h = _vt_safe_float(pre_4h.get("btc_1h_change_pct"), 0.0)
+        if direction.upper() == "LONG":
+            aligned = btc_1h > 0
+        else:
+            aligned = btc_1h < 0
+        pre_4h["btc_alignment_with_signal"] = "YES" if aligned else "NO"
+        return pre_4h
+    except Exception as _ctx_err:
+        log(f"[PRE SIGNAL CONTEXT BUILD ERR] {symbol}: {_ctx_err}")
+        return {}
+
+
+def build_pre_signal_record(symbol: str, direction: str, setup: dict, klines_15m: List[list], signal_price: float, signal_time_iso: str) -> dict:
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "signal_time": signal_time_iso,
+        "status": "SIGNAL_CREATED",
+        "pre_signal_context_log_only": PRE_SIGNAL_CONTEXT_LOG_ONLY,
+        "filter_note": BREAKOUT_FILTER_NOTE,
+        "pre_4h": build_pre_signal_context(
+            symbol=symbol,
+            direction=direction,
+            setup=setup or {},
+            klines_15m=klines_15m or [],
+            signal_price=signal_price,
+            signal_time_iso=signal_time_iso,
+        ),
+    }
+
+
 def _classify_runner(trade):
     max_after_signal = _vt_safe_float(trade.get("max_after_signal_pct"), 0.0)
     pullback = _vt_safe_float(trade.get("pullback_after_signal_pct"), 0.0)
@@ -1176,7 +1408,8 @@ def cleanup_old_trades():
 
 def _create_hybrid_virtual_entries(symbol: str, current_price: float,
                                     confidence: int, setup: dict,
-                                    momentum_score: int):
+                                    momentum_score: int,
+                                    pre_signal_record: Optional[dict] = None):
     """
     Hybrid Entry: 35% immediate + 65% retest virtual positions.
 
@@ -1197,6 +1430,7 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
     created1 = create_virtual_long(
         symbol=symbol, entry_level=current_price, current_price=current_price,
         confidence=confidence, reason=reason_imm, setup_data=sd1,
+        pre_signal_record=pre_signal_record,
     )
 
     # Leg 2 — retest (65%): target entry at fib_382 pullback if available,
@@ -1260,6 +1494,7 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
         "body_ratio": _extract_setup_quality_metrics(sd2)[1],
         "fake_breakout": bool(sd2.get("fake_breakout", False)),
         "retest_done": bool(sd2.get("retest_confirmed", False)),
+        "pre_signal_context": (pre_signal_record or {}).get("pre_4h"),
         "setup": sd2_full,
     }
     data.append(retest_trade)
@@ -1269,7 +1504,7 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
     log(f"[HYBRID ENTRY] {symbol} — leg1(imm)={created1} leg2(ret)={created2} "
         f"momentum={momentum_score} imm_entry={current_price} ret_entry={retest_entry}")
 
-    if not is_tr_quiet_hours():
+    if not should_suppress_signal_now():
         tp1 = round(current_price * (1 + dyn_tp_pct), 8)
         tp2 = round(retest_entry * (1 + dyn_tp_pct), 8)
         tp_pct_show = round(dyn_tp_pct * 100, 2)
@@ -1286,7 +1521,7 @@ def _create_hybrid_virtual_entries(symbol: str, current_price: float,
 
 
 
-def create_virtual_long(symbol, entry_level, current_price, confidence, reason, setup_data=None):
+def create_virtual_long(symbol, entry_level, current_price, confidence, reason, setup_data=None, pre_signal_record: Optional[dict] = None):
     data = load_virtual_trades()
     for t in data:
         if t["symbol"] == symbol and t["status"] in ("WAIT_ENTRY", "OPEN"):
@@ -1344,6 +1579,7 @@ def create_virtual_long(symbol, entry_level, current_price, confidence, reason, 
         "body_ratio": body_ratio,
         "fake_breakout": fake_breakout,
         "retest_done": retest_done,
+        "pre_signal_context": (pre_signal_record or {}).get("pre_4h"),
         "setup": sd,
     }
     data.append(trade)
@@ -1502,10 +1738,29 @@ def analyze_virtual_trades():
     data = load_virtual_trades()
     closed = [t for t in data if t.get("status") == "TP_CLOSED"]
     open_trades = [t for t in data if t.get("status") == "OPEN"]
+    missed_trades = [
+        t for t in data
+        if t.get("status") == "MISSED_RUNNER"
+        or (t.get("aftermath_label") in ("MISSED_RUNNER", "MOMENTUM_RUNNER"))
+    ]
     waiting_trades = [t for t in data if t.get("status") == "WAIT_ENTRY"]
     resolved_trades = [t for t in data if t.get("status") in ("TP_CLOSED", "MISSED_RUNNER", "ENTRY_NOT_TOUCHED_AND_FAILED", "FAKE_BREAKOUT", "OVEREXTENDED_LOSS")]
     if not data:
         return {"total": 0, "message": "Yeterli veri yok"}
+
+    def _avg_metric(items: List[dict], key: str) -> Optional[float]:
+        vals = []
+        for item in items:
+            try:
+                v = float(item.get(key, 0.0))
+                if np.isfinite(v):
+                    vals.append(v)
+            except (TypeError, ValueError):
+                continue
+        if not vals:
+            return None
+        return round(float(np.mean(vals)), 4)
+
     label_counts = {}
     for t in data:
         lb = t.get("aftermath_label") or t.get("status") or "UNKNOWN"
@@ -1541,6 +1796,10 @@ def analyze_virtual_trades():
         "waiting_count": len(waiting_trades),
         "tp_success_rate": round(len(closed) / len(data) * 100, 2),
         "avg_close_minutes": round(avg_close, 2) if avg_close else None,
+        "tp_avg_volume_ratio": _avg_metric(closed, "volume_ratio"),
+        "tp_avg_body_ratio": _avg_metric(closed, "body_ratio"),
+        "open_avg_volume_ratio": _avg_metric(open_trades, "volume_ratio"),
+        "missed_avg_body_ratio": _avg_metric(missed_trades, "body_ratio"),
         "label_counts": label_counts,
         "best_confidence_min": _find_best_confidence_threshold(data),
         "recommendation": _make_entry_recommendation(data),
@@ -1555,6 +1814,26 @@ def analyze_virtual_trades():
 def get_current_utc_hour():
     """Get current UTC hour (0-23)"""
     return datetime.now(timezone.utc).hour
+
+
+def get_current_utc_minute_of_day():
+    now_utc = datetime.now(timezone.utc)
+    return now_utc.hour * 60 + now_utc.minute
+
+
+def is_real_trade_active_window_now() -> bool:
+    minute = get_current_utc_minute_of_day()
+    if minute in REAL_TRADE_ACTIVE_EXACT_MINUTES_UTC:
+        return True
+    for start_min, end_min in REAL_TRADE_ACTIVE_WINDOWS_UTC:
+        if start_min <= minute <= end_min:
+            return True
+    return False
+
+
+def should_suppress_signal_now() -> bool:
+    return not is_real_trade_active_window_now()
+
 
 def is_in_time_window(start_hour, end_hour):
     """
@@ -3695,7 +3974,8 @@ STATE_DEFAULT={
     "initial_margin_balance":0.0, "last_profit_check_ts":0,
     "last_hourly_margin_log":0,
     "avg_max_profit":0.0,  # Average of max profits from open positions
-    "last_virtual_json_send": 0  # Timestamp of last virtual trades JSON Telegram send
+    "last_virtual_json_send": 0,  # Timestamp of last virtual trades JSON Telegram send
+    "last_pre_signal_context_send": 0,  # Timestamp of last pre-signal context JSON Telegram send
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
@@ -5026,6 +5306,10 @@ def auto_report_if_due():
                 f"Waiting Entry: {stats.get('waiting_count')}\n"
                 f"TP Success: %{stats.get('tp_success_rate')}\n"
                 f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
+                f"TP avg vol_ratio: {stats.get('tp_avg_volume_ratio')}\n"
+                f"TP avg body_ratio: {stats.get('tp_avg_body_ratio')}\n"
+                f"Open avg vol_ratio: {stats.get('open_avg_volume_ratio')}\n"
+                f"Missed avg body_ratio: {stats.get('missed_avg_body_ratio')}\n"
                 f"Labels: {stats.get('label_counts')}\n"
                 f"Best Confidence: {stats.get('best_confidence_min')}\n"
                 f"Decision: {stats.get('recommendation')}"
@@ -5036,6 +5320,7 @@ def auto_report_if_due():
 
 
 VIRTUAL_JSON_SEND_INTERVAL = 43200  # 12 hours
+PRE_SIGNAL_JSON_SEND_INTERVAL = 43200  # 12 hours
 
 def send_virtual_json_if_due():
     """Send the virtual trades JSON file to Telegram every 12 hours."""
@@ -5056,6 +5341,29 @@ def send_virtual_json_if_due():
     except Exception as e:
         log(f"[VIRTUAL JSON SEND ERR] {e}")
     STATE["last_virtual_json_send"] = now_now
+    safe_save(STATE_FILE, STATE)
+
+
+def send_pre_signal_context_if_due():
+    """Send pre-signal context JSON to Telegram every 12 hours."""
+    now_now = time.time()
+    if now_now - STATE.get("last_pre_signal_context_send", 0) < PRE_SIGNAL_JSON_SEND_INTERVAL:
+        return
+    try:
+        if os.path.exists(PRE_SIGNAL_CONTEXT_FILE) and os.path.getsize(PRE_SIGNAL_CONTEXT_FILE) > 5:
+            interval_hours = int(PRE_SIGNAL_JSON_SEND_INTERVAL / 3600)
+            tg_send_file(
+                PRE_SIGNAL_CONTEXT_FILE,
+                f"🧠 Pre-signal context JSON — {interval_hours}h rapor\n"
+                f"time: {now_local_iso()}\n"
+                f"Mode: LOG_ONLY={PRE_SIGNAL_CONTEXT_LOG_ONLY}"
+            )
+            log("[PRE SIGNAL JSON SEND] pre_signal_context.json Telegram'a gönderildi")
+        else:
+            log("[PRE SIGNAL JSON SEND] Dosya mevcut değil veya boş, atlandı")
+    except Exception as e:
+        log(f"[PRE SIGNAL JSON SEND ERR] {e}")
+    STATE["last_pre_signal_context_send"] = now_now
     safe_save(STATE_FILE, STATE)
 
 
@@ -5702,6 +6010,10 @@ def _cmd_virtual_stats():
             f"Waiting Entry: {stats.get('waiting_count')}\n"
             f"TP Success: %{stats.get('tp_success_rate')}\n"
             f"Avg Close Min: {stats.get('avg_close_minutes')}\n"
+            f"TP avg vol_ratio: {stats.get('tp_avg_volume_ratio')}\n"
+            f"TP avg body_ratio: {stats.get('tp_avg_body_ratio')}\n"
+            f"Open avg vol_ratio: {stats.get('open_avg_volume_ratio')}\n"
+            f"Missed avg body_ratio: {stats.get('missed_avg_body_ratio')}\n"
             f"Labels: {stats.get('label_counts')}\n"
             f"Best Confidence: {stats.get('best_confidence_min')}\n"
             f"Decision: {stats.get('recommendation')}"
@@ -6130,6 +6442,10 @@ def execute_real_trade(sig):
     # 🌙 TR quiet window (15:00–05:00): skip real trades entirely
     if is_tr_quiet_hours():
         log(f"[QUIET HOURS] {sym} {kind} — TR saati gece saatleri (15:00-05:00), gerçek işlem atlandı")
+        return False
+
+    if not is_real_trade_active_window_now():
+        log(f"[REAL WINDOW SKIP] {sym} {kind} {direction} — aktif saat dışında, sadece virtual/context kayıt")
         return False
 
     # 🔒 Duplicate / Direction limits
@@ -9067,7 +9383,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         f"time: {now_local_iso()}"
     )
     if new_state == "CONFIRMED_LONG":
-        if not is_tr_quiet_hours():
+        if not should_suppress_signal_now():
             tg_send(msg)
         try:
             klines_list = futures_get_klines(symbol, "15m", 120)
@@ -9075,6 +9391,17 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
             if current_price:
                 confidence = 70
                 reason = "CONFIRMED_LONG signal — immediate entry at current price"
+                signal_iso = _vt_now_iso()
+                pre_signal_record = build_pre_signal_record(
+                    symbol=symbol,
+                    direction="LONG",
+                    setup=setup,
+                    klines_15m=klines_list,
+                    signal_price=current_price,
+                    signal_time_iso=signal_iso,
+                )
+                if pre_signal_record.get("pre_4h"):
+                    append_pre_signal_context(pre_signal_record)
 
                 # --- Momentum score & hybrid entry decision ---
                 try:
@@ -9096,7 +9423,10 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
 
                 if use_hybrid:
                     # Hybrid mode: 35% immediate + 65% retest virtual positions
-                    _create_hybrid_virtual_entries(symbol, current_price, confidence, setup, m_score)
+                    _create_hybrid_virtual_entries(
+                        symbol, current_price, confidence, setup, m_score,
+                        pre_signal_record=pre_signal_record,
+                    )
                 else:
                     setup_ctx = _build_virtual_setup_context(setup, momentum_score=m_score)
                     created = create_virtual_long(
@@ -9106,8 +9436,9 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
                         confidence=confidence,
                         reason=reason,
                         setup_data=setup_ctx,
+                        pre_signal_record=pre_signal_record,
                     )
-                    if created and not is_tr_quiet_hours():
+                    if created and not should_suppress_signal_now():
                         tp_pct = _momentum_tp_pct(m_score)
                         tp_level = round(float(current_price) * (1 + tp_pct), 8)
                         tg_send(
@@ -10553,6 +10884,9 @@ def main():
 
             # 4b) 12 saatlik virtual trades JSON gönderimi
             send_virtual_json_if_due()
+
+            # 4c) 12 saatlik pre-signal context JSON gönderimi
+            send_pre_signal_context_if_due()
 
             # 5) Heartbeat (10 dk)
             heartbeat_and_status_check({})
