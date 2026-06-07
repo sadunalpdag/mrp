@@ -2599,7 +2599,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
     after_volume_filter = 0
     if PRE_SIGNAL_SOURCE_MODE == "ALL_FUTURES":
         universe = get_all_futures_usdt_symbols_for_pre_signal()
-        total_symbols_scanned = int(STATE.get("last_pre_signal_total_futures_count", len(universe)))
+        total_symbols_scanned = int(STATE.get("last_pre_signal_total_futures_count", 0))
         after_volume_filter = len(universe)
     else:
         try:
