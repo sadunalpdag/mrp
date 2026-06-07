@@ -11,3 +11,4 @@ joblib>=1.4.0
 websocket-client==1.7.0
 gspread
 google-auth
+gspread-formatting
