@@ -2083,12 +2083,12 @@ def _get_pre_signal_quote_volume_map() -> Dict[str, float]:
 def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
     try:
         info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
-        valid_symbols = sorted({
+        valid_symbols = {
             s["symbol"] for s in info.get("symbols", [])
             if s.get("quoteAsset") == "USDT"
             and s.get("status") == "TRADING"
             and s.get("contractType") == "PERPETUAL"
-        })
+        }
         log(f"[PRE-SIGNAL] Total futures USDT symbols: {len(valid_symbols)}")
 
         quote_map = _get_pre_signal_quote_volume_map()
@@ -2097,6 +2097,7 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
             quote_volume = quote_map.get(symbol, 0.0)
             if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
                 out.append((symbol, quote_volume))
+        out.sort(key=lambda x: x[1], reverse=True)
         log(f"[PRE-SIGNAL] After volume filter: {len(out)}")
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             out = out[:PRE_SIGNAL_MAX_SYMBOLS]
@@ -2494,6 +2495,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
             quote_volume = quote_map.get(symbol, 0.0)
             if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
                 universe.append((symbol, quote_volume))
+        universe.sort(key=lambda x: x[1], reverse=True)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             universe = universe[:PRE_SIGNAL_MAX_SYMBOLS]
         log(f"[PRE-SIGNAL] After volume filter: {len(universe)}")
