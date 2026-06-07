@@ -62,6 +62,7 @@ PUMP_WATCH_DAILY_SUMMARY_FILE = os.path.join(DATA_DIR, "pump_watch_daily_summary
 OPEN_PRE_SIGNAL_PERFORMANCE_FILE = os.path.join(DATA_DIR, "open_pre_signal_performance.json")
 CLOSED_PRE_SIGNAL_PERFORMANCE_FILE = os.path.join(DATA_DIR, "closed_pre_signal_performance.json")
 PRE_SIGNAL_PERFORMANCE_SUMMARY_FILE = os.path.join(DATA_DIR, "pre_signal_performance_summary.json")
+BOT_STATUS_FILE = os.path.join(DATA_DIR, "bot_status.json")
 
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
@@ -157,7 +158,7 @@ MAX_CHANGE_PCT  = 15.0   # Coins with |24h change| > this are skipped
 SPOT_INTERVAL   = "15m"
 SPOT_KLINE_LIMIT = 220
 
-GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEET_ID",  "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 
@@ -2005,11 +2006,13 @@ def export_pre_signal_test_to_google_sheets():
         from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
     except Exception:
         return
-    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_json or not GOOGLE_SHEETS_ID:
         return
     records = [r for r in load_pre_signal_live_state() if isinstance(r, dict)]
     if not records:
         return
+    exported_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     rows_payload = []
     for rec in records:
         prox = _build_pre_signal_proximity(rec)
@@ -2037,19 +2040,23 @@ def export_pre_signal_test_to_google_sheets():
     ]
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
     try:
-        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        gc = gspread.service_account(filename=service_account_json)
+        sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         ws = sh.get_worksheet_by_id(int(GOOGLE_SHEET_GID))
         ws.clear()
-        ws.update("A1", rows)
+        ws.batch_update([
+            {"range": "A1", "values": [["Last export (UTC)", exported_at]]},
+            {"range": "A3", "values": rows},
+        ])
         metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
         last_col = _col_to_a1(len(columns))
         with batch_updater(ws.spreadsheet) as batch:
             hdr_rgb = _hex_to_rgb01(SHEET_COLOR_HEADER)
             pre_row_rgb = _hex_to_rgb01(SHEET_COLOR_PRE_SIGNAL_ROW)
             hdr_fmt = CellFormat(backgroundColor=Color(*hdr_rgb))
-            format_cell_range(ws, f"A1:{last_col}1", hdr_fmt)
-            for ridx, item in enumerate(rows_payload, start=2):
+            format_cell_range(ws, "A1:B1", hdr_fmt)
+            format_cell_range(ws, f"A3:{last_col}3", hdr_fmt)
+            for ridx, item in enumerate(rows_payload, start=4):
                 if item.get("is_pre_signal"):
                     format_cell_range(ws, f"A{ridx}:{last_col}{ridx}", CellFormat(backgroundColor=Color(*pre_row_rgb)))
                 for metric, color_hex in (item.get("_metric_colors") or {}).items():
@@ -6549,8 +6556,28 @@ def heartbeat_and_status_check(_snapshot):
               if ping_ok and key_ok and drift<1500 else
               f"⚠️ HEARTBEAT ping={ping_ok} key={key_ok} drift={int(drift)}")
         log(hb)
+        safe_save(BOT_STATUS_FILE, {
+            "updated_at": _vt_now_iso(),
+            "heartbeat": hb,
+            "server_time": st,
+            "drift_ms": int(drift),
+            "ping_ok": ping_ok,
+            "key_ok": key_ok,
+            "bar_index": STATE.get("bar_index", 0),
+            "auto_trade_active": bool(STATE.get("auto_trade_active", True)),
+            "last_pre_signal_scan_ts": int(STATE.get("last_pre_signal_scan_ts", 0)),
+            "last_pump_watch_report_ts": int(STATE.get("last_pump_watch_report_ts", 0)),
+            "last_pre_signal_performance_report_date": STATE.get("last_pre_signal_performance_report_date", ""),
+        })
     except Exception as e:
         log(f"[HBERR]{e}")
+        safe_save(BOT_STATUS_FILE, {
+            "updated_at": _vt_now_iso(),
+            "heartbeat": "ERROR",
+            "error": str(e),
+            "bar_index": STATE.get("bar_index", 0),
+            "auto_trade_active": bool(STATE.get("auto_trade_active", True)),
+        })
 
     msg=(f"📊 STATUS bar:{STATE.get('bar_index',0)} "
          f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
