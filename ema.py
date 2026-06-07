@@ -2233,10 +2233,18 @@ def test_google_sheets_connection():
         gc = _get_gspread_client()
         if gc is None:
             return False
+        print("[SHEETS ID]", GOOGLE_SHEETS_ID)
         sh = gc.open_by_key(GOOGLE_SHEETS_ID)
-        if not _ensure_sheets_status_tab(sh):
-            raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
+        print("[SHEETS TITLE]", sh.title)
+        ws = sh.sheet1
+        ws.update(
+            range_name="A1",
+            values=[["RENDER TEST"]],
+        )
+        verify = ws.acell("A1").value
+        print("[SHEETS VERIFY]", verify)
         log("[SHEETS TEST] OK")
+        tg_send(f"Google Sheets test success: {verify}")
         return True
     except Exception as e:
         log(f"[SHEETS ERROR] {e}")
