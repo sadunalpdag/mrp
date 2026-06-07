@@ -2058,6 +2058,7 @@ def export_all_pre_signal_params_to_sheets():
         return 0
     if not PRE_SIGNAL_TEST_EXPORT_ENABLED or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return 0
+    print("[PRE SIGNAL EXPORT] START")
     btc_ctx = _fetch_btc_context()
     scan_time_iso = _vt_now_iso()
     rows_payload = []
@@ -2102,6 +2103,7 @@ def export_all_pre_signal_params_to_sheets():
         "is_pre_signal", "reject_reasons",
     ]
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
+    print(f"[PRE SIGNAL EXPORT] rows={len(rows)}")
     try:
         gc = _get_gspread_client()
         if gc is None:
@@ -2110,8 +2112,11 @@ def export_all_pre_signal_params_to_sheets():
         ws = _ensure_pre_signal_test_tab(sh)
         if not ws:
             raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB} in sheet {GOOGLE_SHEETS_ID}")
+        print(f"[PRE SIGNAL EXPORT] tab={PRE_SIGNAL_TEST_TAB}")
         ws.clear()
         ws.update("A1", rows)
+        verify = ws.acell("A2").value
+        print(f"[PRE SIGNAL EXPORT VERIFY] {verify}")
         metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
         last_col = _col_to_a1(len(columns))
         with batch_updater(ws.spreadsheet) as batch:
