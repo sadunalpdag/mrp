@@ -15,6 +15,12 @@ import numpy as np
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+try:
+    import gspread_formatting  # type: ignore
+    FORMATTING_AVAILABLE = True
+except Exception:
+    gspread_formatting = None  # type: ignore
+    FORMATTING_AVAILABLE = False
 
 # ==============================================================================
 # 📘 EMA ULTRA v15.11.0 — Fibonacci Only (LONG) Mode
@@ -164,6 +170,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+PRE_SIGNAL_TEST_FORMAT_ENABLED = os.getenv("PRE_SIGNAL_TEST_FORMAT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 SHEETS_HEARTBEAT_ENABLED = True
 SHEETS_HEARTBEAT_INTERVAL_SECONDS = 60
@@ -2050,12 +2057,36 @@ def send_pre_signal_performance_report():
     STATE["last_pre_signal_performance_report_date"] = today
 
 
+def _apply_pre_signal_test_formatting(ws, rows_payload: List[dict], columns: List[str]) -> None:
+    if not PRE_SIGNAL_TEST_FORMAT_ENABLED or not FORMATTING_AVAILABLE:
+        return
+    if gspread_formatting is None:
+        return
+    CellFormat = gspread_formatting.CellFormat
+    Color = gspread_formatting.Color
+    format_cell_range = gspread_formatting.format_cell_range
+    batch_updater = gspread_formatting.batch_updater
+    metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
+    last_col = _col_to_a1(len(columns))
+    with batch_updater(ws.spreadsheet) as batch:
+        hdr_rgb = _hex_to_rgb01(SHEET_COLOR_HEADER)
+        pre_row_rgb = _hex_to_rgb01(SHEET_COLOR_PRE_SIGNAL_ROW)
+        hdr_fmt = CellFormat(backgroundColor=Color(*hdr_rgb))
+        format_cell_range(ws, f"A1:{last_col}1", hdr_fmt)
+        for ridx, item in enumerate(rows_payload, start=2):
+            if item.get("is_pre_signal"):
+                format_cell_range(ws, f"A{ridx}:{last_col}{ridx}", CellFormat(backgroundColor=Color(*pre_row_rgb)))
+            for metric, color_hex in (item.get("_metric_colors") or {}).items():
+                col = metric_col_idx.get(metric)
+                if not col:
+                    continue
+                rgb = _hex_to_rgb01(color_hex)
+                cell_fmt = CellFormat(backgroundColor=Color(*rgb))
+                col_letter = _col_to_a1(col)
+                format_cell_range(ws, f"{col_letter}{ridx}:{col_letter}{ridx}", cell_fmt)
+
+
 def export_all_pre_signal_params_to_sheets():
-    try:
-        from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
-    except Exception as e:
-        log(f"[SHEETS ERROR] PRE_SIGNAL_TEST export dependency missing: {e}")
-        return 0
     if not PRE_SIGNAL_TEST_EXPORT_ENABLED or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return 0
     btc_ctx = _fetch_btc_context()
@@ -2110,27 +2141,13 @@ def export_all_pre_signal_params_to_sheets():
         ws = _ensure_pre_signal_test_tab(sh)
         if not ws:
             raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB} in sheet {GOOGLE_SHEETS_ID}")
-        ws.clear()
-        ws.update("A1", rows)
-        metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
-        last_col = _col_to_a1(len(columns))
-        with batch_updater(ws.spreadsheet) as batch:
-            hdr_rgb = _hex_to_rgb01(SHEET_COLOR_HEADER)
-            pre_row_rgb = _hex_to_rgb01(SHEET_COLOR_PRE_SIGNAL_ROW)
-            hdr_fmt = CellFormat(backgroundColor=Color(*hdr_rgb))
-            format_cell_range(ws, f"A1:{last_col}1", hdr_fmt)
-            for ridx, item in enumerate(rows_payload, start=2):
-                if item.get("is_pre_signal"):
-                    format_cell_range(ws, f"A{ridx}:{last_col}{ridx}", CellFormat(backgroundColor=Color(*pre_row_rgb)))
-                for metric, color_hex in (item.get("_metric_colors") or {}).items():
-                    col = metric_col_idx.get(metric)
-                    if not col:
-                        continue
-                    rgb = _hex_to_rgb01(color_hex)
-                    cell_fmt = CellFormat(backgroundColor=Color(*rgb))
-                    col_letter = _col_to_a1(col)
-                    format_cell_range(ws, f"{col_letter}{ridx}:{col_letter}{ridx}", cell_fmt)
-        log(f"[SHEETS EXPORT] PRE_SIGNAL_TEST rows={len(rows)}")
+        ws.update(range_name="A1", values=rows)
+        log(f"[SHEETS EXPORT] rows={len(rows)}")
+        if PRE_SIGNAL_TEST_FORMAT_ENABLED and FORMATTING_AVAILABLE:
+            _apply_pre_signal_test_formatting(ws, rows_payload, columns)
+            log("[SHEETS EXPORT] formatting=ENABLED")
+        else:
+            log("[SHEETS EXPORT] formatting=DISABLED")
         return len(rows)
     except Exception as e:
         log(f"[SHEETS ERROR] {e}")
