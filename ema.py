@@ -49,6 +49,9 @@ SHEET_SIGNALS_FILE   = os.path.join(DATA_DIR,"sheet_signals_opened.json")
 VIRTUAL_FILE         = os.path.join(DATA_DIR,"virtual_entry_trades.json")
 BREAKOUT_STATS_FILE  = os.path.join(DATA_DIR,"breakout_stats.json")
 PRE_SIGNAL_CONTEXT_FILE = os.path.join(DATA_DIR, "pre_signal_context.json")
+PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "pre_signals.json")
+PRE_SIGNAL_SCAN_LOG_FILE = os.path.join(DATA_DIR, "pre_signal_scan_log.json")
+OPEN_POSITIONS_JSON_FILE = os.path.join(DATA_DIR, "open_positions.json")
 
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
@@ -72,6 +75,36 @@ BTC_DIRECTION_UP_THRESHOLD_PCT = 0.2
 BTC_DIRECTION_DOWN_THRESHOLD_PCT = -0.2
 EMA_SLOPE_LOOKBACK_CANDLES = 5
 WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
+
+# PRE-SIGNAL system (parallel to existing EMA/FIB flow)
+PRE_SIGNAL_TYPE = "PRE_SIGNAL"
+PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
+PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 50_000_000
+PRE_SIGNAL_TIMEFRAME = "15m"
+PRE_SIGNAL_LOOKBACK_CANDLES = 16
+PRE_SIGNAL_COOLDOWN_HOURS = 4
+PRE_SIGNAL_SCAN_INTERVAL_SECONDS = 15 * 60
+PRE_BTC_4H_FILTER_ENABLED = False
+PRE_BTC_4H_MIN_CHANGE = -1.0
+
+PRE_MIN_PRICE_CHANGE_4H = 1.5
+PRE_MAX_PRICE_CHANGE_4H = 8.0
+PRE_MIN_VOLUME_CHANGE_4H = 100
+PRE_MIN_AVG_VOLUME_RATIO = 1.0
+PRE_MIN_MAX_VOLUME_RATIO = 1.8
+PRE_MIN_AVG_BODY_RATIO = 0.30
+PRE_MIN_MAX_BODY_RATIO = 0.70
+PRE_MIN_EMA_FAST_SLOPE = 0.7
+PRE_MIN_EMA_SLOW_SLOPE = 0.4
+PRE_MIN_RSI_CHANGE = 10
+PRE_MIN_COMPRESSION_SCORE = 88
+PRE_MIN_WHALE_CANDLE_COUNT = 1
+PRE_MIN_BREAKOUT_DISTANCE = 0.5
+PRE_MAX_BREAKOUT_DISTANCE = 5.0
+PRE_MIN_TREND_AGE = 1
+PRE_MAX_TREND_AGE = 10
+PRE_MIN_RANGE_PCT = 2.0
+PRE_MAX_RANGE_PCT = 10.0
 
 # Real-trade active UTC windows (converted from TR/UTC+3):
 # 00:00–01:59, 03:00–03:45, 06:00–08:59, 14:00–17:59, 20:00–20:45
@@ -1189,6 +1222,340 @@ def append_pre_signal_context(record: dict):
         except Exception:
             log(f"[PRE SIGNAL CONTEXT CLEANUP] invalid signal_time '{ts}', dropped record: {item.get('symbol')}")
     save_pre_signal_context(cleaned)
+
+
+def load_pre_signals():
+    data = safe_load(PRE_SIGNALS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_pre_signals(data):
+    safe_save(PRE_SIGNALS_FILE, data if isinstance(data, list) else [])
+
+
+def append_pre_signal_record(record: dict):
+    data = load_pre_signals()
+    data.append(record)
+    save_pre_signals(data)
+
+
+def load_pre_signal_scan_log():
+    data = safe_load(PRE_SIGNAL_SCAN_LOG_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_pre_signal_scan_log(data):
+    safe_save(PRE_SIGNAL_SCAN_LOG_FILE, data if isinstance(data, list) else [])
+
+
+def append_pre_signal_scan_log(records: List[dict]):
+    if not records:
+        return
+    data = load_pre_signal_scan_log()
+    data.extend(records)
+    save_pre_signal_scan_log(data)
+
+
+def load_open_positions_json():
+    data = safe_load(OPEN_POSITIONS_JSON_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_open_positions_json(data):
+    safe_save(OPEN_POSITIONS_JSON_FILE, data if isinstance(data, list) else [])
+
+
+def append_pre_signal_open_position(symbol: str, entry_price: float, signal_time: str):
+    data = load_open_positions_json()
+    data.append({
+        "type": PRE_SIGNAL_TYPE,
+        "symbol": symbol,
+        "entry_price": float(entry_price),
+        "tp_pct": TP_PCT,
+        "signal_time": signal_time,
+    })
+    save_open_positions_json(data)
+
+
+def _has_recent_pre_signal(symbol: str, cooldown_hours: int = PRE_SIGNAL_COOLDOWN_HOURS) -> bool:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+    for item in reversed(load_pre_signals()):
+        if item.get("symbol") != symbol:
+            continue
+        ts = item.get("signal_time")
+        try:
+            if ts and datetime.fromisoformat(ts) >= cutoff:
+                return True
+        except Exception:
+            log(f"[PRE SIGNAL TS PARSE WARN] {symbol} invalid signal_time={ts}")
+            continue
+    return False
+
+
+def _collect_all_futures_with_min_volume(min_quote_volume: float) -> List[Tuple[str, float]]:
+    try:
+        info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
+        valid_symbols = {
+            s["symbol"] for s in info.get("symbols", [])
+            if s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+            and s.get("contractType") == "PERPETUAL"
+        }
+        ticker_response = requests.get(BINANCE_FAPI + "/fapi/v1/ticker/24hr", timeout=15).json()
+        out = []
+        for t in ticker_response if isinstance(ticker_response, list) else []:
+            symbol = t.get("symbol")
+            if symbol not in valid_symbols:
+                continue
+            quote_volume = safe_float(t.get("quoteVolume"), 0.0)
+            if quote_volume >= min_quote_volume:
+                out.append((symbol, quote_volume))
+        out.sort(key=lambda x: x[1], reverse=True)
+        return out
+    except Exception as e:
+        log(f"[PRE SIGNAL UNIVERSE ERR] {e}")
+        return []
+
+
+def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m: List[list], btc_ctx: dict) -> Optional[dict]:
+    candles = (klines_15m or [])[-PRE_SIGNAL_LOOKBACK_CANDLES:]
+    if len(candles) < PRE_SIGNAL_LOOKBACK_CANDLES:
+        return None
+    try:
+        opens = [float(k[1]) for k in candles]
+        highs = [float(k[2]) for k in candles]
+        lows = [float(k[3]) for k in candles]
+        closes = [float(k[4]) for k in candles]
+        volumes = [float(k[5]) for k in candles]
+        ranges = [max(h - l, 1e-12) for h, l in zip(highs, lows)]
+        body_ratios = [abs(c - o) / r for o, c, r in zip(opens, closes, ranges)]
+
+        vol_series = pd.Series(volumes)
+        vol_ma = vol_series.rolling(window=8, min_periods=1).mean()
+        volume_ratios = (vol_series / vol_ma.replace(0, np.nan)).fillna(0.0).tolist()
+
+        ema_fast_vals = ema(closes, 9)
+        ema_slow_vals = ema(closes, 21)
+        rsi_vals = rsi(closes, period=14)
+        atr_vals = atr_like(highs, lows, closes, period=14)
+
+        highest_high = max(highs)
+        lowest_low = min(lows)
+        range_pct = ((highest_high - lowest_low) / lowest_low * 100.0) if lowest_low > 0 else 0.0
+        breakout_level = max(highs[:-1]) if len(highs) > 1 else highest_high
+        breakout_distance_pct = _safe_pct_change(breakout_level, closes[-1]) if breakout_level > 0 else 0.0
+
+        btc_1h = _vt_safe_float(btc_ctx.get("btc_1h_change_pct"), 0.0)
+        btc_aligned_with_long = btc_1h > 0
+
+        fast_start_idx = max(0, len(ema_fast_vals) - EMA_SLOPE_LOOKBACK_CANDLES)
+        slow_start_idx = max(0, len(ema_slow_vals) - EMA_SLOPE_LOOKBACK_CANDLES)
+
+        return {
+            "symbol": symbol,
+            "quote_volume_24h": round(float(quote_volume_24h), 2),
+            "price_change_4h_pct": round(_safe_pct_change(closes[0], closes[-1]), 4),
+            "volume_change_4h_pct": round(_safe_pct_change(volumes[0], volumes[-1]), 4),
+            "avg_volume_ratio": round(float(np.mean(volume_ratios)), 4),
+            "max_volume_ratio": round(float(np.max(volume_ratios)), 4),
+            "avg_body_ratio": round(float(np.mean(body_ratios)), 4),
+            "max_body_ratio": round(float(np.max(body_ratios)), 4),
+            "ema_fast_slope": round(_safe_pct_change(ema_fast_vals[fast_start_idx], ema_fast_vals[-1]), 4),
+            "ema_slow_slope": round(_safe_pct_change(ema_slow_vals[slow_start_idx], ema_slow_vals[-1]), 4),
+            "rsi_start": round(float(rsi_vals[0]), 4),
+            "rsi_end": round(float(rsi_vals[-1]), 4),
+            "rsi_change": round(float(rsi_vals[-1] - rsi_vals[0]), 4),
+            "highest_high": round(float(highest_high), 8),
+            "lowest_low": round(float(lowest_low), 8),
+            "range_pct": round(float(range_pct), 4),
+            "compression_score": round(max(0.0, 100.0 - range_pct), 4),
+            "volume_acceleration": round(_compute_volume_acceleration(volume_ratios), 6),
+            "whale_candle_count": int(sum(1 for br in body_ratios if br > WHALE_CANDLE_BODY_RATIO_THRESHOLD)),
+            "breakout_distance_pct": round(float(breakout_distance_pct), 4),
+            "trend_age": _compute_trend_age(closes, direction="LONG"),
+            "atr_now": round(float(atr_vals[-1]), 8) if atr_vals else 0.0,
+            "btc_15m_change_pct": btc_ctx.get("btc_15m_change_pct"),
+            "btc_1h_change_pct": btc_ctx.get("btc_1h_change_pct"),
+            "btc_4h_change_pct": btc_ctx.get("btc_4h_change_pct"),
+            "btc_market_direction": btc_ctx.get("btc_market_direction", "UNKNOWN"),
+            "btc_alignment_with_signal": "YES" if btc_aligned_with_long else "NO",
+        }
+    except Exception as e:
+        log(f"[PRE SIGNAL METRICS ERR] {symbol}: {e}")
+        return None
+
+
+def _is_pre_signal(metrics: dict) -> bool:
+    if not metrics:
+        return False
+    if PRE_BTC_4H_FILTER_ENABLED:
+        if _vt_safe_float(metrics.get("btc_4h_change_pct"), -999.0) < PRE_BTC_4H_MIN_CHANGE:
+            return False
+    return (
+        metrics.get("price_change_4h_pct", 0) >= PRE_MIN_PRICE_CHANGE_4H
+        and metrics.get("price_change_4h_pct", 0) <= PRE_MAX_PRICE_CHANGE_4H
+        and metrics.get("volume_change_4h_pct", 0) >= PRE_MIN_VOLUME_CHANGE_4H
+        and metrics.get("avg_volume_ratio", 0) >= PRE_MIN_AVG_VOLUME_RATIO
+        and metrics.get("max_volume_ratio", 0) >= PRE_MIN_MAX_VOLUME_RATIO
+        and metrics.get("avg_body_ratio", 0) >= PRE_MIN_AVG_BODY_RATIO
+        and metrics.get("max_body_ratio", 0) >= PRE_MIN_MAX_BODY_RATIO
+        and metrics.get("ema_fast_slope", 0) >= PRE_MIN_EMA_FAST_SLOPE
+        and metrics.get("ema_slow_slope", 0) >= PRE_MIN_EMA_SLOW_SLOPE
+        and metrics.get("rsi_change", 0) >= PRE_MIN_RSI_CHANGE
+        and metrics.get("compression_score", 0) >= PRE_MIN_COMPRESSION_SCORE
+        and metrics.get("whale_candle_count", 0) >= PRE_MIN_WHALE_CANDLE_COUNT
+        and metrics.get("breakout_distance_pct", 0) >= PRE_MIN_BREAKOUT_DISTANCE
+        and metrics.get("breakout_distance_pct", 0) <= PRE_MAX_BREAKOUT_DISTANCE
+        and metrics.get("trend_age", 0) >= PRE_MIN_TREND_AGE
+        and metrics.get("trend_age", 0) <= PRE_MAX_TREND_AGE
+        and metrics.get("range_pct", 0) >= PRE_MIN_RANGE_PCT
+        and metrics.get("range_pct", 0) <= PRE_MAX_RANGE_PCT
+    )
+
+
+def _send_pre_signal_telegram(metrics: dict):
+    symbol = metrics.get("symbol", "")
+    entry = _vt_safe_float(metrics.get("entry"), 0.0)
+    tp = round(entry * (1 + TP_PCT), 8) if entry > 0 else 0.0
+    tg_send(
+        f"🚨 PRE-SIGNAL LONG\n\n"
+        f"Coin: {symbol}\n\n"
+        f"Entry: {entry}\n"
+        f"TP: {tp}\n\n"
+        f"4H Price Change: %{metrics.get('price_change_4h_pct')}\n"
+        f"RSI Change: {metrics.get('rsi_change')}\n"
+        f"EMA Fast Slope: {metrics.get('ema_fast_slope')}\n"
+        f"EMA Slow Slope: {metrics.get('ema_slow_slope')}\n"
+        f"Compression: {metrics.get('compression_score')}\n"
+        f"Max Volume Ratio: {metrics.get('max_volume_ratio')}\n"
+        f"Whale Candles: {metrics.get('whale_candle_count')}\n"
+        f"BTC 4H: %{metrics.get('btc_4h_change_pct')}\n\n"
+        f"Status:\n"
+        f"Potential Early Entry"
+    )
+
+
+def run_pre_signal_scan(all_symbols: List[str]):
+    if PRE_SIGNAL_SOURCE_MODE != "ALL_FUTURES":
+        return
+    now_s = now_ts_s()
+    if now_s - int(STATE.get("last_pre_signal_scan_ts", 0)) < PRE_SIGNAL_SCAN_INTERVAL_SECONDS:
+        return
+
+    universe = _collect_all_futures_with_min_volume(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+    if not universe:
+        STATE["last_pre_signal_scan_ts"] = now_s
+        return
+
+    open_real_symbols = set(REAL_POSITIONS_TRACKER.keys())
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=PRE_SIGNAL_COOLDOWN_HOURS)
+    recent_pre_symbols = set()
+    for item in load_pre_signals():
+        if not isinstance(item, dict):
+            continue
+        ts = item.get("signal_time")
+        try:
+            if ts and datetime.fromisoformat(ts) >= cutoff:
+                recent_pre_symbols.add(item.get("symbol"))
+        except Exception:
+            continue
+    btc_ctx = _fetch_btc_context()
+    scan_time_iso = _vt_now_iso()
+    scan_records = []
+
+    def _scan_one(item: Tuple[str, float]):
+        symbol, quote_volume = item
+        row = {
+            "scan_time": scan_time_iso,
+            "symbol": symbol,
+            "quote_volume_24h": round(float(quote_volume), 2),
+            "source_mode": PRE_SIGNAL_SOURCE_MODE,
+            "timeframe": PRE_SIGNAL_TIMEFRAME,
+            "lookback_candles": PRE_SIGNAL_LOOKBACK_CANDLES,
+            "pre_signal": False,
+        }
+
+        if symbol in open_real_symbols:
+            row["skip_reason"] = "OPEN_POSITION"
+            return row, None
+        if symbol in recent_pre_symbols:
+            row["skip_reason"] = "COOLDOWN"
+            return row, None
+
+        klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
+        metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
+        if not metrics:
+            row["skip_reason"] = "INSUFFICIENT_DATA"
+            return row, None
+        row.update(metrics)
+        entry_price = _vt_safe_float(klines[-1][4], 0.0) if klines else 0.0
+        row["entry"] = round(entry_price, 8) if entry_price > 0 else 0.0
+
+        is_pre = _is_pre_signal(row)
+        row["pre_signal"] = bool(is_pre)
+        if not is_pre:
+            row["skip_reason"] = "CONDITIONS_NOT_MET"
+            return row, None
+
+        signal_time = _vt_now_iso()
+        metric_keys = {
+            "price_change_4h_pct", "volume_change_4h_pct",
+            "avg_volume_ratio", "max_volume_ratio",
+            "avg_body_ratio", "max_body_ratio",
+            "ema_fast_slope", "ema_slow_slope",
+            "rsi_start", "rsi_end", "rsi_change",
+            "highest_high", "lowest_low", "range_pct",
+            "compression_score", "volume_acceleration",
+            "whale_candle_count", "breakout_distance_pct",
+            "trend_age", "atr_now",
+            "btc_15m_change_pct", "btc_1h_change_pct",
+            "btc_4h_change_pct", "btc_market_direction",
+            "btc_alignment_with_signal", "quote_volume_24h",
+        }
+        signal_record = {
+            "type": PRE_SIGNAL_TYPE,
+            "symbol": symbol,
+            "entry_price": round(entry_price, 8) if entry_price > 0 else 0.0,
+            "tp_pct": TP_PCT,
+            "signal_time": signal_time,
+            "metrics": {k: row.get(k) for k in metric_keys},
+        }
+        return row, signal_record
+
+    generated_signals = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [ex.submit(_scan_one, item) for item in universe]
+        for f in as_completed(futs):
+            try:
+                row, signal_record = f.result()
+            except Exception as e:
+                log(f"[PRE SIGNAL SCAN ERR] {e}")
+                continue
+            scan_records.append(row)
+            if signal_record:
+                generated_signals.append(signal_record)
+                recent_pre_symbols.add(signal_record.get("symbol"))
+
+    append_pre_signal_scan_log(scan_records)
+    for rec in generated_signals:
+        append_pre_signal_record(rec)
+        append_pre_signal_open_position(
+            symbol=rec.get("symbol", ""),
+            entry_price=_vt_safe_float(rec.get("entry_price"), 0.0),
+            signal_time=rec.get("signal_time", _vt_now_iso()),
+        )
+        _send_pre_signal_telegram({
+            "symbol": rec.get("symbol"),
+            "entry": rec.get("entry_price"),
+            **(rec.get("metrics") or {}),
+        })
+        log(f"[PRE SIGNAL] {rec.get('symbol')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
+
+    log(
+        f"[PRE SIGNAL SCAN] scanned={len(scan_records)} "
+        f"generated={len(generated_signals)} volume_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME}"
+    )
+    STATE["last_pre_signal_scan_ts"] = now_s
 
 
 def _compute_trend_age(closes: List[float], direction: str = "LONG") -> int:
@@ -3971,6 +4338,7 @@ STATE_DEFAULT={
     "avg_max_profit":0.0,  # Average of max profits from open positions
     "last_virtual_json_send": 0,  # Timestamp of last virtual trades JSON Telegram send
     "last_pre_signal_context_send": 0,  # Timestamp of last pre-signal context JSON Telegram send
+    "last_pre_signal_scan_ts": 0,
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
@@ -9379,6 +9747,8 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
     )
     if new_state == "CONFIRMED_LONG":
         tg_send(f"{msg}{get_real_window_warning_note()}")
+        if _has_recent_pre_signal(symbol, PRE_SIGNAL_COOLDOWN_HOURS):
+            tg_send(f"ℹ️ {symbol}: Bu coin daha önce PRE-SIGNAL vermişti.")
         try:
             klines_list = futures_get_klines(symbol, "15m", 120)
             current_price = float(klines_list[-1][4]) if klines_list else None
@@ -10696,6 +11066,9 @@ def main():
             # Update top volume list every 6 hours (timestamp-based, not bar count)
             # This is handled internally by update_top_volume_symbols checking TOP_VOLUME_LAST_UPDATE
             update_top_volume_symbols(symbols)
+
+            # Parallel PRE-SIGNAL system (all futures, liquidity-filtered)
+            run_pre_signal_scan(symbols)
 
             # 1) Sinyal tarama
             sigs=run_parallel(symbols,bar_i)
