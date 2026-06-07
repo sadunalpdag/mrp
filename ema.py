@@ -2238,6 +2238,8 @@ def test_google_sheets_connection():
         sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         print("[SHEETS TITLE]", sh.title)
         log(f"[SHEETS TITLE] {sh.title}")
+        if not _ensure_sheets_status_tab(sh):
+            raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
         ws = sh.sheet1
         ws.update(
             range_name="A1",
