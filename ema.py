@@ -2154,7 +2154,7 @@ def _is_sheets_rate_limit_error(exc: Exception) -> bool:
     return ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg) or ("RATE LIMIT" in msg)
 
 
-def _apply_incremental_pre_signal_sheet_export(ws, columns: List[str], rows_payload: List[dict], cache: dict) -> Tuple[int, int, Dict[str, int], Dict[str, str], bool]:
+def _apply_incremental_pre_signal_sheet_export(ws, columns: List[str], rows_payload: List[dict], cache: dict) -> Tuple[int, int, Dict[str, int], Dict[str, str]]:
     old_symbol_to_row = cache.get("symbol_to_row") or {}
     old_row_hash = cache.get("row_hash_by_symbol") or {}
     max_existing_row = max(old_symbol_to_row.values(), default=1)
@@ -2188,15 +2188,11 @@ def _apply_incremental_pre_signal_sheet_export(ws, columns: List[str], rows_payl
         updates.append({"range": f"A{old_row_idx}:AF{old_row_idx}", "values": [blank_row]})
         rows_changed += 1
 
-    header_changed = cache.get("columns") != columns
-    if header_changed:
-        updates.append({"range": "A1:AF1", "values": [columns]})
-
     if updates:
         ws.batch_update(updates)
 
     rows_written = rows_changed
-    return len(rows_payload), rows_written, new_symbol_to_row, new_row_hash, header_changed
+    return len(rows_payload), rows_written, new_symbol_to_row, new_row_hash
 
 
 def export_all_pre_signal_params_to_sheets():
@@ -2285,7 +2281,7 @@ def export_all_pre_signal_params_to_sheets():
                 _build_pre_signal_sheet_cache(columns, rows_payload, symbol_to_row, row_hash_by_symbol),
             )
         else:
-            rows_total, rows_written, symbol_to_row, row_hash_by_symbol, _ = _apply_incremental_pre_signal_sheet_export(
+            rows_total, rows_written, symbol_to_row, row_hash_by_symbol = _apply_incremental_pre_signal_sheet_export(
                 ws=ws,
                 columns=columns,
                 rows_payload=rows_payload,
@@ -2300,7 +2296,7 @@ def export_all_pre_signal_params_to_sheets():
             else:
                 log("[SHEETS EXPORT] rows_changed=0, skip write")
         log(f"[SHEETS EXPORT] rows_total={rows_total} rows_changed={rows_changed} rows_written={rows_written}")
-        if formatting_enabled:
+        if formatting_enabled and rows_written > 0:
             _apply_pre_signal_test_formatting(ws, rows_payload, columns)
             log("[SHEETS EXPORT] formatting=ENABLED")
         else:
