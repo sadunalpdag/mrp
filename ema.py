@@ -163,7 +163,7 @@ SPOT_KLINE_LIMIT = 220
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
-PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 SHEETS_HEARTBEAT_ENABLED = True
 SHEETS_HEARTBEAT_INTERVAL_SECONDS = 60
@@ -2053,7 +2053,8 @@ def send_pre_signal_performance_report():
 def export_all_pre_signal_params_to_sheets():
     try:
         from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
-    except Exception:
+    except Exception as e:
+        log(f"[SHEETS ERROR] PRE_SIGNAL_TEST export dependency missing: {e}")
         return 0
     if not PRE_SIGNAL_TEST_EXPORT_ENABLED or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return 0
@@ -2108,7 +2109,7 @@ def export_all_pre_signal_params_to_sheets():
         sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         ws = _ensure_pre_signal_test_tab(sh)
         if not ws:
-            raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB}")
+            raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB} in sheet {GOOGLE_SHEETS_ID}")
         ws.clear()
         ws.update("A1", rows)
         metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
@@ -2578,6 +2579,16 @@ def generate_pre_signal_daily_reports_if_due():
     STATE["last_pre_signal_daily_report_date"] = today
 
 
+def _log_pre_signal_debug(total_symbols_scanned: int, after_volume_filter: int, total_candidates: int, total_rejected: int, total_saved: int, sheet_export_rows: int):
+    log("[PRE-SIGNAL DEBUG]\n"
+        f"total_symbols_scanned={total_symbols_scanned}\n"
+        f"after_volume_filter={after_volume_filter}\n"
+        f"total_candidates={total_candidates}\n"
+        f"total_rejected={total_rejected}\n"
+        f"total_saved={total_saved}\n"
+        f"sheet_export_rows={sheet_export_rows}")
+
+
 def run_pre_signal_scan(all_symbols: List[str]):
     now_s = now_ts_s()
     if now_s - int(STATE.get("last_pre_signal_scan_ts", 0)) < PRE_SIGNAL_SCAN_INTERVAL_SECONDS:
@@ -2588,6 +2599,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
     after_volume_filter = 0
     if PRE_SIGNAL_SOURCE_MODE == "ALL_FUTURES":
         universe = get_all_futures_usdt_symbols_for_pre_signal()
+        total_symbols_scanned = int(STATE.get("last_pre_signal_total_futures_count", len(universe)))
         after_volume_filter = len(universe)
     else:
         try:
@@ -2607,9 +2619,6 @@ def run_pre_signal_scan(all_symbols: List[str]):
         total_symbols_scanned = len(all_symbols)
         after_volume_filter = len(universe)
 
-    if PRE_SIGNAL_SOURCE_MODE == "ALL_FUTURES":
-        total_symbols_scanned = int(STATE.get("last_pre_signal_total_futures_count", after_volume_filter))
-
     print(f"[PRE-SIGNAL] Scanning {len(universe)} futures symbols", flush=True)
     tg_send(f"PRE-SIGNAL scan started: {len(universe)} symbols")
 
@@ -2618,13 +2627,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         STATE["last_pre_signal_symbol_count"] = 0
         STATE["last_pre_signal_error"] = "NONE"
-        log("[PRE-SIGNAL DEBUG]\n"
-            f"total_symbols_scanned={total_symbols_scanned}\n"
-            f"after_volume_filter={after_volume_filter}\n"
-            "total_candidates=0\n"
-            "total_rejected=0\n"
-            "total_saved=0\n"
-            "sheet_export_rows=0")
+        _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, 0, 0, 0, 0)
         log("[PRE-SIGNAL] Scan completed")
         return
 
@@ -2756,13 +2759,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
     sheet_export_rows = export_all_pre_signal_params_to_sheets() if PRE_SIGNAL_TEST_EXPORT_ENABLED else 0
     total_candidates = sum(1 for row in scan_records if bool(row.get("would_pre_signal", row.get("pre_signal"))))
     total_rejected = sum(1 for row in scan_records if not bool(row.get("pre_signal")))
-    log("[PRE-SIGNAL DEBUG]\n"
-        f"total_symbols_scanned={total_symbols_scanned}\n"
-        f"after_volume_filter={after_volume_filter}\n"
-        f"total_candidates={total_candidates}\n"
-        f"total_rejected={total_rejected}\n"
-        f"total_saved={len(generated_signals)}\n"
-        f"sheet_export_rows={sheet_export_rows}")
+    _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, total_candidates, total_rejected, len(generated_signals), sheet_export_rows)
 
 
 def _compute_trend_age(closes: List[float], direction: str = "LONG") -> int:
