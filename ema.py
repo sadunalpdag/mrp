@@ -2086,9 +2086,14 @@ def _apply_pre_signal_test_formatting(ws, rows_payload: List[dict], columns: Lis
                 format_cell_range(ws, f"{col_letter}{ridx}:{col_letter}{ridx}", cell_fmt)
 
 
+def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
+    ws.update(range_name="A1", values=rows)
+
+
 def export_all_pre_signal_params_to_sheets():
     if not PRE_SIGNAL_TEST_EXPORT_ENABLED or not GOOGLE_SERVICE_ACCOUNT_JSON:
         return 0
+    formatting_enabled = PRE_SIGNAL_TEST_FORMAT_ENABLED and FORMATTING_AVAILABLE
     btc_ctx = _fetch_btc_context()
     scan_time_iso = _vt_now_iso()
     rows_payload = []
@@ -2116,7 +2121,8 @@ def export_all_pre_signal_params_to_sheets():
         row["fail_count"] = prox["fail_count"]
         row["is_pre_signal"] = bool(decision.get("is_pre_signal"))
         row["reject_reasons"] = ", ".join(prox["reject_reasons"])
-        row["_metric_colors"] = prox["metric_colors"]
+        if formatting_enabled:
+            row["_metric_colors"] = prox["metric_colors"]
         rows_payload.append(row)
     rows_payload.sort(key=lambda r: (
         0 if r.get("is_pre_signal") else 1,
@@ -2141,9 +2147,9 @@ def export_all_pre_signal_params_to_sheets():
         ws = _ensure_pre_signal_test_tab(sh)
         if not ws:
             raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB} in sheet {GOOGLE_SHEETS_ID}")
-        ws.update(range_name="A1", values=rows)
+        _write_pre_signal_test_rows(ws, rows)
         log(f"[SHEETS EXPORT] rows={len(rows)}")
-        if PRE_SIGNAL_TEST_FORMAT_ENABLED and FORMATTING_AVAILABLE:
+        if formatting_enabled:
             _apply_pre_signal_test_formatting(ws, rows_payload, columns)
             log("[SHEETS EXPORT] formatting=ENABLED")
         else:
