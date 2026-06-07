@@ -158,7 +158,7 @@ MAX_CHANGE_PCT  = 15.0   # Coins with |24h change| > this are skipped
 SPOT_INTERVAL   = "15m"
 SPOT_KLINE_LIMIT = 220
 
-GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
+GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 
@@ -1372,6 +1372,15 @@ def _ms_to_iso_utc(ms: Optional[int]) -> Optional[str]:
         return None
 
 
+def _ts_to_iso_utc(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
 PRE_SIGNAL_THRESHOLD_RULES = [
     {"metric": "price_change_4h_pct", "min": PRE_MIN_PRICE_CHANGE_4H, "max": PRE_MAX_PRICE_CHANGE_4H},
     {"metric": "volume_change_4h_pct", "min": PRE_MIN_VOLUME_CHANGE_4H},
@@ -2007,7 +2016,7 @@ def export_pre_signal_test_to_google_sheets():
     except Exception:
         return
     service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not service_account_json or not GOOGLE_SHEETS_ID:
+    if not service_account_json or not GOOGLE_SHEET_ID:
         return
     records = [r for r in load_pre_signal_live_state() if isinstance(r, dict)]
     if not records:
@@ -2041,7 +2050,7 @@ def export_pre_signal_test_to_google_sheets():
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
     try:
         gc = gspread.service_account(filename=service_account_json)
-        sh = gc.open_by_key(GOOGLE_SHEETS_ID)
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
         ws = sh.get_worksheet_by_id(int(GOOGLE_SHEET_GID))
         ws.clear()
         ws.batch_update([
@@ -6545,6 +6554,22 @@ def heartbeat_and_status_check(_snapshot):
         return
     STATE["last_api_check"]=now
     safe_save(STATE_FILE,STATE)
+    status_payload = {
+        "updated_at": _vt_now_iso(),
+        "heartbeat": "ERROR",
+        "error": None,
+        "server_time_ms": None,
+        "server_time_utc": None,
+        "drift_ms": None,
+        "ping_ok": None,
+        "key_ok": None,
+        "bar_index": STATE.get("bar_index", 0),
+        "auto_trade_active": bool(STATE.get("auto_trade_active", True)),
+        "last_api_check_utc": _ts_to_iso_utc(STATE.get("last_api_check")),
+        "last_pre_signal_scan_utc": _ts_to_iso_utc(STATE.get("last_pre_signal_scan_ts")),
+        "last_pump_watch_report_utc": _ts_to_iso_utc(STATE.get("last_pump_watch_report_ts")),
+        "last_pre_signal_performance_report_date": STATE.get("last_pre_signal_performance_report_date", ""),
+    }
     try:
         st=requests.get(BINANCE_FAPI+"/fapi/v1/time",timeout=5).json()["serverTime"]
         drift=abs(now_ts_ms()-st)
@@ -6556,28 +6581,18 @@ def heartbeat_and_status_check(_snapshot):
               if ping_ok and key_ok and drift<1500 else
               f"⚠️ HEARTBEAT ping={ping_ok} key={key_ok} drift={int(drift)}")
         log(hb)
-        safe_save(BOT_STATUS_FILE, {
-            "updated_at": _vt_now_iso(),
+        status_payload.update({
             "heartbeat": hb,
-            "server_time": st,
+            "server_time_ms": int(st),
+            "server_time_utc": _ms_to_iso_utc(st),
             "drift_ms": int(drift),
             "ping_ok": ping_ok,
             "key_ok": key_ok,
-            "bar_index": STATE.get("bar_index", 0),
-            "auto_trade_active": bool(STATE.get("auto_trade_active", True)),
-            "last_pre_signal_scan_ts": int(STATE.get("last_pre_signal_scan_ts", 0)),
-            "last_pump_watch_report_ts": int(STATE.get("last_pump_watch_report_ts", 0)),
-            "last_pre_signal_performance_report_date": STATE.get("last_pre_signal_performance_report_date", ""),
         })
     except Exception as e:
         log(f"[HBERR]{e}")
-        safe_save(BOT_STATUS_FILE, {
-            "updated_at": _vt_now_iso(),
-            "heartbeat": "ERROR",
-            "error": str(e),
-            "bar_index": STATE.get("bar_index", 0),
-            "auto_trade_active": bool(STATE.get("auto_trade_active", True)),
-        })
+        status_payload["error"] = str(e)
+    safe_save(BOT_STATUS_FILE, status_payload)
 
     msg=(f"📊 STATUS bar:{STATE.get('bar_index',0)} "
          f"auto:{'✅' if STATE.get('auto_trade_active',True) else '🟥'}\n"
