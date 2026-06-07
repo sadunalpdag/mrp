@@ -170,12 +170,16 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-PRE_SIGNAL_TEST_FORMAT_ENABLED = os.getenv("PRE_SIGNAL_TEST_FORMAT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+# Keep formatting fully disabled for PRE_SIGNAL_TEST exports; values-only updates preserve manual sheet formatting.
+PRE_SIGNAL_TEST_FORMAT_ENABLED = False
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 SHEETS_HEARTBEAT_ENABLED = True
 SHEETS_HEARTBEAT_INTERVAL_SECONDS = 60
 SHEETS_STATUS_TAB = "BOT_STATUS"
 PRE_SIGNAL_TEST_TAB = "PRE_SIGNAL_TEST"
+PRE_SIGNAL_TEST_UPDATE_MAX_ROWS = 600
+PRE_SIGNAL_TEST_TRACK_MAX_ROWS = 1000
+PRE_SIGNAL_TEST_UPDATE_RANGE = f"A1:AF{PRE_SIGNAL_TEST_UPDATE_MAX_ROWS}"
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SAVE_LOCK = threading.Lock()
@@ -2087,7 +2091,16 @@ def _apply_pre_signal_test_formatting(ws, rows_payload: List[dict], columns: Lis
 
 
 def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
-    ws.update(range_name="A1", values=rows)
+    write_rows = rows[:PRE_SIGNAL_TEST_UPDATE_MAX_ROWS]
+    existing_rows = ws.get(f"A1:A{PRE_SIGNAL_TEST_TRACK_MAX_ROWS}")
+    previous_row_count = 0
+    for ridx, row in enumerate(existing_rows or [], start=1):
+        if row and str(row[0]).strip():
+            previous_row_count = ridx
+    ws.update(range_name=PRE_SIGNAL_TEST_UPDATE_RANGE, values=write_rows)
+    new_row_count = len(write_rows)
+    if new_row_count < previous_row_count:
+        ws.batch_clear([f"A{new_row_count + 1}:AF{min(previous_row_count, PRE_SIGNAL_TEST_TRACK_MAX_ROWS)}"])
 
 
 def export_all_pre_signal_params_to_sheets():
@@ -2153,7 +2166,7 @@ def export_all_pre_signal_params_to_sheets():
             _apply_pre_signal_test_formatting(ws, rows_payload, columns)
             log("[SHEETS EXPORT] formatting=ENABLED")
         else:
-            log("[SHEETS EXPORT] formatting=DISABLED")
+            log("[SHEETS EXPORT] values updated only, formatting preserved")
         return len(rows)
     except Exception as e:
         log(f"[SHEETS ERROR] {e}")
