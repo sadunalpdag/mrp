@@ -2234,8 +2234,10 @@ def test_google_sheets_connection():
         if gc is None:
             return False
         print("[SHEETS ID]", GOOGLE_SHEETS_ID)
+        log(f"[SHEETS ID] {GOOGLE_SHEETS_ID}")
         sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         print("[SHEETS TITLE]", sh.title)
+        log(f"[SHEETS TITLE] {sh.title}")
         ws = sh.sheet1
         ws.update(
             range_name="A1",
@@ -2243,6 +2245,7 @@ def test_google_sheets_connection():
         )
         verify = ws.acell("A1").value
         print("[SHEETS VERIFY]", verify)
+        log(f"[SHEETS VERIFY] {verify}")
         log("[SHEETS TEST] OK")
         tg_send(f"Google Sheets test success: {verify}")
         return True
