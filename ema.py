@@ -56,6 +56,12 @@ OPEN_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "open_pre_signals.json")
 CLOSED_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "closed_pre_signals.json")
 DAILY_PRE_SIGNAL_REPORT_FILE = os.path.join(DATA_DIR, "daily_pre_signal_report.json")
 PRE_SIGNAL_PARAMETER_STATS_FILE = os.path.join(DATA_DIR, "pre_signal_parameter_stats.json")
+PRE_SIGNAL_LIVE_STATE_FILE = os.path.join(DATA_DIR, "pre_signal_live_state.json")
+PUMP_WATCH_FILE = os.path.join(DATA_DIR, "pump_watch_20plus.json")
+PUMP_WATCH_DAILY_SUMMARY_FILE = os.path.join(DATA_DIR, "pump_watch_daily_summary.json")
+OPEN_PRE_SIGNAL_PERFORMANCE_FILE = os.path.join(DATA_DIR, "open_pre_signal_performance.json")
+CLOSED_PRE_SIGNAL_PERFORMANCE_FILE = os.path.join(DATA_DIR, "closed_pre_signal_performance.json")
+PRE_SIGNAL_PERFORMANCE_SUMMARY_FILE = os.path.join(DATA_DIR, "pre_signal_performance_summary.json")
 
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
@@ -112,6 +118,21 @@ PRE_MIN_TREND_AGE = 1
 PRE_MAX_TREND_AGE = 10
 PRE_MIN_RANGE_PCT = 2.0
 PRE_MAX_RANGE_PCT = 10.0
+PRE_MAX_DAILY_CHANGE_PCT = 7.0
+
+PUMP_WATCH_ENABLED = True
+PUMP_WATCH_DAILY_GAIN_THRESHOLD = 20.0
+PUMP_WATCH_TIMEFRAME = "15m"
+PUMP_WATCH_LOOKBACK_CANDLES = 16
+PUMP_WATCH_REPORT_INTERVAL_HOURS = 12
+
+PRE_SIGNAL_MAX_TRACK_HOURS = 24
+PRE_TP_LEVELS = {
+    "tp_0_6": 0.006,
+    "tp_0_8": 0.008,
+    "tp_1_0": 0.010,
+    "tp_1_2": 0.012,
+}
 
 # Real-trade active UTC windows (converted from TR/UTC+3):
 # 00:00–01:59, 03:00–03:45, 06:00–08:59, 14:00–17:59, 20:00–20:45
@@ -1401,6 +1422,648 @@ def evaluate_pre_signal_thresholds(metrics: dict) -> dict:
     }
 
 
+PRE_SIGNAL_EXPORT_RULES = {
+    "daily_change_pct": {"type": "max", "max": PRE_MAX_DAILY_CHANGE_PCT},
+    "price_change_4h_pct": {"type": "range", "min": PRE_MIN_PRICE_CHANGE_4H, "max": 10.0},
+    "volume_change_4h_pct": {"type": "min", "min": PRE_MIN_VOLUME_CHANGE_4H},
+    "avg_volume_ratio": {"type": "min", "min": PRE_MIN_AVG_VOLUME_RATIO},
+    "max_volume_ratio": {"type": "min", "min": PRE_MIN_MAX_VOLUME_RATIO},
+    "avg_body_ratio": {"type": "min", "min": PRE_MIN_AVG_BODY_RATIO},
+    "max_body_ratio": {"type": "min", "min": PRE_MIN_MAX_BODY_RATIO},
+    "ema_fast_slope": {"type": "min", "min": PRE_MIN_EMA_FAST_SLOPE},
+    "ema_slow_slope": {"type": "min", "min": PRE_MIN_EMA_SLOW_SLOPE},
+    "rsi_change": {"type": "min", "min": PRE_MIN_RSI_CHANGE},
+    "compression_score": {"type": "min", "min": PRE_MIN_COMPRESSION_SCORE},
+    "whale_candle_count": {"type": "min", "min": PRE_MIN_WHALE_CANDLE_COUNT},
+    "breakout_distance_pct": {"type": "range", "min": PRE_MIN_BREAKOUT_DISTANCE, "max": PRE_MAX_BREAKOUT_DISTANCE},
+    "trend_age": {"type": "range", "min": PRE_MIN_TREND_AGE, "max": PRE_MAX_TREND_AGE},
+    "range_pct": {"type": "range", "min": PRE_MIN_RANGE_PCT, "max": PRE_MAX_RANGE_PCT},
+    "btc_4h_change_pct": {"type": "min", "min": PRE_BTC_4H_MIN_CHANGE},
+}
+
+SHEET_COLOR_RED = "#f4cccc"
+SHEET_COLOR_YELLOW = "#fff2cc"
+SHEET_COLOR_GREEN = "#d9ead3"
+SHEET_COLOR_HEADER = "#cfe2f3"
+SHEET_COLOR_PRE_SIGNAL_ROW = "#e2f0d9"
+PRE_SIGNAL_WARN_LOW_RATIO = 0.7
+PRE_SIGNAL_WARN_HIGH_RATIO = 1.3
+PRE_SIGNAL_MIN_THRESHOLD_FLOOR = 1e-9
+MISSING_SENTINEL_NEG = -999.0
+
+
+def _hex_to_rgb01(hex_color: str) -> Tuple[float, float, float]:
+    hx = str(hex_color or "").strip()
+    if len(hx) == 7 and hx.startswith("#"):
+        return (
+            int(hx[1:3], 16) / 255.0,
+            int(hx[3:5], 16) / 255.0,
+            int(hx[5:7], 16) / 255.0,
+        )
+    return (1.0, 1.0, 1.0)
+
+
+def _col_to_a1(col_idx: int) -> str:
+    col_idx = int(max(1, col_idx))
+    letters = []
+    while col_idx > 0:
+        col_idx, rem = divmod(col_idx - 1, 26)
+        letters.append(chr(65 + rem))
+    return "".join(reversed(letters))
+
+
+def _pre_signal_metric_color(metric: str, value: float) -> str:
+    rule = PRE_SIGNAL_EXPORT_RULES.get(metric)
+    if not rule:
+        return SHEET_COLOR_RED
+    v = _vt_safe_float(value, 0.0)
+    if rule["type"] == "min":
+        thr = max(PRE_SIGNAL_MIN_THRESHOLD_FLOOR, _vt_safe_float(rule.get("min"), 0.0))
+        if v >= thr:
+            return SHEET_COLOR_GREEN
+        if v >= thr * PRE_SIGNAL_WARN_LOW_RATIO:
+            return SHEET_COLOR_YELLOW
+        return SHEET_COLOR_RED
+    if rule["type"] == "max":
+        thr = _vt_safe_float(rule.get("max"), 0.0)
+        if v <= thr:
+            return SHEET_COLOR_GREEN
+        if v <= thr * PRE_SIGNAL_WARN_HIGH_RATIO:
+            return SHEET_COLOR_YELLOW
+        return SHEET_COLOR_RED
+    mn = _vt_safe_float(rule.get("min"), 0.0)
+    mx = _vt_safe_float(rule.get("max"), 0.0)
+    low_soft = mn * PRE_SIGNAL_WARN_LOW_RATIO
+    high_soft = mx * PRE_SIGNAL_WARN_HIGH_RATIO
+    if mn <= v <= mx:
+        return SHEET_COLOR_GREEN
+    if low_soft <= v <= high_soft:
+        return SHEET_COLOR_YELLOW
+    return SHEET_COLOR_RED
+
+
+def _build_pre_signal_proximity(record: dict) -> dict:
+    colors = {}
+    pass_count = near_count = fail_count = 0
+    reject = []
+    for metric in PRE_SIGNAL_EXPORT_RULES.keys():
+        color = _pre_signal_metric_color(metric, record.get(metric))
+        colors[metric] = color
+        if color == SHEET_COLOR_GREEN:
+            pass_count += 1
+        elif color == SHEET_COLOR_YELLOW:
+            near_count += 1
+        else:
+            fail_count += 1
+            reject.append(metric)
+    return {
+        "metric_colors": colors,
+        "pass_count": pass_count,
+        "near_count": near_count,
+        "fail_count": fail_count,
+        "pre_signal_score": pass_count * 3 + near_count,
+        "reject_reasons": reject,
+    }
+
+
+def load_pre_signal_live_state():
+    data = safe_load(PRE_SIGNAL_LIVE_STATE_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_pre_signal_live_state(data):
+    safe_save(PRE_SIGNAL_LIVE_STATE_FILE, data if isinstance(data, list) else [])
+
+
+def append_pre_signal_live_state(record: dict):
+    data = load_pre_signal_live_state()
+    data.append(record)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    kept = []
+    for item in data:
+        ts = _parse_iso_utc(item.get("scan_time") or item.get("signal_time"))
+        if ts and ts >= cutoff:
+            kept.append(item)
+    save_pre_signal_live_state(kept)
+
+
+def load_pump_watch_records():
+    data = safe_load(PUMP_WATCH_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_pump_watch_records(data):
+    safe_save(PUMP_WATCH_FILE, data if isinstance(data, list) else [])
+
+
+def _fetch_all_usdt_perpetual_tickers() -> List[dict]:
+    try:
+        info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
+        valid_symbols = {
+            s.get("symbol") for s in info.get("symbols", [])
+            if s.get("quoteAsset") == "USDT"
+            and s.get("contractType") == "PERPETUAL"
+            and s.get("status") == "TRADING"
+        }
+        tickers = requests.get(BINANCE_FAPI + "/fapi/v1/ticker/24hr", timeout=15).json()
+        return [t for t in tickers if isinstance(t, dict) and t.get("symbol") in valid_symbols]
+    except Exception as e:
+        log(f"[PUMP WATCH TICKER ERR] {e}")
+        return []
+
+
+def _find_pre_signal_before_pump(symbol: str, pump_time_iso: str) -> dict:
+    pump_dt = _parse_iso_utc(pump_time_iso)
+    if not symbol or not pump_dt:
+        return {"pre_signal_before_pump": False}
+    earliest = None
+    state_records = load_pre_signal_live_state()
+    if not state_records:
+        state_records = (load_pre_signal_scan_log() or [])[-5000:]
+    for rec in state_records:
+        if not isinstance(rec, dict) or rec.get("symbol") != symbol:
+            continue
+        if not bool(rec.get("would_pre_signal", rec.get("pre_signal", False))):
+            continue
+        ts = _parse_iso_utc(rec.get("scan_time") or rec.get("signal_time"))
+        if ts and ts < pump_dt and (earliest is None or ts < earliest):
+            earliest = ts
+    if earliest is None:
+        for rec in load_pre_signals():
+            if not isinstance(rec, dict) or rec.get("symbol") != symbol:
+                continue
+            ts = _parse_iso_utc(rec.get("signal_time"))
+            if ts and ts < pump_dt and (earliest is None or ts < earliest):
+                earliest = ts
+    if earliest is None:
+        return {"pre_signal_before_pump": False}
+    hours = round((pump_dt - earliest).total_seconds() / 3600.0, 4)
+    return {
+        "pre_signal_before_pump": True,
+        "pre_signal_before_pump_time": earliest.isoformat(),
+        "hours_pre_signal_to_20pct": max(0.0, hours),
+    }
+
+
+def _build_pump_watch_snapshot(ticker: dict, btc_ctx: dict, scan_time_iso: str) -> Optional[dict]:
+    symbol = ticker.get("symbol")
+    if not symbol:
+        return None
+    quote_volume = _vt_safe_float(ticker.get("quoteVolume"), 0.0)
+    daily_change_pct = _vt_safe_float(ticker.get("priceChangePercent"), 0.0)
+    last_price = _vt_safe_float(ticker.get("lastPrice"), 0.0)
+    kl = futures_get_klines(symbol, PUMP_WATCH_TIMEFRAME, PUMP_WATCH_LOOKBACK_CANDLES + 5)
+    metrics = _compute_pre_signal_metrics(symbol, quote_volume, kl, btc_ctx)
+    if not metrics:
+        return None
+    snap = {
+        "scan_time": scan_time_iso,
+        "symbol": symbol,
+        "daily_change_pct": round(daily_change_pct, 4),
+        "quote_volume": round(quote_volume, 2),
+        "last_price": round(last_price, 8),
+        **metrics,
+    }
+    decision = evaluate_pre_signal_thresholds(snap)
+    proximity = _build_pre_signal_proximity(snap)
+    reject_reasons = proximity["reject_reasons"]
+    if not reject_reasons:
+        reject_reasons = [c["metric"] for c in decision.get("checks", []) if not c.get("passed")]
+    snap["pre_signal_score"] = proximity["pre_signal_score"]
+    snap["would_pre_signal"] = bool(decision.get("is_pre_signal"))
+    snap["reject_reasons"] = reject_reasons
+    snap["pass_count"] = proximity["pass_count"]
+    snap["near_count"] = proximity["near_count"]
+    snap["fail_count"] = proximity["fail_count"]
+    return snap
+
+
+def _upsert_pump_watch_record(snapshot: dict):
+    date_key = datetime.now(timezone.utc).date().isoformat()
+    symbol = snapshot.get("symbol")
+    if not symbol:
+        return
+    records = load_pump_watch_records()
+    target_idx = None
+    for i, rec in enumerate(records):
+        if isinstance(rec, dict) and rec.get("date") == date_key and rec.get("symbol") == symbol:
+            target_idx = i
+            break
+    if target_idx is None:
+        base = {
+            "date": date_key,
+            "symbol": symbol,
+            "first_detected_time": snapshot.get("scan_time"),
+            "last_update_time": snapshot.get("scan_time"),
+            "daily_change_pct_first": snapshot.get("daily_change_pct"),
+            "max_daily_change_pct": snapshot.get("daily_change_pct"),
+            "snapshot_count": 1,
+            "latest_snapshot": {
+                "daily_change_pct": snapshot.get("daily_change_pct"),
+                "quote_volume": snapshot.get("quote_volume"),
+                "last_price": snapshot.get("last_price"),
+                "price_change_4h_pct": snapshot.get("price_change_4h_pct"),
+                "volume_change_4h_pct": snapshot.get("volume_change_4h_pct"),
+                "avg_volume_ratio": snapshot.get("avg_volume_ratio"),
+                "max_volume_ratio": snapshot.get("max_volume_ratio"),
+                "ema_fast_slope": snapshot.get("ema_fast_slope"),
+                "ema_slow_slope": snapshot.get("ema_slow_slope"),
+                "rsi_change": snapshot.get("rsi_change"),
+                "compression_score": snapshot.get("compression_score"),
+                "whale_candle_count": snapshot.get("whale_candle_count"),
+                "btc_4h_change_pct": snapshot.get("btc_4h_change_pct"),
+                "pre_signal_score": snapshot.get("pre_signal_score"),
+                "would_pre_signal": snapshot.get("would_pre_signal"),
+                "reject_reasons": snapshot.get("reject_reasons", []),
+            },
+            "max_values": {
+                "max_price_change_4h_pct": snapshot.get("price_change_4h_pct"),
+                "max_volume_ratio": snapshot.get("max_volume_ratio"),
+                "max_rsi_change": snapshot.get("rsi_change"),
+                "max_compression_score": snapshot.get("compression_score"),
+                "max_whale_candle_count": snapshot.get("whale_candle_count"),
+            },
+        }
+        base.update(_find_pre_signal_before_pump(symbol, snapshot.get("scan_time")))
+        records.append(base)
+    else:
+        rec = records[target_idx]
+        rec["last_update_time"] = snapshot.get("scan_time")
+        rec["last_price"] = snapshot.get("last_price")
+        rec["snapshot_count"] = int(rec.get("snapshot_count", 0)) + 1
+        rec["max_daily_change_pct"] = max(_vt_safe_float(rec.get("max_daily_change_pct"), MISSING_SENTINEL_NEG), _vt_safe_float(snapshot.get("daily_change_pct"), MISSING_SENTINEL_NEG))
+        rec.setdefault("max_values", {})
+        rec["max_values"]["max_price_change_4h_pct"] = max(_vt_safe_float(rec["max_values"].get("max_price_change_4h_pct"), MISSING_SENTINEL_NEG), _vt_safe_float(snapshot.get("price_change_4h_pct"), MISSING_SENTINEL_NEG))
+        rec["max_values"]["max_volume_ratio"] = max(_vt_safe_float(rec["max_values"].get("max_volume_ratio"), MISSING_SENTINEL_NEG), _vt_safe_float(snapshot.get("max_volume_ratio"), MISSING_SENTINEL_NEG))
+        rec["max_values"]["max_rsi_change"] = max(_vt_safe_float(rec["max_values"].get("max_rsi_change"), MISSING_SENTINEL_NEG), _vt_safe_float(snapshot.get("rsi_change"), MISSING_SENTINEL_NEG))
+        rec["max_values"]["max_compression_score"] = max(_vt_safe_float(rec["max_values"].get("max_compression_score"), MISSING_SENTINEL_NEG), _vt_safe_float(snapshot.get("compression_score"), MISSING_SENTINEL_NEG))
+        rec["max_values"]["max_whale_candle_count"] = max(_vt_safe_float(rec["max_values"].get("max_whale_candle_count"), MISSING_SENTINEL_NEG), _vt_safe_float(snapshot.get("whale_candle_count"), MISSING_SENTINEL_NEG))
+        rec["latest_snapshot"] = {
+            "daily_change_pct": snapshot.get("daily_change_pct"),
+            "quote_volume": snapshot.get("quote_volume"),
+            "last_price": snapshot.get("last_price"),
+            "price_change_4h_pct": snapshot.get("price_change_4h_pct"),
+            "volume_change_4h_pct": snapshot.get("volume_change_4h_pct"),
+            "avg_volume_ratio": snapshot.get("avg_volume_ratio"),
+            "max_volume_ratio": snapshot.get("max_volume_ratio"),
+            "ema_fast_slope": snapshot.get("ema_fast_slope"),
+            "ema_slow_slope": snapshot.get("ema_slow_slope"),
+            "rsi_change": snapshot.get("rsi_change"),
+            "compression_score": snapshot.get("compression_score"),
+            "whale_candle_count": snapshot.get("whale_candle_count"),
+            "btc_4h_change_pct": snapshot.get("btc_4h_change_pct"),
+            "pre_signal_score": snapshot.get("pre_signal_score"),
+            "would_pre_signal": snapshot.get("would_pre_signal"),
+            "reject_reasons": snapshot.get("reject_reasons", []),
+        }
+    save_pump_watch_records(records)
+
+
+def run_pump_watch_scan():
+    if not PUMP_WATCH_ENABLED:
+        return
+    btc_ctx = _fetch_btc_context()
+    scan_time_iso = _vt_now_iso()
+    found = 0
+    for ticker in _fetch_all_usdt_perpetual_tickers():
+        if _vt_safe_float(ticker.get("priceChangePercent"), 0.0) < PUMP_WATCH_DAILY_GAIN_THRESHOLD:
+            continue
+        snap = _build_pump_watch_snapshot(ticker, btc_ctx, scan_time_iso)
+        if not snap:
+            continue
+        append_pre_signal_live_state(snap)
+        _upsert_pump_watch_record(snap)
+        found += 1
+    log(f"[PUMP WATCH] detected={found} threshold={PUMP_WATCH_DAILY_GAIN_THRESHOLD}")
+
+
+def generate_pump_watch_summary_and_report_if_due():
+    now_ts = now_ts_s()
+    if now_ts - int(STATE.get("last_pump_watch_report_ts", 0)) < int(PUMP_WATCH_REPORT_INTERVAL_HOURS * 3600):
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=PUMP_WATCH_REPORT_INTERVAL_HOURS)
+    rows = []
+    for rec in load_pump_watch_records():
+        if not isinstance(rec, dict):
+            continue
+        upd = _parse_iso_utc(rec.get("last_update_time"))
+        if upd and upd >= cutoff:
+            rows.append(rec)
+    rows.sort(key=lambda x: _vt_safe_float(x.get("max_daily_change_pct"), MISSING_SENTINEL_NEG), reverse=True)
+    count = len(rows)
+    symbols = [r.get("symbol") for r in rows]
+    pre_signal_before_count = sum(1 for r in rows if r.get("pre_signal_before_pump"))
+    avg_compression = _avg([_vt_safe_float((r.get("latest_snapshot") or {}).get("compression_score"), 0.0) for r in rows]) or 0.0
+    avg_rsi_change = _avg([_vt_safe_float((r.get("latest_snapshot") or {}).get("rsi_change"), 0.0) for r in rows]) or 0.0
+    avg_max_vol = _avg([_vt_safe_float((r.get("max_values") or {}).get("max_volume_ratio"), 0.0) for r in rows]) or 0.0
+    avg_whale = _avg([_vt_safe_float((r.get("max_values") or {}).get("max_whale_candle_count"), 0.0) for r in rows]) or 0.0
+    reject_counts = {}
+    for r in rows:
+        reasons = ((r.get("latest_snapshot") or {}).get("reject_reasons")) or []
+        for reason in reasons:
+            reject_counts[reason] = reject_counts.get(reason, 0) + 1
+    top_reasons = dict(sorted(reject_counts.items(), key=lambda kv: kv[1], reverse=True)[:10])
+    summary = {
+        "report_time": _vt_now_iso(),
+        "period_hours": PUMP_WATCH_REPORT_INTERVAL_HOURS,
+        "pump_20plus_count": count,
+        "symbols": symbols,
+        "pre_signal_before_pump_count": pre_signal_before_count,
+        "avg_compression_score": avg_compression,
+        "avg_rsi_change": avg_rsi_change,
+        "avg_max_volume_ratio": avg_max_vol,
+        "avg_whale_candle_count": avg_whale,
+        "top_pumps": [{"symbol": r.get("symbol"), "max_daily_change_pct": r.get("max_daily_change_pct")} for r in rows[:5]],
+        "common_reject_reasons": top_reasons,
+    }
+    safe_save(PUMP_WATCH_DAILY_SUMMARY_FILE, summary)
+    msg_lines = [
+        "🚀 PUMP WATCH REPORT",
+        "",
+        f"Period: Last {int(PUMP_WATCH_REPORT_INTERVAL_HOURS)}h",
+        "",
+        f"20%+ coins: {count}",
+        "",
+        "Top Pump Coins:",
+    ]
+    for i, r in enumerate(rows[:5], start=1):
+        msg_lines.append(f"{i}. {r.get('symbol')} %{round(_vt_safe_float(r.get('max_daily_change_pct'), 0.0), 2)}")
+    msg_lines += [
+        "",
+        "Pre-signal before pump:",
+        f"{pre_signal_before_count}/{count}",
+        "",
+        "Avg values:",
+        f"Compression: {round(_vt_safe_float(avg_compression, 0.0), 3)}",
+        f"RSI Change: {round(_vt_safe_float(avg_rsi_change, 0.0), 3)}",
+        f"Max Volume Ratio: {round(_vt_safe_float(avg_max_vol, 0.0), 3)}",
+        f"Whale Candle: {round(_vt_safe_float(avg_whale, 0.0), 3)}",
+        "",
+        "Most common reject reasons:",
+    ]
+    for i, (reason, rcnt) in enumerate(sorted(reject_counts.items(), key=lambda kv: kv[1], reverse=True)[:3], start=1):
+        msg_lines.append(f"{i}. {reason} {rcnt}")
+    tg_send("\n".join(msg_lines))
+    STATE["last_pump_watch_report_ts"] = now_ts
+
+
+def load_open_pre_signal_performance():
+    data = safe_load(OPEN_PRE_SIGNAL_PERFORMANCE_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_open_pre_signal_performance(data):
+    safe_save(OPEN_PRE_SIGNAL_PERFORMANCE_FILE, data if isinstance(data, list) else [])
+
+
+def load_closed_pre_signal_performance():
+    data = safe_load(CLOSED_PRE_SIGNAL_PERFORMANCE_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_closed_pre_signal_performance(data):
+    safe_save(CLOSED_PRE_SIGNAL_PERFORMANCE_FILE, data if isinstance(data, list) else [])
+
+
+def create_pre_signal_performance_record(signal: dict, context: dict):
+    symbol = signal.get("symbol")
+    entry_price = _vt_safe_float(signal.get("entry_price"), 0.0)
+    signal_time = signal.get("signal_time") or _vt_now_iso()
+    if not symbol or entry_price <= 0:
+        return
+    rec = {
+        "id": f"{symbol}_{int(time.time_ns() // 1_000_000)}",
+        "type": "PRE_SIGNAL",
+        "symbol": symbol,
+        "direction": "LONG",
+        "entry_price": round(entry_price, 8),
+        "signal_time": signal_time,
+        "status": "OPEN",
+        "tp_levels": {},
+        "max_price_seen": round(entry_price, 8),
+        "max_profit_pct": 0.0,
+        "last_price": round(entry_price, 8),
+        "last_update_time": signal_time,
+        "first_whale_candle_time": context.get("first_whale_candle_time"),
+        "last_whale_candle_time": context.get("last_whale_candle_time"),
+        "pre_signal_context": context,
+    }
+    for tp_name, tp_pct in PRE_TP_LEVELS.items():
+        rec["tp_levels"][tp_name] = {
+            "target_pct": tp_pct,
+            "target_price": round(entry_price * (1.0 + tp_pct), 8),
+            "hit": False,
+            "hit_time": None,
+            "bars_to_hit": None,
+            "hours_to_hit": None,
+            "minutes_first_whale_to_hit": None,
+            "bars_first_whale_to_hit": None,
+        }
+    open_data = load_open_pre_signal_performance()
+    open_data.append(rec)
+    save_open_pre_signal_performance(open_data)
+
+
+def update_open_pre_signal_performance():
+    open_data = load_open_pre_signal_performance()
+    if not open_data:
+        return
+    now_dt = datetime.now(timezone.utc)
+    changed = False
+    for rec in open_data:
+        symbol = rec.get("symbol")
+        entry = _vt_safe_float(rec.get("entry_price"), 0.0)
+        if not symbol or entry <= 0:
+            continue
+        current = _vt_safe_float(futures_get_price(symbol), 0.0)
+        if current <= 0:
+            continue
+        changed = True
+        rec["last_price"] = round(current, 8)
+        rec["last_update_time"] = now_dt.isoformat()
+        rec["max_price_seen"] = round(max(_vt_safe_float(rec.get("max_price_seen"), entry), current), 8)
+        rec["max_profit_pct"] = round(((rec["max_price_seen"] / entry) - 1.0) * 100.0, 6)
+        signal_dt = _parse_iso_utc(rec.get("signal_time")) or now_dt
+        elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / 3600.0)
+        first_whale_dt = _parse_iso_utc(rec.get("first_whale_candle_time"))
+        for tp_name, tp_data in (rec.get("tp_levels") or {}).items():
+            if tp_data.get("hit"):
+                continue
+            target_price = _vt_safe_float(tp_data.get("target_price"), 0.0)
+            if target_price <= 0 or current < target_price:
+                continue
+            tp_data["hit"] = True
+            tp_data["hit_time"] = now_dt.isoformat()
+            tp_data["hours_to_hit"] = round(elapsed_hours, 4)
+            tp_data["bars_to_hit"] = int(round((elapsed_hours * MINUTES_PER_HOUR) / PRE_SIGNAL_BAR_INTERVAL_MINUTES))
+            if first_whale_dt:
+                mins = max(0.0, (now_dt - first_whale_dt).total_seconds() / 60.0)
+                tp_data["minutes_first_whale_to_hit"] = round(mins, 2)
+                tp_data["bars_first_whale_to_hit"] = int(round(mins / PRE_SIGNAL_BAR_INTERVAL_MINUTES))
+            rec[f"minutes_first_whale_to_{tp_name}"] = tp_data.get("minutes_first_whale_to_hit")
+            rec[f"bars_first_whale_to_{tp_name}"] = tp_data.get("bars_first_whale_to_hit")
+    if changed:
+        save_open_pre_signal_performance(open_data)
+
+
+def close_finished_pre_signal_performance():
+    open_data = load_open_pre_signal_performance()
+    if not open_data:
+        return
+    now_dt = datetime.now(timezone.utc)
+    still_open, closed_now = [], []
+    for rec in open_data:
+        signal_dt = _parse_iso_utc(rec.get("signal_time")) or now_dt
+        elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / 3600.0)
+        levels = rec.get("tp_levels") or {}
+        all_hit = bool(levels) and all(bool(v.get("hit")) for v in levels.values())
+        expired = elapsed_hours >= PRE_SIGNAL_MAX_TRACK_HOURS
+        if not all_hit and not expired:
+            still_open.append(rec)
+            continue
+        hit_count = sum(1 for v in levels.values() if bool(v.get("hit")))
+        total_levels = max(1, len(levels))
+        rec["status"] = "CLOSED"
+        rec["close_time"] = now_dt.isoformat()
+        rec["total_hours_tracked"] = round(elapsed_hours, 4)
+        if all_hit:
+            rec["final_status"] = "ALL_TP_HIT"
+        elif expired and hit_count == 0:
+            rec["final_status"] = "EXPIRED_24H"
+        elif expired and hit_count < total_levels:
+            rec["final_status"] = "PARTIAL_TP_HIT"
+        else:
+            rec["final_status"] = "NO_TP_HIT"
+        closed_now.append(rec)
+    if closed_now:
+        closed = load_closed_pre_signal_performance()
+        closed.extend(closed_now)
+        save_closed_pre_signal_performance(closed)
+    save_open_pre_signal_performance(still_open)
+
+
+def generate_pre_signal_performance_summary():
+    closed = [r for r in load_closed_pre_signal_performance() if isinstance(r, dict)]
+    total = len(closed)
+    summary = {
+        "generated_at": _vt_now_iso(),
+        "total_pre_signals": total,
+    }
+    avg_max_profit_vals = []
+    for tp_name in PRE_TP_LEVELS.keys():
+        hit_items = []
+        for rec in closed:
+            lv = (rec.get("tp_levels") or {}).get(tp_name) or {}
+            if lv.get("hit"):
+                hit_items.append(lv)
+        hit_count = len(hit_items)
+        summary[tp_name] = {
+            "hit_count": hit_count,
+            "hit_rate": round((hit_count / total) * 100.0, 4) if total > 0 else 0.0,
+            "avg_hours_to_hit": _avg([_vt_safe_float(x.get("hours_to_hit"), 0.0) for x in hit_items]) or 0.0,
+            "avg_bars_to_hit": _avg([_vt_safe_float(x.get("bars_to_hit"), 0.0) for x in hit_items]) or 0.0,
+        }
+    for rec in closed:
+        avg_max_profit_vals.append(_vt_safe_float(rec.get("max_profit_pct"), 0.0))
+    summary["avg_max_profit_pct"] = _avg(avg_max_profit_vals) or 0.0
+    safe_save(PRE_SIGNAL_PERFORMANCE_SUMMARY_FILE, summary)
+    return summary
+
+
+def send_pre_signal_performance_report():
+    today = datetime.now(timezone.utc).date().isoformat()
+    if STATE.get("last_pre_signal_performance_report_date") == today:
+        return
+    summary = generate_pre_signal_performance_summary()
+    total = int(summary.get("total_pre_signals", 0))
+    msg = [
+        "📊 PRE-SIGNAL PERFORMANCE REPORT",
+        "",
+        f"Total PRE-SIGNAL: {total}",
+        "",
+    ]
+    for tp_name, label in [("tp_0_6", "TP 0.6%"), ("tp_0_8", "TP 0.8%"), ("tp_1_0", "TP 1.0%"), ("tp_1_2", "TP 1.2%")]:
+        tp = summary.get(tp_name, {})
+        msg += [
+            f"{label}:",
+            f"Hit: {int(_vt_safe_float(tp.get('hit_count'), 0))}",
+            f"Rate: %{round(_vt_safe_float(tp.get('hit_rate'), 0.0), 2)}",
+            f"Avg Time: {round(_vt_safe_float(tp.get('avg_hours_to_hit'), 0.0), 3)}",
+            "",
+        ]
+    msg += [
+        "Avg Max Profit:",
+        f"{round(_vt_safe_float(summary.get('avg_max_profit_pct'), 0.0), 4)}",
+    ]
+    tg_send("\n".join(msg))
+    STATE["last_pre_signal_performance_report_date"] = today
+
+
+def export_pre_signal_test_to_google_sheets():
+    try:
+        import gspread  # type: ignore
+        from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
+    except Exception:
+        return
+    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        return
+    records = [r for r in load_pre_signal_live_state() if isinstance(r, dict)]
+    if not records:
+        return
+    rows_payload = []
+    for rec in records:
+        prox = _build_pre_signal_proximity(rec)
+        row = dict(rec)
+        row["pre_signal_score"] = prox["pre_signal_score"]
+        row["pass_count"] = prox["pass_count"]
+        row["near_count"] = prox["near_count"]
+        row["fail_count"] = prox["fail_count"]
+        row["is_pre_signal"] = bool(rec.get("would_pre_signal", rec.get("pre_signal", False)))
+        row["reject_reasons"] = ", ".join(prox["reject_reasons"])
+        row["_metric_colors"] = prox["metric_colors"]
+        rows_payload.append(row)
+    rows_payload.sort(key=lambda r: (
+        0 if r.get("is_pre_signal") else 1,
+        -_vt_safe_float(r.get("pre_signal_score"), 0.0),
+        -_vt_safe_float(r.get("pass_count"), 0.0),
+        _vt_safe_float(r.get("fail_count"), 0.0),
+    ))
+    columns = [
+        "scan_time", "symbol", "daily_change_pct", "price_change_4h_pct", "volume_change_4h_pct",
+        "avg_volume_ratio", "max_volume_ratio", "avg_body_ratio", "max_body_ratio", "ema_fast_slope",
+        "ema_slow_slope", "rsi_change", "compression_score", "whale_candle_count", "breakout_distance_pct",
+        "trend_age", "range_pct", "btc_4h_change_pct", "pre_signal_score", "pass_count", "fail_count",
+        "near_count", "is_pre_signal", "reject_reasons",
+    ]
+    rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
+    try:
+        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        ws = sh.get_worksheet_by_id(int(GOOGLE_SHEET_GID))
+        ws.clear()
+        ws.update("A1", rows)
+        metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
+        last_col = _col_to_a1(len(columns))
+        with batch_updater(ws.spreadsheet) as batch:
+            hdr_rgb = _hex_to_rgb01(SHEET_COLOR_HEADER)
+            pre_row_rgb = _hex_to_rgb01(SHEET_COLOR_PRE_SIGNAL_ROW)
+            hdr_fmt = CellFormat(backgroundColor=Color(*hdr_rgb))
+            format_cell_range(ws, f"A1:{last_col}1", hdr_fmt)
+            for ridx, item in enumerate(rows_payload, start=2):
+                if item.get("is_pre_signal"):
+                    format_cell_range(ws, f"A{ridx}:{last_col}{ridx}", CellFormat(backgroundColor=Color(*pre_row_rgb)))
+                for metric, color_hex in (item.get("_metric_colors") or {}).items():
+                    col = metric_col_idx.get(metric)
+                    if not col:
+                        continue
+                    rgb = _hex_to_rgb01(color_hex)
+                    cell_fmt = CellFormat(backgroundColor=Color(*rgb))
+                    col_letter = _col_to_a1(col)
+                    format_cell_range(ws, f"{col_letter}{ridx}:{col_letter}{ridx}", cell_fmt)
+    except Exception as e:
+        log(f"[PRE SIGNAL SHEET EXPORT ERR] {e}")
+
+
 def _collect_all_futures_with_min_volume(min_quote_volume: float) -> List[Tuple[str, float]]:
     try:
         info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
@@ -1755,6 +2418,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "scan_time": scan_time_iso,
             "symbol": symbol,
             "quote_volume_24h": round(float(quote_volume), 2),
+            "daily_change_pct": 0.0,
             "source_mode": PRE_SIGNAL_SOURCE_MODE,
             "timeframe": PRE_SIGNAL_TIMEFRAME,
             "lookback_candles": PRE_SIGNAL_LOOKBACK_CANDLES,
@@ -1781,7 +2445,14 @@ def run_pre_signal_scan(all_symbols: List[str]):
         row["entry"] = round(entry_price, 8) if entry_price > 0 else 0.0
 
         decision = evaluate_pre_signal_thresholds(row)
+        proximity = _build_pre_signal_proximity(row)
         row["threshold_checks"] = decision.get("checks", [])
+        row["pre_signal_score"] = proximity.get("pre_signal_score", 0)
+        row["pass_count"] = proximity.get("pass_count", 0)
+        row["near_count"] = proximity.get("near_count", 0)
+        row["fail_count"] = proximity.get("fail_count", 0)
+        row["reject_reasons"] = proximity.get("reject_reasons", [])
+        row["would_pre_signal"] = bool(decision.get("is_pre_signal"))
         is_pre = bool(decision.get("is_pre_signal"))
         row["pre_signal"] = is_pre
         if not is_pre:
@@ -1827,9 +2498,12 @@ def run_pre_signal_scan(all_symbols: List[str]):
                 recent_pre_symbols.add(signal_record.get("symbol"))
 
     append_pre_signal_scan_log(scan_records)
+    for row in scan_records:
+        append_pre_signal_live_state(row)
     for rec in generated_signals:
         append_pre_signal_record(rec)
         append_open_pre_signal(rec)
+        create_pre_signal_performance_record(rec, rec.get("metrics") or {})
         _send_pre_signal_telegram({
             "symbol": rec.get("symbol"),
             "entry": rec.get("entry_price"),
@@ -1841,6 +2515,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         f"[PRE SIGNAL SCAN] scanned={len(scan_records)} "
         f"generated={len(generated_signals)} volume_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME}"
     )
+    export_pre_signal_test_to_google_sheets()
     STATE["last_pre_signal_scan_ts"] = now_s
 
 
@@ -4626,6 +5301,8 @@ STATE_DEFAULT={
     "last_pre_signal_context_send": 0,  # Timestamp of last pre-signal context JSON Telegram send
     "last_pre_signal_scan_ts": 0,
     "last_pre_signal_daily_report_date": "",
+    "last_pump_watch_report_ts": 0,
+    "last_pre_signal_performance_report_date": "",
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
@@ -11360,6 +12037,12 @@ def main():
             run_pre_signal_scan(symbols)
             update_open_pre_signals_tp()
             generate_pre_signal_daily_reports_if_due()
+            run_pump_watch_scan()
+            generate_pump_watch_summary_and_report_if_due()
+            update_open_pre_signal_performance()
+            close_finished_pre_signal_performance()
+            generate_pre_signal_performance_summary()
+            send_pre_signal_performance_report()
 
             # 1) Sinyal tarama
             sigs=run_parallel(symbols,bar_i)
