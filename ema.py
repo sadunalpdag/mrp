@@ -162,7 +162,6 @@ SPOT_KLINE_LIMIT = 220
 
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
-GOOGLE_SHEET_ID = GOOGLE_SHEETS_ID
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 SHEETS_HEARTBEAT_ENABLED = True
@@ -2011,11 +2010,10 @@ def send_pre_signal_performance_report():
 
 def export_pre_signal_test_to_google_sheets():
     try:
-        import gspread  # type: ignore
         from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
     except Exception:
         return
-    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return
     records = [r for r in load_pre_signal_live_state() if isinstance(r, dict)]
     if not records:
@@ -2047,8 +2045,10 @@ def export_pre_signal_test_to_google_sheets():
     ]
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
     try:
-        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        gc = _get_gspread_client()
+        if gc is None:
+            return
+        sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         ws = sh.get_worksheet_by_id(int(GOOGLE_SHEET_GID))
         ws.clear()
         ws.update("A1", rows)
@@ -2125,10 +2125,16 @@ def _ensure_sheets_status_tab(sheet_client) -> Optional[object]:
 def _get_gspread_client():
     if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEETS_ID:
         return None
-    credentials = Credentials.from_service_account_file(
-        GOOGLE_SERVICE_ACCOUNT_JSON,
-        scopes=GOOGLE_SHEETS_SCOPES,
-    )
+    try:
+        credentials = Credentials.from_service_account_info(
+            json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+            scopes=GOOGLE_SHEETS_SCOPES,
+        )
+    except json.JSONDecodeError:
+        credentials = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_JSON,
+            scopes=GOOGLE_SHEETS_SCOPES,
+        )
     return gspread.authorize(credentials)
 
 
