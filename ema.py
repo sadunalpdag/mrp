@@ -95,7 +95,7 @@ PRE_BTC_4H_FILTER_ENABLED = False
 PRE_BTC_4H_MIN_CHANGE = -1.0
 
 PRE_MIN_PRICE_CHANGE_4H = 1.5
-PRE_MAX_PRICE_CHANGE_4H = 8.0
+PRE_MAX_PRICE_CHANGE_4H = 7.0
 PRE_MIN_VOLUME_CHANGE_4H = 100
 PRE_MIN_AVG_VOLUME_RATIO = 1.0
 PRE_MIN_MAX_VOLUME_RATIO = 1.8
@@ -112,6 +112,10 @@ PRE_MIN_TREND_AGE = 1
 PRE_MAX_TREND_AGE = 10
 PRE_MIN_RANGE_PCT = 2.0
 PRE_MAX_RANGE_PCT = 10.0
+PRE_SIGNAL_ANALYSIS_TARGETS = {
+    "target_0_8_pct": 0.008,   # 0.8%
+    "target_1_0_pct": 0.010,   # 1.0%
+}
 
 # Real-trade active UTC windows (converted from TR/UTC+3):
 # 00:00–01:59, 03:00–03:45, 06:00–08:59, 14:00–17:59, 20:00–20:45
@@ -1531,6 +1535,12 @@ def _send_pre_signal_telegram(metrics: dict):
     )
 
 
+def _pre_signal_target_price(entry_price: float, target_pct: float) -> float:
+    if entry_price <= 0:
+        return 0.0
+    return round(entry_price * (1 + target_pct), 8)
+
+
 def _build_pre_signal_trade_record(symbol: str, entry_price: float, signal_time: str, metrics: dict) -> dict:
     tp_price = round(entry_price * (1 + PRE_SIGNAL_TP_PCT), 8) if entry_price > 0 else 0.0
     first_whale = metrics.get("first_whale_candle_time")
@@ -1540,7 +1550,7 @@ def _build_pre_signal_trade_record(symbol: str, entry_price: float, signal_time:
     minutes_whale_to_signal = None
     if signal_dt and first_whale_dt:
         minutes_whale_to_signal = round((signal_dt - first_whale_dt).total_seconds() / 60.0, 2)
-    return {
+    record = {
         "type": PRE_SIGNAL_TYPE,
         "symbol": symbol,
         "entry_price": round(entry_price, 8),
@@ -1567,6 +1577,16 @@ def _build_pre_signal_trade_record(symbol: str, entry_price: float, signal_time:
         "hours_signal_to_tp": None,
         "metrics": metrics,
     }
+    for target_key, target_pct in PRE_SIGNAL_ANALYSIS_TARGETS.items():
+        record[f"{target_key}_pct"] = target_pct
+        record[f"{target_key}_price"] = _pre_signal_target_price(entry_price, target_pct)
+        record[f"{target_key}_hit"] = False
+        record[f"{target_key}_close_time"] = None
+        record[f"{target_key}_close_price"] = None
+        record[f"{target_key}_profit_pct"] = None
+        record[f"{target_key}_bars_to_hit"] = None
+        record[f"{target_key}_hours_to_hit"] = None
+    return record
 
 
 def _update_pre_signals_master_record(updated_record: dict):
@@ -1619,6 +1639,31 @@ def update_open_pre_signals_tp():
         rec["max_price_seen"] = round(max(_vt_safe_float(rec.get("max_price_seen"), entry), last_price), 8)
         rec["max_profit_pct"] = round(((rec["max_price_seen"] / entry) - 1.0) * 100.0, 6)
         rec["status"] = "OPEN"
+        for target_key, target_pct in PRE_SIGNAL_ANALYSIS_TARGETS.items():
+            target_price_key = f"{target_key}_price"
+            target_hit_key = f"{target_key}_hit"
+            target_close_time_key = f"{target_key}_close_time"
+            target_close_price_key = f"{target_key}_close_price"
+            target_profit_key = f"{target_key}_profit_pct"
+            target_bars_key = f"{target_key}_bars_to_hit"
+            target_hours_key = f"{target_key}_hours_to_hit"
+            rec[f"{target_key}_pct"] = target_pct
+            target_price = _vt_safe_float(rec.get(target_price_key), _pre_signal_target_price(entry, target_pct))
+            rec[target_price_key] = round(target_price, 8)
+            if not bool(rec.get(target_hit_key)) and last_price >= target_price:
+                rec[target_hit_key] = True
+                rec[target_close_time_key] = now_dt.isoformat()
+                rec[target_close_price_key] = round(last_price, 8)
+                rec[target_profit_key] = round(((last_price / entry) - 1.0) * 100.0, 6)
+                rec[target_bars_key] = rec["bars_open"]
+                rec[target_hours_key] = rec["hours_open"]
+            else:
+                rec[target_hit_key] = bool(rec.get(target_hit_key, False))
+                rec.setdefault(target_close_time_key, None)
+                rec.setdefault(target_close_price_key, None)
+                rec.setdefault(target_profit_key, None)
+                rec.setdefault(target_bars_key, None)
+                rec.setdefault(target_hours_key, None)
 
         if last_price >= tp_price:
             close_dt = now_dt
@@ -1658,6 +1703,26 @@ def _build_pre_signal_daily_report() -> dict:
     tp_count = len(tp_records)
     open_count = len(open_records)
     tp_rate = round((tp_count / total) * 100.0, 4) if total > 0 else 0.0
+    hypothetical_target_summary = {}
+    for target_key, target_pct in PRE_SIGNAL_ANALYSIS_TARGETS.items():
+        target_hits = [r for r in all_records if bool(r.get(f"{target_key}_hit"))]
+        hit_count = len(target_hits)
+        hypothetical_target_summary[target_key] = {
+            "target_pct": round(target_pct * 100.0, 4),
+            "hit_count": hit_count,
+            "miss_count": max(0, total - hit_count),
+            "hit_rate": round((hit_count / total) * 100.0, 4) if total > 0 else 0.0,
+            "avg_hours_to_hit": _avg([
+                r.get(f"{target_key}_hours_to_hit")
+                for r in target_hits
+                if isinstance(r.get(f"{target_key}_hours_to_hit"), (int, float))
+            ]),
+            "avg_bars_to_hit": _avg([
+                r.get(f"{target_key}_bars_to_hit")
+                for r in target_hits
+                if isinstance(r.get(f"{target_key}_bars_to_hit"), (int, float))
+            ]),
+        }
     return {
         "generated_at": _vt_now_iso(),
         "total_pre_signals": total,
@@ -1671,6 +1736,7 @@ def _build_pre_signal_daily_report() -> dict:
         "avg_whale_to_tp_bars": _avg([_vt_safe_float(r.get("bars_whale_to_tp"), 0.0) for r in tp_records]),
         "avg_signal_to_tp_minutes": _avg([_vt_safe_float(r.get("hours_signal_to_tp"), 0.0) * MINUTES_PER_HOUR for r in tp_records]),
         "avg_signal_to_tp_bars": _avg([_vt_safe_float(r.get("bars_signal_to_tp"), 0.0) for r in tp_records]),
+        "hypothetical_targets": hypothetical_target_summary,
     }
 
 
