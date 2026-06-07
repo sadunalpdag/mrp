@@ -180,6 +180,8 @@ PRE_SIGNAL_TEST_TAB = "PRE_SIGNAL_TEST"
 PRE_SIGNAL_TEST_UPDATE_MAX_ROWS = 600
 PRE_SIGNAL_TEST_TRACK_MAX_ROWS = 1000
 PRE_SIGNAL_TEST_UPDATE_RANGE = f"A1:AF{PRE_SIGNAL_TEST_UPDATE_MAX_ROWS}"
+PRE_SIGNAL_SHEET_CACHE_FILE = os.path.join(DATA_DIR, "pre_signal_sheet_cache.json")
+SHEETS_EXPORT_COOLDOWN_SECONDS = 5 * 60
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SAVE_LOCK = threading.Lock()
@@ -195,6 +197,7 @@ TOP_VOLUME_SYMBOLS = []  # Top 25 coins by 24h volume (on-chain strategy filter)
 TOP_VOLUME_LAST_UPDATE = 0  # Timestamp of last volume ranking update
 VALID_FUTURES_SYMBOLS: set = set()  # Validated PERPETUAL USDT futures symbols
 LAST_SHEETS_HEARTBEAT_TS = 0
+PRE_SIGNAL_SHEETS_EXPORT_PAUSED_UNTIL = 0
 getcontext().prec = 28
 
 # Algo order types that should be cancelled before closing positions
@@ -2090,6 +2093,11 @@ def _apply_pre_signal_test_formatting(ws, rows_payload: List[dict], columns: Lis
                 format_cell_range(ws, f"{col_letter}{ridx}:{col_letter}{ridx}", cell_fmt)
 
 
+def _hash_pre_signal_row(row_values: List[object]) -> str:
+    payload = json.dumps(row_values, ensure_ascii=False, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
     write_rows = rows[:PRE_SIGNAL_TEST_UPDATE_MAX_ROWS]
     existing_rows = ws.get(f"A1:A{PRE_SIGNAL_TEST_TRACK_MAX_ROWS}")
@@ -2103,8 +2111,102 @@ def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
         ws.batch_clear([f"A{new_row_count + 1}:AF{min(previous_row_count, PRE_SIGNAL_TEST_TRACK_MAX_ROWS)}"])
 
 
+def _build_pre_signal_sheet_cache(columns: List[str], rows_payload: List[dict], symbol_to_row: Dict[str, int], row_hash_by_symbol: Dict[str, str]) -> dict:
+    return {
+        "version": 1,
+        "columns": columns,
+        "symbol_to_row": symbol_to_row,
+        "row_hash_by_symbol": row_hash_by_symbol,
+        "updated_at": _vt_now_iso(),
+        "rows_total": len(rows_payload),
+    }
+
+
+def _normalize_pre_signal_sheet_cache(raw_cache: dict) -> dict:
+    cache = raw_cache if isinstance(raw_cache, dict) else {}
+    symbol_to_row_raw = cache.get("symbol_to_row")
+    hash_raw = cache.get("row_hash_by_symbol")
+    symbol_to_row: Dict[str, int] = {}
+    row_hash_by_symbol: Dict[str, str] = {}
+    if isinstance(symbol_to_row_raw, dict):
+        for symbol, row_idx in symbol_to_row_raw.items():
+            if not symbol:
+                continue
+            try:
+                row_num = int(row_idx)
+            except Exception:
+                continue
+            if row_num >= 2:
+                symbol_to_row[str(symbol)] = row_num
+    if isinstance(hash_raw, dict):
+        for symbol, row_hash in hash_raw.items():
+            if symbol:
+                row_hash_by_symbol[str(symbol)] = str(row_hash or "")
+    return {
+        "columns": cache.get("columns") if isinstance(cache.get("columns"), list) else [],
+        "symbol_to_row": symbol_to_row,
+        "row_hash_by_symbol": row_hash_by_symbol,
+    }
+
+
+def _is_sheets_rate_limit_error(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    return ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg) or ("RATE LIMIT" in msg)
+
+
+def _apply_incremental_pre_signal_sheet_export(ws, columns: List[str], rows_payload: List[dict], cache: dict) -> Tuple[int, int, Dict[str, int], Dict[str, str], bool]:
+    old_symbol_to_row = cache.get("symbol_to_row") or {}
+    old_row_hash = cache.get("row_hash_by_symbol") or {}
+    max_existing_row = max(old_symbol_to_row.values(), default=1)
+    next_row = max_existing_row + 1
+
+    updates = []
+    new_symbol_to_row: Dict[str, int] = {}
+    new_row_hash: Dict[str, str] = {}
+    rows_changed = 0
+
+    for item in rows_payload:
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        row_values = [item.get(c, "") for c in columns]
+        row_hash = _hash_pre_signal_row(row_values)
+        row_idx = old_symbol_to_row.get(symbol)
+        if row_idx is None:
+            row_idx = next_row
+            next_row += 1
+        new_symbol_to_row[symbol] = row_idx
+        new_row_hash[symbol] = row_hash
+        if old_row_hash.get(symbol) != row_hash:
+            updates.append({"range": f"A{row_idx}:AF{row_idx}", "values": [row_values]})
+            rows_changed += 1
+
+    blank_row = [""] * len(columns)
+    for symbol, old_row_idx in old_symbol_to_row.items():
+        if symbol in new_symbol_to_row:
+            continue
+        updates.append({"range": f"A{old_row_idx}:AF{old_row_idx}", "values": [blank_row]})
+        rows_changed += 1
+
+    header_changed = cache.get("columns") != columns
+    if header_changed:
+        updates.append({"range": "A1:AF1", "values": [columns]})
+
+    if updates:
+        ws.batch_update(updates)
+
+    rows_written = rows_changed
+    return len(rows_payload), rows_written, new_symbol_to_row, new_row_hash, header_changed
+
+
 def export_all_pre_signal_params_to_sheets():
+    global PRE_SIGNAL_SHEETS_EXPORT_PAUSED_UNTIL
     if not PRE_SIGNAL_TEST_EXPORT_ENABLED or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return 0
+    now_s = now_ts_s()
+    if now_s < PRE_SIGNAL_SHEETS_EXPORT_PAUSED_UNTIL:
+        remaining = PRE_SIGNAL_SHEETS_EXPORT_PAUSED_UNTIL - now_s
+        log(f"[SHEETS EXPORT] paused_seconds_left={remaining}")
         return 0
     formatting_enabled = PRE_SIGNAL_TEST_FORMAT_ENABLED and FORMATTING_AVAILABLE
     btc_ctx = _fetch_btc_context()
@@ -2153,6 +2255,10 @@ def export_all_pre_signal_params_to_sheets():
     ]
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
     try:
+        cache = _normalize_pre_signal_sheet_cache(safe_load(PRE_SIGNAL_SHEET_CACHE_FILE, {}))
+        old_symbol_to_row = cache.get("symbol_to_row") or {}
+        old_row_hash = cache.get("row_hash_by_symbol") or {}
+        is_first_export = not old_symbol_to_row or not old_row_hash
         gc = _get_gspread_client()
         if gc is None:
             return 0
@@ -2160,15 +2266,50 @@ def export_all_pre_signal_params_to_sheets():
         ws = _ensure_pre_signal_test_tab(sh)
         if not ws:
             raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB} in sheet {GOOGLE_SHEETS_ID}")
-        _write_pre_signal_test_rows(ws, rows)
-        log(f"[SHEETS EXPORT] rows={len(rows)}")
+        if is_first_export:
+            _write_pre_signal_test_rows(ws, rows)
+            symbol_to_row = {}
+            row_hash_by_symbol = {}
+            for idx, item in enumerate(rows_payload, start=2):
+                symbol = str(item.get("symbol") or "").strip()
+                if not symbol:
+                    continue
+                row_values = [item.get(c, "") for c in columns]
+                symbol_to_row[symbol] = idx
+                row_hash_by_symbol[symbol] = _hash_pre_signal_row(row_values)
+            rows_total = len(rows_payload)
+            rows_changed = len(rows_payload)
+            rows_written = len(rows_payload)
+            safe_save(
+                PRE_SIGNAL_SHEET_CACHE_FILE,
+                _build_pre_signal_sheet_cache(columns, rows_payload, symbol_to_row, row_hash_by_symbol),
+            )
+        else:
+            rows_total, rows_written, symbol_to_row, row_hash_by_symbol, _ = _apply_incremental_pre_signal_sheet_export(
+                ws=ws,
+                columns=columns,
+                rows_payload=rows_payload,
+                cache=cache,
+            )
+            rows_changed = rows_written
+            if rows_changed > 0:
+                safe_save(
+                    PRE_SIGNAL_SHEET_CACHE_FILE,
+                    _build_pre_signal_sheet_cache(columns, rows_payload, symbol_to_row, row_hash_by_symbol),
+                )
+            else:
+                log("[SHEETS EXPORT] rows_changed=0, skip write")
+        log(f"[SHEETS EXPORT] rows_total={rows_total} rows_changed={rows_changed} rows_written={rows_written}")
         if formatting_enabled:
             _apply_pre_signal_test_formatting(ws, rows_payload, columns)
             log("[SHEETS EXPORT] formatting=ENABLED")
         else:
             log("[SHEETS EXPORT] values updated only, formatting preserved")
-        return len(rows)
+        return rows_written
     except Exception as e:
+        if _is_sheets_rate_limit_error(e):
+            PRE_SIGNAL_SHEETS_EXPORT_PAUSED_UNTIL = now_ts_s() + SHEETS_EXPORT_COOLDOWN_SECONDS
+            log(f"[SHEETS EXPORT] paused_for_seconds={SHEETS_EXPORT_COOLDOWN_SECONDS} reason=429")
         log(f"[SHEETS ERROR] {e}")
         tg_send(f"[SHEETS ERROR] {e}")
         return 0
