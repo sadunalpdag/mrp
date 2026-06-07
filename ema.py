@@ -13,6 +13,8 @@ from typing import Dict, Optional, List, Tuple
 from dateutil import parser as _dtparser
 import numpy as np
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 
 # ==============================================================================
 # 📘 EMA ULTRA v15.11.0 — Fibonacci Only (LONG) Mode
@@ -158,12 +160,14 @@ MAX_CHANGE_PCT  = 15.0   # Coins with |24h change| > this are skipped
 SPOT_INTERVAL   = "15m"
 SPOT_KLINE_LIMIT = 220
 
-GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEET_ID",  "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 SHEETS_HEARTBEAT_ENABLED = True
 SHEETS_HEARTBEAT_INTERVAL_SECONDS = 60
 SHEETS_STATUS_TAB = "BOT_STATUS"
+GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
@@ -2006,11 +2010,10 @@ def send_pre_signal_performance_report():
 
 def export_pre_signal_test_to_google_sheets():
     try:
-        import gspread  # type: ignore
         from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
     except Exception:
         return
-    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
         return
     records = [r for r in load_pre_signal_live_state() if isinstance(r, dict)]
     if not records:
@@ -2042,8 +2045,10 @@ def export_pre_signal_test_to_google_sheets():
     ]
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
     try:
-        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        gc = _get_gspread_client()
+        if gc is None:
+            return
+        sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         ws = sh.get_worksheet_by_id(int(GOOGLE_SHEET_GID))
         ws.clear()
         ws.update("A1", rows)
@@ -2117,26 +2122,38 @@ def _ensure_sheets_status_tab(sheet_client) -> Optional[object]:
             return None
 
 
-def write_sheets_startup_status():
+def _get_gspread_client():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEETS_ID:
+        return None
+    try:
+        credentials = Credentials.from_service_account_info(
+            json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+            scopes=GOOGLE_SHEETS_SCOPES,
+        )
+    except json.JSONDecodeError:
+        credentials = Credentials.from_service_account_file(
+            GOOGLE_SERVICE_ACCOUNT_JSON,
+            scopes=GOOGLE_SHEETS_SCOPES,
+        )
+    return gspread.authorize(credentials)
+
+
+def test_google_sheets_connection():
     if not SHEETS_HEARTBEAT_ENABLED:
-        return
+        return False
     try:
-        import gspread  # type: ignore
-    except Exception:
-        return
-    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
-        return
-    try:
-        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
-        ws = _ensure_sheets_status_tab(sh)
-        if not ws:
+        gc = _get_gspread_client()
+        if gc is None:
+            return False
+        sh = gc.open_by_key(GOOGLE_SHEETS_ID)
+        if not _ensure_sheets_status_tab(sh):
             raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
-        utc_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        ws.update("A1", [[f"BOT STARTED: {utc_time}"]])
+        log("[SHEETS TEST] OK")
+        return True
     except Exception as e:
         print("[SHEETS ERROR]", str(e), flush=True)
         tg_send(f"Google Sheets connection failed: {e}")
+        return False
 
 
 def update_sheets_heartbeat(symbol_count=None, last_error=None):
@@ -2147,11 +2164,8 @@ def update_sheets_heartbeat(symbol_count=None, last_error=None):
     if now_s - LAST_SHEETS_HEARTBEAT_TS < SHEETS_HEARTBEAT_INTERVAL_SECONDS:
         return
     LAST_SHEETS_HEARTBEAT_TS = now_s
-    try:
-        import gspread  # type: ignore
-    except Exception:
-        return
-    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+    gc = _get_gspread_client()
+    if gc is None:
         return
     if symbol_count is not None:
         STATE["last_pre_signal_symbol_count"] = int(symbol_count)
@@ -2162,16 +2176,15 @@ def update_sheets_heartbeat(symbol_count=None, last_error=None):
     if str(err_val).strip() == "":
         err_val = "NONE"
     try:
-        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
-        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         ws = _ensure_sheets_status_tab(sh)
         if not ws:
             raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
         now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         rows = [
-            [f"Last alive: {now_text}"],
-            ["Service: RUNNING"],
-            [f"Last symbol count: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
+            [f"Last alive UTC: {now_text}"],
+            ["Service RUNNING"],
+            [f"Last scan symbols: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
             [f"Last scan time: {last_scan_time}"],
             [f"Last error: {err_val}"],
         ]
@@ -12127,7 +12140,7 @@ def scan_top_gainers_and_alert():
 def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
-    write_sheets_startup_status()
+    test_google_sheets_connection()
     
     tg_send("🚀 EMA ULTRA v15.11.0 active — Fibonacci LONG only mode\n"
             "📐 Aktif strateji: FIBONACCI RETRACEMENT (LONG only)\n"
