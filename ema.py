@@ -89,6 +89,7 @@ WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
 # PRE-SIGNAL system (parallel to existing EMA/FIB flow)
 PRE_SIGNAL_TYPE = "PRE_SIGNAL"
 PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
+PRE_SIGNAL_MAX_SYMBOLS = 0
 PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 50_000_000
 PRE_SIGNAL_TIMEFRAME = "15m"
 PRE_SIGNAL_LOOKBACK_CANDLES = 16
@@ -160,6 +161,9 @@ SPOT_KLINE_LIMIT = 220
 GOOGLE_SHEET_ID  = os.getenv("GOOGLE_SHEET_ID",  "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
+SHEETS_HEARTBEAT_ENABLED = True
+SHEETS_HEARTBEAT_INTERVAL_SECONDS = 60
+SHEETS_STATUS_TAB = "BOT_STATUS"
 
 SAVE_LOCK = threading.Lock()
 PRECISION_CACHE = {}
@@ -173,6 +177,7 @@ HOURLY_STATS = {}  # Hourly performance statistics
 TOP_VOLUME_SYMBOLS = []  # Top 25 coins by 24h volume (on-chain strategy filter)
 TOP_VOLUME_LAST_UPDATE = 0  # Timestamp of last volume ranking update
 VALID_FUTURES_SYMBOLS: set = set()  # Validated PERPETUAL USDT futures symbols
+LAST_SHEETS_HEARTBEAT_TS = 0
 getcontext().prec = 28
 
 # Algo order types that should be cancelled before closing positions
@@ -2064,7 +2069,18 @@ def export_pre_signal_test_to_google_sheets():
         log(f"[PRE SIGNAL SHEET EXPORT ERR] {e}")
 
 
-def _collect_all_futures_with_min_volume(min_quote_volume: float) -> List[Tuple[str, float]]:
+def _get_pre_signal_quote_volume_map() -> Dict[str, float]:
+    ticker_response = requests.get(BINANCE_FAPI + "/fapi/v1/ticker/24hr", timeout=15).json()
+    out: Dict[str, float] = {}
+    for t in ticker_response if isinstance(ticker_response, list) else []:
+        symbol = t.get("symbol")
+        if not symbol:
+            continue
+        out[symbol] = safe_float(t.get("quoteVolume"), 0.0)
+    return out
+
+
+def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
     try:
         info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
         valid_symbols = {
@@ -2073,20 +2089,97 @@ def _collect_all_futures_with_min_volume(min_quote_volume: float) -> List[Tuple[
             and s.get("status") == "TRADING"
             and s.get("contractType") == "PERPETUAL"
         }
-        ticker_response = requests.get(BINANCE_FAPI + "/fapi/v1/ticker/24hr", timeout=15).json()
+        log(f"[PRE-SIGNAL] Total futures USDT symbols: {len(valid_symbols)}")
+
+        quote_map = _get_pre_signal_quote_volume_map()
         out = []
-        for t in ticker_response if isinstance(ticker_response, list) else []:
-            symbol = t.get("symbol")
-            if symbol not in valid_symbols:
-                continue
-            quote_volume = safe_float(t.get("quoteVolume"), 0.0)
-            if quote_volume >= min_quote_volume:
+        for symbol in valid_symbols:
+            quote_volume = quote_map.get(symbol, 0.0)
+            if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
                 out.append((symbol, quote_volume))
         out.sort(key=lambda x: x[1], reverse=True)
+        log(f"[PRE-SIGNAL] After volume filter: {len(out)}")
+        if PRE_SIGNAL_MAX_SYMBOLS > 0:
+            out = out[:PRE_SIGNAL_MAX_SYMBOLS]
         return out
     except Exception as e:
-        log(f"[PRE SIGNAL UNIVERSE ERR] {e}")
+        log(f"[PRE-SIGNAL UNIVERSE ERR] {e}")
         return []
+
+
+def _ensure_sheets_status_tab(sheet_client) -> Optional[object]:
+    try:
+        return sheet_client.worksheet(SHEETS_STATUS_TAB)
+    except Exception:
+        try:
+            return sheet_client.add_worksheet(title=SHEETS_STATUS_TAB, rows=20, cols=5)
+        except Exception:
+            return None
+
+
+def write_sheets_startup_status():
+    if not SHEETS_HEARTBEAT_ENABLED:
+        return
+    try:
+        import gspread  # type: ignore
+    except Exception:
+        return
+    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        return
+    try:
+        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        ws = _ensure_sheets_status_tab(sh)
+        if not ws:
+            raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
+        utc_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        ws.update("A1", [[f"BOT STARTED: {utc_time}"]])
+    except Exception as e:
+        print("[SHEETS ERROR]", str(e), flush=True)
+        tg_send(f"Google Sheets connection failed: {e}")
+
+
+def update_sheets_heartbeat(symbol_count=None, last_error=None):
+    global LAST_SHEETS_HEARTBEAT_TS
+    if not SHEETS_HEARTBEAT_ENABLED:
+        return
+    now_s = now_ts_s()
+    if now_s - LAST_SHEETS_HEARTBEAT_TS < SHEETS_HEARTBEAT_INTERVAL_SECONDS:
+        return
+    LAST_SHEETS_HEARTBEAT_TS = now_s
+    try:
+        import gspread  # type: ignore
+    except Exception:
+        return
+    if not os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        return
+    if symbol_count is not None:
+        STATE["last_pre_signal_symbol_count"] = int(symbol_count)
+    if last_error is not None:
+        STATE["last_pre_signal_error"] = str(last_error) if str(last_error).strip() else "NONE"
+    last_scan_time = STATE.get("last_pre_signal_scan_time") or "N/A"
+    err_val = STATE.get("last_pre_signal_error") or "NONE"
+    if str(err_val).strip() == "":
+        err_val = "NONE"
+    try:
+        gc = gspread.service_account(filename=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+        sh = gc.open_by_key(GOOGLE_SHEET_ID)
+        ws = _ensure_sheets_status_tab(sh)
+        if not ws:
+            raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
+        now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        rows = [
+            [f"Last alive: {now_text}"],
+            ["Service: RUNNING"],
+            [f"Last symbol count: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
+            [f"Last scan time: {last_scan_time}"],
+            [f"Last error: {err_val}"],
+        ]
+        ws.update("A1", rows)
+        log("[SHEETS] Heartbeat updated")
+    except Exception as e:
+        print("[SHEETS ERROR]", str(e), flush=True)
+        tg_send(f"Google Sheets connection failed: {e}")
 
 
 def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m: List[list], btc_ctx: dict) -> Optional[dict]:
@@ -2384,15 +2477,38 @@ def generate_pre_signal_daily_reports_if_due():
 
 
 def run_pre_signal_scan(all_symbols: List[str]):
-    if PRE_SIGNAL_SOURCE_MODE != "ALL_FUTURES":
-        return
     now_s = now_ts_s()
     if now_s - int(STATE.get("last_pre_signal_scan_ts", 0)) < PRE_SIGNAL_SCAN_INTERVAL_SECONDS:
         return
 
-    universe = _collect_all_futures_with_min_volume(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+    log(f"[PRE-SIGNAL] Source mode: {PRE_SIGNAL_SOURCE_MODE}")
+    if PRE_SIGNAL_SOURCE_MODE == "ALL_FUTURES":
+        universe = get_all_futures_usdt_symbols_for_pre_signal()
+    else:
+        try:
+            quote_map = _get_pre_signal_quote_volume_map()
+        except Exception as e:
+            log(f"[PRE-SIGNAL FALLBACK UNIVERSE ERR] {e}")
+            quote_map = {}
+        universe = []
+        for symbol in all_symbols:
+            quote_volume = quote_map.get(symbol, 0.0)
+            if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
+                universe.append((symbol, quote_volume))
+        universe.sort(key=lambda x: x[1], reverse=True)
+        if PRE_SIGNAL_MAX_SYMBOLS > 0:
+            universe = universe[:PRE_SIGNAL_MAX_SYMBOLS]
+        log(f"[PRE-SIGNAL] After volume filter: {len(universe)}")
+
+    print(f"[PRE-SIGNAL] Scanning {len(universe)} futures symbols", flush=True)
+    tg_send(f"PRE-SIGNAL scan started: {len(universe)} symbols")
+
     if not universe:
         STATE["last_pre_signal_scan_ts"] = now_s
+        STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        STATE["last_pre_signal_symbol_count"] = 0
+        STATE["last_pre_signal_error"] = "NONE"
+        log("[PRE-SIGNAL] Scan completed")
         return
 
     open_real_symbols = set(REAL_POSITIONS_TRACKER.keys())
@@ -2515,8 +2631,12 @@ def run_pre_signal_scan(all_symbols: List[str]):
         f"[PRE SIGNAL SCAN] scanned={len(scan_records)} "
         f"generated={len(generated_signals)} volume_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME}"
     )
+    log("[PRE-SIGNAL] Scan completed")
     export_pre_signal_test_to_google_sheets()
     STATE["last_pre_signal_scan_ts"] = now_s
+    STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    STATE["last_pre_signal_symbol_count"] = len(scan_records)
+    STATE["last_pre_signal_error"] = "NONE"
 
 
 def _compute_trend_age(closes: List[float], direction: str = "LONG") -> int:
@@ -5300,6 +5420,9 @@ STATE_DEFAULT={
     "last_virtual_json_send": 0,  # Timestamp of last virtual trades JSON Telegram send
     "last_pre_signal_context_send": 0,  # Timestamp of last pre-signal context JSON Telegram send
     "last_pre_signal_scan_ts": 0,
+    "last_pre_signal_scan_time": "",
+    "last_pre_signal_symbol_count": 0,
+    "last_pre_signal_error": "NONE",
     "last_pre_signal_daily_report_date": "",
     "last_pump_watch_report_ts": 0,
     "last_pre_signal_performance_report_date": "",
@@ -12004,6 +12127,7 @@ def scan_top_gainers_and_alert():
 def main():
     # Initialize hourly statistics tracking
     initialize_hourly_stats()
+    write_sheets_startup_status()
     
     tg_send("🚀 EMA ULTRA v15.11.0 active — Fibonacci LONG only mode\n"
             "📐 Aktif strateji: FIBONACCI RETRACEMENT (LONG only)\n"
@@ -12236,6 +12360,10 @@ def main():
             _cleanup_trend_lock_expired()
 
             # 7) state save & sleep
+            update_sheets_heartbeat(
+                symbol_count=STATE.get("last_pre_signal_symbol_count", 0),
+                last_error=STATE.get("last_pre_signal_error", "NONE"),
+            )
             safe_save(STATE_FILE,STATE)
             time.sleep(30)
 
@@ -12243,10 +12371,14 @@ def main():
             # Catch type errors (like str/float division) with detailed logging
             log(f"[LOOP TYPE ERR] {te}")
             log(f"[LOOP TYPE ERR TRACE] {traceback.format_exc()}")
+            STATE["last_pre_signal_error"] = str(te)
+            update_sheets_heartbeat(last_error=te)
             time.sleep(10)
         except Exception as e:
             log(f"[LOOP ERR]{e}")
             log(f"[LOOP ERR TRACE] {traceback.format_exc()}")
+            STATE["last_pre_signal_error"] = str(e)
+            update_sheets_heartbeat(last_error=e)
             time.sleep(10)
 
 # ===================== ENTRY =====================
