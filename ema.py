@@ -1418,8 +1418,12 @@ def _collect_all_futures_with_min_volume(min_quote_volume: float) -> List[Tuple[
             if symbol not in valid_symbols:
                 continue
             quote_volume = safe_float(t.get("quoteVolume"), 0.0)
-            if quote_volume >= min_quote_volume:
-                out.append((symbol, quote_volume))
+            if quote_volume < min_quote_volume:
+                continue
+            price_change_pct = safe_float(t.get("priceChangePercent"), 0.0)
+            if price_change_pct > MAX_INCREASE_PCT:
+                continue
+            out.append((symbol, quote_volume))
         out.sort(key=lambda x: x[1], reverse=True)
         return out
     except Exception as e:
@@ -8282,9 +8286,6 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
 
     # Filter out overextended coins (>15% 24h change in either direction)
     df = df[df["priceChangePercent"].abs() <= MAX_CHANGE_PCT]
-
-    # Filter out coins with daily increase > MAX_INCREASE_PCT (günlük artış limiti)
-    df = df[df["priceChangePercent"] <= MAX_INCREASE_PCT]
 
     df = df.sort_values("priceChangePercent", ascending=False).head(top_n)
     return df[["symbol", "priceChangePercent", "quoteVolume"]].reset_index(drop=True)
