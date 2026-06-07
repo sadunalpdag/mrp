@@ -89,6 +89,8 @@ PRE_SIGNAL_LOOKBACK_CANDLES = 16
 PRE_SIGNAL_COOLDOWN_HOURS = 4
 PRE_SIGNAL_SCAN_INTERVAL_SECONDS = 15 * 60
 PRE_SIGNAL_TP_PCT = 0.006
+PRE_SIGNAL_BAR_INTERVAL_MINUTES = 15.0
+MINUTES_PER_HOUR = 60.0
 PRE_BTC_4H_FILTER_ENABLED = False
 PRE_BTC_4H_MIN_CHANGE = -1.0
 
@@ -1457,9 +1459,13 @@ def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m
 
         fast_start_idx = max(0, len(ema_fast_vals) - EMA_SLOPE_LOOKBACK_CANDLES)
         slow_start_idx = max(0, len(ema_slow_vals) - EMA_SLOPE_LOOKBACK_CANDLES)
-        whale_indices = [idx for idx, br in enumerate(body_ratios) if br > WHALE_CANDLE_BODY_RATIO_THRESHOLD]
-        first_whale_time = _ms_to_iso_utc(candles[whale_indices[0]][0]) if whale_indices else None
-        last_whale_time = _ms_to_iso_utc(candles[whale_indices[-1]][0]) if whale_indices else None
+        whale_candle_indices = [idx for idx, br in enumerate(body_ratios) if br > WHALE_CANDLE_BODY_RATIO_THRESHOLD]
+        if whale_candle_indices:
+            first_whale_time = _ms_to_iso_utc(candles[whale_candle_indices[0]][0])
+            last_whale_time = _ms_to_iso_utc(candles[whale_candle_indices[-1]][0])
+        else:
+            first_whale_time = None
+            last_whale_time = None
 
         return {
             "symbol": symbol,
@@ -1580,7 +1586,7 @@ def _update_pre_signals_master_record(updated_record: dict):
 
 
 def _avg(vals: List[float]) -> Optional[float]:
-    clean = [float(v) for v in vals if isinstance(v, (int, float))]
+    clean = [v for v in vals if isinstance(v, (int, float))]
     if not clean:
         return None
     return round(float(np.mean(clean)), 6)
@@ -1607,9 +1613,9 @@ def update_open_pre_signals_tp():
             still_open.append(rec)
             continue
         signal_dt = _parse_iso_utc(rec.get("signal_time")) or now_dt
-        elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / 3600.0)
+        elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / (MINUTES_PER_HOUR * MINUTES_PER_HOUR))
         rec["hours_open"] = round(elapsed_hours, 4)
-        rec["bars_open"] = max(0, int(round((elapsed_hours * 60.0) / 15.0)))
+        rec["bars_open"] = max(0, int(round((elapsed_hours * MINUTES_PER_HOUR) / PRE_SIGNAL_BAR_INTERVAL_MINUTES)))
         rec["max_price_seen"] = round(max(_vt_safe_float(rec.get("max_price_seen"), entry), last_price), 8)
         rec["max_profit_pct"] = round(((rec["max_price_seen"] / entry) - 1.0) * 100.0, 6)
         rec["status"] = "OPEN"
@@ -1627,10 +1633,10 @@ def update_open_pre_signals_tp():
 
             first_whale_dt = _parse_iso_utc(rec.get("first_whale_candle_time"))
             if first_whale_dt:
-                whale_to_tp_min = max(0.0, (close_dt - first_whale_dt).total_seconds() / 60.0)
+                whale_to_tp_min = max(0.0, (close_dt - first_whale_dt).total_seconds() / MINUTES_PER_HOUR)
                 rec["minutes_whale_to_tp"] = round(whale_to_tp_min, 2)
-                rec["bars_whale_to_tp"] = int(round(whale_to_tp_min / 15.0))
-                rec["hours_whale_to_tp"] = round(whale_to_tp_min / 60.0, 4)
+                rec["bars_whale_to_tp"] = int(round(whale_to_tp_min / PRE_SIGNAL_BAR_INTERVAL_MINUTES))
+                rec["hours_whale_to_tp"] = round(whale_to_tp_min / MINUTES_PER_HOUR, 4)
             closed_now.append(rec)
         else:
             still_open.append(rec)
@@ -1663,7 +1669,7 @@ def _build_pre_signal_daily_report() -> dict:
         "avg_bars_to_tp": _avg([_vt_safe_float(r.get("bars_to_tp"), 0.0) for r in tp_records]),
         "avg_whale_to_tp_minutes": _avg([_vt_safe_float(r.get("minutes_whale_to_tp"), 0.0) for r in tp_records]),
         "avg_whale_to_tp_bars": _avg([_vt_safe_float(r.get("bars_whale_to_tp"), 0.0) for r in tp_records]),
-        "avg_signal_to_tp_minutes": _avg([_vt_safe_float(r.get("hours_signal_to_tp"), 0.0) * 60.0 for r in tp_records]),
+        "avg_signal_to_tp_minutes": _avg([_vt_safe_float(r.get("hours_signal_to_tp"), 0.0) * MINUTES_PER_HOUR for r in tp_records]),
         "avg_signal_to_tp_bars": _avg([_vt_safe_float(r.get("bars_signal_to_tp"), 0.0) for r in tp_records]),
     }
 
@@ -1698,6 +1704,7 @@ def _build_pre_signal_parameter_stats() -> dict:
         "tp_count": len(tp_group),
         "non_tp_count": len(non_tp_group),
         "tp": _group_avg(tp_group),
+        "non_tp": _group_avg(non_tp_group),
         "missed_open": _group_avg(non_tp_group),
     }
 
@@ -10029,6 +10036,7 @@ def _setup_transition(symbol: str, new_state: str, extra: dict = None):
         tg_send(f"{msg}{get_real_window_warning_note()}")
         if _has_recent_pre_signal(symbol, PRE_SIGNAL_COOLDOWN_HOURS):
             tg_send(f"ℹ️ {symbol}: Bu coin daha önce PRE-SIGNAL vermişti.")
+            # Keep existing Turkish message unchanged and append the requested v2 note.
             tg_send("ℹ️ Previously generated PRE-SIGNAL")
         try:
             klines_list = futures_get_klines(symbol, "15m", 120)
