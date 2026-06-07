@@ -163,10 +163,12 @@ SPOT_KLINE_LIMIT = 220
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
+PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
 SHEETS_HEARTBEAT_ENABLED = True
 SHEETS_HEARTBEAT_INTERVAL_SECONDS = 60
 SHEETS_STATUS_TAB = "BOT_STATUS"
+PRE_SIGNAL_TEST_TAB = "PRE_SIGNAL_TEST"
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 SAVE_LOCK = threading.Lock()
@@ -1746,7 +1748,7 @@ def run_pump_watch_scan():
     log(f"[PUMP WATCH] detected={found} threshold={PUMP_WATCH_DAILY_GAIN_THRESHOLD}")
 
 
-def generate_pump_watch_summary_and_report_if_due():
+def send_pump_watch_report_if_due():
     now_ts = now_ts_s()
     if now_ts - int(STATE.get("last_pump_watch_report_ts", 0)) < int(PUMP_WATCH_REPORT_INTERVAL_HOURS * 3600):
         return
@@ -1802,18 +1804,32 @@ def generate_pump_watch_summary_and_report_if_due():
         "Pre-signal before pump:",
         f"{pre_signal_before_count}/{count}",
         "",
-        "Avg values:",
-        f"Compression: {round(_vt_safe_float(avg_compression, 0.0), 3)}",
-        f"RSI Change: {round(_vt_safe_float(avg_rsi_change, 0.0), 3)}",
-        f"Max Volume Ratio: {round(_vt_safe_float(avg_max_vol, 0.0), 3)}",
-        f"Whale Candle: {round(_vt_safe_float(avg_whale, 0.0), 3)}",
+        "Avg Compression:",
+        f"{round(_vt_safe_float(avg_compression, 0.0), 3)}",
+        "",
+        "Avg RSI Change:",
+        f"{round(_vt_safe_float(avg_rsi_change, 0.0), 3)}",
+        "",
+        "Avg Max Volume Ratio:",
+        f"{round(_vt_safe_float(avg_max_vol, 0.0), 3)}",
+        "",
+        "Avg Whale Candle:",
+        f"{round(_vt_safe_float(avg_whale, 0.0), 3)}",
         "",
         "Most common reject reasons:",
     ]
-    for i, (reason, rcnt) in enumerate(sorted(reject_counts.items(), key=lambda kv: kv[1], reverse=True)[:3], start=1):
+    top_three_reasons = sorted(reject_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    for i, (reason, rcnt) in enumerate(top_three_reasons, start=1):
         msg_lines.append(f"{i}. {reason} {rcnt}")
+    if not top_three_reasons:
+        msg_lines.append("1. NONE 0")
     tg_send("\n".join(msg_lines))
     STATE["last_pump_watch_report_ts"] = now_ts
+    log("[PUMP WATCH REPORT] sent")
+
+
+def generate_pump_watch_summary_and_report_if_due():
+    send_pump_watch_report_if_due()
 
 
 def load_open_pre_signal_performance():
@@ -1851,6 +1867,8 @@ def create_pre_signal_performance_record(signal: dict, context: dict):
         "tp_levels": {},
         "max_price_seen": round(entry_price, 8),
         "max_profit_pct": 0.0,
+        "bars_open": 0,
+        "hours_open": 0.0,
         "last_price": round(entry_price, 8),
         "last_update_time": signal_time,
         "first_whale_candle_time": context.get("first_whale_candle_time"),
@@ -1858,6 +1876,7 @@ def create_pre_signal_performance_record(signal: dict, context: dict):
         "pre_signal_context": context,
     }
     for tp_name, tp_pct in PRE_TP_LEVELS.items():
+        rec[f"minutes_first_whale_to_{tp_name}"] = None
         rec["tp_levels"][tp_name] = {
             "target_pct": tp_pct,
             "target_price": round(entry_price * (1.0 + tp_pct), 8),
@@ -1876,6 +1895,7 @@ def create_pre_signal_performance_record(signal: dict, context: dict):
 def update_open_pre_signal_performance():
     open_data = load_open_pre_signal_performance()
     if not open_data:
+        log("[PRE PERF] open=0")
         return
     now_dt = datetime.now(timezone.utc)
     changed = False
@@ -1884,16 +1904,19 @@ def update_open_pre_signal_performance():
         entry = _vt_safe_float(rec.get("entry_price"), 0.0)
         if not symbol or entry <= 0:
             continue
+        signal_dt = _parse_iso_utc(rec.get("signal_time")) or now_dt
+        elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / 3600.0)
+        rec["status"] = "OPEN"
+        rec["hours_open"] = round(elapsed_hours, 4)
+        rec["bars_open"] = int(round((elapsed_hours * MINUTES_PER_HOUR) / PRE_SIGNAL_BAR_INTERVAL_MINUTES))
+        changed = True
         current = _vt_safe_float(futures_get_price(symbol), 0.0)
         if current <= 0:
             continue
-        changed = True
         rec["last_price"] = round(current, 8)
         rec["last_update_time"] = now_dt.isoformat()
         rec["max_price_seen"] = round(max(_vt_safe_float(rec.get("max_price_seen"), entry), current), 8)
         rec["max_profit_pct"] = round(((rec["max_price_seen"] / entry) - 1.0) * 100.0, 6)
-        signal_dt = _parse_iso_utc(rec.get("signal_time")) or now_dt
-        elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / 3600.0)
         first_whale_dt = _parse_iso_utc(rec.get("first_whale_candle_time"))
         for tp_name, tp_data in (rec.get("tp_levels") or {}).items():
             if tp_data.get("hit"):
@@ -1913,17 +1936,21 @@ def update_open_pre_signal_performance():
             rec[f"bars_first_whale_to_{tp_name}"] = tp_data.get("bars_first_whale_to_hit")
     if changed:
         save_open_pre_signal_performance(open_data)
+    log(f"[PRE PERF] open={len(open_data)}")
 
 
 def close_finished_pre_signal_performance():
     open_data = load_open_pre_signal_performance()
     if not open_data:
+        log(f"[PRE PERF] closed={len(load_closed_pre_signal_performance())}")
         return
     now_dt = datetime.now(timezone.utc)
     still_open, closed_now = [], []
     for rec in open_data:
         signal_dt = _parse_iso_utc(rec.get("signal_time")) or now_dt
         elapsed_hours = max(0.0, (now_dt - signal_dt).total_seconds() / 3600.0)
+        rec["hours_open"] = round(elapsed_hours, 4)
+        rec["bars_open"] = int(round((elapsed_hours * MINUTES_PER_HOUR) / PRE_SIGNAL_BAR_INTERVAL_MINUTES))
         levels = rec.get("tp_levels") or {}
         all_hit = bool(levels) and all(bool(v.get("hit")) for v in levels.values())
         expired = elapsed_hours >= PRE_SIGNAL_MAX_TRACK_HOURS
@@ -1934,6 +1961,8 @@ def close_finished_pre_signal_performance():
         total_levels = max(1, len(levels))
         rec["status"] = "CLOSED"
         rec["close_time"] = now_dt.isoformat()
+        rec["close_price"] = rec.get("last_price")
+        rec["profit_pct"] = rec.get("max_profit_pct")
         rec["total_hours_tracked"] = round(elapsed_hours, 4)
         if all_hit:
             rec["final_status"] = "ALL_TP_HIT"
@@ -1948,23 +1977,34 @@ def close_finished_pre_signal_performance():
         closed = load_closed_pre_signal_performance()
         closed.extend(closed_now)
         save_closed_pre_signal_performance(closed)
+        closed_count = len(closed)
+    else:
+        closed_count = len(load_closed_pre_signal_performance())
     save_open_pre_signal_performance(still_open)
+    log(f"[PRE PERF] closed={closed_count}")
 
 
 def generate_pre_signal_performance_summary():
+    open_records = [r for r in load_open_pre_signal_performance() if isinstance(r, dict)]
     closed = [r for r in load_closed_pre_signal_performance() if isinstance(r, dict)]
-    total = len(closed)
+    all_records = closed + open_records
+    total = len(all_records)
     summary = {
         "generated_at": _vt_now_iso(),
         "total_pre_signals": total,
+        "open_count": len(open_records),
+        "closed_count": len(closed),
     }
     avg_max_profit_vals = []
+    whale_to_tp_minutes = []
     for tp_name in PRE_TP_LEVELS.keys():
         hit_items = []
-        for rec in closed:
+        for rec in all_records:
             lv = (rec.get("tp_levels") or {}).get(tp_name) or {}
             if lv.get("hit"):
                 hit_items.append(lv)
+                if lv.get("minutes_first_whale_to_hit") is not None:
+                    whale_to_tp_minutes.append(_vt_safe_float(lv.get("minutes_first_whale_to_hit"), 0.0))
         hit_count = len(hit_items)
         summary[tp_name] = {
             "hit_count": hit_count,
@@ -1972,10 +2012,12 @@ def generate_pre_signal_performance_summary():
             "avg_hours_to_hit": _avg([_vt_safe_float(x.get("hours_to_hit"), 0.0) for x in hit_items]) or 0.0,
             "avg_bars_to_hit": _avg([_vt_safe_float(x.get("bars_to_hit"), 0.0) for x in hit_items]) or 0.0,
         }
-    for rec in closed:
+    for rec in all_records:
         avg_max_profit_vals.append(_vt_safe_float(rec.get("max_profit_pct"), 0.0))
     summary["avg_max_profit_pct"] = _avg(avg_max_profit_vals) or 0.0
+    summary["avg_whale_to_tp_minutes"] = _avg(whale_to_tp_minutes) or 0.0
     safe_save(PRE_SIGNAL_PERFORMANCE_SUMMARY_FILE, summary)
+    log("[PRE PERF] summary updated")
     return summary
 
 
@@ -2008,25 +2050,40 @@ def send_pre_signal_performance_report():
     STATE["last_pre_signal_performance_report_date"] = today
 
 
-def export_pre_signal_test_to_google_sheets():
+def export_all_pre_signal_params_to_sheets():
     try:
         from gspread_formatting import CellFormat, Color, format_cell_range, batch_updater  # type: ignore
-    except Exception:
-        return
-    if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        return
-    records = [r for r in load_pre_signal_live_state() if isinstance(r, dict)]
-    if not records:
-        return
+    except Exception as e:
+        log(f"[SHEETS ERROR] PRE_SIGNAL_TEST export dependency missing: {e}")
+        return 0
+    if not PRE_SIGNAL_TEST_EXPORT_ENABLED or not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return 0
+    btc_ctx = _fetch_btc_context()
+    scan_time_iso = _vt_now_iso()
     rows_payload = []
-    for rec in records:
-        prox = _build_pre_signal_proximity(rec)
-        row = dict(rec)
+    for ticker in _fetch_all_usdt_perpetual_tickers():
+        symbol = ticker.get("symbol")
+        quote_volume = _vt_safe_float(ticker.get("quoteVolume"), 0.0)
+        if not symbol or quote_volume < PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
+            continue
+        klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
+        metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
+        if not metrics:
+            continue
+        row = {
+            "scan_time": scan_time_iso,
+            "symbol": symbol,
+            "daily_change_pct": round(_vt_safe_float(ticker.get("priceChangePercent"), 0.0), 4),
+            "quote_volume": round(quote_volume, 2),
+            **metrics,
+        }
+        decision = evaluate_pre_signal_thresholds(row)
+        prox = _build_pre_signal_proximity(row)
         row["pre_signal_score"] = prox["pre_signal_score"]
         row["pass_count"] = prox["pass_count"]
         row["near_count"] = prox["near_count"]
         row["fail_count"] = prox["fail_count"]
-        row["is_pre_signal"] = bool(rec.get("would_pre_signal", rec.get("pre_signal", False)))
+        row["is_pre_signal"] = bool(decision.get("is_pre_signal"))
         row["reject_reasons"] = ", ".join(prox["reject_reasons"])
         row["_metric_colors"] = prox["metric_colors"]
         rows_payload.append(row)
@@ -2037,19 +2094,22 @@ def export_pre_signal_test_to_google_sheets():
         _vt_safe_float(r.get("fail_count"), 0.0),
     ))
     columns = [
-        "scan_time", "symbol", "daily_change_pct", "price_change_4h_pct", "volume_change_4h_pct",
-        "avg_volume_ratio", "max_volume_ratio", "avg_body_ratio", "max_body_ratio", "ema_fast_slope",
-        "ema_slow_slope", "rsi_change", "compression_score", "whale_candle_count", "breakout_distance_pct",
-        "trend_age", "range_pct", "btc_4h_change_pct", "pre_signal_score", "pass_count", "fail_count",
-        "near_count", "is_pre_signal", "reject_reasons",
+        "scan_time", "symbol", "daily_change_pct", "quote_volume", "price_change_4h_pct",
+        "volume_change_4h_pct", "avg_volume_ratio", "max_volume_ratio", "avg_body_ratio", "max_body_ratio",
+        "ema_fast_slope", "ema_slow_slope", "rsi_start", "rsi_end", "rsi_change", "range_pct",
+        "compression_score", "volume_acceleration", "whale_candle_count", "breakout_distance_pct",
+        "trend_age", "btc_4h_change_pct", "pre_signal_score", "pass_count", "near_count", "fail_count",
+        "is_pre_signal", "reject_reasons",
     ]
     rows = [columns] + [[item.get(c, "") for c in columns] for item in rows_payload]
     try:
         gc = _get_gspread_client()
         if gc is None:
-            return
+            return 0
         sh = gc.open_by_key(GOOGLE_SHEETS_ID)
-        ws = sh.get_worksheet_by_id(int(GOOGLE_SHEET_GID))
+        ws = _ensure_pre_signal_test_tab(sh)
+        if not ws:
+            raise RuntimeError(f"Could not open/create tab: {PRE_SIGNAL_TEST_TAB} in sheet {GOOGLE_SHEETS_ID}")
         ws.clear()
         ws.update("A1", rows)
         metric_col_idx = {c: i + 1 for i, c in enumerate(columns)}
@@ -2070,8 +2130,16 @@ def export_pre_signal_test_to_google_sheets():
                     cell_fmt = CellFormat(backgroundColor=Color(*rgb))
                     col_letter = _col_to_a1(col)
                     format_cell_range(ws, f"{col_letter}{ridx}:{col_letter}{ridx}", cell_fmt)
+        log(f"[SHEETS EXPORT] PRE_SIGNAL_TEST rows={len(rows)}")
+        return len(rows)
     except Exception as e:
-        log(f"[PRE SIGNAL SHEET EXPORT ERR] {e}")
+        log(f"[SHEETS ERROR] {e}")
+        tg_send(f"[SHEETS ERROR] {e}")
+        return 0
+
+
+def export_pre_signal_test_to_google_sheets():
+    return export_all_pre_signal_params_to_sheets()
 
 
 def _get_pre_signal_quote_volume_map() -> Dict[str, float]:
@@ -2094,6 +2162,7 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
             and s.get("status") == "TRADING"
             and s.get("contractType") == "PERPETUAL"
         }
+        STATE["last_pre_signal_total_futures_count"] = len(valid_symbols)
         log(f"[PRE-SIGNAL] Total futures USDT symbols: {len(valid_symbols)}")
 
         quote_map = _get_pre_signal_quote_volume_map()
@@ -2104,6 +2173,7 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
                 out.append((symbol, quote_volume))
         out.sort(key=lambda x: x[1], reverse=True)
         log(f"[PRE-SIGNAL] After volume filter: {len(out)}")
+        STATE["last_pre_signal_after_volume_filter"] = len(out)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             out = out[:PRE_SIGNAL_MAX_SYMBOLS]
         return out
@@ -2120,6 +2190,24 @@ def _ensure_sheets_status_tab(sheet_client) -> Optional[object]:
             return sheet_client.add_worksheet(title=SHEETS_STATUS_TAB, rows=20, cols=5)
         except Exception:
             return None
+
+
+def _ensure_pre_signal_test_tab(sheet_client) -> Optional[object]:
+    try:
+        return sheet_client.worksheet(PRE_SIGNAL_TEST_TAB)
+    except Exception:
+        pass
+    try:
+        gid = int(str(GOOGLE_SHEET_GID).strip())
+        ws = sheet_client.get_worksheet_by_id(gid)
+        if ws:
+            return ws
+    except Exception:
+        pass
+    try:
+        return sheet_client.add_worksheet(title=PRE_SIGNAL_TEST_TAB, rows=5000, cols=40)
+    except Exception:
+        return None
 
 
 def _get_gspread_client():
@@ -2151,12 +2239,12 @@ def test_google_sheets_connection():
         log("[SHEETS TEST] OK")
         return True
     except Exception as e:
-        print("[SHEETS ERROR]", str(e), flush=True)
-        tg_send(f"Google Sheets connection failed: {e}")
+        log(f"[SHEETS ERROR] {e}")
+        tg_send(f"[SHEETS ERROR] {e}")
         return False
 
 
-def update_sheets_heartbeat(symbol_count=None, last_error=None):
+def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=None):
     global LAST_SHEETS_HEARTBEAT_TS
     if not SHEETS_HEARTBEAT_ENABLED:
         return
@@ -2169,6 +2257,8 @@ def update_sheets_heartbeat(symbol_count=None, last_error=None):
         return
     if symbol_count is not None:
         STATE["last_pre_signal_symbol_count"] = int(symbol_count)
+    if last_scan_time is not None:
+        STATE["last_pre_signal_scan_time"] = str(last_scan_time)
     if last_error is not None:
         STATE["last_pre_signal_error"] = str(last_error) if str(last_error).strip() else "NONE"
     last_scan_time = STATE.get("last_pre_signal_scan_time") or "N/A"
@@ -2182,17 +2272,17 @@ def update_sheets_heartbeat(symbol_count=None, last_error=None):
             raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
         now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         rows = [
-            [f"Last alive UTC: {now_text}"],
-            ["Service RUNNING"],
-            [f"Last scan symbols: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
+            [f"Last alive: {now_text}"],
+            ["Service: RUNNING"],
+            [f"Last pre-signal scan symbols: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
             [f"Last scan time: {last_scan_time}"],
             [f"Last error: {err_val}"],
         ]
         ws.update("A1", rows)
         log("[SHEETS] Heartbeat updated")
     except Exception as e:
-        print("[SHEETS ERROR]", str(e), flush=True)
-        tg_send(f"Google Sheets connection failed: {e}")
+        log(f"[SHEETS ERROR] {e}")
+        tg_send(f"[SHEETS ERROR] {e}")
 
 
 def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m: List[list], btc_ctx: dict) -> Optional[dict]:
@@ -2489,14 +2579,28 @@ def generate_pre_signal_daily_reports_if_due():
     STATE["last_pre_signal_daily_report_date"] = today
 
 
+def _log_pre_signal_debug(total_symbols_scanned: int, after_volume_filter: int, total_candidates: int, total_rejected: int, total_saved: int, sheet_export_rows: int):
+    log("[PRE-SIGNAL DEBUG]\n"
+        f"total_symbols_scanned={total_symbols_scanned}\n"
+        f"after_volume_filter={after_volume_filter}\n"
+        f"total_candidates={total_candidates}\n"
+        f"total_rejected={total_rejected}\n"
+        f"total_saved={total_saved}\n"
+        f"sheet_export_rows={sheet_export_rows}")
+
+
 def run_pre_signal_scan(all_symbols: List[str]):
     now_s = now_ts_s()
     if now_s - int(STATE.get("last_pre_signal_scan_ts", 0)) < PRE_SIGNAL_SCAN_INTERVAL_SECONDS:
         return
 
     log(f"[PRE-SIGNAL] Source mode: {PRE_SIGNAL_SOURCE_MODE}")
+    total_symbols_scanned = 0
+    after_volume_filter = 0
     if PRE_SIGNAL_SOURCE_MODE == "ALL_FUTURES":
         universe = get_all_futures_usdt_symbols_for_pre_signal()
+        total_symbols_scanned = int(STATE.get("last_pre_signal_total_futures_count", 0))
+        after_volume_filter = len(universe)
     else:
         try:
             quote_map = _get_pre_signal_quote_volume_map()
@@ -2512,6 +2616,8 @@ def run_pre_signal_scan(all_symbols: List[str]):
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             universe = universe[:PRE_SIGNAL_MAX_SYMBOLS]
         log(f"[PRE-SIGNAL] After volume filter: {len(universe)}")
+        total_symbols_scanned = len(all_symbols)
+        after_volume_filter = len(universe)
 
     print(f"[PRE-SIGNAL] Scanning {len(universe)} futures symbols", flush=True)
     tg_send(f"PRE-SIGNAL scan started: {len(universe)} symbols")
@@ -2521,6 +2627,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         STATE["last_pre_signal_symbol_count"] = 0
         STATE["last_pre_signal_error"] = "NONE"
+        _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, 0, 0, 0, 0)
         log("[PRE-SIGNAL] Scan completed")
         return
 
@@ -2645,11 +2752,14 @@ def run_pre_signal_scan(all_symbols: List[str]):
         f"generated={len(generated_signals)} volume_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME}"
     )
     log("[PRE-SIGNAL] Scan completed")
-    export_pre_signal_test_to_google_sheets()
     STATE["last_pre_signal_scan_ts"] = now_s
     STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     STATE["last_pre_signal_symbol_count"] = len(scan_records)
     STATE["last_pre_signal_error"] = "NONE"
+    sheet_export_rows = export_all_pre_signal_params_to_sheets() if PRE_SIGNAL_TEST_EXPORT_ENABLED else 0
+    total_candidates = sum(1 for row in scan_records if bool(row.get("would_pre_signal", row.get("pre_signal"))))
+    total_rejected = sum(1 for row in scan_records if not bool(row.get("pre_signal")))
+    _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, total_candidates, total_rejected, len(generated_signals), sheet_export_rows)
 
 
 def _compute_trend_age(closes: List[float], direction: str = "LONG") -> int:
@@ -12175,7 +12285,7 @@ def main():
             update_open_pre_signals_tp()
             generate_pre_signal_daily_reports_if_due()
             run_pump_watch_scan()
-            generate_pump_watch_summary_and_report_if_due()
+            send_pump_watch_report_if_due()
             update_open_pre_signal_performance()
             close_finished_pre_signal_performance()
             generate_pre_signal_performance_summary()
@@ -12375,6 +12485,7 @@ def main():
             # 7) state save & sleep
             update_sheets_heartbeat(
                 symbol_count=STATE.get("last_pre_signal_symbol_count", 0),
+                last_scan_time=STATE.get("last_pre_signal_scan_time", "N/A"),
                 last_error=STATE.get("last_pre_signal_error", "NONE"),
             )
             safe_save(STATE_FILE,STATE)
@@ -12385,13 +12496,19 @@ def main():
             log(f"[LOOP TYPE ERR] {te}")
             log(f"[LOOP TYPE ERR TRACE] {traceback.format_exc()}")
             STATE["last_pre_signal_error"] = str(te)
-            update_sheets_heartbeat(last_error=te)
+            update_sheets_heartbeat(
+                last_scan_time=STATE.get("last_pre_signal_scan_time", "N/A"),
+                last_error=te,
+            )
             time.sleep(10)
         except Exception as e:
             log(f"[LOOP ERR]{e}")
             log(f"[LOOP ERR TRACE] {traceback.format_exc()}")
             STATE["last_pre_signal_error"] = str(e)
-            update_sheets_heartbeat(last_error=e)
+            update_sheets_heartbeat(
+                last_scan_time=STATE.get("last_pre_signal_scan_time", "N/A"),
+                last_error=e,
+            )
             time.sleep(10)
 
 # ===================== ENTRY =====================
