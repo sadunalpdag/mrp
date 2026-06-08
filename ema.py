@@ -179,7 +179,10 @@ SHEETS_STATUS_TAB = "BOT_STATUS"
 PRE_SIGNAL_TEST_TAB = "PRE_SIGNAL_TEST"
 PRE_SIGNAL_TEST_UPDATE_MAX_ROWS = 600
 PRE_SIGNAL_TEST_TRACK_MAX_ROWS = 1000
-PRE_SIGNAL_TEST_UPDATE_RANGE = f"A1:AF{PRE_SIGNAL_TEST_UPDATE_MAX_ROWS}"
+PRE_SIGNAL_DASHBOARD_ROWS = 15
+PRE_SIGNAL_TABLE_HEADER_ROW = PRE_SIGNAL_DASHBOARD_ROWS + 2
+PRE_SIGNAL_TABLE_DATA_START_ROW = PRE_SIGNAL_TABLE_HEADER_ROW + 1
+PRE_SIGNAL_TEST_UPDATE_RANGE = f"A{PRE_SIGNAL_TABLE_HEADER_ROW}:AF{PRE_SIGNAL_TABLE_HEADER_ROW + PRE_SIGNAL_TEST_UPDATE_MAX_ROWS - 1}"
 PRE_SIGNAL_SHEET_CACHE_FILE = os.path.join(DATA_DIR, "pre_signal_sheet_cache.json")
 SHEETS_EXPORT_COOLDOWN_SECONDS = 5 * 60
 GOOGLE_SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -2100,7 +2103,7 @@ def _hash_pre_signal_row(row_values: List[object]) -> str:
 
 def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
     write_rows = rows[:PRE_SIGNAL_TEST_UPDATE_MAX_ROWS]
-    existing_rows = ws.get(f"A1:A{PRE_SIGNAL_TEST_TRACK_MAX_ROWS}")
+    existing_rows = ws.get(f"A{PRE_SIGNAL_TABLE_HEADER_ROW}:A{PRE_SIGNAL_TABLE_HEADER_ROW + PRE_SIGNAL_TEST_TRACK_MAX_ROWS - 1}")
     previous_row_count = 0
     for ridx, row in enumerate(existing_rows or [], start=1):
         if row and str(row[0]).strip():
@@ -2108,12 +2111,15 @@ def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
     ws.update(range_name=PRE_SIGNAL_TEST_UPDATE_RANGE, values=write_rows)
     new_row_count = len(write_rows)
     if new_row_count < previous_row_count:
-        ws.batch_clear([f"A{new_row_count + 1}:AF{min(previous_row_count, PRE_SIGNAL_TEST_TRACK_MAX_ROWS)}"])
+        ws.batch_clear([
+            f"A{PRE_SIGNAL_TABLE_HEADER_ROW + new_row_count}:AF{PRE_SIGNAL_TABLE_HEADER_ROW + min(previous_row_count, PRE_SIGNAL_TEST_TRACK_MAX_ROWS) - 1}"
+        ])
 
 
 def _build_pre_signal_sheet_cache(columns: List[str], rows_payload: List[dict], symbol_to_row: Dict[str, int], row_hash_by_symbol: Dict[str, str]) -> dict:
     return {
         "version": 1,
+        "table_data_start_row": PRE_SIGNAL_TABLE_DATA_START_ROW,
         "columns": columns,
         "symbol_to_row": symbol_to_row,
         "row_hash_by_symbol": row_hash_by_symbol,
@@ -2124,10 +2130,12 @@ def _build_pre_signal_sheet_cache(columns: List[str], rows_payload: List[dict], 
 
 def _normalize_pre_signal_sheet_cache(raw_cache: dict) -> dict:
     cache = raw_cache if isinstance(raw_cache, dict) else {}
+    cache_table_start_row = int(_vt_safe_float(cache.get("table_data_start_row"), PRE_SIGNAL_TABLE_DATA_START_ROW))
     symbol_to_row_raw = cache.get("symbol_to_row")
     hash_raw = cache.get("row_hash_by_symbol")
     symbol_to_row: Dict[str, int] = {}
     row_hash_by_symbol: Dict[str, str] = {}
+    use_cached_rows = cache_table_start_row == PRE_SIGNAL_TABLE_DATA_START_ROW
     if isinstance(symbol_to_row_raw, dict):
         for symbol, row_idx in symbol_to_row_raw.items():
             if not symbol:
@@ -2136,7 +2144,7 @@ def _normalize_pre_signal_sheet_cache(raw_cache: dict) -> dict:
                 row_num = int(row_idx)
             except Exception:
                 continue
-            if row_num >= 2:
+            if use_cached_rows and row_num >= PRE_SIGNAL_TABLE_DATA_START_ROW:
                 symbol_to_row[str(symbol)] = row_num
     if isinstance(hash_raw, dict):
         for symbol, row_hash in hash_raw.items():
@@ -2149,6 +2157,119 @@ def _normalize_pre_signal_sheet_cache(raw_cache: dict) -> dict:
     }
 
 
+def _setup_warning_score(item: dict) -> float:
+    fail_count = _vt_safe_float(item.get("fail_count"), 0.0)
+    near_count = _vt_safe_float(item.get("near_count"), 0.0)
+    return max(0.0, round(fail_count + (near_count * 0.5), 4))
+
+
+def _setup_warning_bucket(score: float) -> str:
+    if score <= 1.0:
+        return "healthy"
+    if score <= 2.5:
+        return "caution"
+    return "high_risk"
+
+
+def _apply_dashboard_color(ws, a1_cell: str, color_hex: str) -> None:
+    rgb = _hex_to_rgb01(color_hex)
+    try:
+        if gspread_formatting is not None:
+            CellFormat = gspread_formatting.CellFormat
+            Color = gspread_formatting.Color
+            gspread_formatting.format_cell_range(
+                ws,
+                f"{a1_cell}:{a1_cell}",
+                CellFormat(backgroundColor=Color(*rgb)),
+            )
+            return
+        ws.format(
+            a1_cell,
+            {
+                "backgroundColor": {
+                    "red": rgb[0],
+                    "green": rgb[1],
+                    "blue": rgb[2],
+                }
+            },
+        )
+    except Exception:
+        pass
+
+
+def _build_setup_warning_dashboard_rows(rows_payload: List[dict], scan_time_iso: str) -> Tuple[List[list], Dict[str, str]]:
+    total_rows = len(rows_payload)
+    warning_scores: List[float] = []
+    bucket_counts = {
+        "healthy": 0,
+        "caution": 0,
+        "high_risk": 0,
+    }
+    reason_counts: Dict[str, int] = {}
+    for item in rows_payload:
+        score = _setup_warning_score(item)
+        warning_scores.append(score)
+        bucket_counts[_setup_warning_bucket(score)] += 1
+        reasons = str(item.get("reject_reasons") or "")
+        for reason in reasons.split(","):
+            reason_clean = reason.strip()
+            if not reason_clean:
+                continue
+            reason_counts[reason_clean] = reason_counts.get(reason_clean, 0) + 1
+
+    warning_ratio = round((((bucket_counts["caution"] + bucket_counts["high_risk"]) / total_rows) * 100.0), 2) if total_rows > 0 else 0.0
+    avg_warning_score = round((sum(warning_scores) / len(warning_scores)), 2) if warning_scores else 0.0
+    top_warning_reason = "-"
+    top_warning_reason_count = 0
+    if reason_counts:
+        top_warning_reason, top_warning_reason_count = max(reason_counts.items(), key=lambda x: x[1])
+
+    closed_perf = [r for r in load_closed_pre_signal_performance() if isinstance(r, dict)]
+    expired_setups = sum(1 for r in closed_perf if str(r.get("final_status")) == "EXPIRED_24H")
+    tracked_pre_signals = [r for r in load_pre_signals() if isinstance(r, dict)]
+    open_setups = sum(1 for r in tracked_pre_signals if str(r.get("status")) == "OPEN")
+    tp_setups = sum(1 for r in tracked_pre_signals if str(r.get("status")) == "TP")
+
+    rows = [
+        ["Setup Warning Dashboard", ""],
+        ["Last alive", _vt_now_iso()],
+        ["Service", "PRE_SIGNAL_TEST"],
+        ["Last scan time", scan_time_iso],
+        ["Scanned symbols", total_rows],
+        ["Healthy setups", bucket_counts["healthy"]],
+        ["Caution setups", bucket_counts["caution"]],
+        ["High risk setups", bucket_counts["high_risk"]],
+        ["Warning ratio %", warning_ratio],
+        ["Average warning score", avg_warning_score],
+        ["Top warning reason", top_warning_reason],
+        ["Top warning reason count", top_warning_reason_count],
+        ["Expired setups", expired_setups],
+        ["Open setups", open_setups],
+        ["TP setups", tp_setups],
+    ]
+
+    if warning_ratio < 20.0:
+        warning_ratio_color = SHEET_COLOR_GREEN
+    elif warning_ratio < 40.0:
+        warning_ratio_color = SHEET_COLOR_YELLOW
+    else:
+        warning_ratio_color = SHEET_COLOR_RED
+    color_map = {
+        "B6": SHEET_COLOR_GREEN,
+        "B7": SHEET_COLOR_YELLOW,
+        "B8": SHEET_COLOR_RED,
+        "B9": warning_ratio_color,
+    }
+    return rows, color_map
+
+
+def _update_pre_signal_dashboard(ws, rows_payload: List[dict], scan_time_iso: str) -> None:
+    dashboard_rows, dashboard_color_map = _build_setup_warning_dashboard_rows(rows_payload, scan_time_iso)
+    ws.update(range_name="A1:B15", values=dashboard_rows)
+    for cell_ref, color_hex in dashboard_color_map.items():
+        _apply_dashboard_color(ws, cell_ref, color_hex)
+
+
 def _is_sheets_rate_limit_error(exc: Exception) -> bool:
     msg = str(exc).upper()
     return ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg) or ("RATE LIMIT" in msg)
@@ -2157,7 +2278,7 @@ def _is_sheets_rate_limit_error(exc: Exception) -> bool:
 def _apply_incremental_pre_signal_sheet_export(ws, columns: List[str], rows_payload: List[dict], cache: dict) -> Tuple[int, int, Dict[str, int], Dict[str, str]]:
     old_symbol_to_row = cache.get("symbol_to_row") or {}
     old_row_hash = cache.get("row_hash_by_symbol") or {}
-    max_existing_row = max(old_symbol_to_row.values(), default=1)
+    max_existing_row = max(old_symbol_to_row.values(), default=PRE_SIGNAL_TABLE_DATA_START_ROW - 1)
     next_row = max_existing_row + 1
 
     updates = []
@@ -2266,7 +2387,7 @@ def export_all_pre_signal_params_to_sheets():
             _write_pre_signal_test_rows(ws, rows)
             symbol_to_row = {}
             row_hash_by_symbol = {}
-            for idx, item in enumerate(rows_payload, start=2):
+            for idx, item in enumerate(rows_payload, start=PRE_SIGNAL_TABLE_DATA_START_ROW):
                 symbol = str(item.get("symbol") or "").strip()
                 if not symbol:
                     continue
@@ -2295,6 +2416,7 @@ def export_all_pre_signal_params_to_sheets():
                 )
             else:
                 log("[SHEETS EXPORT] rows_changed=0, skip write")
+        _update_pre_signal_dashboard(ws, rows_payload, scan_time_iso)
         log(f"[SHEETS EXPORT] rows_total={rows_total} rows_changed={rows_changed} rows_written={rows_written}")
         if formatting_enabled and rows_written > 0:
             _apply_pre_signal_test_formatting(ws, rows_payload, columns)
