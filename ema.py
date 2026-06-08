@@ -7537,6 +7537,8 @@ def auto_report_if_due():
 
 VIRTUAL_JSON_SEND_INTERVAL = 43200  # 12 hours
 PRE_SIGNAL_JSON_SEND_INTERVAL = 43200  # 12 hours
+REQUESTED_JSON_SEND_INTERVAL = 43200  # 12 hours
+MIN_JSON_FILE_SIZE_BYTES = 5
 
 def send_virtual_json_if_due():
     """Send the virtual trades JSON file to Telegram every 12 hours."""
@@ -7585,10 +7587,10 @@ def send_pre_signal_context_if_due():
 
 def send_requested_json_files_if_due():
     """Send requested JSON files to Telegram every 12 hours."""
-    now_now = time.time()
-    if now_now - STATE.get("last_requested_json_send", 0) < PRE_SIGNAL_JSON_SEND_INTERVAL:
+    current_time = time.time()
+    if current_time - STATE.get("last_requested_json_send", 0) < REQUESTED_JSON_SEND_INTERVAL:
         return
-    interval_hours = int(PRE_SIGNAL_JSON_SEND_INTERVAL / 3600)
+    interval_hours = int(REQUESTED_JSON_SEND_INTERVAL / 3600)
     files_to_send = [
         ("pump_candidates.json", PUMP_CANDIDATES_FILE),
         ("confirmed_pumps.json", CONFIRMED_PUMPS_FILE),
@@ -7602,7 +7604,7 @@ def send_requested_json_files_if_due():
     sent_count = 0
     for file_name, file_path in files_to_send:
         try:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > 5:
+            if os.path.exists(file_path) and os.path.getsize(file_path) > MIN_JSON_FILE_SIZE_BYTES:
                 tg_send_file(
                     file_path,
                     f"📦 {file_name} — {interval_hours}h rapor\n"
@@ -7614,7 +7616,7 @@ def send_requested_json_files_if_due():
                 log(f"[REQUESTED JSON SEND] {file_name} mevcut değil veya boş, atlandı")
         except Exception as _rq_json_err:
             log(f"[REQUESTED JSON SEND ERR] {file_name}: {_rq_json_err}")
-    STATE["last_requested_json_send"] = now_now
+    STATE["last_requested_json_send"] = current_time
     safe_save(STATE_FILE, STATE)
     log(f"[REQUESTED JSON SEND] sent={sent_count}/{len(files_to_send)}")
 
