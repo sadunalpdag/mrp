@@ -5,6 +5,7 @@
 
 
 import os, re, time, requests, hmac, hashlib, threading, math, json, traceback, csv, io
+from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP, getcontext
@@ -159,7 +160,7 @@ PRE_TP_LEVELS = {
     "tp_1_4": 0.014,
     "tp_1_6": 0.016,
 }
-PRE_TP_LEVEL_KEYS = list(PRE_TP_LEVELS.keys())
+PRE_TP_LEVEL_KEYS = [k for k, _ in sorted(PRE_TP_LEVELS.items(), key=lambda item: item[1])]
 
 # Real-trade active UTC windows (converted from TR/UTC+3):
 # 00:00–01:59, 03:00–03:45, 06:00–08:59, 14:00–17:59, 20:00–20:45
@@ -1262,6 +1263,11 @@ def _safe_pct_change(start_val: float, end_val: float) -> float:
     return ((end - start) / start) * 100.0
 
 
+def _generate_trade_id(symbol: str) -> str:
+    base = re.sub(r"[^A-Z0-9_]+", "", str(symbol or "").upper()) or "TRADE"
+    return f"{base}_{uuid4().hex}"
+
+
 def load_pre_signal_context():
     if not os.path.exists(PRE_SIGNAL_CONTEXT_FILE):
         return []
@@ -1928,7 +1934,7 @@ def create_pre_signal_performance_record(signal: dict, context: dict):
     direction = str(signal.get("direction") or "LONG").upper()
     if not symbol or entry_price <= 0:
         return
-    trade_id = signal.get("trade_id") or f"{symbol}_{int(time.time_ns() // 1_000_000)}"
+    trade_id = signal.get("trade_id") or _generate_trade_id(symbol)
     rec = {
         "id": trade_id,
         "trade_id": trade_id,
@@ -2922,7 +2928,7 @@ def _is_pre_signal(metrics: dict) -> bool:
     return bool(evaluate_pre_signal_thresholds(metrics).get("is_pre_signal"))
 
 
-def _send_pre_signal_(metrics: dict):
+def _send_pre_signal_(metrics: dict) -> str:
     symbol = metrics.get("symbol", "")
     entry = _vt_safe_float(metrics.get("entry"), 0.0)
     tp = round(entry * (1 + PRE_SIGNAL_TP_PCT), 8) if entry > 0 else 0.0
@@ -2954,7 +2960,7 @@ def _build_pre_signal_trade_record(symbol: str, entry_price: float, signal_time:
     last_whale = metrics.get("last_whale_candle_time")
     signal_dt = _parse_iso_utc(signal_time)
     first_whale_dt = _parse_iso_utc(first_whale) if first_whale else None
-    trade_id = f"{symbol}_{int(time.time_ns() // 1_000_000)}"
+    trade_id = _generate_trade_id(symbol)
     minutes_whale_to_signal = None
     if signal_dt and first_whale_dt:
         minutes_whale_to_signal = round((signal_dt - first_whale_dt).total_seconds() / 60.0, 2)
@@ -2993,7 +2999,7 @@ def _update_pre_signals_master_record(updated_record: dict):
     trade_id = updated_record.get("trade_id")
     symbol = updated_record.get("symbol")
     signal_time = updated_record.get("signal_time")
-    if not trade_id and (not symbol or not signal_time):
+    if not (trade_id or (symbol and signal_time)):
         return
     data = load_pre_signals()
     for idx in range(len(data) - 1, -1, -1):
