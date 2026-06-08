@@ -1507,14 +1507,15 @@ def _col_to_a1(col_idx: int) -> str:
 
 
 def _pre_signal_metric_color(metric: str, value: float) -> str:
-    v = _vt_safe_float(value, 0.0)
     if metric == "ema_fast_slope":
+        v = _vt_safe_float(value, 0.0)
         if v < PRE_SIGNAL_WARNING_EMA_FAST_HIGH_RISK_MAX:
             return SHEET_COLOR_RED
         if v < PRE_SIGNAL_WARNING_EMA_FAST_CAUTION_MAX:
             return SHEET_COLOR_YELLOW
         return SHEET_COLOR_GREEN
     if metric == "ema_slow_slope":
+        v = _vt_safe_float(value, 0.0)
         if v < PRE_SIGNAL_WARNING_EMA_SLOW_HIGH_RISK_MAX:
             return SHEET_COLOR_RED
         if v < PRE_SIGNAL_WARNING_EMA_SLOW_CAUTION_MAX:
@@ -1523,6 +1524,7 @@ def _pre_signal_metric_color(metric: str, value: float) -> str:
     rule = PRE_SIGNAL_EXPORT_RULES.get(metric)
     if not rule:
         return SHEET_COLOR_RED
+    v = _vt_safe_float(value, 0.0)
     if rule["type"] == "min":
         thr = max(PRE_SIGNAL_MIN_THRESHOLD_FLOOR, _vt_safe_float(rule.get("min"), 0.0))
         if v >= thr:
