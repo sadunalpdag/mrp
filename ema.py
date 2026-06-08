@@ -98,7 +98,8 @@ WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
 PRE_SIGNAL_TYPE = "PRE_SIGNAL"
 PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
 PRE_SIGNAL_MAX_SYMBOLS = 0
-PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 20_000_000
+PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 1_000_000
+PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME = 20_000_000
 PRE_SIGNAL_TIMEFRAME = "15m"
 PRE_SIGNAL_LOOKBACK_CANDLES = 16
 PRE_SIGNAL_COOLDOWN_HOURS = 4
@@ -2111,7 +2112,20 @@ def _write_pre_signal_test_rows(ws, rows: List[list]) -> None:
         ws.batch_clear([f"A{new_row_count + 1}:AF{min(previous_row_count, PRE_SIGNAL_TEST_TRACK_MAX_ROWS)}"])
 
 
-def _build_pre_signal_sheet_cache(columns: List[str], rows_payload: List[dict], symbol_to_row: Dict[str, int], row_hash_by_symbol: Dict[str, str]) -> dict:
+def _build_pre_signal_sheet_cache(
+    columns: List[str],
+    rows_payload: List[dict],
+    symbol_to_row: Dict[str, int],
+    row_hash_by_symbol: Dict[str, str],
+    analyzed_rows_payload: List[dict],
+) -> dict:
+    analyzed_symbols = []
+    for item in analyzed_rows_payload:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol") or "").strip()
+        if symbol:
+            analyzed_symbols.append(symbol)
     return {
         "version": 1,
         "columns": columns,
@@ -2119,6 +2133,8 @@ def _build_pre_signal_sheet_cache(columns: List[str], rows_payload: List[dict], 
         "row_hash_by_symbol": row_hash_by_symbol,
         "updated_at": _vt_now_iso(),
         "rows_total": len(rows_payload),
+        "analyzed_rows_total": len(analyzed_rows_payload),
+        "analyzed_symbols": analyzed_symbols,
     }
 
 
@@ -2207,6 +2223,7 @@ def export_all_pre_signal_params_to_sheets():
     formatting_enabled = PRE_SIGNAL_TEST_FORMAT_ENABLED and FORMATTING_AVAILABLE
     btc_ctx = _fetch_btc_context()
     scan_time_iso = _vt_now_iso()
+    analyzed_rows_payload = []
     rows_payload = []
     for ticker in _fetch_all_usdt_perpetual_tickers():
         symbol = ticker.get("symbol")
@@ -2234,7 +2251,21 @@ def export_all_pre_signal_params_to_sheets():
         row["reject_reasons"] = ", ".join(prox["reject_reasons"])
         if formatting_enabled:
             row["_metric_colors"] = prox["metric_colors"]
-        rows_payload.append(row)
+        analyzed_rows_payload.append(row)
+        if quote_volume >= PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME:
+            rows_payload.append(row)
+    analyzed_count = len(analyzed_rows_payload)
+    visible_count = len(rows_payload)
+    hidden_by_volume_count = analyzed_count - visible_count
+    STATE["last_pre_signal_sheet_analyzed_count"] = analyzed_count
+    STATE["last_pre_signal_sheet_visible_symbols"] = visible_count
+    STATE["last_pre_signal_sheet_hidden_by_volume"] = hidden_by_volume_count
+    STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+    STATE["last_pre_signal_sheet_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME)
+    log("[SHEETS EXPORT]")
+    log(f"Analyzed: {analyzed_count}")
+    log(f"Exported: {visible_count}")
+    log(f"Hidden by volume filter: {hidden_by_volume_count}")
     rows_payload.sort(key=lambda r: (
         0 if r.get("is_pre_signal") else 1,
         -_vt_safe_float(r.get("pre_signal_score"), 0.0),
@@ -2278,7 +2309,13 @@ def export_all_pre_signal_params_to_sheets():
             rows_written = len(rows_payload)
             safe_save(
                 PRE_SIGNAL_SHEET_CACHE_FILE,
-                _build_pre_signal_sheet_cache(columns, rows_payload, symbol_to_row, row_hash_by_symbol),
+                _build_pre_signal_sheet_cache(
+                    columns,
+                    rows_payload,
+                    symbol_to_row,
+                    row_hash_by_symbol,
+                    analyzed_rows_payload=analyzed_rows_payload,
+                ),
             )
         else:
             rows_total, rows_written, symbol_to_row, row_hash_by_symbol = _apply_incremental_pre_signal_sheet_export(
@@ -2291,7 +2328,13 @@ def export_all_pre_signal_params_to_sheets():
             if rows_changed > 0:
                 safe_save(
                     PRE_SIGNAL_SHEET_CACHE_FILE,
-                    _build_pre_signal_sheet_cache(columns, rows_payload, symbol_to_row, row_hash_by_symbol),
+                    _build_pre_signal_sheet_cache(
+                        columns,
+                        rows_payload,
+                        symbol_to_row,
+                        row_hash_by_symbol,
+                        analyzed_rows_payload=analyzed_rows_payload,
+                    ),
                 )
             else:
                 log("[SHEETS EXPORT] rows_changed=0, skip write")
@@ -2336,7 +2379,8 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
             and s.get("contractType") == "PERPETUAL"
         }
         STATE["last_pre_signal_total_futures_count"] = len(valid_symbols)
-        log(f"[PRE-SIGNAL] Total futures USDT symbols: {len(valid_symbols)}")
+        log("[PRE-SIGNAL]")
+        log(f"Total futures symbols: {len(valid_symbols)}")
 
         quote_map = _get_pre_signal_quote_volume_map()
         out = []
@@ -2345,7 +2389,7 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
             if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
                 out.append((symbol, quote_volume))
         out.sort(key=lambda x: x[1], reverse=True)
-        log(f"[PRE-SIGNAL] After volume filter: {len(out)}")
+        log(f"After scan volume filter: {len(out)}")
         STATE["last_pre_signal_after_volume_filter"] = len(out)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             out = out[:PRE_SIGNAL_MAX_SYMBOLS]
@@ -2450,6 +2494,12 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
             [f"Last pre-signal scan symbols: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
             [f"Last scan time: {last_scan_time}"],
             [f"Last error: {err_val}"],
+            [f"Total futures symbols: {int(STATE.get('last_pre_signal_total_futures_count', 0))}"],
+            [f"After scan volume filter: {int(STATE.get('last_pre_signal_after_volume_filter', 0))}"],
+            [f"Sheet visible symbols: {int(STATE.get('last_pre_signal_sheet_visible_symbols', 0))}"],
+            [f"Sheet hidden by volume: {int(STATE.get('last_pre_signal_sheet_hidden_by_volume', 0))}"],
+            [f"Scan volume threshold: {int(STATE.get('last_pre_signal_scan_volume_threshold', PRE_SIGNAL_MIN_24H_QUOTE_VOLUME))}"],
+            [f"Sheet volume threshold: {int(STATE.get('last_pre_signal_sheet_volume_threshold', PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME))}"],
         ]
         ws.update("A1", rows)
         log("[SHEETS] Heartbeat updated")
@@ -2788,9 +2838,16 @@ def run_pre_signal_scan(all_symbols: List[str]):
         universe.sort(key=lambda x: x[1], reverse=True)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             universe = universe[:PRE_SIGNAL_MAX_SYMBOLS]
-        log(f"[PRE-SIGNAL] After volume filter: {len(universe)}")
         total_symbols_scanned = len(all_symbols)
         after_volume_filter = len(universe)
+        STATE["last_pre_signal_total_futures_count"] = total_symbols_scanned
+        STATE["last_pre_signal_after_volume_filter"] = after_volume_filter
+        log("[PRE-SIGNAL]")
+        log(f"Total futures symbols: {total_symbols_scanned}")
+        log(f"After scan volume filter: {after_volume_filter}")
+
+    STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+    STATE["last_pre_signal_sheet_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME)
 
     print(f"[PRE-SIGNAL] Scanning {len(universe)} futures symbols", flush=True)
   
@@ -2800,6 +2857,9 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         STATE["last_pre_signal_symbol_count"] = 0
         STATE["last_pre_signal_error"] = "NONE"
+        STATE["last_pre_signal_sheet_analyzed_count"] = 0
+        STATE["last_pre_signal_sheet_visible_symbols"] = 0
+        STATE["last_pre_signal_sheet_hidden_by_volume"] = 0
         _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, 0, 0, 0, 0)
         log("[PRE-SIGNAL] Scan completed")
         return
@@ -5719,6 +5779,13 @@ STATE_DEFAULT={
     "last_pre_signal_scan_time": "",
     "last_pre_signal_symbol_count": 0,
     "last_pre_signal_error": "NONE",
+    "last_pre_signal_total_futures_count": 0,
+    "last_pre_signal_after_volume_filter": 0,
+    "last_pre_signal_sheet_analyzed_count": 0,
+    "last_pre_signal_sheet_visible_symbols": 0,
+    "last_pre_signal_sheet_hidden_by_volume": 0,
+    "last_pre_signal_scan_volume_threshold": PRE_SIGNAL_MIN_24H_QUOTE_VOLUME,
+    "last_pre_signal_sheet_volume_threshold": PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME,
     "last_pre_signal_daily_report_date": "",
     "last_pump_watch_report_ts": 0,
     "last_pre_signal_performance_report_date": "",
