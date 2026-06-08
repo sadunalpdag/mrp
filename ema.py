@@ -98,7 +98,7 @@ WHALE_CANDLE_BODY_RATIO_THRESHOLD = 0.70
 PRE_SIGNAL_TYPE = "PRE_SIGNAL"
 PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
 PRE_SIGNAL_MAX_SYMBOLS = 0
-PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 1_000_000
+PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 20_000_000
 PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME = 20_000_000
 PRE_SIGNAL_WARNING_FAIL_WEIGHT = 2
 PRE_SIGNAL_WARNING_HEALTHY_MAX_FAILS = 1
@@ -2599,7 +2599,7 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
             ["Total futures symbols", int(STATE.get("last_pre_signal_total_futures_count", 0))],
             ["After volume filter", int(STATE.get("last_pre_signal_filtered_count", STATE.get("last_pre_signal_after_volume_filter", 0)))],
             ["Generated pre-signals", int(STATE.get("last_pre_signal_generated_count", 0))],
-            ["Analyzed setups (>=1M volume)", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
+            ["Analyzed setups (>=20M volume)", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
             ["PRE_SIGNAL_TEST setups (>=20M volume)", int(STATE.get("last_pre_signal_sheet_visible_symbols", 0))],
             ["Healthy setups", setup_warning_summary.get("healthy_count", 0)],
             ["Caution setups", setup_warning_summary.get("caution_count", 0)],
@@ -2722,6 +2722,8 @@ def _send_pre_signal_(metrics: dict):
         f"Max Volume Ratio: {metrics.get('max_volume_ratio')}\n"
         f"Whale Candles: {metrics.get('whale_candle_count')}\n"
         f"BTC 4H: %{metrics.get('btc_4h_change_pct')}\n\n"
+        f"24H Quote Volume: {metrics.get('quote_volume_24h')}\n"
+        f"Scan Volume Threshold: {int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)}\n\n"
         f"Status:\n"
         f"Potential Early Entry"
     )
@@ -3102,7 +3104,12 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "entry": rec.get("entry_price"),
             **(rec.get("metrics") or {}),
         })
-        log(f"[PRE SIGNAL] {rec.get('symbol')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
+        rec_metrics = rec.get("metrics") or {}
+        log(
+            f"[PRE SIGNAL] {rec.get('symbol')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')} "
+            f"quote_volume_24h={_vt_safe_float(rec_metrics.get('quote_volume_24h'), 0.0):.2f} "
+            f"scan_volume_threshold={int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)}"
+        )
 
     log(
         f"[PRE SIGNAL SCAN] scanned={len(scan_records)} "
