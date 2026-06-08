@@ -180,6 +180,11 @@ PRE_SIGNAL_TEST_TAB = "PRE_SIGNAL_TEST"
 PRE_SIGNAL_TEST_UPDATE_MAX_ROWS = 600
 PRE_SIGNAL_TEST_TRACK_MAX_ROWS = 1000
 PRE_SIGNAL_DASHBOARD_ROWS = 15
+PRE_SIGNAL_DASHBOARD_RANGE = f"A1:B{PRE_SIGNAL_DASHBOARD_ROWS}"
+PRE_SIGNAL_DASHBOARD_ROW_HEALTHY = 6
+PRE_SIGNAL_DASHBOARD_ROW_CAUTION = 7
+PRE_SIGNAL_DASHBOARD_ROW_HIGH_RISK = 8
+PRE_SIGNAL_DASHBOARD_ROW_WARNING_RATIO = 9
 PRE_SIGNAL_TABLE_HEADER_ROW = PRE_SIGNAL_DASHBOARD_ROWS + 2
 PRE_SIGNAL_TABLE_DATA_START_ROW = PRE_SIGNAL_TABLE_HEADER_ROW + 1
 PRE_SIGNAL_TEST_UPDATE_RANGE = f"A{PRE_SIGNAL_TABLE_HEADER_ROW}:AF{PRE_SIGNAL_TABLE_HEADER_ROW + PRE_SIGNAL_TEST_UPDATE_MAX_ROWS - 1}"
@@ -2217,7 +2222,8 @@ def _build_setup_warning_dashboard_rows(rows_payload: List[dict], scan_time_iso:
                 continue
             reason_counts[reason_clean] = reason_counts.get(reason_clean, 0) + 1
 
-    warning_ratio = round((((bucket_counts["caution"] + bucket_counts["high_risk"]) / total_rows) * 100.0), 2) if total_rows > 0 else 0.0
+    warning_count = bucket_counts["caution"] + bucket_counts["high_risk"]
+    warning_ratio = round(((warning_count / total_rows) * 100.0), 2) if total_rows > 0 else 0.0
     avg_warning_score = round((sum(warning_scores) / len(warning_scores)), 2) if warning_scores else 0.0
     top_warning_reason = "-"
     top_warning_reason_count = 0
@@ -2255,17 +2261,17 @@ def _build_setup_warning_dashboard_rows(rows_payload: List[dict], scan_time_iso:
     else:
         warning_ratio_color = SHEET_COLOR_RED
     color_map = {
-        "B6": SHEET_COLOR_GREEN,
-        "B7": SHEET_COLOR_YELLOW,
-        "B8": SHEET_COLOR_RED,
-        "B9": warning_ratio_color,
+        f"B{PRE_SIGNAL_DASHBOARD_ROW_HEALTHY}": SHEET_COLOR_GREEN,
+        f"B{PRE_SIGNAL_DASHBOARD_ROW_CAUTION}": SHEET_COLOR_YELLOW,
+        f"B{PRE_SIGNAL_DASHBOARD_ROW_HIGH_RISK}": SHEET_COLOR_RED,
+        f"B{PRE_SIGNAL_DASHBOARD_ROW_WARNING_RATIO}": warning_ratio_color,
     }
     return rows, color_map
 
 
 def _update_pre_signal_dashboard(ws, rows_payload: List[dict], scan_time_iso: str) -> None:
     dashboard_rows, dashboard_color_map = _build_setup_warning_dashboard_rows(rows_payload, scan_time_iso)
-    ws.update(range_name="A1:B15", values=dashboard_rows)
+    ws.update(range_name=PRE_SIGNAL_DASHBOARD_RANGE, values=dashboard_rows)
     for cell_ref, color_hex in dashboard_color_map.items():
         _apply_dashboard_color(ws, cell_ref, color_hex)
 
