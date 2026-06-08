@@ -99,7 +99,9 @@ PRE_SIGNAL_TYPE = "PRE_SIGNAL"
 PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
 PRE_SIGNAL_MAX_SYMBOLS = 0
 PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 5_000_000
+PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME = 20_000_000
 PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME = 20_000_000
+PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME = 20_000_000
 PRE_SIGNAL_WARNING_FAIL_WEIGHT = 2
 PRE_SIGNAL_WARNING_HEALTHY_MAX_FAILS = 1
 PRE_SIGNAL_WARNING_CAUTION_MAX_FAILS = 3
@@ -1507,6 +1509,20 @@ def _col_to_a1(col_idx: int) -> str:
 
 
 def _pre_signal_metric_color(metric: str, value: float) -> str:
+    if metric == "projected_24h_volume":
+        v = _vt_safe_float(value, 0.0)
+        if v >= 20_000_000:
+            return SHEET_COLOR_GREEN
+        if v >= 10_000_000:
+            return SHEET_COLOR_YELLOW
+        return SHEET_COLOR_RED
+    if metric == "volume_growth_factor":
+        v = _vt_safe_float(value, 0.0)
+        if v >= 3.0:
+            return SHEET_COLOR_GREEN
+        if v >= 1.5:
+            return SHEET_COLOR_YELLOW
+        return SHEET_COLOR_RED
     if metric == "ema_fast_slope":
         v = _vt_safe_float(value, 0.0)
         if v < PRE_SIGNAL_WARNING_EMA_FAST_HIGH_RISK_MAX:
@@ -2247,15 +2263,26 @@ def export_all_pre_signal_params_to_sheets():
     scan_time_iso = _vt_now_iso()
     analyzed_rows_payload = []
     rows_payload = []
+    qualified_24h_count = 0
+    qualified_projected_count = 0
     for ticker in _fetch_all_usdt_perpetual_tickers():
         symbol = ticker.get("symbol")
         quote_volume = _vt_safe_float(ticker.get("quoteVolume"), 0.0)
-        if not symbol or quote_volume < PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
+        if not symbol:
             continue
         klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
         metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
         if not metrics:
             continue
+        projected_24h_volume = _vt_safe_float(metrics.get("projected_24h_volume"), 0.0)
+        qualifies_24h = quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME
+        qualifies_projected = projected_24h_volume >= PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME
+        if not (qualifies_24h or qualifies_projected):
+            continue
+        if qualifies_24h:
+            qualified_24h_count += 1
+        if qualifies_projected:
+            qualified_projected_count += 1
         row = {
             "scan_time": scan_time_iso,
             "symbol": symbol,
@@ -2272,9 +2299,16 @@ def export_all_pre_signal_params_to_sheets():
         row["is_pre_signal"] = bool(decision.get("is_pre_signal"))
         row["reject_reasons"] = ", ".join(prox["reject_reasons"])
         if formatting_enabled:
-            row["_metric_colors"] = prox["metric_colors"]
+            row["_metric_colors"] = {
+                **prox["metric_colors"],
+                "projected_24h_volume": _pre_signal_metric_color("projected_24h_volume", row.get("projected_24h_volume")),
+                "volume_growth_factor": _pre_signal_metric_color("volume_growth_factor", row.get("volume_growth_factor")),
+            }
         analyzed_rows_payload.append(row)
-        if quote_volume >= PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME:
+        if (
+            quote_volume >= PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME
+            or projected_24h_volume >= PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME
+        ):
             rows_payload.append(row)
     analyzed_count = len(analyzed_rows_payload)
     visible_count = len(rows_payload)
@@ -2290,8 +2324,12 @@ def export_all_pre_signal_params_to_sheets():
     STATE["last_pre_signal_avg_warning_score"] = _vt_safe_float(setup_warning_summary.get("avg_warning_score"), 0.0)
     STATE["last_pre_signal_top_warning_reason"] = str(setup_warning_summary.get("top_warning_reason", "NONE") or "NONE")
     STATE["last_pre_signal_top_warning_reason_count"] = int(setup_warning_summary.get("top_warning_reason_count", 0))
+    STATE["last_pre_signal_24h_volume_qualified"] = int(qualified_24h_count)
+    STATE["last_pre_signal_projected_volume_qualified"] = int(qualified_projected_count)
     STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+    STATE["last_pre_signal_scan_projected_volume_threshold"] = int(PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)
     STATE["last_pre_signal_sheet_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME)
+    STATE["last_pre_signal_sheet_projected_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME)
     log("[SHEETS EXPORT]")
     log(f"Analyzed: {analyzed_count}")
     log(f"Exported: {visible_count}")
@@ -2304,6 +2342,7 @@ def export_all_pre_signal_params_to_sheets():
     ))
     columns = [
         "scan_time", "symbol", "daily_change_pct", "quote_volume", "price_change_4h_pct",
+        "projected_24h_volume", "volume_growth_factor",
         "volume_change_4h_pct", "avg_volume_ratio", "max_volume_ratio", "avg_body_ratio", "max_body_ratio",
         "ema_fast_slope", "ema_slow_slope", "rsi_start", "rsi_end", "rsi_change", "range_pct",
         "compression_score", "volume_acceleration", "whale_candle_count", "breakout_distance_pct",
@@ -2416,12 +2455,9 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
         out = []
         for symbol in valid_symbols:
             quote_volume = quote_map.get(symbol, 0.0)
-            if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
-                out.append((symbol, quote_volume))
+            out.append((symbol, quote_volume))
         out.sort(key=lambda x: x[1], reverse=True)
-        log(f"After scan volume filter: {len(out)}")
-        STATE["last_pre_signal_after_volume_filter"] = len(out)
-        STATE["last_pre_signal_filtered_count"] = len(out)
+        log(f"Candidates for volume analysis: {len(out)}")
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             out = out[:PRE_SIGNAL_MAX_SYMBOLS]
         return out
@@ -2597,10 +2633,12 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
             ["Last scan time", last_scan_time],
             ["Last error", err_val],
             ["Total futures symbols", int(STATE.get("last_pre_signal_total_futures_count", 0))],
-            ["After volume filter", int(STATE.get("last_pre_signal_filtered_count", STATE.get("last_pre_signal_after_volume_filter", 0)))],
+            ["24h volume qualified symbols", int(STATE.get("last_pre_signal_24h_volume_qualified", 0))],
+            ["Projected volume qualified symbols", int(STATE.get("last_pre_signal_projected_volume_qualified", 0))],
+            ["Total analyzed symbols", int(STATE.get("last_pre_signal_filtered_count", STATE.get("last_pre_signal_after_volume_filter", 0)))],
             ["Generated pre-signals", int(STATE.get("last_pre_signal_generated_count", 0))],
-            ["Analyzed setups (>=1M volume)", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
-            ["PRE_SIGNAL_TEST setups (>=20M volume)", int(STATE.get("last_pre_signal_sheet_visible_symbols", 0))],
+            ["Sheet analyzed setups (24h>=5M OR projected>=20M)", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
+            ["PRE_SIGNAL_TEST setups (24h>=20M OR projected>=20M)", int(STATE.get("last_pre_signal_sheet_visible_symbols", 0))],
             ["Healthy setups", setup_warning_summary.get("healthy_count", 0)],
             ["Caution setups", setup_warning_summary.get("caution_count", 0)],
             ["High risk setups", setup_warning_summary.get("high_risk_count", 0)],
@@ -2613,7 +2651,9 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
             ["TP setups", performance_summary.get("tp_count", 0)],
             ["Sheet hidden by volume", int(STATE.get("last_pre_signal_sheet_hidden_by_volume", 0))],
             ["Scan volume threshold", int(STATE.get("last_pre_signal_scan_volume_threshold", PRE_SIGNAL_MIN_24H_QUOTE_VOLUME))],
+            ["Scan projected threshold", int(STATE.get("last_pre_signal_scan_projected_volume_threshold", PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME))],
             ["Sheet volume threshold", int(STATE.get("last_pre_signal_sheet_volume_threshold", PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME))],
+            ["Sheet projected threshold", int(STATE.get("last_pre_signal_sheet_projected_volume_threshold", PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME))],
         ]
         ws.update("A1", rows)
         log("[SHEETS] Heartbeat updated")
@@ -2632,8 +2672,16 @@ def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m
         lows = [float(k[3]) for k in candles]
         closes = [float(k[4]) for k in candles]
         volumes = [float(k[5]) for k in candles]
+        quote_volumes = [
+            _vt_safe_float(k[7], _vt_safe_float(k[5], 0.0) * _vt_safe_float(k[4], 0.0)) if len(k) > 7
+            else _vt_safe_float(k[5], 0.0) * _vt_safe_float(k[4], 0.0)
+            for k in candles
+        ]
         ranges = [max(h - l, 1e-12) for h, l in zip(highs, lows)]
         body_ratios = [abs(c - o) / r for o, c, r in zip(opens, closes, ranges)]
+        last_1h_quote_volume = float(sum(quote_volumes[-4:])) if quote_volumes else 0.0
+        projected_24h_volume = max(0.0, last_1h_quote_volume * 24.0)
+        volume_growth_factor = projected_24h_volume / max(float(quote_volume_24h), 1.0)
 
         vol_series = pd.Series(volumes)
         vol_ma = vol_series.rolling(window=8, min_periods=1).mean()
@@ -2666,6 +2714,8 @@ def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m
         return {
             "symbol": symbol,
             "quote_volume_24h": round(float(quote_volume_24h), 2),
+            "projected_24h_volume": round(float(projected_24h_volume), 2),
+            "volume_growth_factor": round(float(volume_growth_factor), 4),
             "price_change_4h_pct": round(_safe_pct_change(closes[0], closes[-1]), 4),
             "volume_change_4h_pct": round(_safe_pct_change(volumes[0], volumes[-1]), 4),
             "avg_volume_ratio": round(float(np.mean(volume_ratios)), 4),
@@ -2937,7 +2987,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
     if PRE_SIGNAL_SOURCE_MODE == "ALL_FUTURES":
         universe = get_all_futures_usdt_symbols_for_pre_signal()
         total_symbols_scanned = int(STATE.get("last_pre_signal_total_futures_count", 0))
-        after_volume_filter = len(universe)
+        after_volume_filter = 0
     else:
         try:
             quote_map = _get_pre_signal_quote_volume_map()
@@ -2947,22 +2997,21 @@ def run_pre_signal_scan(all_symbols: List[str]):
         universe = []
         for symbol in all_symbols:
             quote_volume = quote_map.get(symbol, 0.0)
-            if quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME:
-                universe.append((symbol, quote_volume))
+            universe.append((symbol, quote_volume))
         universe.sort(key=lambda x: x[1], reverse=True)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             universe = universe[:PRE_SIGNAL_MAX_SYMBOLS]
         total_symbols_scanned = len(all_symbols)
-        after_volume_filter = len(universe)
+        after_volume_filter = 0
         STATE["last_pre_signal_total_futures_count"] = total_symbols_scanned
-        STATE["last_pre_signal_after_volume_filter"] = after_volume_filter
-        STATE["last_pre_signal_filtered_count"] = after_volume_filter
         log("[PRE-SIGNAL]")
         log(f"Total futures symbols: {total_symbols_scanned}")
-        log(f"After scan volume filter: {after_volume_filter}")
+        log(f"Candidates for volume analysis: {len(universe)}")
 
     STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+    STATE["last_pre_signal_scan_projected_volume_threshold"] = int(PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)
     STATE["last_pre_signal_sheet_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME)
+    STATE["last_pre_signal_sheet_projected_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME)
 
     print(f"[PRE-SIGNAL] Scanning {len(universe)} futures symbols", flush=True)
   
@@ -2972,8 +3021,11 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         STATE["last_pre_signal_symbol_count"] = 0
         STATE["last_pre_signal_error"] = "NONE"
+        STATE["last_pre_signal_after_volume_filter"] = after_volume_filter
         STATE["last_pre_signal_filtered_count"] = after_volume_filter
         STATE["last_pre_signal_generated_count"] = 0
+        STATE["last_pre_signal_24h_volume_qualified"] = 0
+        STATE["last_pre_signal_projected_volume_qualified"] = 0
         STATE["last_pre_signal_sheet_analyzed_count"] = 0
         STATE["last_pre_signal_sheet_visible_symbols"] = 0
         STATE["last_pre_signal_sheet_hidden_by_volume"] = 0
@@ -3011,6 +3063,11 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "scan_time": scan_time_iso,
             "symbol": symbol,
             "quote_volume_24h": round(float(quote_volume), 2),
+            "projected_24h_volume": 0.0,
+            "volume_growth_factor": 0.0,
+            "volume_24h_qualified": False,
+            "projected_volume_qualified": False,
+            "volume_filter_passed": False,
             "daily_change_pct": 0.0,
             "source_mode": PRE_SIGNAL_SOURCE_MODE,
             "timeframe": PRE_SIGNAL_TIMEFRAME,
@@ -3018,6 +3075,18 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "pre_signal": False,
         }
 
+        klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
+        metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
+        if not metrics:
+            row["skip_reason"] = "INSUFFICIENT_DATA"
+            return row, None
+        row.update(metrics)
+        row["volume_24h_qualified"] = bool(quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+        row["projected_volume_qualified"] = bool(_vt_safe_float(row.get("projected_24h_volume"), 0.0) >= PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)
+        row["volume_filter_passed"] = bool(row["volume_24h_qualified"] or row["projected_volume_qualified"])
+        if not row["volume_filter_passed"]:
+            row["skip_reason"] = "VOLUME_FILTER"
+            return row, None
         if symbol in open_real_symbols:
             row["skip_reason"] = "OPEN_POSITION"
             return row, None
@@ -3027,13 +3096,6 @@ def run_pre_signal_scan(all_symbols: List[str]):
         if symbol in recent_pre_symbols:
             row["skip_reason"] = "COOLDOWN"
             return row, None
-
-        klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
-        metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
-        if not metrics:
-            row["skip_reason"] = "INSUFFICIENT_DATA"
-            return row, None
-        row.update(metrics)
         entry_price = _vt_safe_float(klines[-1][4], 0.0) if klines else 0.0
         row["entry"] = round(entry_price, 8) if entry_price > 0 else 0.0
 
@@ -3066,6 +3128,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "btc_15m_change_pct", "btc_1h_change_pct",
             "btc_4h_change_pct", "btc_market_direction",
             "btc_alignment_with_signal", "quote_volume_24h",
+            "projected_24h_volume", "volume_growth_factor",
             "first_whale_candle_time", "last_whale_candle_time",
         }
         signal_record = _build_pre_signal_trade_record(
@@ -3104,9 +3167,21 @@ def run_pre_signal_scan(all_symbols: List[str]):
         })
         log(f"[PRE SIGNAL] {rec.get('symbol')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
 
+    qualified_24h_count = sum(1 for row in scan_records if bool(row.get("volume_24h_qualified")))
+    qualified_projected_count = sum(1 for row in scan_records if bool(row.get("projected_volume_qualified")))
+    after_volume_filter = sum(1 for row in scan_records if bool(row.get("volume_filter_passed")))
+    STATE["last_pre_signal_after_volume_filter"] = after_volume_filter
+    STATE["last_pre_signal_filtered_count"] = after_volume_filter
+    STATE["last_pre_signal_24h_volume_qualified"] = qualified_24h_count
+    STATE["last_pre_signal_projected_volume_qualified"] = qualified_projected_count
+    log("[PRE-SIGNAL VOLUME]")
+    log(f"24h qualified = {qualified_24h_count}")
+    log(f"Projected qualified = {qualified_projected_count}")
+    log(f"Total analyzed = {after_volume_filter}")
+
     log(
         f"[PRE SIGNAL SCAN] scanned={len(scan_records)} "
-        f"generated={len(generated_signals)} volume_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME}"
+        f"generated={len(generated_signals)} volume_24h_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME} projected_24h_min={PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME}"
     )
     log("[PRE-SIGNAL] Scan completed")
     STATE["last_pre_signal_scan_ts"] = now_s
@@ -5907,6 +5982,8 @@ STATE_DEFAULT={
     "last_pre_signal_total_futures_count": 0,
     "last_pre_signal_after_volume_filter": 0,
     "last_pre_signal_filtered_count": 0,
+    "last_pre_signal_24h_volume_qualified": 0,
+    "last_pre_signal_projected_volume_qualified": 0,
     "last_pre_signal_generated_count": 0,
     "last_pre_signal_sheet_analyzed_count": 0,
     "last_pre_signal_sheet_visible_symbols": 0,
@@ -5919,7 +5996,9 @@ STATE_DEFAULT={
     "last_pre_signal_top_warning_reason": "NONE",
     "last_pre_signal_top_warning_reason_count": 0,
     "last_pre_signal_scan_volume_threshold": PRE_SIGNAL_MIN_24H_QUOTE_VOLUME,
+    "last_pre_signal_scan_projected_volume_threshold": PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME,
     "last_pre_signal_sheet_volume_threshold": PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME,
+    "last_pre_signal_sheet_projected_volume_threshold": PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME,
     "last_pre_signal_daily_report_date": "",
     "last_pump_watch_report_ts": 0,
     "last_pre_signal_performance_report_date": "",
