@@ -2973,7 +2973,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         append_pre_signal_record(rec)
         append_open_pre_signal(rec)
         create_pre_signal_performance_record(rec, rec.get("metrics") or {})
-        _send_pre_signal_telegram({
+        _send_pre_signal_({
             "symbol": rec.get("symbol"),
             "entry": rec.get("entry_price"),
             **(rec.get("metrics") or {}),
