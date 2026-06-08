@@ -100,6 +100,10 @@ PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
 PRE_SIGNAL_MAX_SYMBOLS = 0
 PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 1_000_000
 PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME = 20_000_000
+PRE_SIGNAL_WARNING_FAIL_WEIGHT = 2
+PRE_SIGNAL_WARNING_HEALTHY_MAX_FAILS = 1
+PRE_SIGNAL_WARNING_CAUTION_MAX_FAILS = 3
+PRE_SIGNAL_EXPIRED_FINAL_STATUSES = {"EXPIRED_24H", "PARTIAL_TP_HIT"}
 PRE_SIGNAL_TIMEFRAME = "15m"
 PRE_SIGNAL_LOOKBACK_CANDLES = 16
 PRE_SIGNAL_COOLDOWN_HOURS = 4
@@ -2257,9 +2261,17 @@ def export_all_pre_signal_params_to_sheets():
     analyzed_count = len(analyzed_rows_payload)
     visible_count = len(rows_payload)
     hidden_by_volume_count = analyzed_count - visible_count
+    setup_warning_summary = _build_pre_signal_setup_warning_summary(analyzed_rows_payload)
     STATE["last_pre_signal_sheet_analyzed_count"] = analyzed_count
     STATE["last_pre_signal_sheet_visible_symbols"] = visible_count
     STATE["last_pre_signal_sheet_hidden_by_volume"] = hidden_by_volume_count
+    STATE["last_pre_signal_healthy_count"] = int(setup_warning_summary.get("healthy_count", 0))
+    STATE["last_pre_signal_caution_count"] = int(setup_warning_summary.get("caution_count", 0))
+    STATE["last_pre_signal_high_risk_count"] = int(setup_warning_summary.get("high_risk_count", 0))
+    STATE["last_pre_signal_warning_ratio"] = _vt_safe_float(setup_warning_summary.get("warning_ratio"), 0.0)
+    STATE["last_pre_signal_avg_warning_score"] = _vt_safe_float(setup_warning_summary.get("avg_warning_score"), 0.0)
+    STATE["last_pre_signal_top_warning_reason"] = str(setup_warning_summary.get("top_warning_reason", "NONE") or "NONE")
+    STATE["last_pre_signal_top_warning_reason_count"] = int(setup_warning_summary.get("top_warning_reason_count", 0))
     STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
     STATE["last_pre_signal_sheet_volume_threshold"] = int(PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME)
     log("[SHEETS EXPORT]")
@@ -2391,6 +2403,7 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
         out.sort(key=lambda x: x[1], reverse=True)
         log(f"After scan volume filter: {len(out)}")
         STATE["last_pre_signal_after_volume_filter"] = len(out)
+        STATE["last_pre_signal_filtered_count"] = len(out)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             out = out[:PRE_SIGNAL_MAX_SYMBOLS]
         return out
@@ -2461,6 +2474,67 @@ def test_google_sheets_connection():
         return False
 
 
+def _build_pre_signal_setup_warning_summary(rows_payload: List[dict]) -> dict:
+    total = len(rows_payload)
+    if total <= 0:
+        return {
+            "healthy_count": 0,
+            "caution_count": 0,
+            "high_risk_count": 0,
+            "warning_ratio": 0.0,
+            "avg_warning_score": 0.0,
+            "top_warning_reason": "NONE",
+            "top_warning_reason_count": 0,
+        }
+    healthy_count = 0
+    caution_count = 0
+    high_risk_count = 0
+    warning_scores = []
+    reason_counts = {}
+    for row in rows_payload:
+        fail_count = int(_vt_safe_float(row.get("fail_count"), 0))
+        near_count = int(_vt_safe_float(row.get("near_count"), 0))
+        warning_score = fail_count * PRE_SIGNAL_WARNING_FAIL_WEIGHT + near_count
+        warning_scores.append(warning_score)
+        if fail_count <= PRE_SIGNAL_WARNING_HEALTHY_MAX_FAILS:
+            healthy_count += 1
+        elif fail_count <= PRE_SIGNAL_WARNING_CAUTION_MAX_FAILS:
+            caution_count += 1
+        else:
+            high_risk_count += 1
+        reject_reasons = row.get("reject_reasons", [])
+        if isinstance(reject_reasons, str):
+            reject_reasons = [r.strip() for r in reject_reasons.split(",") if r.strip()]
+        elif not isinstance(reject_reasons, list):
+            reject_reasons = []
+        for reason in reject_reasons:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    top_warning_reason = "NONE"
+    top_warning_reason_count = 0
+    if reason_counts:
+        top_warning_reason, top_warning_reason_count = max(reason_counts.items(), key=lambda kv: kv[1])
+    warning_count = caution_count + high_risk_count
+    return {
+        "healthy_count": healthy_count,
+        "caution_count": caution_count,
+        "high_risk_count": high_risk_count,
+        "warning_ratio": round((warning_count / total) * 100.0, 2),
+        "avg_warning_score": round(sum(warning_scores) / total, 2),
+        "top_warning_reason": top_warning_reason,
+        "top_warning_reason_count": int(top_warning_reason_count),
+    }
+
+
+def _build_pre_signal_status_performance_summary() -> dict:
+    all_records = [r for r in load_pre_signals() if isinstance(r, dict)]
+    closed_perf = [r for r in load_closed_pre_signal_performance() if isinstance(r, dict)]
+    return {
+        "expired_count": sum(1 for r in closed_perf if str(r.get("final_status")).upper() in PRE_SIGNAL_EXPIRED_FINAL_STATUSES),
+        "open_count": sum(1 for r in all_records if str(r.get("status")).upper() == "OPEN"),
+        "tp_count": sum(1 for r in all_records if str(r.get("status")).upper() == "TP"),
+    }
+
+
 def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=None):
     global LAST_SHEETS_HEARTBEAT_TS
     if not SHEETS_HEARTBEAT_ENABLED:
@@ -2482,6 +2556,16 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
     err_val = STATE.get("last_pre_signal_error") or "NONE"
     if str(err_val).strip() == "":
         err_val = "NONE"
+    setup_warning_summary = {
+        "healthy_count": int(STATE.get("last_pre_signal_healthy_count", 0)),
+        "caution_count": int(STATE.get("last_pre_signal_caution_count", 0)),
+        "high_risk_count": int(STATE.get("last_pre_signal_high_risk_count", 0)),
+        "warning_ratio": _vt_safe_float(STATE.get("last_pre_signal_warning_ratio", 0.0), 0.0),
+        "avg_warning_score": _vt_safe_float(STATE.get("last_pre_signal_avg_warning_score", 0.0), 0.0),
+        "top_warning_reason": str(STATE.get("last_pre_signal_top_warning_reason", "NONE") or "NONE"),
+        "top_warning_reason_count": int(STATE.get("last_pre_signal_top_warning_reason_count", 0)),
+    }
+    performance_summary = _build_pre_signal_status_performance_summary()
     try:
         sh = gc.open_by_key(GOOGLE_SHEETS_ID)
         ws = _ensure_sheets_status_tab(sh)
@@ -2489,17 +2573,29 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
             raise RuntimeError(f"Could not open/create tab: {SHEETS_STATUS_TAB}")
         now_text = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         rows = [
-            [f"Last alive: {now_text}"],
-            ["Service: RUNNING"],
-            [f"Last pre-signal scan symbols: {int(STATE.get('last_pre_signal_symbol_count', 0))}"],
-            [f"Last scan time: {last_scan_time}"],
-            [f"Last error: {err_val}"],
-            [f"Total futures symbols: {int(STATE.get('last_pre_signal_total_futures_count', 0))}"],
-            [f"After scan volume filter: {int(STATE.get('last_pre_signal_after_volume_filter', 0))}"],
-            [f"Sheet visible symbols: {int(STATE.get('last_pre_signal_sheet_visible_symbols', 0))}"],
-            [f"Sheet hidden by volume: {int(STATE.get('last_pre_signal_sheet_hidden_by_volume', 0))}"],
-            [f"Scan volume threshold: {int(STATE.get('last_pre_signal_scan_volume_threshold', PRE_SIGNAL_MIN_24H_QUOTE_VOLUME))}"],
-            [f"Sheet volume threshold: {int(STATE.get('last_pre_signal_sheet_volume_threshold', PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME))}"],
+            ["Last alive", now_text],
+            ["Service", "RUNNING"],
+            ["Last pre-signal scan symbols", int(STATE.get("last_pre_signal_symbol_count", 0))],
+            ["Last scan time", last_scan_time],
+            ["Last error", err_val],
+            ["Total futures symbols", int(STATE.get("last_pre_signal_total_futures_count", 0))],
+            ["After volume filter", int(STATE.get("last_pre_signal_filtered_count", STATE.get("last_pre_signal_after_volume_filter", 0)))],
+            ["Generated pre-signals", int(STATE.get("last_pre_signal_generated_count", 0))],
+            ["Analyzed setups (>=1M volume)", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
+            ["PRE_SIGNAL_TEST setups (>=20M volume)", int(STATE.get("last_pre_signal_sheet_visible_symbols", 0))],
+            ["Healthy setups", setup_warning_summary.get("healthy_count", 0)],
+            ["Caution setups", setup_warning_summary.get("caution_count", 0)],
+            ["High risk setups", setup_warning_summary.get("high_risk_count", 0)],
+            ["Warning ratio %", setup_warning_summary.get("warning_ratio", 0)],
+            ["Average warning score", setup_warning_summary.get("avg_warning_score", 0)],
+            ["Top warning reason", setup_warning_summary.get("top_warning_reason", "NONE")],
+            ["Top warning reason count", setup_warning_summary.get("top_warning_reason_count", 0)],
+            ["Expired setups", performance_summary.get("expired_count", 0)],
+            ["Open setups", performance_summary.get("open_count", 0)],
+            ["TP setups", performance_summary.get("tp_count", 0)],
+            ["Sheet hidden by volume", int(STATE.get("last_pre_signal_sheet_hidden_by_volume", 0))],
+            ["Scan volume threshold", int(STATE.get("last_pre_signal_scan_volume_threshold", PRE_SIGNAL_MIN_24H_QUOTE_VOLUME))],
+            ["Sheet volume threshold", int(STATE.get("last_pre_signal_sheet_volume_threshold", PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME))],
         ]
         ws.update("A1", rows)
         log("[SHEETS] Heartbeat updated")
@@ -2842,6 +2938,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         after_volume_filter = len(universe)
         STATE["last_pre_signal_total_futures_count"] = total_symbols_scanned
         STATE["last_pre_signal_after_volume_filter"] = after_volume_filter
+        STATE["last_pre_signal_filtered_count"] = after_volume_filter
         log("[PRE-SIGNAL]")
         log(f"Total futures symbols: {total_symbols_scanned}")
         log(f"After scan volume filter: {after_volume_filter}")
@@ -2857,9 +2954,18 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         STATE["last_pre_signal_symbol_count"] = 0
         STATE["last_pre_signal_error"] = "NONE"
+        STATE["last_pre_signal_filtered_count"] = after_volume_filter
+        STATE["last_pre_signal_generated_count"] = 0
         STATE["last_pre_signal_sheet_analyzed_count"] = 0
         STATE["last_pre_signal_sheet_visible_symbols"] = 0
         STATE["last_pre_signal_sheet_hidden_by_volume"] = 0
+        STATE["last_pre_signal_healthy_count"] = 0
+        STATE["last_pre_signal_caution_count"] = 0
+        STATE["last_pre_signal_high_risk_count"] = 0
+        STATE["last_pre_signal_warning_ratio"] = 0.0
+        STATE["last_pre_signal_avg_warning_score"] = 0.0
+        STATE["last_pre_signal_top_warning_reason"] = "NONE"
+        STATE["last_pre_signal_top_warning_reason_count"] = 0
         _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, 0, 0, 0, 0)
         log("[PRE-SIGNAL] Scan completed")
         return
@@ -2989,6 +3095,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
     STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     STATE["last_pre_signal_symbol_count"] = len(scan_records)
     STATE["last_pre_signal_error"] = "NONE"
+    STATE["last_pre_signal_generated_count"] = len(generated_signals)
     sheet_export_rows = export_all_pre_signal_params_to_sheets() if PRE_SIGNAL_TEST_EXPORT_ENABLED else 0
     total_candidates = sum(1 for row in scan_records if bool(row.get("would_pre_signal", row.get("pre_signal"))))
     total_rejected = sum(1 for row in scan_records if not bool(row.get("pre_signal")))
@@ -5781,9 +5888,18 @@ STATE_DEFAULT={
     "last_pre_signal_error": "NONE",
     "last_pre_signal_total_futures_count": 0,
     "last_pre_signal_after_volume_filter": 0,
+    "last_pre_signal_filtered_count": 0,
+    "last_pre_signal_generated_count": 0,
     "last_pre_signal_sheet_analyzed_count": 0,
     "last_pre_signal_sheet_visible_symbols": 0,
     "last_pre_signal_sheet_hidden_by_volume": 0,
+    "last_pre_signal_healthy_count": 0,
+    "last_pre_signal_caution_count": 0,
+    "last_pre_signal_high_risk_count": 0,
+    "last_pre_signal_warning_ratio": 0.0,
+    "last_pre_signal_avg_warning_score": 0.0,
+    "last_pre_signal_top_warning_reason": "NONE",
+    "last_pre_signal_top_warning_reason_count": 0,
     "last_pre_signal_scan_volume_threshold": PRE_SIGNAL_MIN_24H_QUOTE_VOLUME,
     "last_pre_signal_sheet_volume_threshold": PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME,
     "last_pre_signal_daily_report_date": "",
