@@ -102,6 +102,11 @@ PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 5_000_000
 PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME = 20_000_000
 PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME = 20_000_000
 PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME = 20_000_000
+PRE_SIGNAL_PROJECTED_24H_MULTIPLIER = 24.0
+PRE_SIGNAL_PROJECTED_COLOR_YELLOW_MIN = PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME / 2.0
+KLINE_IDX_CLOSE = 4
+KLINE_IDX_VOLUME = 5
+KLINE_IDX_QUOTE_VOLUME = 7
 PRE_SIGNAL_WARNING_FAIL_WEIGHT = 2
 PRE_SIGNAL_WARNING_HEALTHY_MAX_FAILS = 1
 PRE_SIGNAL_WARNING_CAUTION_MAX_FAILS = 3
@@ -1511,9 +1516,9 @@ def _col_to_a1(col_idx: int) -> str:
 def _pre_signal_metric_color(metric: str, value: float) -> str:
     if metric == "projected_24h_volume":
         v = _vt_safe_float(value, 0.0)
-        if v >= 20_000_000:
+        if v >= PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME:
             return SHEET_COLOR_GREEN
-        if v >= 10_000_000:
+        if v >= PRE_SIGNAL_PROJECTED_COLOR_YELLOW_MIN:
             return SHEET_COLOR_YELLOW
         return SHEET_COLOR_RED
     if metric == "volume_growth_factor":
@@ -1587,6 +1592,13 @@ def _build_pre_signal_proximity(record: dict) -> dict:
         "fail_count": fail_count,
         "pre_signal_score": pass_count * 3 + near_count,
         "reject_reasons": reject,
+    }
+
+
+def _build_pre_signal_volume_insight_colors(record: dict) -> dict:
+    return {
+        "projected_24h_volume": _pre_signal_metric_color("projected_24h_volume", record.get("projected_24h_volume")),
+        "volume_growth_factor": _pre_signal_metric_color("volume_growth_factor", record.get("volume_growth_factor")),
     }
 
 
@@ -2301,8 +2313,7 @@ def export_all_pre_signal_params_to_sheets():
         if formatting_enabled:
             row["_metric_colors"] = {
                 **prox["metric_colors"],
-                "projected_24h_volume": _pre_signal_metric_color("projected_24h_volume", row.get("projected_24h_volume")),
-                "volume_growth_factor": _pre_signal_metric_color("volume_growth_factor", row.get("volume_growth_factor")),
+                **_build_pre_signal_volume_insight_colors(row),
             }
         analyzed_rows_payload.append(row)
         if (
@@ -2637,8 +2648,8 @@ def update_sheets_heartbeat(symbol_count=None, last_scan_time=None, last_error=N
             ["Projected volume qualified symbols", int(STATE.get("last_pre_signal_projected_volume_qualified", 0))],
             ["Total analyzed symbols", int(STATE.get("last_pre_signal_filtered_count", STATE.get("last_pre_signal_after_volume_filter", 0)))],
             ["Generated pre-signals", int(STATE.get("last_pre_signal_generated_count", 0))],
-            ["Sheet analyzed setups (24h>=5M OR projected>=20M)", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
-            ["PRE_SIGNAL_TEST setups (24h>=20M OR projected>=20M)", int(STATE.get("last_pre_signal_sheet_visible_symbols", 0))],
+            [f"Sheet analyzed (24h>={int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)} OR projected>={int(PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)})", int(STATE.get("last_pre_signal_sheet_analyzed_count", 0))],
+            [f"PRE_SIGNAL_TEST (24h>={int(PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME)} OR projected>={int(PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME)})", int(STATE.get("last_pre_signal_sheet_visible_symbols", 0))],
             ["Healthy setups", setup_warning_summary.get("healthy_count", 0)],
             ["Caution setups", setup_warning_summary.get("caution_count", 0)],
             ["High risk setups", setup_warning_summary.get("high_risk_count", 0)],
@@ -2670,17 +2681,16 @@ def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m
         opens = [float(k[1]) for k in candles]
         highs = [float(k[2]) for k in candles]
         lows = [float(k[3]) for k in candles]
-        closes = [float(k[4]) for k in candles]
-        volumes = [float(k[5]) for k in candles]
-        quote_volumes = [
-            _vt_safe_float(k[7], _vt_safe_float(k[5], 0.0) * _vt_safe_float(k[4], 0.0)) if len(k) > 7
-            else _vt_safe_float(k[5], 0.0) * _vt_safe_float(k[4], 0.0)
-            for k in candles
-        ]
+        closes = [float(k[KLINE_IDX_CLOSE]) for k in candles]
+        volumes = [float(k[KLINE_IDX_VOLUME]) for k in candles]
+        quote_volumes = []
+        for k in candles:
+            fallback_quote_volume = _vt_safe_float(k[KLINE_IDX_VOLUME], 0.0) * _vt_safe_float(k[KLINE_IDX_CLOSE], 0.0)
+            quote_volumes.append(_vt_safe_float(k[KLINE_IDX_QUOTE_VOLUME], fallback_quote_volume) if len(k) > KLINE_IDX_QUOTE_VOLUME else fallback_quote_volume)
         ranges = [max(h - l, 1e-12) for h, l in zip(highs, lows)]
         body_ratios = [abs(c - o) / r for o, c, r in zip(opens, closes, ranges)]
-        last_1h_quote_volume = float(sum(quote_volumes[-4:])) if quote_volumes else 0.0
-        projected_24h_volume = max(0.0, last_1h_quote_volume * 24.0)
+        recent_1h_quote_volume = float(sum(quote_volumes[-4:])) if quote_volumes else 0.0
+        projected_24h_volume = max(0.0, recent_1h_quote_volume * PRE_SIGNAL_PROJECTED_24H_MULTIPLIER)
         volume_growth_factor = projected_24h_volume / max(float(quote_volume_24h), 1.0)
 
         vol_series = pd.Series(volumes)
