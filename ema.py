@@ -2117,11 +2117,10 @@ def _build_pre_signal_sheet_cache(
     rows_payload: List[dict],
     symbol_to_row: Dict[str, int],
     row_hash_by_symbol: Dict[str, str],
-    analyzed_rows_payload: Optional[List[dict]] = None,
+    analyzed_rows_payload: List[dict],
 ) -> dict:
-    analyzed_rows = analyzed_rows_payload if isinstance(analyzed_rows_payload, list) else rows_payload
     analyzed_symbols = []
-    for item in analyzed_rows:
+    for item in analyzed_rows_payload:
         if not isinstance(item, dict):
             continue
         symbol = str(item.get("symbol") or "").strip()
@@ -2134,7 +2133,7 @@ def _build_pre_signal_sheet_cache(
         "row_hash_by_symbol": row_hash_by_symbol,
         "updated_at": _vt_now_iso(),
         "rows_total": len(rows_payload),
-        "analyzed_rows_total": len(analyzed_rows),
+        "analyzed_rows_total": len(analyzed_rows_payload),
         "analyzed_symbols": analyzed_symbols,
     }
 
@@ -2257,8 +2256,8 @@ def export_all_pre_signal_params_to_sheets():
             rows_payload.append(row)
     analyzed_count = len(analyzed_rows_payload)
     visible_count = len(rows_payload)
-    hidden_by_volume_count = max(0, analyzed_count - visible_count)
-    STATE["last_pre_signal_sheet_analyzed_symbols"] = analyzed_count
+    hidden_by_volume_count = analyzed_count - visible_count
+    STATE["last_pre_signal_sheet_analyzed_count"] = analyzed_count
     STATE["last_pre_signal_sheet_visible_symbols"] = visible_count
     STATE["last_pre_signal_sheet_hidden_by_volume"] = hidden_by_volume_count
     STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
@@ -2345,7 +2344,7 @@ def export_all_pre_signal_params_to_sheets():
             log("[SHEETS EXPORT] formatting=ENABLED")
         else:
             log("[SHEETS EXPORT] values updated only, formatting preserved")
-        return visible_count
+        return rows_written
     except Exception as e:
         if _is_sheets_rate_limit_error(e):
             PRE_SIGNAL_SHEETS_EXPORT_PAUSED_UNTIL = now_ts_s() + SHEETS_EXPORT_COOLDOWN_SECONDS
@@ -2858,7 +2857,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_scan_time"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         STATE["last_pre_signal_symbol_count"] = 0
         STATE["last_pre_signal_error"] = "NONE"
-        STATE["last_pre_signal_sheet_analyzed_symbols"] = 0
+        STATE["last_pre_signal_sheet_analyzed_count"] = 0
         STATE["last_pre_signal_sheet_visible_symbols"] = 0
         STATE["last_pre_signal_sheet_hidden_by_volume"] = 0
         _log_pre_signal_debug(total_symbols_scanned, after_volume_filter, 0, 0, 0, 0)
@@ -5782,7 +5781,7 @@ STATE_DEFAULT={
     "last_pre_signal_error": "NONE",
     "last_pre_signal_total_futures_count": 0,
     "last_pre_signal_after_volume_filter": 0,
-    "last_pre_signal_sheet_analyzed_symbols": 0,
+    "last_pre_signal_sheet_analyzed_count": 0,
     "last_pre_signal_sheet_visible_symbols": 0,
     "last_pre_signal_sheet_hidden_by_volume": 0,
     "last_pre_signal_scan_volume_threshold": PRE_SIGNAL_MIN_24H_QUOTE_VOLUME,
