@@ -2708,6 +2708,8 @@ def _is_pre_signal(metrics: dict) -> bool:
 def _send_pre_signal_(metrics: dict):
     symbol = metrics.get("symbol", "")
     entry = _vt_safe_float(metrics.get("entry"), 0.0)
+    quote_volume_24h = _vt_safe_float(metrics.get("quote_volume_24h"), 0.0)
+    quote_volume_text = f"{quote_volume_24h:,.2f}"
     tp = round(entry * (1 + PRE_SIGNAL_TP_PCT), 8) if entry > 0 else 0.0
     tg_send(
         f"🚨 PRE-SIGNAL LONG\n\n"
@@ -2722,7 +2724,7 @@ def _send_pre_signal_(metrics: dict):
         f"Max Volume Ratio: {metrics.get('max_volume_ratio')}\n"
         f"Whale Candles: {metrics.get('whale_candle_count')}\n"
         f"BTC 4H: %{metrics.get('btc_4h_change_pct')}\n\n"
-        f"24H Quote Volume: {metrics.get('quote_volume_24h')}\n"
+        f"24H Quote Volume: {quote_volume_text}\n"
         f"Scan Volume Threshold: {int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)}\n\n"
         f"Status:\n"
         f"Potential Early Entry"
@@ -3105,9 +3107,10 @@ def run_pre_signal_scan(all_symbols: List[str]):
             **(rec.get("metrics") or {}),
         })
         rec_metrics = rec.get("metrics") or {}
+        quote_volume_text = f"{_vt_safe_float(rec_metrics.get('quote_volume_24h'), 0.0):,.2f}"
         log(
             f"[PRE SIGNAL] {rec.get('symbol')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')} "
-            f"quote_volume_24h={_vt_safe_float(rec_metrics.get('quote_volume_24h'), 0.0):.2f} "
+            f"quote_volume_24h={quote_volume_text} "
             f"scan_volume_threshold={int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)}"
         )
 
