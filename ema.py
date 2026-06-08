@@ -33,10 +33,10 @@ except Exception:
 #  - Tarama: Top 25 vadeli işlem sembolü (hacime göre)
 #  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
 #  - PER-STRATEGY LIMITS: Fibonacci max 3 long / 0 short
-#  - Strategy enable/disable via Telegram commands
+#  - Strategy enable/disable via  commands
 #  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
 #  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
-#  - Smart TP, 6h TrendLock, Guards, Telegram sistemi aynı
+#  - Smart TP, 6h TrendLock, Guards,  sistemi aynı
 # ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -2541,7 +2541,7 @@ def _is_pre_signal(metrics: dict) -> bool:
     return bool(evaluate_pre_signal_thresholds(metrics).get("is_pre_signal"))
 
 
-def _send_pre_signal_telegram(metrics: dict):
+def _send_pre_signal_(metrics: dict):
     symbol = metrics.get("symbol", "")
     entry = _vt_safe_float(metrics.get("entry"), 0.0)
     tp = round(entry * (1 + PRE_SIGNAL_TP_PCT), 8) if entry > 0 else 0.0
@@ -2793,7 +2793,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         after_volume_filter = len(universe)
 
     print(f"[PRE-SIGNAL] Scanning {len(universe)} futures symbols", flush=True)
-    tg_send(f"PRE-SIGNAL scan started: {len(universe)} symbols")
+  
 
     if not universe:
         STATE["last_pre_signal_scan_ts"] = now_s
