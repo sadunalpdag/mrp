@@ -188,7 +188,7 @@ SPOT_KLINE_LIMIT = 220
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", os.getenv("GOOGLE_SHEET_ID", "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI")).strip()
 GOOGLE_SHEET_GID = os.getenv("GOOGLE_SHEET_GID", "418193721")
-PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+PRE_SIGNAL_TEST_EXPORT_ENABLED = os.getenv("PRE_SIGNAL_TEST_EXPORT_ENABLED", "FALSE").strip().lower() in ("1", "true", "yes", "on")
 # Keep formatting fully disabled for PRE_SIGNAL_TEST exports; values-only updates preserve manual sheet formatting.
 PRE_SIGNAL_TEST_FORMAT_ENABLED = False
 SHEET_SIGNAL_MAX_AGE_HOURS = 24  # Signals older than this are skipped even after restart
