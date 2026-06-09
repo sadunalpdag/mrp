@@ -7730,8 +7730,15 @@ def _cmd_set(args):
         tg_send(f"❌ /set hata: {e}")
 
 def _cmd_export():
-    for fpath in [PARAM_FILE,STATE_FILE,AI_SIGNALS_FILE,AI_ANALYSIS_FILE,AI_RL_FILE,REAL_CLOSED_FILE,LOG_FILE]:
-        tg_send_file(fpath, f"📦 {os.path.basename(fpath)}")
+    files = [
+        PARAM_FILE, STATE_FILE, AI_SIGNALS_FILE, AI_ANALYSIS_FILE, 
+        AI_RL_FILE, REAL_CLOSED_FILE, LOG_FILE, PRE_SIGNALS_FILE, 
+        OPEN_PRE_SIGNALS_FILE, CLOSED_PRE_SIGNALS_FILE, 
+        OPEN_POSITIONS_JSON_FILE, PRE_SIGNAL_CONTEXT_FILE
+    ]
+    for fpath in files:
+        if os.path.exists(fpath):
+            tg_send_file(fpath, f"📦 {os.path.basename(fpath)}")
 
 def _cmd_balance():
     """Show current balance and unrealized profit"""
