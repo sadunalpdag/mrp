@@ -74,10 +74,6 @@ PRE_SIGNAL_PERFORMANCE_SUMMARY_FILE = os.path.join(DATA_DIR, "pre_signal_perform
 SIGNALS_WITH_CONTEXT_FILE = os.path.join(DATA_DIR, "signals_with_context.json")
 TP_TRACKING_FILE = os.path.join(DATA_DIR, "tp_tracking.json")
 AI_ANALYSIS_READY_FILE = os.path.join(DATA_DIR, "ai_analysis_ready.json")
-PUMP_CANDIDATES_FILE = os.path.join(DATA_DIR, "pump_candidates.json")
-CONFIRMED_PUMPS_FILE = os.path.join(DATA_DIR, "confirmed_pumps.json")
-PRE_PUMP_CONTEXT_FILE = os.path.join(DATA_DIR, "pre_pump_context.json")
-AI_PUMP_ANALYSIS_READY_FILE = os.path.join(DATA_DIR, "ai_pump_analysis_ready.json")
 
 # Virtual entry tracker settings
 RETENTION_DAYS = 15
@@ -6190,7 +6186,6 @@ STATE_DEFAULT={
     "last_pre_signal_sheet_volume_threshold": PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME,
     "last_pre_signal_sheet_projected_volume_threshold": PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME,
     "last_pre_signal_daily_report_date": "",
-    "last_pre_signal_daily_json_send": 0,
     "last_pump_watch_report_ts": 0,
     "last_pre_signal_performance_report_date": "",
 }
@@ -7538,9 +7533,6 @@ def auto_report_if_due():
 
 VIRTUAL_JSON_SEND_INTERVAL = 43200  # 12 hours
 PRE_SIGNAL_JSON_SEND_INTERVAL = 43200  # 12 hours
-REQUESTED_JSON_SEND_INTERVAL = 43200  # 12 hours
-PRE_SIGNAL_DAILY_JSON_SEND_INTERVAL = 86400  # 24 hours
-MIN_JSON_FILE_SIZE_BYTES = 5
 
 def send_virtual_json_if_due():
     """Send the virtual trades JSON file to Telegram every 12 hours."""
@@ -7584,74 +7576,6 @@ def send_pre_signal_context_if_due():
     except Exception as e:
         log(f"[PRE SIGNAL JSON SEND ERR] {e}")
     STATE["last_pre_signal_context_send"] = now_now
-    safe_save(STATE_FILE, STATE)
-
-
-def send_requested_json_files_if_due():
-    """Send requested JSON files to Telegram every 12 hours."""
-    current_time = time.time()
-    if current_time - STATE.get("last_requested_json_send", 0) < REQUESTED_JSON_SEND_INTERVAL:
-        return
-    interval_hours = int(REQUESTED_JSON_SEND_INTERVAL / 3600)
-    files_to_send = [
-        ("pump_candidates.json", PUMP_CANDIDATES_FILE),
-        ("confirmed_pumps.json", CONFIRMED_PUMPS_FILE),
-        ("pre_pump_context.json", PRE_PUMP_CONTEXT_FILE),
-        ("ai_pump_analysis_ready.json", AI_PUMP_ANALYSIS_READY_FILE),
-        ("signals_with_context.json", SIGNALS_WITH_CONTEXT_FILE),
-        ("open_positions.json", OPEN_POSITIONS_JSON_FILE),
-        ("tp_tracking.json", TP_TRACKING_FILE),
-        ("ai_analysis_ready.json", AI_ANALYSIS_READY_FILE),
-    ]
-    sent_count = 0
-    for file_name, file_path in files_to_send:
-        try:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > MIN_JSON_FILE_SIZE_BYTES:
-                tg_send_file(
-                    file_path,
-                    f"📦 {file_name} — {interval_hours}h rapor\n"
-                    f"time: {now_local_iso()}"
-                )
-                sent_count += 1
-                log(f"[REQUESTED JSON SEND] {file_name} Telegram'a gönderildi")
-            else:
-                log(f"[REQUESTED JSON SEND] {file_name} mevcut değil veya boş, atlandı")
-        except Exception as _rq_json_err:
-            log(f"[REQUESTED JSON SEND ERR] {file_name}: {_rq_json_err}")
-    log(f"[REQUESTED JSON SEND] sent={sent_count}/{len(files_to_send)}")
-    STATE["last_requested_json_send"] = current_time
-    safe_save(STATE_FILE, STATE)
-
-
-def send_pre_signal_daily_json_files_if_due():
-    """Send daily pre-signal JSON files to Telegram every 24 hours."""
-    current_time = time.time()
-    if current_time - STATE.get("last_pre_signal_daily_json_send", 0) < PRE_SIGNAL_DAILY_JSON_SEND_INTERVAL:
-        return
-    interval_hours = int(PRE_SIGNAL_DAILY_JSON_SEND_INTERVAL / 3600)
-    files_to_send = [
-        ("pre_signal_parameter_stats.json", PRE_SIGNAL_PARAMETER_STATS_FILE),
-        ("pre_signals.json", PRE_SIGNALS_FILE),
-        ("daily_pre_signal_report.json", DAILY_PRE_SIGNAL_REPORT_FILE),
-    ]
-    sent_count = 0
-    for file_name, file_path in files_to_send:
-        try:
-            if os.path.exists(file_path) and os.path.getsize(file_path) > MIN_JSON_FILE_SIZE_BYTES:
-                tg_send_file(
-                    file_path,
-                    f"📦 {file_name} — {interval_hours}h rapor\n"
-                    f"time: {now_local_iso()}"
-                )
-                sent_count += 1
-                log(f"[PRE SIGNAL DAILY JSON SEND] {file_name} Telegram'a gönderildi")
-            else:
-                log(f"[PRE SIGNAL DAILY JSON SEND] {file_name} mevcut değil veya boş, atlandı")
-        except Exception as _pre_daily_json_err:
-            log(f"[PRE SIGNAL DAILY JSON SEND ERR] {file_name}: {_pre_daily_json_err}")
-    if sent_count:
-        log(f"[PRE SIGNAL DAILY JSON SEND] Toplam {sent_count} dosya gönderildi")
-    STATE["last_pre_signal_daily_json_send"] = current_time
     safe_save(STATE_FILE, STATE)
 
 
@@ -13191,12 +13115,6 @@ def main():
 
             # 4c) 12 saatlik pre-signal context JSON gönderimi
             send_pre_signal_context_if_due()
-
-            # 4d) 12 saatlik istenen JSON dosyaları gönderimi
-            send_requested_json_files_if_due()
-
-            # 4e) 24 saatlik pre-signal günlük JSON dosyaları gönderimi
-            send_pre_signal_daily_json_files_if_due()
 
             # 5) Heartbeat (10 dk)
             heartbeat_and_status_check({})
