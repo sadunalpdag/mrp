@@ -104,6 +104,10 @@ PRE_SIGNAL_SOURCE_MODE = "ALL_FUTURES"
 PRE_SIGNAL_MAX_SYMBOLS = 0
 PRE_SIGNAL_MIN_24H_QUOTE_VOLUME = 5_000_000
 PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME = 5_000_000
+PRE_SIGNAL_DAILY_CHANGE_MIN_PCT = -5.0
+PRE_SIGNAL_DAILY_CHANGE_MAX_PCT = 5.0
+PRE_SIGNAL_MIN_1H_QUOTE_VOLUME = 200_000
+PRE_SIGNAL_MAX_WORKERS = 4
 PRE_SIGNAL_SHEET_MIN_24H_QUOTE_VOLUME = 20_000_000
 PRE_SIGNAL_SHEET_MIN_PROJECTED_24H_VOLUME = 20_000_000
 PRE_SIGNAL_PROJECTED_24H_MULTIPLIER = 24.0
@@ -2601,7 +2605,21 @@ def _get_pre_signal_quote_volume_map() -> Dict[str, float]:
     return out
 
 
-def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
+def _get_pre_signal_ticker_map() -> Dict[str, dict]:
+    ticker_response = requests.get(BINANCE_FAPI + "/fapi/v1/ticker/24hr", timeout=15).json()
+    out: Dict[str, dict] = {}
+    for t in ticker_response if isinstance(ticker_response, list) else []:
+        symbol = t.get("symbol")
+        if not symbol:
+            continue
+        out[symbol] = {
+            "quote_volume": safe_float(t.get("quoteVolume"), 0.0),
+            "daily_change_pct": safe_float(t.get("priceChangePercent"), 0.0),
+        }
+    return out
+
+
+def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float, float]]:
     try:
         info = requests.get(BINANCE_FAPI + "/fapi/v1/exchangeInfo", timeout=10).json()
         valid_symbols = {
@@ -2614,13 +2632,17 @@ def get_all_futures_usdt_symbols_for_pre_signal() -> List[Tuple[str, float]]:
         log("[PRE-SIGNAL]")
         log(f"Total futures symbols: {len(valid_symbols)}")
 
-        quote_map = _get_pre_signal_quote_volume_map()
+        ticker_map = _get_pre_signal_ticker_map()
         out = []
         for symbol in valid_symbols:
-            quote_volume = quote_map.get(symbol, 0.0)
-            out.append((symbol, quote_volume))
+            ticker = ticker_map.get(symbol, {})
+            quote_volume = _vt_safe_float(ticker.get("quote_volume"), 0.0)
+            daily_change_pct = _vt_safe_float(ticker.get("daily_change_pct"), 0.0)
+            if not (PRE_SIGNAL_DAILY_CHANGE_MIN_PCT <= daily_change_pct <= PRE_SIGNAL_DAILY_CHANGE_MAX_PCT):
+                continue
+            out.append((symbol, quote_volume, daily_change_pct))
         out.sort(key=lambda x: x[1], reverse=True)
-        log(f"Candidates for volume analysis: {len(out)}")
+        log(f"Candidates after daily change filter: {len(out)}")
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             out = out[:PRE_SIGNAL_MAX_SYMBOLS]
         return out
@@ -3173,14 +3195,18 @@ def run_pre_signal_scan(all_symbols: List[str]):
         after_volume_filter = 0
     else:
         try:
-            quote_map = _get_pre_signal_quote_volume_map()
+            ticker_map = _get_pre_signal_ticker_map()
         except Exception as e:
             log(f"[PRE-SIGNAL FALLBACK UNIVERSE ERR] {e}")
-            quote_map = {}
+            ticker_map = {}
         universe = []
         for symbol in all_symbols:
-            quote_volume = quote_map.get(symbol, 0.0)
-            universe.append((symbol, quote_volume))
+            ticker = ticker_map.get(symbol, {})
+            quote_volume = _vt_safe_float(ticker.get("quote_volume"), 0.0)
+            daily_change_pct = _vt_safe_float(ticker.get("daily_change_pct"), 0.0)
+            if not (PRE_SIGNAL_DAILY_CHANGE_MIN_PCT <= daily_change_pct <= PRE_SIGNAL_DAILY_CHANGE_MAX_PCT):
+                continue
+            universe.append((symbol, quote_volume, daily_change_pct))
         universe.sort(key=lambda x: x[1], reverse=True)
         if PRE_SIGNAL_MAX_SYMBOLS > 0:
             universe = universe[:PRE_SIGNAL_MAX_SYMBOLS]
@@ -3189,7 +3215,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         STATE["last_pre_signal_total_futures_count"] = total_symbols_scanned
         log("[PRE-SIGNAL]")
         log(f"Total futures symbols: {total_symbols_scanned}")
-        log(f"Candidates for volume analysis: {len(universe)}")
+        log(f"Candidates after daily change filter: {len(universe)}")
 
     STATE["last_pre_signal_scan_volume_threshold"] = int(PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
     STATE["last_pre_signal_scan_projected_volume_threshold"] = int(PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)
@@ -3240,33 +3266,53 @@ def run_pre_signal_scan(all_symbols: List[str]):
     scan_time_iso = _vt_now_iso()
     scan_records = []
 
-    def _scan_one(item: Tuple[str, float]):
-        symbol, quote_volume = item
+    def _scan_one(item: Tuple[str, float, float]):
+        symbol, quote_volume, daily_change_pct = item
         row = {
             "scan_time": scan_time_iso,
             "symbol": symbol,
             "quote_volume_24h": round(float(quote_volume), 2),
             "projected_24h_volume": 0.0,
             "volume_growth_factor": 0.0,
+            "recent_1h_quote_volume": 0.0,
             "volume_24h_qualified": False,
+            "volume_1h_qualified": False,
             "projected_volume_qualified": False,
             "volume_filter_passed": False,
-            "daily_change_pct": 0.0,
+            "daily_change_pct": round(float(daily_change_pct), 4),
+            "daily_change_filter_passed": bool(PRE_SIGNAL_DAILY_CHANGE_MIN_PCT <= daily_change_pct <= PRE_SIGNAL_DAILY_CHANGE_MAX_PCT),
             "source_mode": PRE_SIGNAL_SOURCE_MODE,
             "timeframe": PRE_SIGNAL_TIMEFRAME,
             "lookback_candles": PRE_SIGNAL_LOOKBACK_CANDLES,
             "pre_signal": False,
         }
+        if not row["daily_change_filter_passed"]:
+            row["skip_reason"] = "DAILY_CHANGE_FILTER"
+            return row, None
 
         klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
+        recent_candles = (klines or [])[-4:]
+        recent_1h_quote_volume = 0.0
+        for k in recent_candles:
+            fallback_quote_volume = _vt_safe_float(k[KLINE_IDX_VOLUME], 0.0) * _vt_safe_float(k[KLINE_IDX_CLOSE], 0.0)
+            recent_1h_quote_volume += _vt_safe_float(k[KLINE_IDX_QUOTE_VOLUME], fallback_quote_volume) if len(k) > KLINE_IDX_QUOTE_VOLUME else fallback_quote_volume
+        row["recent_1h_quote_volume"] = round(float(recent_1h_quote_volume), 2)
+        row["volume_1h_qualified"] = bool(recent_1h_quote_volume >= PRE_SIGNAL_MIN_1H_QUOTE_VOLUME)
+        if not row["volume_1h_qualified"]:
+            row["skip_reason"] = "LOW_1H_VOLUME"
+            return row, None
+
         metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
         if not metrics:
             row["skip_reason"] = "INSUFFICIENT_DATA"
             return row, None
         row.update(metrics)
+        row["daily_change_pct"] = round(float(daily_change_pct), 4)
+        row["recent_1h_quote_volume"] = round(float(recent_1h_quote_volume), 2)
         row["volume_24h_qualified"] = bool(quote_volume >= PRE_SIGNAL_MIN_24H_QUOTE_VOLUME)
+        row["volume_1h_qualified"] = bool(recent_1h_quote_volume >= PRE_SIGNAL_MIN_1H_QUOTE_VOLUME)
         row["projected_volume_qualified"] = bool(_vt_safe_float(row.get("projected_24h_volume"), 0.0) >= PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)
-        row["volume_filter_passed"] = bool(row["volume_24h_qualified"] or row["projected_volume_qualified"])
+        row["volume_filter_passed"] = bool(row["volume_1h_qualified"] and (row["volume_24h_qualified"] or row["projected_volume_qualified"]))
         if not row["volume_filter_passed"]:
             row["skip_reason"] = "VOLUME_FILTER"
             return row, None
@@ -3313,6 +3359,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "btc_4h_change_pct", "btc_market_direction",
             "btc_alignment_with_signal", "quote_volume_24h",
             "projected_24h_volume", "volume_growth_factor",
+            "daily_change_pct", "recent_1h_quote_volume",
             "first_whale_candle_time", "last_whale_candle_time",
         }
         signal_record = _build_pre_signal_trade_record(
@@ -3324,7 +3371,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         return row, signal_record
 
     generated_signals = []
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=PRE_SIGNAL_MAX_WORKERS) as ex:
         futs = [ex.submit(_scan_one, item) for item in universe]
         for f in as_completed(futs):
             try:
@@ -3354,6 +3401,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         log(f"[PRE SIGNAL] {rec.get('symbol')} trade_id={rec.get('trade_id')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
 
     qualified_24h_count = sum(1 for row in scan_records if bool(row.get("volume_24h_qualified")))
+    qualified_1h_count = sum(1 for row in scan_records if bool(row.get("volume_1h_qualified")))
     qualified_projected_count = sum(1 for row in scan_records if bool(row.get("projected_volume_qualified")))
     after_volume_filter = sum(1 for row in scan_records if bool(row.get("volume_filter_passed")))
     STATE["last_pre_signal_after_volume_filter"] = after_volume_filter
@@ -3362,12 +3410,15 @@ def run_pre_signal_scan(all_symbols: List[str]):
     STATE["last_pre_signal_projected_volume_qualified"] = qualified_projected_count
     log("[PRE-SIGNAL VOLUME]")
     log(f"24h qualified = {qualified_24h_count}")
+    log(f"1h qualified = {qualified_1h_count}")
     log(f"Projected qualified = {qualified_projected_count}")
     log(f"Total analyzed = {after_volume_filter}")
 
     log(
         f"[PRE SIGNAL SCAN] scanned={len(scan_records)} "
-        f"generated={len(generated_signals)} volume_24h_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME} projected_24h_min={PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME}"
+        f"generated={len(generated_signals)} daily_change={PRE_SIGNAL_DAILY_CHANGE_MIN_PCT}..{PRE_SIGNAL_DAILY_CHANGE_MAX_PCT} "
+        f"volume_1h_min={PRE_SIGNAL_MIN_1H_QUOTE_VOLUME} volume_24h_min={PRE_SIGNAL_MIN_24H_QUOTE_VOLUME} "
+        f"projected_24h_min={PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME}"
     )
     log("[PRE-SIGNAL] Scan completed")
     STATE["last_pre_signal_scan_ts"] = now_s
@@ -5686,6 +5737,8 @@ def scan_symbol(sym, bar_i):
     return sigs
 
 def run_parallel(symbols,bar_i):
+    # FIB scanner disabled: keep the hook inert while preserving the rest of the loop.
+    return []
     out=[]
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs=[ex.submit(scan_symbol,s,bar_i) for s in symbols]
@@ -13093,8 +13146,7 @@ def main():
             # 3.5) Check and activate hourly analysis if 2 weeks have passed (disabled)
             # check_and_activate_hourly_analysis()
 
-            # 3.6) Scan top gainers for support-bounce pattern and send LONG alerts
-            scan_top_gainers_and_alert()
+            # 3.6) Spot/top-gainer scanner disabled.
 
             # 3.7) Process signal follow-up evaluations
             try:
@@ -13102,12 +13154,7 @@ def main():
             except Exception as _st_err:
                 log(f"[SIGNAL TRACKER ERR] {_st_err}")
 
-            # 3.8) Advance breakout setup state machines and trigger confirmed trades
-            try:
-                process_active_setups()
-            except Exception as _setup_err:
-                log(f"[SETUP STATE ERR] {_setup_err}")
-                log(f"[SETUP STATE TRACE] {traceback.format_exc()}")
+            # 3.8) Breakout setup state machine disabled with spot scanner.
 
             # 3.9) Clean up old virtual entry trades (>15 days)
             try:
