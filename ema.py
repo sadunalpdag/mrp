@@ -12,6 +12,10 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 from dateutil import parser as _dtparser
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 import numpy as np
 import pandas as pd
 import gspread
@@ -60,6 +64,7 @@ BREAKOUT_STATS_FILE  = os.path.join(DATA_DIR,"breakout_stats.json")
 PRE_SIGNAL_CONTEXT_FILE = os.path.join(DATA_DIR, "pre_signal_context.json")
 PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "pre_signals.json")
 PRE_SIGNAL_SCAN_LOG_FILE = os.path.join(DATA_DIR, "pre_signal_scan_log.json")
+BOUNCE_BACK_LOG_FILE = os.path.join(DATA_DIR, "bounce_back_log.json")
 OPEN_POSITIONS_JSON_FILE = os.path.join(DATA_DIR, "open_positions.json")
 OPEN_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "open_pre_signals.json")
 CLOSED_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "closed_pre_signals.json")
@@ -128,6 +133,20 @@ PRE_SIGNAL_BAR_INTERVAL_MINUTES = 15.0
 MINUTES_PER_HOUR = 60.0
 PRE_BTC_4H_FILTER_ENABLED = False
 PRE_BTC_4H_MIN_CHANGE = -1.0
+PRE_SIGNAL_HOUR_FILTER_ENABLED = True
+PRE_SIGNAL_ALLOWED_HOURS_TR = [0, 1, 2, 3, 7, 8, 9, 11, 13, 15, 17, 18, 22, 23]
+
+# Bounce-back warning signal settings (experimental)
+BOUNCE_BACK_ENABLED = True
+BOUNCE_BACK_MIN_PULLBACK_PCT = 0.20      # binde 2 geri çekilme
+BOUNCE_BACK_MAX_PULLBACK_PCT = 1.80      # çok sert dump olursa alma
+BOUNCE_BACK_MIN_RECOVERY_PCT = 0.15      # dipten en az binde 1.5 toparlanma
+BOUNCE_BACK_MIN_LAST_BODY_RATIO = 0.25
+BOUNCE_BACK_MIN_EMA_FAST_SLOPE = 0.20
+BOUNCE_BACK_MIN_EMA_SLOW_SLOPE = 0.00
+BOUNCE_BACK_MIN_RSI = 45.0
+BOUNCE_BACK_MAX_RSI = 82.0
+BOUNCE_BACK_LOOKBACK_CANDLES = 6
 
 PRE_MIN_PRICE_CHANGE_4H = 1.5
 PRE_MAX_PRICE_CHANGE_4H = 8.0
@@ -1367,6 +1386,37 @@ def append_pre_signal_scan_log(records: List[dict]):
     save_pre_signal_scan_log(data)
 
 
+def load_bounce_back_log():
+    data = safe_load(BOUNCE_BACK_LOG_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_bounce_back_log(data):
+    safe_save(BOUNCE_BACK_LOG_FILE, data if isinstance(data, list) else [])
+
+
+def append_bounce_back_log(records: List[dict]):
+    """
+    Second PRE_SIGNAL log type.
+
+    Normal scan log stays in PRE_SIGNAL_SCAN_LOG_FILE.
+    Bounce-back diagnostic log goes to BOUNCE_BACK_LOG_FILE so we can study
+    which symbols made a pullback + recovery and whether they later hit TP.
+    """
+    if not records:
+        return
+    data = load_bounce_back_log()
+    data.extend(records)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    kept = []
+    for item in data:
+        ts = _parse_iso_utc(item.get("scan_time") or item.get("signal_time"))
+        if ts and ts >= cutoff:
+            kept.append(item)
+    save_bounce_back_log(kept)
+
+
 def load_open_positions_json():
     data = safe_load(OPEN_POSITIONS_JSON_FILE, [])
     return data if isinstance(data, list) else []
@@ -1413,6 +1463,322 @@ def _parse_iso_utc(ts: str) -> Optional[datetime]:
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
+
+
+
+def get_metric(metrics, key, default=0.0):
+    """
+    Safely read a numeric metric. Missing/bad values never crash the bot.
+    """
+    try:
+        if not isinstance(metrics, dict):
+            return default
+        value = metrics.get(key, default)
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def get_tr_hour(signal_time):
+    """
+    Signal time comes as UTC. Convert it to Europe/Istanbul and return hour.
+    Accepts ISO string or datetime. Falls back safely to current UTC time.
+    """
+    try:
+        if isinstance(signal_time, datetime):
+            dt = signal_time
+        else:
+            raw = str(signal_time or "").strip()
+            if not raw:
+                dt = datetime.now(timezone.utc)
+            else:
+                raw = raw.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(raw)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+
+        if ZoneInfo is not None:
+            return dt.astimezone(ZoneInfo("Europe/Istanbul")).hour
+
+        # Turkey is UTC+3. Safe fallback when zoneinfo is unavailable.
+        return (dt + timedelta(hours=3)).hour
+    except Exception:
+        return (datetime.now(timezone.utc) + timedelta(hours=3)).hour
+
+
+def passes_new_filter(metrics):
+    """
+    New main PRE_SIGNAL filter.
+    """
+    return (
+        get_metric(metrics, "ema_fast_slope", 0.0) > 0.7
+        and get_metric(metrics, "ema_slow_slope", 0.0) > 0.4
+        and get_metric(metrics, "trend_age", 999.0) <= 5
+        and get_metric(metrics, "breakout_distance_pct", 999.0) <= -0.3
+        and 65 <= get_metric(metrics, "rsi_end", 0.0) <= 78
+    )
+
+
+def classify_signal(metrics):
+    """
+    TURBO: new filter + extra strength
+    PREMIUM: new filter but not turbo
+    RISKLI: old-system signal but new filter failed
+    """
+    if passes_new_filter(metrics):
+        is_turbo = (
+            get_metric(metrics, "rsi_change", 0.0) > 25
+            and get_metric(metrics, "ema_fast_slope", 0.0) > 1.0
+            and get_metric(metrics, "ema_slow_slope", 0.0) > 0.6
+            and get_metric(metrics, "whale_candle_count", 0.0) >= 4
+        )
+        return "TURBO" if is_turbo else "PREMIUM"
+
+    return "RISKLI"
+
+
+def build_warnings(metrics):
+    warnings = []
+
+    if get_metric(metrics, "volume_acceleration", 0.0) <= 0:
+        warnings.append("Weak Momentum")
+    if get_metric(metrics, "breakout_distance_pct", 999.0) > -0.3:
+        warnings.append("Late Breakout")
+    if get_metric(metrics, "trend_age", 999.0) > 5:
+        warnings.append("Old Trend")
+    if get_metric(metrics, "rsi_end", 0.0) < 65:
+        warnings.append("RSI Low")
+    if get_metric(metrics, "rsi_end", 999.0) > 78:
+        warnings.append("RSI High")
+
+    return warnings
+
+
+def get_entry_plan(entry_price, quality):
+    try:
+        entry_price = float(entry_price or 0.0)
+    except Exception:
+        entry_price = 0.0
+
+    if quality == "TURBO":
+        return {
+            "entry_mode": "MARKET",
+            "suggested_entry": round(entry_price, 8),
+            "risk_note": "TURBO sinyal. Market giriş önerilir."
+        }
+
+    if quality == "PREMIUM":
+        return {
+            "entry_mode": "LIMIT",
+            "suggested_entry": round(entry_price * 0.998, 8),
+            "risk_note": "PREMIUM sinyal. Binde 2 aşağı limit giriş önerilir."
+        }
+
+    if quality == "BOUNCE_BACK":
+        return {
+            "entry_mode": "LIMIT / WARNING",
+            "suggested_entry": round(entry_price, 8),
+            "risk_note": "BOUNCE_BACK deneysel sinyal. Geri çekilme sonrası toparlanma var; küçük pozisyon veya sadece takip önerilir."
+        }
+
+    return {
+        "entry_mode": "LIMIT / NO TRADE",
+        "suggested_entry": round(entry_price * 0.996, 8),
+        "risk_note": "RISKLI sinyal. Binde 4 aşağı limit bekle veya işlem açma."
+    }
+
+
+def format_telegram_message(symbol, entry_price, metrics, signal_time=None, trade_id=None):
+    quality = metrics.get("signal_quality") or classify_signal(metrics)
+    tr_hour = get_tr_hour(signal_time)
+    warnings = build_warnings(metrics)
+    entry_plan = get_entry_plan(entry_price, quality)
+
+    entry_safe = get_metric({"entry_price": entry_price}, "entry_price", 0.0)
+    warning_text = ", ".join(warnings) if warnings else "None"
+
+    msg = ""
+    msg += f"🚀 PRE_SIGNAL | {symbol}\n"
+    msg += f"Signal Quality: {quality}\n"
+    msg += f"TR Hour: {tr_hour}\n"
+    msg += f"Entry Mode: {entry_plan['entry_mode']}\n"
+    msg += f"Entry Price: {round(entry_safe, 8)}\n"
+    msg += f"Suggested Entry: {entry_plan['suggested_entry']}\n"
+
+    if trade_id:
+        msg += f"Trade ID: {trade_id}\n"
+
+    msg += "\n"
+    msg += "📊 Metrics\n"
+    msg += f"ema_fast_slope: {get_metric(metrics, 'ema_fast_slope', 0.0)}\n"
+    msg += f"ema_slow_slope: {get_metric(metrics, 'ema_slow_slope', 0.0)}\n"
+    msg += f"trend_age: {get_metric(metrics, 'trend_age', 0.0)}\n"
+    msg += f"breakout_distance_pct: {get_metric(metrics, 'breakout_distance_pct', 0.0)}\n"
+    msg += f"rsi_end: {get_metric(metrics, 'rsi_end', 0.0)}\n"
+    msg += f"rsi_change: {get_metric(metrics, 'rsi_change', 0.0)}\n"
+    msg += f"whale_candle_count: {get_metric(metrics, 'whale_candle_count', 0.0)}\n"
+    msg += f"volume_acceleration: {get_metric(metrics, 'volume_acceleration', 0.0)}\n"
+
+    if quality == "BOUNCE_BACK":
+        msg += "\n"
+        msg += "⚠️ BOUNCE_BACK WARNING SIGNAL\n"
+        msg += f"bounce_back_reason: {metrics.get('bounce_back_reason', 'UNKNOWN')}\n"
+        msg += f"bounce_back_drop_pct: {get_metric(metrics, 'bounce_back_drop_pct', 0.0)}\n"
+        msg += f"bounce_back_recovery_pct: {get_metric(metrics, 'bounce_back_recovery_pct', 0.0)}\n"
+        msg += f"bounce_back_body_ratio: {get_metric(metrics, 'bounce_back_body_ratio', 0.0)}\n"
+        msg += "This is experimental. Normal PRE_SIGNAL filter may not be fully confirmed.\n"
+
+    msg += "\n"
+    msg += f"⚠️ Risk warnings: {warning_text}\n"
+    msg += f"Risk note: {entry_plan['risk_note']}\n"
+
+    return msg
+
+
+PRE_SIGNAL_RECORD_METRIC_KEYS = {
+    "candles_15m",
+    "price_change_4h_pct", "volume_change_4h_pct",
+    "avg_volume_ratio", "max_volume_ratio",
+    "avg_body_ratio", "max_body_ratio",
+    "ema_fast_slope", "ema_slow_slope",
+    "rsi_start", "rsi_end", "rsi_change",
+    "highest_high", "lowest_low", "range_pct",
+    "compression_score", "volume_acceleration",
+    "whale_candle_count", "breakout_distance_pct",
+    "trend_age", "atr_now",
+    "btc_15m_change_pct", "btc_1h_change_pct",
+    "btc_4h_change_pct", "btc_market_direction",
+    "btc_alignment_with_signal", "quote_volume_24h",
+    "projected_24h_volume", "volume_growth_factor",
+    "daily_change_pct", "recent_1h_quote_volume",
+    "first_whale_candle_time", "last_whale_candle_time",
+    "hour_tr", "signal_quality", "risk_warnings",
+    "entry_mode", "suggested_entry", "old_system_signal",
+    "bounce_back_checked", "bounce_back_signal", "bounce_back_reason",
+    "bounce_back_drop_pct", "bounce_back_recovery_pct",
+    "bounce_back_body_ratio", "bounce_back_last_green",
+    "bounce_back_warning",
+}
+
+
+def _pick_pre_signal_record_metrics(row: dict) -> dict:
+    return {k: row.get(k) for k in PRE_SIGNAL_RECORD_METRIC_KEYS}
+
+
+def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict:
+    """
+    Experimental bounce-back detector.
+
+    How it works:
+    1) Look at recent 15m candles.
+    2) Price must pull back from a recent high by at least BOUNCE_BACK_MIN_PULLBACK_PCT.
+    3) Price must recover from the pullback low by at least BOUNCE_BACK_MIN_RECOVERY_PCT.
+    4) Last candle should be green and not too weak.
+    5) EMA slopes and RSI must not be dead.
+
+    This is not a normal clean PRE_SIGNAL. It is sent as BOUNCE_BACK with warning.
+    """
+    result = {
+        "bounce_back_checked": True,
+        "bounce_back_signal": False,
+        "bounce_back_reason": "NOT_CHECKED",
+        "bounce_back_drop_pct": 0.0,
+        "bounce_back_recovery_pct": 0.0,
+        "bounce_back_body_ratio": 0.0,
+        "bounce_back_last_green": False,
+        "bounce_back_warning": "Experimental bounce-back signal. Higher risk than TURBO/PREMIUM.",
+    }
+
+    if not BOUNCE_BACK_ENABLED:
+        result["bounce_back_reason"] = "DISABLED"
+        return result
+
+    try:
+        if not klines or len(klines) < max(4, BOUNCE_BACK_LOOKBACK_CANDLES):
+            result["bounce_back_reason"] = "INSUFFICIENT_KLINES"
+            return result
+
+        window = klines[-BOUNCE_BACK_LOOKBACK_CANDLES:]
+        opens = [_vt_safe_float(k[1], 0.0) for k in window]
+        highs = [_vt_safe_float(k[2], 0.0) for k in window]
+        lows = [_vt_safe_float(k[3], 0.0) for k in window]
+        closes = [_vt_safe_float(k[4], 0.0) for k in window]
+
+        last_open = opens[-1]
+        last_high = highs[-1]
+        last_low = lows[-1]
+        last_close = closes[-1]
+
+        recent_high = max(highs[:-1]) if len(highs) > 1 else max(highs)
+        pullback_low = min(lows)
+        if recent_high <= 0 or pullback_low <= 0 or last_close <= 0:
+            result["bounce_back_reason"] = "BAD_PRICE_DATA"
+            return result
+
+        drop_pct = ((recent_high - pullback_low) / recent_high) * 100.0
+        recovery_pct = ((last_close - pullback_low) / pullback_low) * 100.0
+        candle_range = max(1e-12, last_high - last_low)
+        body_ratio = abs(last_close - last_open) / candle_range
+        last_green = last_close > last_open
+
+        result.update({
+            "bounce_back_drop_pct": round(drop_pct, 4),
+            "bounce_back_recovery_pct": round(recovery_pct, 4),
+            "bounce_back_body_ratio": round(body_ratio, 4),
+            "bounce_back_last_green": bool(last_green),
+        })
+
+        ema_fast_ok = get_metric(metrics, "ema_fast_slope", 0.0) >= BOUNCE_BACK_MIN_EMA_FAST_SLOPE
+        ema_slow_ok = get_metric(metrics, "ema_slow_slope", 0.0) >= BOUNCE_BACK_MIN_EMA_SLOW_SLOPE
+        rsi_end = get_metric(metrics, "rsi_end", 0.0)
+        rsi_ok = BOUNCE_BACK_MIN_RSI <= rsi_end <= BOUNCE_BACK_MAX_RSI
+
+        checks = [
+            (drop_pct >= BOUNCE_BACK_MIN_PULLBACK_PCT, "PULLBACK_TOO_SMALL"),
+            (drop_pct <= BOUNCE_BACK_MAX_PULLBACK_PCT, "PULLBACK_TOO_DEEP"),
+            (recovery_pct >= BOUNCE_BACK_MIN_RECOVERY_PCT, "RECOVERY_TOO_WEAK"),
+            (last_green, "LAST_CANDLE_NOT_GREEN"),
+            (body_ratio >= BOUNCE_BACK_MIN_LAST_BODY_RATIO, "LAST_BODY_WEAK"),
+            (ema_fast_ok, "EMA_FAST_WEAK"),
+            (ema_slow_ok, "EMA_SLOW_WEAK"),
+            (rsi_ok, "RSI_OUT_OF_RANGE"),
+        ]
+
+        failed = [reason for ok, reason in checks if not ok]
+        if failed:
+            result["bounce_back_reason"] = ",".join(failed)
+            return result
+
+        result["bounce_back_signal"] = True
+        result["bounce_back_reason"] = "PULLBACK_RECOVERY_CONFIRMED"
+        return result
+
+    except Exception as e:
+        result["bounce_back_reason"] = f"ERR:{e}"
+        return result
+
+
+def build_bounce_back_log_record(row: dict) -> dict:
+    """
+    Compact diagnostic record for bounce-back analysis.
+    """
+    keys = [
+        "scan_time", "signal_time", "symbol", "pre_signal", "would_pre_signal",
+        "old_system_signal", "signal_quality", "skip_reason", "hour_tr",
+        "entry", "suggested_entry", "entry_mode",
+        "bounce_back_checked", "bounce_back_signal", "bounce_back_reason",
+        "bounce_back_drop_pct", "bounce_back_recovery_pct",
+        "bounce_back_body_ratio", "bounce_back_last_green", "bounce_back_warning",
+        "ema_fast_slope", "ema_slow_slope", "trend_age", "breakout_distance_pct",
+        "rsi_end", "rsi_change", "volume_acceleration", "whale_candle_count",
+        "daily_change_pct", "recent_1h_quote_volume", "projected_24h_volume",
+    ]
+    return {k: row.get(k) for k in keys if k in row}
 
 
 def _ms_to_iso_utc(ms: Optional[int]) -> Optional[str]:
@@ -2950,28 +3316,26 @@ def _is_pre_signal(metrics: dict) -> bool:
     return bool(evaluate_pre_signal_thresholds(metrics).get("is_pre_signal"))
 
 
-def _send_pre_signal_(metrics: dict) -> str:
-    symbol = metrics.get("symbol", "")
-    entry = _vt_safe_float(metrics.get("entry"), 0.0)
-    tp = round(entry * (1 + PRE_SIGNAL_TP_PCT), 8) if entry > 0 else 0.0
-    trade_id = metrics.get("trade_id")
-    msg = (
-        f"🚨 PRE-SIGNAL LONG\n\n"
-        f"Trade ID: {trade_id}\n"
-        f"Coin: {symbol}\n\n"
-        f"Entry: {entry}\n"
-        f"TP: {tp}\n\n"
-        f"4H Price Change: %{metrics.get('price_change_4h_pct')}\n"
-        f"RSI Change: {metrics.get('rsi_change')}\n"
-        f"EMA Fast Slope: {metrics.get('ema_fast_slope')}\n"
-        f"EMA Slow Slope: {metrics.get('ema_slow_slope')}\n"
-        f"Compression: {metrics.get('compression_score')}\n"
-        f"Max Volume Ratio: {metrics.get('max_volume_ratio')}\n"
-        f"Whale Candles: {metrics.get('whale_candle_count')}\n"
-        f"BTC 4H: %{metrics.get('btc_4h_change_pct')}\n\n"
-        f"Status:\n"
-        f"Potential Early Entry"
+def _send_pre_signal_(payload: dict) -> str:
+    payload = payload or {}
+
+    symbol = payload.get("symbol", "")
+    entry_price = get_metric(payload, "entry", 0.0)
+    signal_time = payload.get("signal_time") or _vt_now_iso()
+    trade_id = payload.get("trade_id")
+
+    metrics = dict(payload)
+    quality = payload.get("signal_quality") or classify_signal(metrics)
+    metrics["signal_quality"] = quality
+
+    msg = format_telegram_message(
+        symbol=symbol,
+        entry_price=entry_price,
+        metrics=metrics,
+        signal_time=signal_time,
+        trade_id=trade_id,
     )
+
     tg_send(msg)
     return msg
 
@@ -3337,13 +3701,58 @@ def run_pre_signal_scan(all_symbols: List[str]):
         row["fail_count"] = proximity.get("fail_count", 0)
         row["reject_reasons"] = proximity.get("reject_reasons", [])
         row["would_pre_signal"] = bool(decision.get("is_pre_signal"))
-        is_pre = bool(decision.get("is_pre_signal"))
-        row["pre_signal"] = is_pre
-        if not is_pre:
-            row["skip_reason"] = "CONDITIONS_NOT_MET"
-            return row, None
+        old_system_signal = bool(decision.get("is_pre_signal"))
+        row["old_system_signal"] = old_system_signal
 
         signal_time = _vt_now_iso()
+        hour_tr = get_tr_hour(signal_time)
+        row["hour_tr"] = hour_tr
+
+        bounce_back = detect_bounce_back_signal(klines, row, entry_price)
+        row.update(bounce_back)
+
+        if not old_system_signal:
+            if not bool(row.get("bounce_back_signal")):
+                row["pre_signal"] = False
+                row["skip_reason"] = "CONDITIONS_NOT_MET"
+                return row, None
+
+            if PRE_SIGNAL_HOUR_FILTER_ENABLED and hour_tr not in PRE_SIGNAL_ALLOWED_HOURS_TR:
+                row["pre_signal"] = False
+                row["skip_reason"] = "TR_HOUR_FILTER_BOUNCE_BACK"
+                return row, None
+
+            row["pre_signal"] = True
+            row["skip_reason"] = None
+            row["signal_quality"] = "BOUNCE_BACK"
+            row["risk_warnings"] = build_warnings(row) + ["Bounce Back Experimental", row.get("bounce_back_warning")]
+            entry_plan = get_entry_plan(entry_price, "BOUNCE_BACK")
+            row["entry_mode"] = entry_plan["entry_mode"]
+            row["suggested_entry"] = entry_plan["suggested_entry"]
+
+            signal_record = _build_pre_signal_trade_record(
+                symbol=symbol,
+                entry_price=round(entry_price, 8) if entry_price > 0 else 0.0,
+                signal_time=signal_time,
+                metrics=_pick_pre_signal_record_metrics(row),
+            )
+            return row, signal_record
+
+        if PRE_SIGNAL_HOUR_FILTER_ENABLED and hour_tr not in PRE_SIGNAL_ALLOWED_HOURS_TR:
+            row["pre_signal"] = False
+            row["skip_reason"] = "TR_HOUR_FILTER"
+            return row, None
+
+        quality = classify_signal(row)
+        warnings = build_warnings(row)
+        entry_plan = get_entry_plan(entry_price, quality)
+
+        row["signal_quality"] = quality
+        row["risk_warnings"] = warnings
+        row["entry_mode"] = entry_plan["entry_mode"]
+        row["suggested_entry"] = entry_plan["suggested_entry"]
+        row["pre_signal"] = True
+
         metric_keys = {
             "candles_15m",
             "price_change_4h_pct", "volume_change_4h_pct",
@@ -3361,12 +3770,14 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "projected_24h_volume", "volume_growth_factor",
             "daily_change_pct", "recent_1h_quote_volume",
             "first_whale_candle_time", "last_whale_candle_time",
+            "hour_tr", "signal_quality", "risk_warnings",
+            "entry_mode", "suggested_entry", "old_system_signal",
         }
         signal_record = _build_pre_signal_trade_record(
             symbol=symbol,
             entry_price=round(entry_price, 8) if entry_price > 0 else 0.0,
             signal_time=signal_time,
-            metrics={k: row.get(k) for k in metric_keys},
+            metrics=_pick_pre_signal_record_metrics(row),
         )
         return row, signal_record
 
@@ -3385,6 +3796,15 @@ def run_pre_signal_scan(all_symbols: List[str]):
                 recent_pre_symbols.add(signal_record.get("symbol"))
 
     append_pre_signal_scan_log(scan_records)
+
+    bounce_back_records = [
+        build_bounce_back_log_record(row)
+        for row in scan_records
+        if bool(row.get("bounce_back_checked"))
+        and (bool(row.get("bounce_back_signal")) or get_metric(row, "bounce_back_drop_pct", 0.0) >= 0.10)
+    ]
+    append_bounce_back_log(bounce_back_records)
+
     for row in scan_records:
         append_pre_signal_live_state(row)
     for rec in generated_signals:
@@ -3392,13 +3812,15 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "trade_id": rec.get("trade_id"),
             "symbol": rec.get("symbol"),
             "entry": rec.get("entry_price"),
+            "signal_time": rec.get("signal_time"),
             **(rec.get("metrics") or {}),
         })
         rec["telegram_message"] = telegram_message
         append_pre_signal_record(rec)
         append_open_pre_signal(rec)
         create_pre_signal_performance_record(rec, rec.get("metrics") or {})
-        log(f"[PRE SIGNAL] {rec.get('symbol')} trade_id={rec.get('trade_id')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
+        rec_quality = (rec.get("metrics") or {}).get("signal_quality")
+        log(f"[PRE SIGNAL] {rec.get('symbol')} quality={rec_quality} trade_id={rec.get('trade_id')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
 
     qualified_24h_count = sum(1 for row in scan_records if bool(row.get("volume_24h_qualified")))
     qualified_1h_count = sum(1 for row in scan_records if bool(row.get("volume_1h_qualified")))
