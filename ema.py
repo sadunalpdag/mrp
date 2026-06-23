@@ -4192,9 +4192,10 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "lookback_candles": PRE_SIGNAL_LOOKBACK_CANDLES,
             "pre_signal": False,
         }
+        # Do not return here: BOUNCE_SIGNAL must still be evaluated/logged even
+        # when the legacy PRE_SIGNAL daily-change filter fails.
         if not row["daily_change_filter_passed"]:
             row["skip_reason"] = "DAILY_CHANGE_FILTER"
-            return row, None
 
         klines = futures_get_klines(symbol, PRE_SIGNAL_TIMEFRAME, PRE_SIGNAL_LOOKBACK_CANDLES + 5)
         recent_candles = (klines or [])[-4:]
@@ -4204,9 +4205,10 @@ def run_pre_signal_scan(all_symbols: List[str]):
             recent_1h_quote_volume += _vt_safe_float(k[KLINE_IDX_QUOTE_VOLUME], fallback_quote_volume) if len(k) > KLINE_IDX_QUOTE_VOLUME else fallback_quote_volume
         row["recent_1h_quote_volume"] = round(float(recent_1h_quote_volume), 2)
         row["volume_1h_qualified"] = bool(recent_1h_quote_volume >= PRE_SIGNAL_MIN_1H_QUOTE_VOLUME)
+        # Do not return here: low 1h volume should be logged/rejected for bounce,
+        # not skipped before BOUNCE_SIGNAL is checked.
         if not row["volume_1h_qualified"]:
             row["skip_reason"] = "LOW_1H_VOLUME"
-            return row, None
 
         metrics = _compute_pre_signal_metrics(symbol, quote_volume, klines, btc_ctx)
         if not metrics:
@@ -4219,18 +4221,22 @@ def run_pre_signal_scan(all_symbols: List[str]):
         row["volume_1h_qualified"] = bool(recent_1h_quote_volume >= PRE_SIGNAL_MIN_1H_QUOTE_VOLUME)
         row["projected_volume_qualified"] = bool(_vt_safe_float(row.get("projected_24h_volume"), 0.0) >= PRE_SIGNAL_MIN_PROJECTED_24H_VOLUME)
         row["volume_filter_passed"] = bool(row["volume_1h_qualified"] and (row["volume_24h_qualified"] or row["projected_volume_qualified"]))
+        # Do not return on legacy filters before bounce evaluation.
+        # They can still block old PRE_SIGNAL, but BOUNCE_SIGNAL must be checked
+        # quickly and logged for later analysis.
+        legacy_block_reasons = []
         if not row["volume_filter_passed"]:
-            row["skip_reason"] = "VOLUME_FILTER"
-            return row, None
+            legacy_block_reasons.append("VOLUME_FILTER")
         if symbol in open_real_symbols:
-            row["skip_reason"] = "OPEN_POSITION"
-            return row, None
+            legacy_block_reasons.append("OPEN_POSITION")
         if symbol in open_pre_symbols:
-            row["skip_reason"] = "OPEN_PRE_SIGNAL"
-            return row, None
+            legacy_block_reasons.append("OPEN_PRE_SIGNAL")
         if symbol in recent_pre_symbols:
-            row["skip_reason"] = "COOLDOWN"
-            return row, None
+            legacy_block_reasons.append("COOLDOWN")
+        if legacy_block_reasons:
+            row["legacy_block_reasons"] = legacy_block_reasons
+            row["skip_reason"] = legacy_block_reasons[0]
+
         entry_price = _vt_safe_float(klines[-1][4], 0.0) if klines else 0.0
         row["entry"] = round(entry_price, 8) if entry_price > 0 else 0.0
 
@@ -4277,14 +4283,19 @@ def run_pre_signal_scan(all_symbols: List[str]):
             )
             return row, signal_record
 
+        # Legacy PRE_SIGNAL is now LOG-ONLY. It must not create Telegram/open records
+        # while the BOUNCE_SIGNAL test is active. We still compute/store its quality
+        # in scan/live logs so it can be analysed later.
         if not old_system_signal:
             row["pre_signal"] = False
             row["signal_quality"] = "NO_TRADE" if bounce_quality == "NO_TRADE" else None
-            row["skip_reason"] = "CONDITIONS_NOT_MET"
+            row["skip_reason"] = row.get("skip_reason") or "CONDITIONS_NOT_MET"
             return row, None
 
         if PRE_SIGNAL_HOUR_FILTER_ENABLED and hour_tr not in PRE_SIGNAL_ALLOWED_HOURS_TR:
             row["pre_signal"] = False
+            row["signal_type"] = PRE_SIGNAL_TYPE
+            row["signal_quality"] = "PRE_SIGNAL_LOG_ONLY"
             row["skip_reason"] = "TR_HOUR_FILTER"
             return row, None
 
@@ -4298,6 +4309,9 @@ def run_pre_signal_scan(all_symbols: List[str]):
         row["entry_mode"] = entry_plan["entry_mode"]
         row["suggested_entry"] = entry_plan["suggested_entry"]
         row["pre_signal"] = True
+        row["pre_signal_log_only"] = True
+        row["skip_reason"] = "PRE_SIGNAL_LOG_ONLY_BOUNCE_TEST_ACTIVE"
+        return row, None
 
         metric_keys = {
             "candles_15m",
@@ -4359,9 +4373,19 @@ def run_pre_signal_scan(all_symbols: List[str]):
     ]
     append_rejected_signals(rejected_bounce_records)
 
+    STATE["last_bounce_checked_count"] = sum(1 for row in scan_records if bool(row.get("bounce_back_checked")))
+    STATE["last_bounce_detected_count"] = sum(1 for row in scan_records if bool(row.get("bounce_back_signal")))
+    STATE["last_bounce_rejected_count"] = len(rejected_bounce_records)
+    STATE["last_bounce_generated_count"] = sum(1 for rec in generated_signals if rec.get("type") == BOUNCE_SIGNAL_TYPE)
+    STATE["last_pre_signal_log_only_count"] = sum(1 for row in scan_records if bool(row.get("pre_signal_log_only")))
+
     for row in scan_records:
         append_pre_signal_live_state(row)
     for rec in generated_signals:
+        if rec.get("type") != BOUNCE_SIGNAL_TYPE:
+            # Safety: old PRE_SIGNAL records are log-only during bounce test.
+            log(f"[SIGNAL SKIP TELEGRAM] type={rec.get('type')} symbol={rec.get('symbol')}")
+            continue
         rec_quality = (rec.get("metrics") or {}).get("signal_quality") or rec.get("signal_quality")
         telegram_message = _send_pre_signal_({
             "trade_id": rec.get("trade_id"),
