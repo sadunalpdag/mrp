@@ -65,6 +65,7 @@ PRE_SIGNAL_CONTEXT_FILE = os.path.join(DATA_DIR, "pre_signal_context.json")
 PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "pre_signals.json")
 PRE_SIGNAL_SCAN_LOG_FILE = os.path.join(DATA_DIR, "pre_signal_scan_log.json")
 BOUNCE_BACK_LOG_FILE = os.path.join(DATA_DIR, "bounce_back_log.json")
+REJECTED_SIGNALS_FILE = os.path.join(DATA_DIR, "rejected_signals.json")
 OPEN_POSITIONS_JSON_FILE = os.path.join(DATA_DIR, "open_positions.json")
 OPEN_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "open_pre_signals.json")
 CLOSED_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "closed_pre_signals.json")
@@ -136,17 +137,30 @@ PRE_BTC_4H_MIN_CHANGE = -1.0
 PRE_SIGNAL_HOUR_FILTER_ENABLED = True
 PRE_SIGNAL_ALLOWED_HOURS_TR = [0, 1, 2, 3, 7, 8, 9, 11, 13, 15, 17, 18, 22, 23]
 
-# Bounce-back warning signal settings (experimental)
+# BOUNCE_SIGNAL strategy settings (experimental, LONG only)
+# Goal: catch coins that drop sharply, print a wick/reversal, then recover quickly
+# before classic breakout confirmation. Rich logs are kept for later analysis.
 BOUNCE_BACK_ENABLED = True
-BOUNCE_BACK_MIN_PULLBACK_PCT = 0.20      # binde 2 geri çekilme
-BOUNCE_BACK_MAX_PULLBACK_PCT = 1.80      # çok sert dump olursa alma
-BOUNCE_BACK_MIN_RECOVERY_PCT = 0.15      # dipten en az binde 1.5 toparlanma
-BOUNCE_BACK_MIN_LAST_BODY_RATIO = 0.25
-BOUNCE_BACK_MIN_EMA_FAST_SLOPE = 0.20
-BOUNCE_BACK_MIN_EMA_SLOW_SLOPE = 0.00
-BOUNCE_BACK_MIN_RSI = 45.0
-BOUNCE_BACK_MAX_RSI = 82.0
-BOUNCE_BACK_LOOKBACK_CANDLES = 6
+BOUNCE_SIGNAL_TYPE = "BOUNCE_SIGNAL"
+BOUNCE_BACK_LOOKBACK_CANDLES = 16
+BOUNCE_BACK_MIN_PULLBACK_PCT = 4.0
+BOUNCE_BACK_MIN_RECOVERY_PCT = 3.0
+BOUNCE_BACK_MIN_LAST_BODY_RATIO = 0.35
+BOUNCE_BACK_MIN_EMA_FAST_SLOPE = 0.30
+BOUNCE_BACK_MIN_EMA_SLOW_SLOPE = 0.10
+BOUNCE_BACK_MIN_RSI = 55.0
+BOUNCE_BACK_MAX_RSI = 78.0
+BOUNCE_BACK_MAX_TREND_AGE = 5
+BOUNCE_BACK_MIN_VOLUME_GROWTH_FACTOR = 1.20
+BOUNCE_BACK_MIN_WHALE_COUNT_ALT = 2
+BOUNCE_BACK_MAX_BREAKOUT_DISTANCE_PCT = 1.0
+BOUNCE_BACK_MIN_BTC_15M_CHANGE_PCT = -0.5
+BOUNCE_BACK_MIN_BTC_1H_CHANGE_PCT = -1.0
+BOUNCE_TURBO_TP_PCT = 0.006
+BOUNCE_PREMIUM_TP_PCT = 0.005
+BOUNCE_REJECTED_RETENTION_DAYS = RETENTION_DAYS
+# Backward-compatible alias used by older diagnostic score logic.
+BOUNCE_BACK_MAX_PULLBACK_PCT = 999.0
 
 PRE_MIN_PRICE_CHANGE_4H = 1.5
 PRE_MAX_PRICE_CHANGE_4H = 8.0
@@ -1422,6 +1436,65 @@ def append_bounce_back_log(records: List[dict]):
     save_bounce_back_log(kept)
 
 
+
+def load_rejected_signals():
+    data = safe_load(REJECTED_SIGNALS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def save_rejected_signals(data):
+    safe_save(REJECTED_SIGNALS_FILE, data if isinstance(data, list) else [])
+
+
+def append_rejected_signals(records: List[dict]):
+    if not records:
+        return
+    data = load_rejected_signals()
+    data.extend(records)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=BOUNCE_REJECTED_RETENTION_DAYS)
+    kept = []
+    for item in data:
+        ts = _parse_iso_utc(item.get("scan_time") or item.get("signal_time"))
+        if ts and ts >= cutoff:
+            kept.append(item)
+    save_rejected_signals(kept)
+
+
+def build_rejected_signal_record(row: dict) -> dict:
+    metrics = row if isinstance(row, dict) else {}
+    signal_time = metrics.get("signal_time") or metrics.get("scan_time") or _vt_now_iso()
+    hour_tr = int(get_metric(metrics, "hour_tr", get_tr_hour(signal_time)))
+    return {
+        "schema": "rejected_signal_v1",
+        "strategy": BOUNCE_SIGNAL_TYPE,
+        "scan_time": metrics.get("scan_time"),
+        "signal_time": signal_time,
+        "symbol": metrics.get("symbol"),
+        "quality": metrics.get("bounce_signal_quality", "NO_TRADE"),
+        "reason": metrics.get("bounce_back_reason"),
+        "no_trade_reasons": metrics.get("bounce_no_trade_reasons", []),
+        "entry_price": metrics.get("entry"),
+        "hour_tr": hour_tr,
+        "session": _tr_session_name(hour_tr),
+        "bounce_back_drop_pct": metrics.get("bounce_back_drop_pct"),
+        "bounce_back_recovery_pct": metrics.get("bounce_back_recovery_pct"),
+        "bounce_back_last_green": metrics.get("bounce_back_last_green"),
+        "bounce_back_body_ratio": metrics.get("bounce_back_body_ratio"),
+        "rsi_end": metrics.get("rsi_end"),
+        "ema_fast_slope": metrics.get("ema_fast_slope"),
+        "ema_slow_slope": metrics.get("ema_slow_slope"),
+        "trend_age": metrics.get("trend_age"),
+        "volume_growth_factor": metrics.get("volume_growth_factor"),
+        "whale_candle_count": metrics.get("whale_candle_count"),
+        "breakout_distance_pct": metrics.get("breakout_distance_pct"),
+        "btc_15m_change_pct": metrics.get("btc_15m_change_pct"),
+        "btc_1h_change_pct": metrics.get("btc_1h_change_pct"),
+        "daily_change_pct": metrics.get("daily_change_pct"),
+        "quote_volume_24h": metrics.get("quote_volume_24h"),
+        "projected_24h_volume": metrics.get("projected_24h_volume"),
+    }
+
+
 def load_open_positions_json():
     data = safe_load(OPEN_POSITIONS_JSON_FILE, [])
     return data if isinstance(data, list) else []
@@ -1584,11 +1657,28 @@ def get_entry_plan(entry_price, quality):
             "risk_note": "PREMIUM sinyal. Binde 2 aşağı limit giriş önerilir."
         }
 
-    if quality == "BOUNCE_BACK":
+    if quality == "BOUNCE_TURBO":
+        return {
+            "entry_mode": "MARKET",
+            "suggested_entry": round(entry_price, 8),
+            "tp_pct": BOUNCE_TURBO_TP_PCT,
+            "risk_note": "BOUNCE_TURBO: dipten hızlı toparlanma. Market giriş denenir; deneysel strateji."
+        }
+
+    if quality == "BOUNCE_PREMIUM":
+        return {
+            "entry_mode": "LIMIT",
+            "suggested_entry": round(entry_price * 0.998, 8),
+            "tp_pct": BOUNCE_PREMIUM_TP_PCT,
+            "risk_note": "BOUNCE_PREMIUM: binde 2 aşağı limit giriş; TP 0.4-0.5 aralığı takip."
+        }
+
+    if quality in ("BOUNCE_BACK", "BOUNCE_SIGNAL"):
         return {
             "entry_mode": "LIMIT / WARNING",
-            "suggested_entry": round(entry_price, 8),
-            "risk_note": "BOUNCE_BACK deneysel sinyal. Geri çekilme sonrası toparlanma var; küçük pozisyon veya sadece takip önerilir."
+            "suggested_entry": round(entry_price * 0.998, 8),
+            "tp_pct": BOUNCE_PREMIUM_TP_PCT,
+            "risk_note": "BOUNCE_SIGNAL deneysel. Sadece BOUNCE_TURBO/PREMIUM Telegram'a gider."
         }
 
     return {
@@ -1645,6 +1735,132 @@ def build_tp_progress(entry_price, metrics):
         "status_text": status_text,
         "late_entry_warning": bool(hit_levels),
     }
+
+
+def bounce_main_filter_passes(metrics: dict) -> bool:
+    return (
+        get_metric(metrics, "bounce_back_drop_pct", 0.0) >= BOUNCE_BACK_MIN_PULLBACK_PCT
+        and get_metric(metrics, "bounce_back_recovery_pct", 0.0) >= BOUNCE_BACK_MIN_RECOVERY_PCT
+        and bool(metrics.get("bounce_back_last_green", False))
+        and get_metric(metrics, "bounce_back_body_ratio", 0.0) >= BOUNCE_BACK_MIN_LAST_BODY_RATIO
+        and BOUNCE_BACK_MIN_RSI <= get_metric(metrics, "rsi_end", 0.0) <= BOUNCE_BACK_MAX_RSI
+        and get_metric(metrics, "ema_fast_slope", 0.0) > BOUNCE_BACK_MIN_EMA_FAST_SLOPE
+        and get_metric(metrics, "ema_slow_slope", 0.0) > BOUNCE_BACK_MIN_EMA_SLOW_SLOPE
+        and get_metric(metrics, "trend_age", 999.0) <= BOUNCE_BACK_MAX_TREND_AGE
+        and (
+            get_metric(metrics, "volume_growth_factor", 0.0) >= BOUNCE_BACK_MIN_VOLUME_GROWTH_FACTOR
+            or get_metric(metrics, "whale_candle_count", 0.0) >= BOUNCE_BACK_MIN_WHALE_COUNT_ALT
+        )
+        and get_metric(metrics, "breakout_distance_pct", 999.0) <= BOUNCE_BACK_MAX_BREAKOUT_DISTANCE_PCT
+        and get_metric(metrics, "btc_15m_change_pct", 0.0) > BOUNCE_BACK_MIN_BTC_15M_CHANGE_PCT
+        and get_metric(metrics, "btc_1h_change_pct", 0.0) > BOUNCE_BACK_MIN_BTC_1H_CHANGE_PCT
+    )
+
+
+def classify_bounce_signal(metrics: dict) -> str:
+    no_trade_reasons = []
+    if not bool(metrics.get("bounce_back_last_green", False)):
+        no_trade_reasons.append("LAST_CANDLE_NOT_GREEN")
+    if get_metric(metrics, "bounce_back_body_ratio", 0.0) < BOUNCE_BACK_MIN_LAST_BODY_RATIO:
+        no_trade_reasons.append("BODY_WEAK")
+    if get_metric(metrics, "rsi_end", 0.0) > BOUNCE_BACK_MAX_RSI:
+        no_trade_reasons.append("RSI_HIGH")
+    if get_metric(metrics, "btc_1h_change_pct", 0.0) <= BOUNCE_BACK_MIN_BTC_1H_CHANGE_PCT:
+        no_trade_reasons.append("BTC_1H_DUMP")
+    if get_metric(metrics, "breakout_distance_pct", 999.0) > BOUNCE_BACK_MAX_BREAKOUT_DISTANCE_PCT:
+        no_trade_reasons.append("LATE_BREAKOUT")
+
+    if no_trade_reasons:
+        metrics["bounce_no_trade_reasons"] = no_trade_reasons
+        return "NO_TRADE"
+
+    if not bounce_main_filter_passes(metrics):
+        failed = []
+        if get_metric(metrics, "bounce_back_drop_pct", 0.0) < BOUNCE_BACK_MIN_PULLBACK_PCT:
+            failed.append("DROP_LT_4")
+        if get_metric(metrics, "bounce_back_recovery_pct", 0.0) < BOUNCE_BACK_MIN_RECOVERY_PCT:
+            failed.append("RECOVERY_LT_3")
+        if get_metric(metrics, "rsi_end", 0.0) < BOUNCE_BACK_MIN_RSI:
+            failed.append("RSI_LOW")
+        if get_metric(metrics, "ema_fast_slope", 0.0) <= BOUNCE_BACK_MIN_EMA_FAST_SLOPE:
+            failed.append("EMA_FAST_WEAK")
+        if get_metric(metrics, "ema_slow_slope", 0.0) <= BOUNCE_BACK_MIN_EMA_SLOW_SLOPE:
+            failed.append("EMA_SLOW_WEAK")
+        if get_metric(metrics, "trend_age", 999.0) > BOUNCE_BACK_MAX_TREND_AGE:
+            failed.append("OLD_TREND")
+        if not (
+            get_metric(metrics, "volume_growth_factor", 0.0) >= BOUNCE_BACK_MIN_VOLUME_GROWTH_FACTOR
+            or get_metric(metrics, "whale_candle_count", 0.0) >= BOUNCE_BACK_MIN_WHALE_COUNT_ALT
+        ):
+            failed.append("VOLUME_OR_WHALE_WEAK")
+        if get_metric(metrics, "btc_15m_change_pct", 0.0) <= BOUNCE_BACK_MIN_BTC_15M_CHANGE_PCT:
+            failed.append("BTC_15M_WEAK")
+        metrics["bounce_no_trade_reasons"] = failed
+        return "NO_TRADE"
+
+    is_turbo = (
+        get_metric(metrics, "bounce_back_drop_pct", 0.0) >= 5.0
+        and get_metric(metrics, "bounce_back_recovery_pct", 0.0) >= 4.0
+        and get_metric(metrics, "bounce_back_body_ratio", 0.0) >= 0.45
+        and get_metric(metrics, "ema_fast_slope", 0.0) > 0.7
+        and 60 <= get_metric(metrics, "rsi_end", 0.0) <= 74
+        and get_metric(metrics, "whale_candle_count", 0.0) >= 3
+    )
+    return "BOUNCE_TURBO" if is_turbo else "BOUNCE_PREMIUM"
+
+
+def build_bounce_warnings(metrics: dict) -> List[str]:
+    warnings = []
+    if get_metric(metrics, "bounce_back_recovery_pct", 0.0) < 4.0:
+        warnings.append("Recovery not turbo")
+    if get_metric(metrics, "bounce_back_body_ratio", 0.0) < 0.45:
+        warnings.append("Body moderate")
+    if get_metric(metrics, "rsi_end", 0.0) > 74:
+        warnings.append("RSI near high")
+    if get_metric(metrics, "btc_15m_change_pct", 0.0) < 0:
+        warnings.append("BTC short-term weak")
+    if get_metric(metrics, "breakout_distance_pct", 0.0) > 0.5:
+        warnings.append("Breakout may be late")
+    return warnings
+
+
+def format_bounce_telegram_message(symbol, entry_price, metrics, signal_time=None, trade_id=None):
+    quality = metrics.get("signal_quality") or metrics.get("bounce_signal_quality") or classify_bounce_signal(metrics)
+    tr_hour = get_tr_hour(signal_time)
+    entry_plan = get_entry_plan(entry_price, quality)
+    warnings = build_bounce_warnings(metrics)
+    warning_text = ", ".join(warnings) if warnings else "None"
+    entry_safe = get_metric({"entry_price": entry_price}, "entry_price", 0.0)
+
+    msg = ""
+    msg += f"🔄 BOUNCE SIGNAL | {symbol}\n"
+    msg += "Signal Type: BOUNCE\n"
+    msg += f"Signal Quality: {quality}\n"
+    msg += f"TR Hour: {tr_hour}\n"
+    msg += f"Entry Mode: {entry_plan['entry_mode']}\n"
+    msg += f"Entry Price: {round(entry_safe, 8)}\n"
+    msg += f"Suggested Entry: {entry_plan['suggested_entry']}\n"
+    msg += f"TP Target: {round(get_metric(entry_plan, 'tp_pct', BOUNCE_PREMIUM_TP_PCT) * 100, 3)}%\n"
+    if trade_id:
+        msg += f"Trade ID: {trade_id}\n"
+    msg += "\n"
+    msg += "📊 Bounce Data\n"
+    msg += f"Bounce Drop %: {get_metric(metrics, 'bounce_back_drop_pct', 0.0)}\n"
+    msg += f"Bounce Recovery %: {get_metric(metrics, 'bounce_back_recovery_pct', 0.0)}\n"
+    msg += f"Last Green: {bool(metrics.get('bounce_back_last_green', False))}\n"
+    msg += f"Body Ratio: {get_metric(metrics, 'bounce_back_body_ratio', 0.0)}\n"
+    msg += f"RSI: {get_metric(metrics, 'rsi_end', 0.0)}\n"
+    msg += f"EMA Fast Slope: {get_metric(metrics, 'ema_fast_slope', 0.0)}\n"
+    msg += f"EMA Slow Slope: {get_metric(metrics, 'ema_slow_slope', 0.0)}\n"
+    msg += f"Trend Age: {get_metric(metrics, 'trend_age', 0.0)}\n"
+    msg += f"Volume Growth: {get_metric(metrics, 'volume_growth_factor', 0.0)}\n"
+    msg += f"Whale Count: {get_metric(metrics, 'whale_candle_count', 0.0)}\n"
+    msg += f"Breakout Distance: {get_metric(metrics, 'breakout_distance_pct', 0.0)}\n"
+    msg += f"BTC 15m: {get_metric(metrics, 'btc_15m_change_pct', 0.0)}% | BTC 1h: {get_metric(metrics, 'btc_1h_change_pct', 0.0)}%\n"
+    msg += "\n"
+    msg += f"⚠️ Risk Warnings: {warning_text}\n"
+    msg += f"Risk note: {entry_plan['risk_note']}\n"
+    return msg
 
 
 def format_telegram_message(symbol, entry_price, metrics, signal_time=None, trade_id=None):
@@ -1720,10 +1936,10 @@ PRE_SIGNAL_RECORD_METRIC_KEYS = {
     "first_whale_candle_time", "last_whale_candle_time",
     "hour_tr", "signal_quality", "risk_warnings",
     "entry_mode", "suggested_entry", "old_system_signal",
-    "bounce_back_checked", "bounce_back_signal", "bounce_back_reason",
-    "bounce_back_drop_pct", "bounce_back_recovery_pct",
+    "bounce_back_checked", "bounce_back_signal", "bounce_signal_quality", "bounce_back_reason",
+    "bounce_no_trade_reasons", "bounce_back_drop_pct", "bounce_back_recovery_pct",
     "bounce_back_body_ratio", "bounce_back_last_green",
-    "bounce_back_warning",
+    "bounce_back_warning", "bounce_back_score", "bounce_back_status",
 }
 
 
@@ -1837,16 +2053,19 @@ def _calc_bounce_score(result: dict, metrics: dict) -> int:
 
 def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict:
     """
-    Rich diagnostic bounce-back detector.
+    BOUNCE_SIGNAL detector.
 
-    It does NOT send Telegram by itself. It only marks/logs pullback + recovery
-    setups so later AI analysis can compare bounce quality versus TP outcomes.
+    Detects a sharp 15m pullback within the last 16 candles followed by a quick
+    recovery and a green confirmation candle. It returns rich diagnostics for
+    logging and can classify BOUNCE_TURBO / BOUNCE_PREMIUM / NO_TRADE.
     """
     result = {
         "bounce_back_checked": True,
         "bounce_back_signal": False,
+        "bounce_signal_quality": "NO_TRADE",
         "bounce_back_reason": "NOT_CHECKED",
-        "bounce_back_warning": "Experimental bounce-back log only. Not a normal PRE_SIGNAL entry.",
+        "bounce_no_trade_reasons": [],
+        "bounce_back_warning": "Experimental BOUNCE_SIGNAL. Logs are used for later analysis.",
         "bounce_back_score": 0,
         "bounce_back_drop_pct": 0.0,
         "bounce_back_recovery_pct": 0.0,
@@ -1865,21 +2084,25 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
         "bounce_back_ema_gap_pct": 0.0,
         "bounce_back_distance_from_entry_pct": 0.0,
         "bounce_back_distance_from_high_pct": 0.0,
+        "bounce_back_tp_0_4_hit": False,
+        "bounce_back_tp_0_5_hit": False,
         "bounce_back_tp_0_6_hit": False,
         "bounce_back_tp_0_8_hit": False,
         "bounce_back_tp_1_0_hit": False,
         "bounce_back_max_gain_pct_at_scan": 0.0,
         "bounce_back_max_drawdown_pct_at_scan": 0.0,
-        "bounce_back_status": "LOG_ONLY",
+        "bounce_back_status": "EVALUATED",
     }
 
     if not BOUNCE_BACK_ENABLED:
         result["bounce_back_reason"] = "DISABLED"
+        result["bounce_no_trade_reasons"] = ["DISABLED"]
         return result
 
     try:
         if not klines or len(klines) < max(4, BOUNCE_BACK_LOOKBACK_CANDLES):
             result["bounce_back_reason"] = "INSUFFICIENT_KLINES"
+            result["bounce_no_trade_reasons"] = ["INSUFFICIENT_KLINES"]
             return result
 
         window = klines[-BOUNCE_BACK_LOOKBACK_CANDLES:]
@@ -1889,23 +2112,39 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
         closes = [_vt_safe_float(k[4], 0.0) for k in window]
         volumes = [_vt_safe_float(k[5], 0.0) if len(k) > 5 else 0.0 for k in window]
 
-        last_open = opens[-1]
-        last_high = highs[-1]
-        last_low = lows[-1]
-        last_close = closes[-1]
-
-        recent_high_idx = max(range(len(highs)), key=lambda i: highs[i])
-        pullback_low_idx = min(range(len(lows)), key=lambda i: lows[i])
-        recent_high = highs[recent_high_idx]
-        pullback_low = lows[pullback_low_idx]
-
-        if recent_high <= 0 or pullback_low <= 0 or last_close <= 0:
+        last_open, last_high, last_low, last_close = opens[-1], highs[-1], lows[-1], closes[-1]
+        if min([x for x in highs + lows + closes if x is not None] or [0]) <= 0 or last_close <= 0:
             result["bounce_back_reason"] = "BAD_PRICE_DATA"
+            result["bounce_no_trade_reasons"] = ["BAD_PRICE_DATA"]
             return result
 
-        drop_pct = ((recent_high - pullback_low) / recent_high) * 100.0
-        recovery_pct = ((last_close - pullback_low) / pullback_low) * 100.0
-        pullback_candles = max(0, pullback_low_idx - recent_high_idx) if pullback_low_idx >= recent_high_idx else 0
+        # Pick the best high -> later low -> current recovery structure.
+        best = None
+        for low_idx in range(1, len(window)):
+            prior_high_idx = max(range(0, low_idx + 1), key=lambda i: highs[i])
+            prior_high = highs[prior_high_idx]
+            low_price = lows[low_idx]
+            if prior_high <= 0 or low_price <= 0 or low_idx < prior_high_idx:
+                continue
+            drop_pct_candidate = ((prior_high - low_price) / prior_high) * 100.0
+            recovery_pct_candidate = ((last_close - low_price) / low_price) * 100.0
+            if recovery_pct_candidate < 0:
+                continue
+            score_key = (drop_pct_candidate, recovery_pct_candidate)
+            if best is None or score_key > best[0]:
+                best = (score_key, prior_high_idx, low_idx, prior_high, low_price)
+
+        if best is None:
+            recent_high_idx = max(range(len(highs)), key=lambda i: highs[i])
+            pullback_low_idx = min(range(len(lows)), key=lambda i: lows[i])
+            recent_high = highs[recent_high_idx]
+            pullback_low = lows[pullback_low_idx]
+        else:
+            _, recent_high_idx, pullback_low_idx, recent_high, pullback_low = best
+
+        drop_pct = ((recent_high - pullback_low) / recent_high) * 100.0 if recent_high > 0 else 0.0
+        recovery_pct = ((last_close - pullback_low) / pullback_low) * 100.0 if pullback_low > 0 else 0.0
+        pullback_candles = max(0, pullback_low_idx - recent_high_idx)
         recovery_candles = max(0, (len(window) - 1) - pullback_low_idx)
         speed_pct_per_bar = drop_pct / max(1, pullback_candles)
 
@@ -1949,6 +2188,8 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
             "bounce_back_distance_from_high_pct": round(distance_from_high_pct, 4),
             "bounce_back_volume_sum": round(sum(volumes), 4),
             "bounce_back_avg_volume": round((sum(volumes) / len(volumes)) if volumes else 0.0, 4),
+            "bounce_back_tp_0_4_hit": bool(move_decimal >= 0.004),
+            "bounce_back_tp_0_5_hit": bool(move_decimal >= 0.005),
             "bounce_back_tp_0_6_hit": bool(move_decimal >= 0.006),
             "bounce_back_tp_0_8_hit": bool(move_decimal >= 0.008),
             "bounce_back_tp_1_0_hit": bool(move_decimal >= 0.010),
@@ -1956,36 +2197,27 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
             "bounce_back_max_drawdown_pct_at_scan": round(max_drawdown_pct, 4),
         })
 
-        ema_fast_ok = get_metric(metrics, "ema_fast_slope", 0.0) >= BOUNCE_BACK_MIN_EMA_FAST_SLOPE
-        ema_slow_ok = get_metric(metrics, "ema_slow_slope", 0.0) >= BOUNCE_BACK_MIN_EMA_SLOW_SLOPE
-        rsi_end = get_metric(metrics, "rsi_end", 0.0)
-        rsi_ok = BOUNCE_BACK_MIN_RSI <= rsi_end <= BOUNCE_BACK_MAX_RSI
+        # Classify with the new requested BOUNCE_SIGNAL rules.
+        tmp = dict(metrics)
+        tmp.update(result)
+        quality = classify_bounce_signal(tmp)
+        result["bounce_signal_quality"] = quality
+        result["bounce_no_trade_reasons"] = tmp.get("bounce_no_trade_reasons", [])
+        result["bounce_back_score"] = _calc_bounce_score(result, tmp)
 
-        checks = [
-            (drop_pct >= BOUNCE_BACK_MIN_PULLBACK_PCT, "PULLBACK_TOO_SMALL"),
-            (drop_pct <= BOUNCE_BACK_MAX_PULLBACK_PCT, "PULLBACK_TOO_DEEP"),
-            (recovery_pct >= BOUNCE_BACK_MIN_RECOVERY_PCT, "RECOVERY_TOO_WEAK"),
-            (last_green, "LAST_CANDLE_NOT_GREEN"),
-            (body_ratio >= BOUNCE_BACK_MIN_LAST_BODY_RATIO, "LAST_BODY_WEAK"),
-            (ema_fast_ok, "EMA_FAST_WEAK"),
-            (ema_slow_ok, "EMA_SLOW_WEAK"),
-            (rsi_ok, "RSI_OUT_OF_RANGE"),
-        ]
-
-        failed = [reason for ok, reason in checks if not ok]
-        result["bounce_back_score"] = _calc_bounce_score(result, metrics)
-        if failed:
-            result["bounce_back_reason"] = ",".join(failed)
-            return result
-
-        result["bounce_back_signal"] = True
-        result["bounce_back_reason"] = "PULLBACK_RECOVERY_CONFIRMED"
-        result["bounce_back_status"] = "DETECTED_LOG_ONLY"
-        result["bounce_back_score"] = _calc_bounce_score(result, metrics)
+        if quality in ("BOUNCE_TURBO", "BOUNCE_PREMIUM"):
+            result["bounce_back_signal"] = True
+            result["bounce_back_reason"] = "BOUNCE_SIGNAL_CONFIRMED"
+            result["bounce_back_status"] = quality
+        else:
+            result["bounce_back_signal"] = False
+            result["bounce_back_reason"] = ",".join(result["bounce_no_trade_reasons"] or ["BOUNCE_FILTER_FAILED"])
+            result["bounce_back_status"] = "NO_TRADE"
         return result
 
     except Exception as e:
         result["bounce_back_reason"] = f"ERR:{e}"
+        result["bounce_no_trade_reasons"] = [f"ERR:{e}"]
         return result
 
 
@@ -2022,7 +2254,7 @@ def build_bounce_back_log_record(row: dict) -> dict:
 
     analysis_keys = [
         # bounce decision/result
-        "bounce_back_checked", "bounce_back_signal", "bounce_back_reason", "bounce_back_warning",
+        "bounce_back_checked", "bounce_back_signal", "bounce_signal_quality", "bounce_back_reason", "bounce_no_trade_reasons", "bounce_back_warning",
         "bounce_back_score", "bounce_back_status",
         # pullback/recovery structure
         "bounce_back_recent_high", "bounce_back_pullback_low", "bounce_back_last_close",
@@ -2047,7 +2279,7 @@ def build_bounce_back_log_record(row: dict) -> dict:
         "btc_15m_change_pct", "btc_1h_change_pct", "btc_4h_change_pct",
         "btc_market_direction", "btc_alignment_with_signal",
         # TP/progress placeholders for later tracking
-        "bounce_back_tp_0_6_hit", "bounce_back_tp_0_8_hit", "bounce_back_tp_1_0_hit",
+        "bounce_back_tp_0_4_hit", "bounce_back_tp_0_5_hit", "bounce_back_tp_0_6_hit", "bounce_back_tp_0_8_hit", "bounce_back_tp_1_0_hit",
         "bounce_back_max_gain_pct_at_scan", "bounce_back_max_drawdown_pct_at_scan",
     ]
     for key in analysis_keys:
@@ -3615,13 +3847,22 @@ def _send_pre_signal_(payload: dict) -> str:
     quality = payload.get("signal_quality") or classify_signal(metrics)
     metrics["signal_quality"] = quality
 
-    msg = format_telegram_message(
-        symbol=symbol,
-        entry_price=entry_price,
-        metrics=metrics,
-        signal_time=signal_time,
-        trade_id=trade_id,
-    )
+    if str(quality).startswith("BOUNCE_"):
+        msg = format_bounce_telegram_message(
+            symbol=symbol,
+            entry_price=entry_price,
+            metrics=metrics,
+            signal_time=signal_time,
+            trade_id=trade_id,
+        )
+    else:
+        msg = format_telegram_message(
+            symbol=symbol,
+            entry_price=entry_price,
+            metrics=metrics,
+            signal_time=signal_time,
+            trade_id=trade_id,
+        )
 
     tg_send(msg)
     return msg
@@ -3666,6 +3907,20 @@ def _build_pre_signal_trade_record(symbol: str, entry_price: float, signal_time:
         "hours_signal_to_tp": None,
         "metrics": metrics,
     }
+
+
+def _build_bounce_signal_trade_record(symbol: str, entry_price: float, signal_time: str, metrics: dict) -> dict:
+    quality = metrics.get("signal_quality") or metrics.get("bounce_signal_quality") or "BOUNCE_PREMIUM"
+    tp_pct = BOUNCE_TURBO_TP_PCT if quality == "BOUNCE_TURBO" else BOUNCE_PREMIUM_TP_PCT
+    rec = _build_pre_signal_trade_record(symbol, entry_price, signal_time, metrics)
+    rec["type"] = BOUNCE_SIGNAL_TYPE
+    rec["strategy"] = BOUNCE_SIGNAL_TYPE
+    rec["tp_pct"] = tp_pct
+    rec["tp_price"] = round(entry_price * (1 + tp_pct), 8) if entry_price > 0 else 0.0
+    rec["signal_quality"] = quality
+    rec["metrics"] = metrics
+    return rec
+
 
 
 def _update_pre_signals_master_record(updated_record: dict):
@@ -3998,19 +4253,34 @@ def run_pre_signal_scan(all_symbols: List[str]):
         bounce_back = detect_bounce_back_signal(klines, row, entry_price)
         row.update(bounce_back)
 
-        if not old_system_signal:
-            # Bounce-back is LOG ONLY now. It should not send instant Telegram
-            # and should not create an open PRE_SIGNAL trade record.
+        bounce_quality = row.get("bounce_signal_quality") or "NO_TRADE"
+
+        # BOUNCE_SIGNAL is independent from the old PRE_SIGNAL filter.
+        # It should trigger fast after wick/drop + recovery. Only BOUNCE_TURBO and
+        # BOUNCE_PREMIUM send Telegram. NO_TRADE goes only to rejected_signals.json.
+        if bounce_quality in ("BOUNCE_TURBO", "BOUNCE_PREMIUM"):
             row["pre_signal"] = False
-            if bool(row.get("bounce_back_signal")):
-                row["skip_reason"] = "BOUNCE_BACK_LOG_ONLY"
-                row["signal_quality"] = "BOUNCE_BACK_LOG_ONLY"
-                row["risk_warnings"] = build_warnings(row) + ["Bounce Back Log Only", row.get("bounce_back_warning")]
-                entry_plan = get_entry_plan(entry_price, "BOUNCE_BACK")
-                row["entry_mode"] = entry_plan["entry_mode"]
-                row["suggested_entry"] = entry_plan["suggested_entry"]
-            else:
-                row["skip_reason"] = "CONDITIONS_NOT_MET"
+            row["signal_type"] = BOUNCE_SIGNAL_TYPE
+            row["signal_quality"] = bounce_quality
+            row["skip_reason"] = None
+            bounce_warnings = build_bounce_warnings(row)
+            row["risk_warnings"] = bounce_warnings
+            entry_plan = get_entry_plan(entry_price, bounce_quality)
+            row["entry_mode"] = entry_plan["entry_mode"]
+            row["suggested_entry"] = entry_plan["suggested_entry"]
+            row["tp_pct"] = entry_plan.get("tp_pct", BOUNCE_PREMIUM_TP_PCT)
+            signal_record = _build_bounce_signal_trade_record(
+                symbol=symbol,
+                entry_price=round(entry_price, 8) if entry_price > 0 else 0.0,
+                signal_time=signal_time,
+                metrics=_pick_pre_signal_record_metrics(row),
+            )
+            return row, signal_record
+
+        if not old_system_signal:
+            row["pre_signal"] = False
+            row["signal_quality"] = "NO_TRADE" if bounce_quality == "NO_TRADE" else None
+            row["skip_reason"] = "CONDITIONS_NOT_MET"
             return row, None
 
         if PRE_SIGNAL_HOUR_FILTER_ENABLED and hour_tr not in PRE_SIGNAL_ALLOWED_HOURS_TR:
@@ -4022,6 +4292,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         warnings = build_warnings(row)
         entry_plan = get_entry_plan(entry_price, quality)
 
+        row["signal_type"] = PRE_SIGNAL_TYPE
         row["signal_quality"] = quality
         row["risk_warnings"] = warnings
         row["entry_mode"] = entry_plan["entry_mode"]
@@ -4080,13 +4351,18 @@ def run_pre_signal_scan(all_symbols: List[str]):
     ]
     append_bounce_back_log(bounce_back_records)
 
+    rejected_bounce_records = [
+        build_rejected_signal_record(row)
+        for row in scan_records
+        if bool(row.get("bounce_back_checked"))
+        and row.get("bounce_signal_quality") == "NO_TRADE"
+    ]
+    append_rejected_signals(rejected_bounce_records)
+
     for row in scan_records:
         append_pre_signal_live_state(row)
     for rec in generated_signals:
-        rec_quality = (rec.get("metrics") or {}).get("signal_quality")
-        if str(rec_quality or "").startswith("BOUNCE_BACK"):
-            log(f"[BOUNCE BACK LOG ONLY] {rec.get('symbol')} skipped instant Telegram trade_id={rec.get('trade_id')}")
-            continue
+        rec_quality = (rec.get("metrics") or {}).get("signal_quality") or rec.get("signal_quality")
         telegram_message = _send_pre_signal_({
             "trade_id": rec.get("trade_id"),
             "symbol": rec.get("symbol"),
@@ -4098,7 +4374,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         append_pre_signal_record(rec)
         append_open_pre_signal(rec)
         create_pre_signal_performance_record(rec, rec.get("metrics") or {})
-        log(f"[PRE SIGNAL] {rec.get('symbol')} quality={rec_quality} trade_id={rec.get('trade_id')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
+        log(f"[SIGNAL] type={rec.get('type')} symbol={rec.get('symbol')} quality={rec_quality} trade_id={rec.get('trade_id')} entry={rec.get('entry_price')} tp_pct={rec.get('tp_pct')}")
 
     qualified_24h_count = sum(1 for row in scan_records if bool(row.get("volume_24h_qualified")))
     qualified_1h_count = sum(1 for row in scan_records if bool(row.get("volume_1h_qualified")))
@@ -6944,6 +7220,7 @@ STATE_DEFAULT={
     "last_pre_signal_performance_report_date": "",
     "last_pre_signal_scan_log_send": 0,
     "last_bounce_back_log_send": 0,
+    "last_rejected_signals_send": 0,
 }
 PARAM_DEFAULT={
     "SCALP_TP_PCT":0.006, "SCALP_SL_PCT":0.20, "TRADE_SIZE_USDT":750.0,
@@ -8291,6 +8568,7 @@ VIRTUAL_JSON_SEND_INTERVAL = 43200  # 12 hours
 PRE_SIGNAL_JSON_SEND_INTERVAL = 43200  # 12 hours
 PRE_SIGNAL_SCAN_LOG_SEND_INTERVAL = 43200  # 12 hours
 BOUNCE_BACK_LOG_SEND_INTERVAL = 43200  # 12 hours
+REJECTED_SIGNALS_SEND_INTERVAL = 43200  # 12 hours
 
 def send_virtual_json_if_due():
     """Send the virtual trades JSON file to Telegram every 12 hours."""
@@ -8376,6 +8654,24 @@ def send_pre_signal_and_bounce_logs_if_due():
         except Exception as e:
             log(f"[BOUNCE BACK LOG SEND ERR] {e}")
         STATE["last_bounce_back_log_send"] = now_now
+        safe_save(STATE_FILE, STATE)
+
+    if now_now - STATE.get("last_rejected_signals_send", 0) >= REJECTED_SIGNALS_SEND_INTERVAL:
+        try:
+            if os.path.exists(REJECTED_SIGNALS_FILE) and os.path.getsize(REJECTED_SIGNALS_FILE) > 5:
+                interval_hours = int(REJECTED_SIGNALS_SEND_INTERVAL / 3600)
+                tg_send_file(
+                    REJECTED_SIGNALS_FILE,
+                    f"🚫 BOUNCE NO_TRADE rejected_signals — {interval_hours}h rapor\n"
+                    f"time: {now_local_iso()}\n"
+                    f"İçerik: Telegram'a gönderilmeyen BOUNCE_SIGNAL reddedilenleri ve nedenleri."
+                )
+                log("[REJECTED SIGNALS SEND] rejected_signals.json Telegram'a gönderildi")
+            else:
+                log("[REJECTED SIGNALS SEND] Dosya mevcut değil veya boş, atlandı")
+        except Exception as e:
+            log(f"[REJECTED SIGNALS SEND ERR] {e}")
+        STATE["last_rejected_signals_send"] = now_now
         safe_save(STATE_FILE, STATE)
 
 
