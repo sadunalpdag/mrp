@@ -66,6 +66,7 @@ PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "pre_signals.json")
 PRE_SIGNAL_SCAN_LOG_FILE = os.path.join(DATA_DIR, "pre_signal_scan_log.json")
 BOUNCE_BACK_LOG_FILE = os.path.join(DATA_DIR, "bounce_back_log.json")
 REJECTED_SIGNALS_FILE = os.path.join(DATA_DIR, "rejected_signals.json")
+BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "bounce_state.json")
 OPEN_POSITIONS_JSON_FILE = os.path.join(DATA_DIR, "open_positions.json")
 OPEN_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "open_pre_signals.json")
 CLOSED_PRE_SIGNALS_FILE = os.path.join(DATA_DIR, "closed_pre_signals.json")
@@ -142,6 +143,7 @@ PRE_SIGNAL_ALLOWED_HOURS_TR = [0, 1, 2, 3, 7, 8, 9, 11, 13, 15, 17, 18, 22, 23]
 # before classic breakout confirmation. Rich logs are kept for later analysis.
 BOUNCE_BACK_ENABLED = True
 BOUNCE_SIGNAL_TYPE = "BOUNCE_SIGNAL"
+BOUNCE_COOLDOWN_HOURS = 24
 BOUNCE_BACK_LOOKBACK_CANDLES = 16
 BOUNCE_BACK_MIN_PULLBACK_PCT = 4.0
 BOUNCE_BACK_MIN_RECOVERY_PCT = 3.0
@@ -1460,6 +1462,90 @@ def append_rejected_signals(records: List[dict]):
     save_rejected_signals(kept)
 
 
+
+def load_bounce_state():
+    data = safe_load(BOUNCE_STATE_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_bounce_state(state):
+    safe_save(BOUNCE_STATE_FILE, state if isinstance(state, dict) else {})
+
+
+def _bounce_state_dt(value):
+    try:
+        raw = str(value or "").strip().replace("Z", "+00:00")
+        if not raw:
+            return None
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def bounce_can_send(symbol: str, quality: str) -> Tuple[bool, str, float]:
+    """
+    Prevent repeated BOUNCE_SIGNAL Telegram messages for the same symbol.
+
+    Rule:
+    - No previous symbol state -> send.
+    - Cooldown expired -> send.
+    - Within cooldown -> block.
+    - Exception: allow one upgrade from BOUNCE_PREMIUM to BOUNCE_TURBO.
+
+    Returns: (can_send, reason, age_hours)
+    """
+    symbol = str(symbol or "").upper().strip()
+    quality = str(quality or "").upper().strip()
+    if not symbol:
+        return True, "NO_SYMBOL_STATE", 9999.0
+
+    state = load_bounce_state()
+    item = state.get(symbol)
+    if not isinstance(item, dict):
+        return True, "NO_PREVIOUS_BOUNCE", 9999.0
+
+    last_dt = _bounce_state_dt(item.get("signal_time"))
+    if not last_dt:
+        return True, "BAD_PREVIOUS_TIME", 9999.0
+
+    age_hours = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600.0
+    if age_hours >= BOUNCE_COOLDOWN_HOURS:
+        return True, "COOLDOWN_EXPIRED", round(age_hours, 4)
+
+    last_quality = str(item.get("quality") or "").upper().strip()
+    if last_quality == "BOUNCE_PREMIUM" and quality == "BOUNCE_TURBO":
+        return True, "QUALITY_UPGRADE_PREMIUM_TO_TURBO", round(age_hours, 4)
+
+    return False, "BOUNCE_COOLDOWN", round(age_hours, 4)
+
+
+def register_bounce_signal(symbol: str, quality: str, entry_price: float, signal_time: Optional[str] = None, metrics: Optional[dict] = None):
+    """Register a sent bounce signal so the same symbol does not spam Telegram."""
+    symbol = str(symbol or "").upper().strip()
+    if not symbol:
+        return
+
+    metrics = metrics if isinstance(metrics, dict) else {}
+    state = load_bounce_state()
+    state[symbol] = {
+        "quality": str(quality or ""),
+        "signal_time": signal_time or datetime.now(timezone.utc).isoformat(),
+        "entry_price": _vt_safe_float(entry_price, 0.0),
+        "cooldown_hours": BOUNCE_COOLDOWN_HOURS,
+        "bounce_back_drop_pct": metrics.get("bounce_back_drop_pct"),
+        "bounce_back_recovery_pct": metrics.get("bounce_back_recovery_pct"),
+        "bounce_back_body_ratio": metrics.get("bounce_back_body_ratio"),
+        "rsi_end": metrics.get("rsi_end"),
+        "ema_fast_slope": metrics.get("ema_fast_slope"),
+        "ema_slow_slope": metrics.get("ema_slow_slope"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_bounce_state(state)
+
+
 def build_rejected_signal_record(row: dict) -> dict:
     metrics = row if isinstance(row, dict) else {}
     signal_time = metrics.get("signal_time") or metrics.get("scan_time") or _vt_now_iso()
@@ -1492,6 +1578,10 @@ def build_rejected_signal_record(row: dict) -> dict:
         "daily_change_pct": metrics.get("daily_change_pct"),
         "quote_volume_24h": metrics.get("quote_volume_24h"),
         "projected_24h_volume": metrics.get("projected_24h_volume"),
+        "telegram_sent": metrics.get("telegram_sent"),
+        "cooldown_hours": metrics.get("cooldown_hours"),
+        "cooldown_age_hours": metrics.get("cooldown_age_hours"),
+        "cooldown_reason": metrics.get("cooldown_reason"),
     }
 
 
@@ -1940,6 +2030,7 @@ PRE_SIGNAL_RECORD_METRIC_KEYS = {
     "bounce_no_trade_reasons", "bounce_back_drop_pct", "bounce_back_recovery_pct",
     "bounce_back_body_ratio", "bounce_back_last_green",
     "bounce_back_warning", "bounce_back_score", "bounce_back_status",
+    "telegram_sent", "cooldown_hours", "cooldown_age_hours", "cooldown_reason",
 }
 
 
@@ -4352,6 +4443,27 @@ def run_pre_signal_scan(all_symbols: List[str]):
                 continue
             scan_records.append(row)
             if signal_record:
+                # BOUNCE duplicate protection runs on the main thread to avoid
+                # race conditions between worker threads. Duplicates are logged
+                # but Telegram is suppressed.
+                if signal_record.get("type") == BOUNCE_SIGNAL_TYPE:
+                    rec_metrics = signal_record.get("metrics") or {}
+                    rec_quality = rec_metrics.get("signal_quality") or signal_record.get("signal_quality") or rec_metrics.get("bounce_signal_quality")
+                    can_send, cooldown_reason, cooldown_age_hours = bounce_can_send(signal_record.get("symbol"), rec_quality)
+                    rec_metrics["cooldown_hours"] = BOUNCE_COOLDOWN_HOURS
+                    rec_metrics["cooldown_reason"] = cooldown_reason
+                    rec_metrics["cooldown_age_hours"] = cooldown_age_hours
+                    if not can_send:
+                        row["telegram_sent"] = False
+                        row["cooldown_hours"] = BOUNCE_COOLDOWN_HOURS
+                        row["cooldown_reason"] = cooldown_reason
+                        row["cooldown_age_hours"] = cooldown_age_hours
+                        row["skip_reason"] = "BOUNCE_COOLDOWN"
+                        row["bounce_no_trade_reasons"] = list(row.get("bounce_no_trade_reasons") or []) + ["BOUNCE_COOLDOWN"]
+                        append_rejected_signals([build_rejected_signal_record(row)])
+                        continue
+                    rec_metrics["telegram_sent"] = True
+                    signal_record["metrics"] = rec_metrics
                 generated_signals.append(signal_record)
                 recent_pre_symbols.add(signal_record.get("symbol"))
 
@@ -4395,6 +4507,15 @@ def run_pre_signal_scan(all_symbols: List[str]):
             **(rec.get("metrics") or {}),
         })
         rec["telegram_message"] = telegram_message
+        if rec.get("type") == BOUNCE_SIGNAL_TYPE:
+            rec_metrics = rec.get("metrics") or {}
+            register_bounce_signal(
+                symbol=rec.get("symbol"),
+                quality=rec_metrics.get("signal_quality") or rec_metrics.get("bounce_signal_quality") or rec.get("signal_quality"),
+                entry_price=rec.get("entry_price"),
+                signal_time=rec.get("signal_time"),
+                metrics=rec_metrics,
+            )
         append_pre_signal_record(rec)
         append_open_pre_signal(rec)
         create_pre_signal_performance_record(rec, rec.get("metrics") or {})
