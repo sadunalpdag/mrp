@@ -175,6 +175,22 @@ BOUNCE_EARLY_MIN_EMA_FAST_SLOPE_NOW = 0.0
 BOUNCE_EARLY_MAX_EMA_FAST_SLOPE_PREV = 0.0
 BOUNCE_EARLY_MIN_BTC_15M_CHANGE_PCT = -0.5
 BOUNCE_EARLY_MIN_BTC_1H_CHANGE_PCT = -1.0
+
+# BOUNCE_REVERSAL catches a panic red candle followed by the first strong green
+# reaction candle. It intentionally does NOT wait for RSI 55 or EMA slow
+# confirmation, so PLAY/BOB-style first reversal candles can be logged/sent early.
+BOUNCE_REVERSAL_TP_PCT = 0.004
+BOUNCE_REVERSAL_MIN_RED_DROP_PCT = 2.0
+BOUNCE_REVERSAL_MIN_RED_BODY_RATIO = 0.50
+BOUNCE_REVERSAL_MIN_RECOVERY_FROM_LOW_PCT = 1.0
+BOUNCE_REVERSAL_MIN_GREEN_BODY_RATIO = 0.25
+BOUNCE_REVERSAL_MIN_RECLAIM_RED_BODY_RATIO = 0.45
+BOUNCE_REVERSAL_MIN_RSI = 30.0
+BOUNCE_REVERSAL_MAX_RSI = 78.0
+BOUNCE_REVERSAL_MIN_BTC_15M_CHANGE_PCT = -0.5
+BOUNCE_REVERSAL_MIN_BTC_1H_CHANGE_PCT = -1.0
+BOUNCE_REVERSAL_MAX_BREAKOUT_DISTANCE_PCT = 1.2
+
 BOUNCE_REJECTED_RETENTION_DAYS = RETENTION_DAYS
 # Backward-compatible alias used by older diagnostic score logic.
 BOUNCE_BACK_MAX_PULLBACK_PCT = 999.0
@@ -1778,6 +1794,14 @@ def get_entry_plan(entry_price, quality):
             "risk_note": "BOUNCE_PREMIUM: binde 2 aşağı limit giriş; TP 0.4-0.5 aralığı takip."
         }
 
+    if quality == "BOUNCE_REVERSAL":
+        return {
+            "entry_mode": "LIMIT / WARNING",
+            "suggested_entry": round(entry_price * 0.998, 8),
+            "tp_pct": BOUNCE_REVERSAL_TP_PCT,
+            "risk_note": "BOUNCE_REVERSAL: büyük kırmızı satıştan sonraki ilk güçlü yeşil tepki. Çok erken uyarı; EMA/RSI onayı beklenmez."
+        }
+
     if quality == "BOUNCE_EARLY":
         return {
             "entry_mode": "LIMIT / WARNING",
@@ -1850,6 +1874,29 @@ def build_tp_progress(entry_price, metrics):
     }
 
 
+def panic_reversal_filter_passes(metrics: dict) -> bool:
+    """
+    BOUNCE_REVERSAL: panic red candle + first strong green reaction.
+
+    This is the earliest bounce family signal. It does not require EMA slow
+    confirmation or RSI>=55 because those often arrive several candles late.
+    It is meant to catch wick/panic reversal candidates for analysis and
+    warning-style Telegram signals.
+    """
+    return (
+        bool(metrics.get("bounce_back_last_green", False))
+        and get_metric(metrics, "panic_red_drop_pct", 0.0) >= BOUNCE_REVERSAL_MIN_RED_DROP_PCT
+        and get_metric(metrics, "panic_red_body_ratio", 0.0) >= BOUNCE_REVERSAL_MIN_RED_BODY_RATIO
+        and get_metric(metrics, "panic_recovery_from_low_pct", 0.0) >= BOUNCE_REVERSAL_MIN_RECOVERY_FROM_LOW_PCT
+        and get_metric(metrics, "panic_green_body_ratio", 0.0) >= BOUNCE_REVERSAL_MIN_GREEN_BODY_RATIO
+        and get_metric(metrics, "panic_reclaim_red_body_ratio", 0.0) >= BOUNCE_REVERSAL_MIN_RECLAIM_RED_BODY_RATIO
+        and BOUNCE_REVERSAL_MIN_RSI <= get_metric(metrics, "rsi_end", 0.0) <= BOUNCE_REVERSAL_MAX_RSI
+        and get_metric(metrics, "btc_15m_change_pct", 0.0) > BOUNCE_REVERSAL_MIN_BTC_15M_CHANGE_PCT
+        and get_metric(metrics, "btc_1h_change_pct", 0.0) > BOUNCE_REVERSAL_MIN_BTC_1H_CHANGE_PCT
+        and get_metric(metrics, "breakout_distance_pct", 999.0) <= BOUNCE_REVERSAL_MAX_BREAKOUT_DISTANCE_PCT
+    )
+
+
 def early_bounce_filter_passes(metrics: dict) -> bool:
     """
     EARLY_BOUNCE: catches wick/drop + first EMA fast slope sign-change.
@@ -1896,9 +1943,10 @@ def classify_bounce_signal(metrics: dict) -> str:
 
     Priority:
     1) Hard NO_TRADE blocks: red last candle, RSI too high, BTC dump, late breakout.
-    2) Confirmed BOUNCE_TURBO / BOUNCE_PREMIUM.
-    3) Early slope sign-change BOUNCE_EARLY.
-    4) NO_TRADE with detailed reasons.
+    2) Panic red candle + first strong green BOUNCE_REVERSAL.
+    3) Confirmed BOUNCE_TURBO / BOUNCE_PREMIUM.
+    4) Early slope sign-change BOUNCE_EARLY.
+    5) NO_TRADE with detailed reasons.
     """
     hard_no_trade_reasons = []
     if not bool(metrics.get("bounce_back_last_green", False)):
@@ -1913,6 +1961,10 @@ def classify_bounce_signal(metrics: dict) -> str:
     if hard_no_trade_reasons:
         metrics["bounce_no_trade_reasons"] = hard_no_trade_reasons
         return "NO_TRADE"
+
+    if panic_reversal_filter_passes(metrics):
+        metrics["bounce_no_trade_reasons"] = []
+        return "BOUNCE_REVERSAL"
 
     if bounce_main_filter_passes(metrics):
         is_turbo = (
@@ -1953,6 +2005,17 @@ def classify_bounce_signal(metrics: dict) -> str:
         failed.append("BTC_15M_WEAK")
 
     # Early-bounce diagnostics: why wick/slope did not qualify.
+    if get_metric(metrics, "panic_red_drop_pct", 0.0) < BOUNCE_REVERSAL_MIN_RED_DROP_PCT:
+        failed.append("PANIC_RED_DROP_TOO_SMALL")
+    if get_metric(metrics, "panic_red_body_ratio", 0.0) < BOUNCE_REVERSAL_MIN_RED_BODY_RATIO:
+        failed.append("PANIC_RED_BODY_WEAK")
+    if get_metric(metrics, "panic_recovery_from_low_pct", 0.0) < BOUNCE_REVERSAL_MIN_RECOVERY_FROM_LOW_PCT:
+        failed.append("PANIC_RECOVERY_TOO_SMALL")
+    if get_metric(metrics, "panic_green_body_ratio", 0.0) < BOUNCE_REVERSAL_MIN_GREEN_BODY_RATIO:
+        failed.append("PANIC_GREEN_BODY_WEAK")
+    if get_metric(metrics, "panic_reclaim_red_body_ratio", 0.0) < BOUNCE_REVERSAL_MIN_RECLAIM_RED_BODY_RATIO:
+        failed.append("PANIC_RECLAIM_TOO_SMALL")
+
     if get_metric(metrics, "bounce_back_recovery_pct", 0.0) < BOUNCE_EARLY_MIN_RECOVERY_PCT:
         failed.append("EARLY_RECOVERY_LT_1_2")
     if get_metric(metrics, "bounce_back_body_ratio", 0.0) < BOUNCE_EARLY_MIN_BODY_RATIO:
@@ -1972,6 +2035,9 @@ def classify_bounce_signal(metrics: dict) -> str:
 def build_bounce_warnings(metrics: dict) -> List[str]:
     warnings = []
     quality = metrics.get("signal_quality") or metrics.get("bounce_signal_quality")
+    if quality == "BOUNCE_REVERSAL":
+        warnings.append("EARLY: panic reversal after large red candle")
+        warnings.append("EMA/RSI confirmation may be incomplete")
     if quality == "BOUNCE_EARLY":
         warnings.append("EARLY: EMA fast slope sign-change")
         warnings.append("EMA slow / RSI confirmation may be incomplete")
@@ -2000,6 +2066,8 @@ def format_bounce_telegram_message(symbol, entry_price, metrics, signal_time=Non
     msg += f"🔄 BOUNCE SIGNAL | {symbol}\n"
     msg += "Signal Type: BOUNCE\n"
     msg += f"Signal Quality: {quality}\n"
+    if quality == "BOUNCE_REVERSAL":
+        msg += "⚡ BOUNCE REVERSAL: büyük kırmızı mumdan sonra ilk güçlü yeşil tepki.\n"
     if quality == "BOUNCE_EARLY":
         msg += "⚡ EARLY BOUNCE: slope yön değiştirdi, onay beklemeden uyarı.\n"
     msg += f"TR Hour: {tr_hour}\n"
@@ -2015,6 +2083,10 @@ def format_bounce_telegram_message(symbol, entry_price, metrics, signal_time=Non
     msg += f"Bounce Recovery %: {get_metric(metrics, 'bounce_back_recovery_pct', 0.0)}\n"
     msg += f"Last Green: {bool(metrics.get('bounce_back_last_green', False))}\n"
     msg += f"Body Ratio: {get_metric(metrics, 'bounce_back_body_ratio', 0.0)}\n"
+    msg += f"Panic Red Drop %: {get_metric(metrics, 'panic_red_drop_pct', 0.0)}\n"
+    msg += f"Panic Red Body: {get_metric(metrics, 'panic_red_body_ratio', 0.0)}\n"
+    msg += f"Panic Recovery From Low %: {get_metric(metrics, 'panic_recovery_from_low_pct', 0.0)}\n"
+    msg += f"Panic Reclaim Ratio: {get_metric(metrics, 'panic_reclaim_red_body_ratio', 0.0)}\n"
     msg += f"RSI: {get_metric(metrics, 'rsi_end', 0.0)}\n"
     msg += f"EMA Fast Slope: {get_metric(metrics, 'ema_fast_slope', 0.0)}\n"
     msg += f"EMA Fast Slope Prev→Now: {get_metric(metrics, 'bounce_ema_fast_slope_prev', 0.0)} → {get_metric(metrics, 'bounce_ema_fast_slope_now', 0.0)}\n"
@@ -2255,6 +2327,19 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
         "bounce_ema_fast_slope_changed_up": False,
         "bounce_early_signal": False,
         "bounce_early_reason": None,
+        "panic_reversal_signal": False,
+        "panic_reversal_reason": None,
+        "panic_red_idx": None,
+        "panic_red_open": 0.0,
+        "panic_red_close": 0.0,
+        "panic_red_high": 0.0,
+        "panic_red_low": 0.0,
+        "panic_red_drop_pct": 0.0,
+        "panic_red_body_ratio": 0.0,
+        "panic_green_body_ratio": 0.0,
+        "panic_recovery_from_low_pct": 0.0,
+        "panic_reclaim_red_body_ratio": 0.0,
+        "panic_candles_since_red": 0,
         "bounce_back_ema_gap_pct": 0.0,
         "bounce_back_distance_from_entry_pct": 0.0,
         "bounce_back_distance_from_high_pct": 0.0,
@@ -2333,6 +2418,44 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
         green_count = sum(1 for o, c in zip(opens, closes) if c > o)
         red_count = sum(1 for o, c in zip(opens, closes) if c < o)
 
+        # Panic reversal detector: find the strongest red candle before the latest
+        # candle, then measure how much the latest green candle reclaimed from that
+        # panic low/body. This is designed to fire before EMA/RSI confirmations.
+        panic_red_idx = None
+        panic_red_score = -1.0
+        for i in range(0, max(0, len(window) - 1)):
+            o_i, h_i, l_i, c_i = opens[i], highs[i], lows[i], closes[i]
+            if o_i <= 0 or h_i <= l_i or c_i >= o_i:
+                continue
+            red_drop_i = ((o_i - c_i) / o_i) * 100.0
+            red_range_i = max(1e-12, h_i - l_i)
+            red_body_ratio_i = abs(c_i - o_i) / red_range_i
+            # Prefer large % red candles with clean bodies and recent occurrence.
+            recency_bonus = i / max(1, len(window) - 1)
+            score_i = red_drop_i * 2.0 + red_body_ratio_i * 5.0 + recency_bonus
+            if score_i > panic_red_score:
+                panic_red_score = score_i
+                panic_red_idx = i
+
+        panic_red_open = panic_red_close = panic_red_high = panic_red_low = 0.0
+        panic_red_drop_pct = panic_red_body_ratio = 0.0
+        panic_green_body_ratio = body_ratio
+        panic_recovery_from_low_pct = 0.0
+        panic_reclaim_red_body_ratio = 0.0
+        panic_candles_since_red = 0
+        if panic_red_idx is not None:
+            panic_red_open = opens[panic_red_idx]
+            panic_red_close = closes[panic_red_idx]
+            panic_red_high = highs[panic_red_idx]
+            panic_red_low = lows[panic_red_idx]
+            panic_red_drop_pct = ((panic_red_open - panic_red_close) / panic_red_open) * 100.0 if panic_red_open > 0 else 0.0
+            panic_red_body_range = max(1e-12, panic_red_high - panic_red_low)
+            panic_red_body = abs(panic_red_open - panic_red_close)
+            panic_red_body_ratio = panic_red_body / panic_red_body_range
+            panic_recovery_from_low_pct = ((last_close - panic_red_low) / panic_red_low) * 100.0 if panic_red_low > 0 else 0.0
+            panic_reclaim_red_body_ratio = max(0.0, (last_close - panic_red_close) / max(1e-12, panic_red_body))
+            panic_candles_since_red = max(0, (len(window) - 1) - panic_red_idx)
+
         # Early bounce slope sign-change. This uses the last two single-bar EMA(7)
         # slopes so it reacts faster than the older 5-candle slope metric.
         try:
@@ -2372,6 +2495,17 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
             "bounce_back_red_candle_count": int(red_count),
             "bounce_back_last_upper_wick_ratio": round(upper_wick_ratio, 4),
             "bounce_back_last_lower_wick_ratio": round(lower_wick_ratio, 4),
+            "panic_red_idx": panic_red_idx,
+            "panic_red_open": round(panic_red_open, 8),
+            "panic_red_close": round(panic_red_close, 8),
+            "panic_red_high": round(panic_red_high, 8),
+            "panic_red_low": round(panic_red_low, 8),
+            "panic_red_drop_pct": round(panic_red_drop_pct, 4),
+            "panic_red_body_ratio": round(panic_red_body_ratio, 4),
+            "panic_green_body_ratio": round(panic_green_body_ratio, 4),
+            "panic_recovery_from_low_pct": round(panic_recovery_from_low_pct, 4),
+            "panic_reclaim_red_body_ratio": round(panic_reclaim_red_body_ratio, 4),
+            "panic_candles_since_red": int(panic_candles_since_red),
             "bounce_ema_fast_slope_prev": round(ema_fast_slope_prev, 4),
             "bounce_ema_fast_slope_now": round(ema_fast_slope_now, 4),
             "bounce_ema_fast_slope_changed_up": bool(ema_fast_slope_changed_up),
@@ -2398,8 +2532,10 @@ def detect_bounce_back_signal(klines, metrics: dict, entry_price: float) -> dict
         result["bounce_back_score"] = _calc_bounce_score(result, tmp)
         result["bounce_early_signal"] = bool(quality == "BOUNCE_EARLY")
         result["bounce_early_reason"] = "EMA_FAST_SLOPE_SIGN_CHANGE" if quality == "BOUNCE_EARLY" else None
+        result["panic_reversal_signal"] = bool(quality == "BOUNCE_REVERSAL")
+        result["panic_reversal_reason"] = "PANIC_RED_TO_GREEN_RECLAIM" if quality == "BOUNCE_REVERSAL" else None
 
-        if quality in ("BOUNCE_TURBO", "BOUNCE_PREMIUM", "BOUNCE_EARLY"):
+        if quality in ("BOUNCE_TURBO", "BOUNCE_PREMIUM", "BOUNCE_EARLY", "BOUNCE_REVERSAL"):
             result["bounce_back_signal"] = True
             result["bounce_back_reason"] = "BOUNCE_SIGNAL_CONFIRMED"
             result["bounce_back_status"] = quality
@@ -2462,6 +2598,10 @@ def build_bounce_back_log_record(row: dict) -> dict:
         "bounce_back_last_lower_wick_ratio",
         "bounce_ema_fast_slope_prev", "bounce_ema_fast_slope_now",
         "bounce_ema_fast_slope_changed_up", "bounce_early_signal", "bounce_early_reason",
+        "panic_reversal_signal", "panic_reversal_reason",
+        "panic_red_idx", "panic_red_open", "panic_red_close", "panic_red_high", "panic_red_low",
+        "panic_red_drop_pct", "panic_red_body_ratio", "panic_green_body_ratio",
+        "panic_recovery_from_low_pct", "panic_reclaim_red_body_ratio", "panic_candles_since_red",
         # EMA/RSI/volume/whale/compression/breakout context
         "ema_fast", "ema_slow", "bounce_back_ema_gap_pct",
         "ema_fast_slope", "ema_slow_slope", "trend_age", "breakout_distance_pct",
@@ -4465,7 +4605,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
         # BOUNCE_SIGNAL is independent from the old PRE_SIGNAL filter.
         # It should trigger fast after wick/drop + recovery. Only BOUNCE_TURBO and
         # BOUNCE_PREMIUM send Telegram. NO_TRADE goes only to rejected_signals.json.
-        if bounce_quality in ("BOUNCE_TURBO", "BOUNCE_PREMIUM", "BOUNCE_EARLY"):
+        if bounce_quality in ("BOUNCE_TURBO", "BOUNCE_PREMIUM", "BOUNCE_EARLY", "BOUNCE_REVERSAL"):
             row["pre_signal"] = False
             row["signal_type"] = BOUNCE_SIGNAL_TYPE
             row["signal_quality"] = bounce_quality
