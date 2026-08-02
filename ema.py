@@ -129,6 +129,52 @@ MINUTES_PER_HOUR = 60.0
 PRE_BTC_4H_FILTER_ENABLED = False
 PRE_BTC_4H_MIN_CHANGE = -1.0
 
+# Experimental PRE-SIGNAL quality thresholds; forward-test required.
+PRE_SIGNAL_MIN_QUALITY_SCORE = 70
+PRE_SIGNAL_MAX_QUALITY_SCORE = 100
+PRE_SIGNAL_MAX_PARAMETER_SCORE = 90
+PRE_SIGNAL_MAX_DAY_BONUS = 3
+PRE_SIGNAL_MAX_HOUR_BONUS = 7
+PRE_SIGNAL_MAX_SCORE_PENALTY = 20
+PRE_SIGNAL_ISTANBUL_UTC_OFFSET_HOURS = 3
+
+PRE_SCORE_BTC_STRONG_4H = 0.439
+PRE_SCORE_BTC_POSITIVE_4H = 0.20
+PRE_SCORE_BTC_NEUTRAL_4H = 0.0
+
+PRE_SCORE_RSI_IDEAL_MIN = 70.0
+PRE_SCORE_RSI_IDEAL_MAX = 80.9
+PRE_SCORE_RSI_SOFT_MIN = 65.0
+PRE_SCORE_RSI_SOFT_MAX = 84.0
+
+PRE_SCORE_PRICE_4H_IDEAL_MIN = 2.32
+PRE_SCORE_PRICE_4H_IDEAL_MAX = 3.95
+PRE_SCORE_PRICE_4H_SOFT_MIN = 1.50
+PRE_SCORE_PRICE_4H_SOFT_MAX = 5.00
+
+PRE_SCORE_EMA_FAST_IDEAL_MIN = 0.873
+PRE_SCORE_EMA_FAST_IDEAL_MAX = 1.405
+PRE_SCORE_EMA_FAST_SOFT_MIN = 0.70
+PRE_SCORE_EMA_FAST_SOFT_MAX = 1.60
+
+PRE_SCORE_EMA_SLOW_IDEAL_MIN = 0.526
+PRE_SCORE_EMA_SLOW_IDEAL_MAX = 0.840
+PRE_SCORE_EMA_SLOW_SOFT_MIN = 0.40
+PRE_SCORE_EMA_SLOW_SOFT_MAX = 1.00
+
+PRE_SCORE_AVG_VOLUME_IDEAL_MIN = 1.182
+PRE_SCORE_AVG_VOLUME_IDEAL_MAX = 1.371
+PRE_SCORE_AVG_VOLUME_SOFT_MIN = 1.00
+PRE_SCORE_AVG_VOLUME_SOFT_MAX = 1.60
+
+PRE_SCORE_VOLUME_ACCEL_POSITIVE = 0.0
+PRE_SCORE_VOLUME_ACCEL_GOOD = -0.0044
+PRE_SCORE_VOLUME_ACCEL_SOFT = -0.0200
+
+PRE_SCORE_MAX_VOLUME_IDEAL_MIN = 1.80
+PRE_SCORE_MAX_VOLUME_IDEAL_MAX = 3.271
+PRE_SCORE_MAX_VOLUME_SOFT_MAX = 4.339
+
 PRE_MIN_PRICE_CHANGE_4H = 1.5
 PRE_MAX_PRICE_CHANGE_4H = 8.0
 PRE_MIN_VOLUME_CHANGE_4H = 100
@@ -1440,6 +1486,187 @@ PRE_SIGNAL_THRESHOLD_RULES = [
     {"metric": "trend_age", "min": PRE_MIN_TREND_AGE, "max": PRE_MAX_TREND_AGE},
     {"metric": "range_pct", "min": PRE_MIN_RANGE_PCT, "max": PRE_MAX_RANGE_PCT},
 ]
+def calculate_pre_signal_quality_score(metrics: dict) -> dict:
+    metrics = metrics if isinstance(metrics, dict) else {}
+    breakdown = {}
+    values = {}
+
+    def _add_parameter(metric: str, max_points: int, scorer) -> int:
+        raw_value = metrics.get(metric)
+        status = "missing" if metric not in metrics or raw_value is None else "valid"
+        value = None
+        if status == "valid":
+            try:
+                value = float(raw_value)
+                if not math.isfinite(value):
+                    status = "invalid"
+                    value = None
+            except (TypeError, ValueError):
+                status = "invalid"
+        points = int(scorer(value)) if value is not None else 0
+        values[metric] = value
+        breakdown[metric] = {
+            "value": round(value, 6) if value is not None else None,
+            "points": points,
+            "max_points": max_points,
+            "status": status,
+        }
+        return points
+
+    parameter_score = 0
+    parameter_score += _add_parameter(
+        "btc_4h_change_pct",
+        15,
+        lambda value: (
+            15 if value >= PRE_SCORE_BTC_STRONG_4H
+            else 10 if value >= PRE_SCORE_BTC_POSITIVE_4H
+            else 5 if value >= PRE_SCORE_BTC_NEUTRAL_4H
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "rsi_end",
+        15,
+        lambda value: (
+            15 if PRE_SCORE_RSI_IDEAL_MIN <= value <= PRE_SCORE_RSI_IDEAL_MAX
+            else 7 if PRE_SCORE_RSI_SOFT_MIN <= value <= PRE_SCORE_RSI_SOFT_MAX
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "price_change_4h_pct",
+        15,
+        lambda value: (
+            15 if PRE_SCORE_PRICE_4H_IDEAL_MIN <= value <= PRE_SCORE_PRICE_4H_IDEAL_MAX
+            else 7 if PRE_SCORE_PRICE_4H_SOFT_MIN <= value <= PRE_SCORE_PRICE_4H_SOFT_MAX
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "ema_fast_slope",
+        15,
+        lambda value: (
+            15 if PRE_SCORE_EMA_FAST_IDEAL_MIN <= value <= PRE_SCORE_EMA_FAST_IDEAL_MAX
+            else 7 if PRE_SCORE_EMA_FAST_SOFT_MIN <= value <= PRE_SCORE_EMA_FAST_SOFT_MAX
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "ema_slow_slope",
+        10,
+        lambda value: (
+            10 if PRE_SCORE_EMA_SLOW_IDEAL_MIN <= value <= PRE_SCORE_EMA_SLOW_IDEAL_MAX
+            else 5 if PRE_SCORE_EMA_SLOW_SOFT_MIN <= value <= PRE_SCORE_EMA_SLOW_SOFT_MAX
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "avg_volume_ratio",
+        8,
+        lambda value: (
+            8 if PRE_SCORE_AVG_VOLUME_IDEAL_MIN <= value <= PRE_SCORE_AVG_VOLUME_IDEAL_MAX
+            else 4 if PRE_SCORE_AVG_VOLUME_SOFT_MIN <= value <= PRE_SCORE_AVG_VOLUME_SOFT_MAX
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "volume_acceleration",
+        7,
+        lambda value: (
+            7 if value >= PRE_SCORE_VOLUME_ACCEL_POSITIVE
+            else 5 if value >= PRE_SCORE_VOLUME_ACCEL_GOOD
+            else 2 if value >= PRE_SCORE_VOLUME_ACCEL_SOFT
+            else 0
+        ),
+    )
+    parameter_score += _add_parameter(
+        "max_volume_ratio",
+        5,
+        lambda value: (
+            5 if PRE_SCORE_MAX_VOLUME_IDEAL_MIN <= value <= PRE_SCORE_MAX_VOLUME_IDEAL_MAX
+            else 2 if PRE_SCORE_MAX_VOLUME_IDEAL_MAX < value <= PRE_SCORE_MAX_VOLUME_SOFT_MAX
+            else 0
+        ),
+    )
+    parameter_score = min(PRE_SIGNAL_MAX_PARAMETER_SCORE, parameter_score)
+
+    score_time = metrics.get("signal_time") or metrics.get("scan_time")
+    score_time_utc = _parse_iso_utc(score_time) if score_time else None
+    if score_time_utc is None:
+        score_time_utc = datetime.now(timezone.utc)
+    istanbul_time = score_time_utc.astimezone(
+        timezone(timedelta(hours=PRE_SIGNAL_ISTANBUL_UTC_OFFSET_HOURS))
+    )
+    istanbul_weekday = int(istanbul_time.weekday())
+    istanbul_hour = int(istanbul_time.hour)
+
+    day_bonus = {0: 3, 1: 2, 2: 1}.get(istanbul_weekday, 0)
+    if 18 <= istanbul_hour < 21:
+        hour_bonus = 7
+    elif 12 <= istanbul_hour < 15:
+        hour_bonus = 5
+    elif 21 <= istanbul_hour < 24:
+        hour_bonus = 4
+    elif 3 <= istanbul_hour < 6:
+        hour_bonus = 3
+    elif 0 <= istanbul_hour < 3:
+        hour_bonus = 2
+    elif 6 <= istanbul_hour < 9:
+        hour_bonus = 1
+    else:
+        hour_bonus = 0
+
+    penalties = []
+    if values.get("rsi_end") is not None and values["rsi_end"] > PRE_SCORE_RSI_SOFT_MAX:
+        penalties.append({"reason": "rsi_end_above_soft_max", "points": 8})
+    if (
+        values.get("price_change_4h_pct") is not None
+        and values["price_change_4h_pct"] > PRE_SCORE_PRICE_4H_SOFT_MAX
+    ):
+        penalties.append({"reason": "price_change_4h_pct_above_soft_max", "points": 8})
+    if (
+        values.get("ema_fast_slope") is not None
+        and values["ema_fast_slope"] > PRE_SCORE_EMA_FAST_SOFT_MAX
+    ):
+        penalties.append({"reason": "ema_fast_slope_above_soft_max", "points": 8})
+    if (
+        values.get("max_volume_ratio") is not None
+        and values.get("volume_acceleration") is not None
+        and values["max_volume_ratio"] > PRE_SCORE_MAX_VOLUME_SOFT_MAX
+        and values["volume_acceleration"] < PRE_SCORE_VOLUME_ACCEL_POSITIVE
+    ):
+        penalties.append({"reason": "max_volume_high_with_negative_acceleration", "points": 6})
+    penalty = min(PRE_SIGNAL_MAX_SCORE_PENALTY, sum(item["points"] for item in penalties))
+
+    breakdown["day_bonus"] = {
+        "weekday": istanbul_weekday,
+        "points": day_bonus,
+        "max_points": PRE_SIGNAL_MAX_DAY_BONUS,
+    }
+    breakdown["hour_bonus"] = {
+        "hour": istanbul_hour,
+        "points": hour_bonus,
+        "max_points": PRE_SIGNAL_MAX_HOUR_BONUS,
+    }
+    breakdown["penalties"] = {
+        "items": penalties,
+        "points": penalty,
+        "max_points": PRE_SIGNAL_MAX_SCORE_PENALTY,
+    }
+
+    final_score = parameter_score + day_bonus + hour_bonus - penalty
+    score = max(0, min(PRE_SIGNAL_MAX_QUALITY_SCORE, round(final_score)))
+    return {
+        "score": int(score),
+        "qualified": bool(score >= PRE_SIGNAL_MIN_QUALITY_SCORE),
+        "parameter_score": int(parameter_score),
+        "day_bonus": int(day_bonus),
+        "hour_bonus": int(hour_bonus),
+        "penalty": int(penalty),
+        "istanbul_weekday": istanbul_weekday,
+        "istanbul_hour": istanbul_hour,
+        "breakdown": breakdown,
+    }
 
 
 def evaluate_pre_signal_thresholds(metrics: dict) -> dict:
@@ -1469,9 +1696,18 @@ def evaluate_pre_signal_thresholds(metrics: dict) -> dict:
             "max": None,
             "passed": btc_passed,
         })
+    quality = calculate_pre_signal_quality_score(metrics)
     return {
-        "is_pre_signal": all(c["passed"] for c in checks),
+        "is_pre_signal": quality["qualified"],
         "checks": checks,
+        "pre_signal_score": quality["score"],
+        "score_breakdown": quality["breakdown"],
+        "parameter_score": quality["parameter_score"],
+        "day_bonus": quality["day_bonus"],
+        "hour_bonus": quality["hour_bonus"],
+        "score_penalty": quality["penalty"],
+        "istanbul_weekday": quality["istanbul_weekday"],
+        "istanbul_hour": quality["istanbul_hour"],
     }
 
 
@@ -1601,12 +1837,20 @@ def _build_pre_signal_proximity(record: dict) -> dict:
         else:
             fail_count += 1
             reject.append(metric)
+    quality = calculate_pre_signal_quality_score(record)
     return {
         "metric_colors": colors,
         "pass_count": pass_count,
         "near_count": near_count,
         "fail_count": fail_count,
-        "pre_signal_score": pass_count * 3 + near_count,
+        "pre_signal_score": quality["score"],
+        "score_breakdown": quality["breakdown"],
+        "parameter_score": quality["parameter_score"],
+        "day_bonus": quality["day_bonus"],
+        "hour_bonus": quality["hour_bonus"],
+        "score_penalty": quality["penalty"],
+        "istanbul_weekday": quality["istanbul_weekday"],
+        "istanbul_hour": quality["istanbul_hour"],
         "reject_reasons": reject,
     }
 
@@ -2460,7 +2704,7 @@ def export_all_pre_signal_params_to_sheets():
         }
         decision = evaluate_pre_signal_thresholds(row)
         prox = _build_pre_signal_proximity(row)
-        row["pre_signal_score"] = prox["pre_signal_score"]
+        row["pre_signal_score"] = decision.get("pre_signal_score", 0)
         row["pass_count"] = prox["pass_count"]
         row["near_count"] = prox["near_count"]
         row["fail_count"] = prox["fail_count"]
@@ -3331,7 +3575,14 @@ def run_pre_signal_scan(all_symbols: List[str]):
         decision = evaluate_pre_signal_thresholds(row)
         proximity = _build_pre_signal_proximity(row)
         row["threshold_checks"] = decision.get("checks", [])
-        row["pre_signal_score"] = proximity.get("pre_signal_score", 0)
+        row["pre_signal_score"] = decision.get("pre_signal_score", 0)
+        row["parameter_score"] = decision.get("parameter_score", 0)
+        row["day_bonus"] = decision.get("day_bonus", 0)
+        row["hour_bonus"] = decision.get("hour_bonus", 0)
+        row["score_penalty"] = decision.get("score_penalty", 0)
+        row["score_breakdown"] = decision.get("score_breakdown", {})
+        row["istanbul_weekday"] = decision.get("istanbul_weekday")
+        row["istanbul_hour"] = decision.get("istanbul_hour")
         row["pass_count"] = proximity.get("pass_count", 0)
         row["near_count"] = proximity.get("near_count", 0)
         row["fail_count"] = proximity.get("fail_count", 0)
@@ -3361,6 +3612,9 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "projected_24h_volume", "volume_growth_factor",
             "daily_change_pct", "recent_1h_quote_volume",
             "first_whale_candle_time", "last_whale_candle_time",
+            "pre_signal_score", "parameter_score",
+            "day_bonus", "hour_bonus", "score_penalty", "score_breakdown",
+            "istanbul_weekday", "istanbul_hour",
         }
         signal_record = _build_pre_signal_trade_record(
             symbol=symbol,
