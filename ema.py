@@ -131,6 +131,8 @@ PRE_BTC_4H_MIN_CHANGE = -1.0
 
 # Experimental PRE-SIGNAL quality thresholds; forward-test required.
 PRE_SIGNAL_MIN_QUALITY_SCORE = 70
+PRE_SIGNAL_LOW_SCORE_MIN = 50
+PRE_SIGNAL_LOW_SCORE_MAX = 69
 PRE_SIGNAL_MAX_QUALITY_SCORE = 100
 PRE_SIGNAL_MAX_PARAMETER_SCORE = 90
 PRE_SIGNAL_MAX_DAY_BONUS = 3
@@ -3199,12 +3201,16 @@ def _send_pre_signal_(metrics: dict) -> str:
     entry = _vt_safe_float(metrics.get("entry"), 0.0)
     tp = round(entry * (1 + PRE_SIGNAL_TP_PCT), 8) if entry > 0 else 0.0
     trade_id = metrics.get("trade_id")
+    is_low_score = bool(metrics.get("low_score_pre_signal"))
+    score_text = f"Quality Score: {metrics.get('pre_signal_score')}/100\n\n"
+    status_text = "Low Score Candidate (50-69)" if is_low_score else "Potential Early Entry"
     msg = (
         f"🚨 PRE-SIGNAL LONG\n\n"
         f"Trade ID: {trade_id}\n"
         f"Coin: {symbol}\n\n"
         f"Entry: {entry}\n"
         f"TP: {tp}\n\n"
+        f"{score_text}"
         f"4H Price Change: %{metrics.get('price_change_4h_pct')}\n"
         f"RSI Change: {metrics.get('rsi_change')}\n"
         f"EMA Fast Slope: {metrics.get('ema_fast_slope')}\n"
@@ -3214,7 +3220,7 @@ def _send_pre_signal_(metrics: dict) -> str:
         f"Whale Candles: {metrics.get('whale_candle_count')}\n"
         f"BTC 4H: %{metrics.get('btc_4h_change_pct')}\n\n"
         f"Status:\n"
-        f"Potential Early Entry"
+        f"{status_text}"
     )
     tg_send(msg)
     return msg
@@ -3575,7 +3581,8 @@ def run_pre_signal_scan(all_symbols: List[str]):
         decision = evaluate_pre_signal_thresholds(row)
         proximity = _build_pre_signal_proximity(row)
         row["threshold_checks"] = decision.get("checks", [])
-        row["pre_signal_score"] = decision.get("pre_signal_score", 0)
+        pre_signal_score = int(decision.get("pre_signal_score", 0))
+        row["pre_signal_score"] = pre_signal_score
         row["parameter_score"] = decision.get("parameter_score", 0)
         row["day_bonus"] = decision.get("day_bonus", 0)
         row["hour_bonus"] = decision.get("hour_bonus", 0)
@@ -3589,8 +3596,15 @@ def run_pre_signal_scan(all_symbols: List[str]):
         row["reject_reasons"] = proximity.get("reject_reasons", [])
         row["would_pre_signal"] = bool(decision.get("is_pre_signal"))
         is_pre = bool(decision.get("is_pre_signal"))
+        is_low_score = bool(
+            not is_pre
+            and PRE_SIGNAL_LOW_SCORE_MIN <= pre_signal_score <= PRE_SIGNAL_LOW_SCORE_MAX
+        )
         row["pre_signal"] = is_pre
-        if not is_pre:
+        row["qualified_pre_signal"] = is_pre
+        row["low_score_pre_signal"] = is_low_score
+        row["signal_tier"] = "QUALIFIED" if is_pre else "LOW_SCORE" if is_low_score else "REJECTED"
+        if not (is_pre or is_low_score):
             row["skip_reason"] = "CONDITIONS_NOT_MET"
             return row, None
 
@@ -3615,6 +3629,7 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "pre_signal_score", "parameter_score",
             "day_bonus", "hour_bonus", "score_penalty", "score_breakdown",
             "istanbul_weekday", "istanbul_hour",
+            "qualified_pre_signal", "low_score_pre_signal", "signal_tier",
         }
         signal_record = _build_pre_signal_trade_record(
             symbol=symbol,
@@ -3622,6 +3637,8 @@ def run_pre_signal_scan(all_symbols: List[str]):
             signal_time=signal_time,
             metrics={k: row.get(k) for k in metric_keys},
         )
+        signal_record["qualified"] = is_pre
+        signal_record["signal_tier"] = row["signal_tier"]
         return row, signal_record
 
     generated_signals = []
@@ -13469,3 +13486,4 @@ if __name__=="__main__":
 
 
     
+
