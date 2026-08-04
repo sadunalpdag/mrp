@@ -261,6 +261,7 @@ TREND_LOCK = {}
 TREND_LOCK_TIME = {}
 TRENDLOCK_EXPIRY_SEC = 6 * 3600
 REAL_POSITIONS_TRACKER = {}  # Track open positions with strategy info
+PENDING_TP = {}  # sym -> {"direction": str, "tp_price": float} for unfilled LIMIT orders
 LAST_REAL_CLOSE_CHECK = 0  # Timestamp of last real close check
 LAST_MAX_PROFIT_UPDATE = 0  # Timestamp of last max profit update
 HOURLY_STATS = {}  # Hourly performance statistics
@@ -6160,6 +6161,7 @@ def check_and_log_real_closed_trades():
         # Remove closed positions from tracker
         for sym in closed_symbols:
             REAL_POSITIONS_TRACKER.pop(sym, None)
+            PENDING_TP.pop(sym, None)  # Clean up any pending TP for closed positions
         
         # Save tracker after removing closed positions
         if closed_symbols:
@@ -9288,18 +9290,20 @@ def open_limit_position(sym, direction, qty, price):
 
 
 def open_stop_market_position(sym, direction, qty, stop_price):
-    """Place a STOP_MARKET order that triggers when price reaches stop_price."""
+    """Place a STOP_MARKET algo order that triggers when price reaches stop_price."""
     side = "BUY" if direction == "UP" else "SELL"
     pos_side = "LONG" if direction == "UP" else "SHORT"
     stop_str = format_price_by_tick(sym, round_to_tick(sym, stop_price))
-    res = _signed_request("POST", "/fapi/v1/order", {
+    res = _signed_request("POST", "/fapi/v1/algoOrder", {
         "symbol": sym, "side": side, "type": "STOP_MARKET",
-        "quantity": f"{qty}", "stopPrice": stop_str,
+        "algoType": "CONDITIONAL", "quantity": f"{qty}",
+        "triggerPrice": stop_str, "workingType": "MARK_PRICE",
         "positionSide": pos_side, "timestamp": now_ts_ms()
     })
-    log(f"[STOP_MARKET ORDER] {sym} {direction} stopPrice={stop_str} qty={qty} orderId={res.get('orderId')}")
+    order_id = res.get("orderId") or res.get("algoId")
+    log(f"[STOP_MARKET ORDER] {sym} {direction} triggerPrice={stop_str} qty={qty} orderId={order_id}")
     return {"symbol": sym, "dir": direction, "qty": qty, "entry": stop_price,
-            "pos_side": pos_side, "order_id": res.get("orderId")}
+            "pos_side": pos_side, "order_id": order_id}
 
 
 def futures_set_tp_at_price(sym, direction, tp_price):
@@ -9327,6 +9331,32 @@ def futures_set_tp_at_price(sym, direction, tp_price):
     except Exception as e:
         log(f"[TP AT PRICE ERR] {sym} tp={tp_price} {e}")
         return False
+
+
+def retry_pending_tps():
+    """
+    Retry setting TP for symbols that had a LIMIT entry order not yet filled when
+    the TP was first attempted (error -4509).  Called each main-loop iteration.
+    Only sets TP once the position is confirmed open by Binance.
+    """
+    global PENDING_TP
+    if not PENDING_TP:
+        return
+    try:
+        acc = _signed_request("GET", "/fapi/v2/positionRisk", {"timestamp": now_ts_ms()})
+        open_syms = {p["symbol"] for p in acc if float(p.get("positionAmt", 0)) != 0}
+    except Exception as e:
+        log(f"[PENDING TP CHECK ERR] {e}")
+        return
+    done = []
+    for sym, info in list(PENDING_TP.items()):
+        if sym in open_syms:
+            ok = futures_set_tp_at_price(sym, info["direction"], info["tp_price"])
+            if ok:
+                log(f"[PENDING TP SET] {sym} tp={info['tp_price']}")
+                done.append(sym)
+    for sym in done:
+        PENDING_TP.pop(sym, None)
 
 
 def execute_sheet_trade(sig):
@@ -9390,7 +9420,11 @@ def execute_sheet_trade(sig):
         tp_ok = False
         if tp_price and tp_price > 0:
             tp_ok = futures_set_tp_at_price(sym, direction, tp_price)
-        tp_note = f"TP:{tp_price}" if tp_ok else "TP: not set"
+            # LIMIT orders may not be filled yet; queue TP for retry once position opens
+            if not tp_ok and order_type == "LIMIT":
+                PENDING_TP[sym] = {"direction": direction, "tp_price": tp_price}
+                log(f"[PENDING TP QUEUED] {sym} tp={tp_price} (LIMIT order pending fill)")
+        tp_note = f"TP:{tp_price}" if tp_ok else (f"TP:{tp_price} (pending)" if sym in PENDING_TP else "TP: not set")
 
         # Stop loss is intentionally disabled for sheet signals
         sl_note = "SL: disabled"
@@ -13432,6 +13466,9 @@ def main():
                 cleanup_old_trades()
             except Exception as _cleanup_err:
                 log(f"[VIRTUAL CLEANUP ERR] {_cleanup_err}")
+
+            # 3.7) Retry pending TPs for LIMIT orders that may now be filled
+            retry_pending_tps()
 
             # 4) 4 saatlik auto-backup
             auto_report_if_due()
