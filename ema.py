@@ -10158,6 +10158,9 @@ def get_top_gainers_usdt(top_n=SPOT_TOP_N):
     if not isinstance(data, list):
         raise ValueError(f"Binance API unexpected response: {data}")
 
+    if not isinstance(data, list):
+        raise ValueError(f"Binance API unexpected response: {data}")
+
     df = pd.DataFrame(data)
     df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
     df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
@@ -10186,6 +10189,9 @@ def get_top_losers_usdt(top_n=10):
     data = _get_rest_mgr().get(url, cache_key="ticker_24hr", cache_ttl=TICKER_CACHE_TTL_SEC)
     if data is None:
         return pd.DataFrame(columns=["symbol", "priceChangePercent", "quoteVolume"])
+    if not isinstance(data, list):
+        raise ValueError(f"Binance API unexpected response: {data}")
+
     if not isinstance(data, list):
         raise ValueError(f"Binance API unexpected response: {data}")
 
