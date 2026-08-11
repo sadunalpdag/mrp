@@ -7037,7 +7037,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
             else:  # Short position
                 side = "BUY"
                 pos_side = "SHORT"
-                amt = abs(amt)
+            
+            # Always use absolute value for quantity
+            amt = abs(amt)
             
             # Place take profit order at mark price
             try:
