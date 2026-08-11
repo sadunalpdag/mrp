@@ -8806,10 +8806,18 @@ def futures_set_sl_only(sym, direction, qty, entry_exec, sl_low_usd=22, sl_high_
 def open_market_position(sym, direction, qty):
     side="BUY" if direction=="UP" else "SELL"
     pos_side="LONG" if direction=="UP" else "SHORT"
-    res=_signed_request("POST","/fapi/v1/order",{
-        "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
-        "positionSide":pos_side,"timestamp":now_ts_ms()
-    })
+    
+    try:
+        res=_signed_request("POST","/fapi/v1/order",{
+            "symbol":sym,"side":side,"type":"MARKET","quantity":f"{qty}",
+            "positionSide":pos_side,"timestamp":now_ts_ms()
+        })
+    except (RuntimeError, requests.exceptions.RequestException, ValueError) as e:
+        # Handle API errors (HTTP errors, network errors, timeouts, JSON decode errors)
+        log(f"[ORDER API ERR] {sym} {direction} - {e}")
+        # Return a failed order dict with entry=0 to signal failure
+        return {"symbol":sym,"dir":direction,"qty":qty,"entry":0.0,"pos_side":pos_side}
+    
     # Try to get fill price from response, handling zero/empty values properly
     fill = None
     if res.get("avgPrice") is not None:
