@@ -1174,12 +1174,23 @@ def safe_load(p,d):
     except: pass
     return d
 
+def handle_numpy_serialization(item):
+    """Fallback handler for json serialization of special types"""
+    item_type = type(item).__name__
+    module_name = getattr(type(item), '__module__', '')
+    if 'numpy' in module_name:
+        if hasattr(item, 'tolist'):
+            return item.tolist()
+        elif hasattr(item, 'item'):
+            return item.item()
+    raise TypeError(f"Type {item_type} not serializable")
+
 def safe_save(p,d):
     try:
         with SAVE_LOCK:
             tmp=p+".tmp"
             with open(tmp,"w",encoding="utf-8") as f:
-                json.dump(d,f,ensure_ascii=False,indent=2)
+                json.dump(d,f,ensure_ascii=False,indent=2,default=handle_numpy_serialization)
                 f.flush(); os.fsync(f.fileno())
             os.replace(tmp,p)
     except Exception as e:
