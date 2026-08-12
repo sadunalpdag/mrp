@@ -6541,6 +6541,7 @@ PARAM_DEFAULT={
 }
 PARAM=safe_load(PARAM_FILE,PARAM_DEFAULT)
 if not isinstance(PARAM,dict): PARAM=PARAM_DEFAULT
+for k,v in PARAM_DEFAULT.items(): PARAM.setdefault(k,v)
 STATE=safe_load(STATE_FILE,STATE_DEFAULT)
 for k,v in STATE_DEFAULT.items(): STATE.setdefault(k,v)
 
