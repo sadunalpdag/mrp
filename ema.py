@@ -7047,6 +7047,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                     log(f"[CLOSE ALL SKIP] {sym} - unable to get mark price")
                     continue
                 
+                # Initialize actual execution price (will be populated from order response if available)
+                actual_exit_price = None
+                
                 # Format stop price according to symbol's tick size
                 stop_price_str = format_price_by_tick(sym, mark_price)
                 
@@ -7190,6 +7193,15 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             # IOC orders are automatically cancelled if not immediately filled
                             if not isinstance(res, dict):
                                 raise Exception(f"Invalid response from LIMIT order: {res}")
+                            
+                            # Capture actual execution price from order response
+                            if res.get("avgPrice") is not None:
+                                try:
+                                    price_val = float(res.get("avgPrice"))
+                                    if price_val > 0:
+                                        actual_exit_price = price_val
+                                except (ValueError, TypeError):
+                                    pass
                                 
                             filled_qty = float(res.get("executedQty", 0))
                             # Use the formatted amount that was actually sent to the exchange
@@ -7223,6 +7235,23 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                                     }
                                     try:
                                         market_res = _signed_request("POST", "/fapi/v1/order", market_payload)
+                                        
+                                        # Capture actual execution price from MARKET order response
+                                        # For partial fills, we need to calculate weighted average
+                                        if market_res and isinstance(market_res, dict) and market_res.get("avgPrice") is not None:
+                                            try:
+                                                market_price = float(market_res.get("avgPrice"))
+                                                if market_price > 0:
+                                                    # Calculate weighted average of LIMIT and MARKET fills
+                                                    if actual_exit_price and filled_qty > 0:
+                                                        total_qty = filled_qty + remaining_qty_float
+                                                        if total_qty > 0:
+                                                            actual_exit_price = (actual_exit_price * filled_qty + market_price * remaining_qty_float) / total_qty
+                                                    else:
+                                                        actual_exit_price = market_price
+                                            except (ValueError, TypeError, ZeroDivisionError):
+                                                pass
+                                        
                                         log(f"[CLOSE ALL] {sym} {pos_side} closed: {filled_qty} via LIMIT, {remaining_qty_formatted} via MARKET")
                                     except Exception as market_err:
                                         log(f"[CLOSE ALL ERROR] {sym} MARKET fallback failed: {market_err}")
@@ -7258,8 +7287,9 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                 
                 # Log to closed trades with exit reason
                 entry_price = safe_float(p.get("entryPrice", 0))
-                # Get mark price as exit price
-                exit_price = futures_get_mark_price(sym)
+                # Use actual execution price if available, otherwise fall back to mark price
+                # Actual execution price is more accurate as it reflects the real filled price
+                exit_price = actual_exit_price if actual_exit_price else futures_get_mark_price(sym)
                 
                 # Get position info from tracker if available
                 pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
