@@ -7237,11 +7237,19 @@ def close_all_positions_at_market(exit_reason="PROFIT_TARGET"):
                             closed_symbols.append(sym)
                             # Store position info for reopening
                             direction = "UP" if pos_side == "LONG" else "DOWN"
+                            # Extract strategy kind from position tracker for preservation
+                            pos_info = REAL_POSITIONS_TRACKER.get(sym, {})
+                            tracked_strategy_kind = pos_info.get("kind")
+                            if not tracked_strategy_kind:
+                                # Position not tracked or missing kind - log warning
+                                log(f"[CASHOUT WARNING] {sym} missing strategy kind in tracker, will use fallback on reopen")
+                                tracked_strategy_kind = None  # Will use fallback in reopen
                             closed_positions_info.append({
                                 "symbol": sym,
                                 "direction": direction,
                                 "pos_side": pos_side,
-                                "amount": amt
+                                "amount": amt,
+                                "kind": tracked_strategy_kind  # Preserve strategy kind for reopen (may be None)
                             })
                         except Exception as limit_err:
                             # If LIMIT order completely fails, log error but don't add to closed list
@@ -7385,16 +7393,20 @@ def reopen_positions_with_tp(closed_positions_info):
             TREND_LOCK_TIME[sym] = now_ts_s()
             log(f"[TRENDLOCK SET] {sym} {direction}")
             
-            # Track the new position
-            # Note: power is set to 0.0 for cashout reopens since they're not based on
-            # strategy signals but rather maintaining positions after profit realization
+            # Track the new position with preserved strategy kind
+            # Preserve the original strategy kind to maintain proper position limits
+            # If no kind was provided (old data or missing tracker), use CASHOUT_REOPEN as fallback
+            preserved_strategy_kind = pos_info.get("kind")
+            if not preserved_strategy_kind:
+                preserved_strategy_kind = "CASHOUT_REOPEN"
+                log(f"[REOPEN WARNING] {sym} missing strategy kind, using fallback: {preserved_strategy_kind}")
             REAL_POSITIONS_TRACKER[sym] = {
                 "symbol": sym,
                 "direction": direction,
                 "entry_price": entry_exec,
-                "kind": "CASHOUT_REOPEN",
+                "kind": preserved_strategy_kind,  # Preserve original strategy kind for limit tracking
                 "tag": "💰 REOPEN",
-                "power": 0.0,  # No power score for cashout reopens (not signal-based)
+                "power": 0.0,  # Reopened positions have no power score (not based on new signal)
                 "open_time": now_local_iso(),
                 "tp_target": tp_usd_used or tp_pct_used,
                 "market_state": "",
