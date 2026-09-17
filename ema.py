@@ -140,6 +140,14 @@ PRE_SIGNAL_MAX_HOUR_BONUS = 7
 PRE_SIGNAL_MAX_SCORE_PENALTY = 20
 PRE_SIGNAL_ISTANBUL_UTC_OFFSET_HOURS = 3
 
+# CORE_V1 — data-driven PRE-SIGNAL execution gate
+CORE_V1_ENABLED = True
+CORE_V1_ISTANBUL_HOURS = {1, 4, 6, 10, 11, 14, 15}
+CORE_V1_MIN_AVG_BODY_RATIO = 0.40
+CORE_V1_MIN_MAX_BODY_RATIO = 0.78
+CORE_V1_MIN_BREAKOUT_DISTANCE_PCT = -1.50
+CORE_V1_MIN_WHALE_TO_SIGNAL_MINUTES = 115.0
+
 PRE_SCORE_BTC_STRONG_4H = 0.439
 PRE_SCORE_BTC_POSITIVE_4H = 0.20
 PRE_SCORE_BTC_NEUTRAL_4H = 0.0
@@ -3190,6 +3198,45 @@ def _compute_pre_signal_metrics(symbol: str, quote_volume_24h: float, klines_15m
         return None
 
 
+def evaluate_core_v1_filter(metrics: dict, signal_time_iso: Optional[str] = None) -> dict:
+    """Evaluate the CORE_V1 gate without mutating the raw PRE-SIGNAL metrics."""
+    m = metrics if isinstance(metrics, dict) else {}
+    hour = int(_vt_safe_float(m.get("istanbul_hour"), -1))
+    avg_body = _vt_safe_float(m.get("avg_body_ratio"), 0.0)
+    max_body = _vt_safe_float(m.get("max_body_ratio"), 0.0)
+    breakout = _vt_safe_float(m.get("breakout_distance_pct"), -999.0)
+
+    first_whale = m.get("first_whale_candle_time")
+    signal_dt = _parse_iso_utc(signal_time_iso or m.get("signal_time") or m.get("scan_time"))
+    first_whale_dt = _parse_iso_utc(first_whale) if first_whale else None
+    whale_minutes = None
+    if signal_dt and first_whale_dt:
+        whale_minutes = round((signal_dt - first_whale_dt).total_seconds() / 60.0, 2)
+
+    checks = {
+        "istanbul_hour": hour in CORE_V1_ISTANBUL_HOURS,
+        "avg_body_ratio": avg_body >= CORE_V1_MIN_AVG_BODY_RATIO,
+        "max_body_ratio": max_body >= CORE_V1_MIN_MAX_BODY_RATIO,
+        "breakout_distance_pct": breakout >= CORE_V1_MIN_BREAKOUT_DISTANCE_PCT,
+        "minutes_whale_to_signal": whale_minutes is not None and whale_minutes >= CORE_V1_MIN_WHALE_TO_SIGNAL_MINUTES,
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    return {
+        "enabled": CORE_V1_ENABLED,
+        "passed": bool(all(checks.values())) if CORE_V1_ENABLED else True,
+        "checks": checks,
+        "failed_checks": failed,
+        "minutes_whale_to_signal": whale_minutes,
+        "rules": {
+            "istanbul_hours": sorted(CORE_V1_ISTANBUL_HOURS),
+            "min_avg_body_ratio": CORE_V1_MIN_AVG_BODY_RATIO,
+            "min_max_body_ratio": CORE_V1_MIN_MAX_BODY_RATIO,
+            "min_breakout_distance_pct": CORE_V1_MIN_BREAKOUT_DISTANCE_PCT,
+            "min_minutes_whale_to_signal": CORE_V1_MIN_WHALE_TO_SIGNAL_MINUTES,
+        },
+    }
+
+
 def _is_pre_signal(metrics: dict) -> bool:
     if not metrics:
         return False
@@ -3609,6 +3656,18 @@ def run_pre_signal_scan(all_symbols: List[str]):
             return row, None
 
         signal_time = _vt_now_iso()
+
+        # CORE_V1 is an execution/output gate. Raw scan rows remain available for analysis.
+        core_v1 = evaluate_core_v1_filter(row, signal_time)
+        row["core_v1_pass"] = bool(core_v1.get("passed"))
+        row["core_v1_failed_checks"] = core_v1.get("failed_checks", [])
+        row["core_v1_checks"] = core_v1.get("checks", {})
+        row["core_v1_rules"] = core_v1.get("rules", {})
+        row["minutes_whale_to_signal"] = core_v1.get("minutes_whale_to_signal")
+        if CORE_V1_ENABLED and not row["core_v1_pass"]:
+            row["skip_reason"] = "CORE_V1_FILTER"
+            return row, None
+
         metric_keys = {
             "candles_15m",
             "price_change_4h_pct", "volume_change_4h_pct",
@@ -3630,6 +3689,8 @@ def run_pre_signal_scan(all_symbols: List[str]):
             "day_bonus", "hour_bonus", "score_penalty", "score_breakdown",
             "istanbul_weekday", "istanbul_hour",
             "qualified_pre_signal", "low_score_pre_signal", "signal_tier",
+            "core_v1_pass", "core_v1_failed_checks", "core_v1_checks", "core_v1_rules",
+            "minutes_whale_to_signal",
         }
         signal_record = _build_pre_signal_trade_record(
             symbol=symbol,
