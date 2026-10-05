@@ -5,9 +5,9 @@ ema.py now runs only the foreground crash-bounce loop. Legacy strategy data coll
 - One new signal per coin per rolling 24h, persisted in DATA_DIR/crash_bounce_state.json.
 - Entry candidate: minimum of last 16 fully closed 15m lows and observed price, plus 0.3%, rounded up to tick. Gross TP: entry plus 1%, rounded up to tick.
 - Levels are conditional, unbacktested reference levels; notifications do not verify a reversal or execution.
-- One bulk 24h ticker call per scan, hourly exchangeInfo, 64 candles only for eligible coins without a current cooldown.
-- Nominal scan start interval: 180 seconds; long scans and cooldowns delay it. Intraminute transient threshold crossings may be missed.
-- Startup waits at least 120 seconds to let old process traffic age out.
+- Prices and rolling 24h changes arrive over one Futures WebSocket. exchangeInfo refreshes daily; missing candle history uses a capped REST bootstrap.
+- Nominal scan start interval: 180 seconds; long scans delay it. REST cooldown does not stop WebSocket scans. Threshold crossings between scans may be missed.
+- Startup starts WebSocket immediately. Persisted REST cooldown applies only to market metadata and candle bootstrap.
 - REST requests are serial, at least one second apart, with a conservative local weight budget of 120/minute. IP usage >=50% of the exchangeInfo minute limit pauses requests until the next minute.
 - 429: at least 120s exponential cooldown. 403/418: at least 900s. Honor longer Retry-After and ban expiry from the error body, with a 5s margin.
 - Cooldown saved atomically in DATA_DIR/crash_bounce_rest_cooldown.json and respected on restart. Invalid persistence fails closed.
@@ -19,10 +19,10 @@ Offline validation:
 python -m py_compile ema.py
 python -m unittest discover -p 'test_crash*.py' -v
 
-21 tests cover top-20 ranking, threshold, price rounding, daily deduplication, Telegram routing/retries, persistence failures, startup isolation, cooldown persistence, 429/418, endpoint restrictions, spacing and weight limits. No live Binance or Telegram calls in tests.
+29 tests cover top-20 ranking, threshold, price rounding, daily deduplication, Telegram routing/retries, persistence failures, startup isolation, cooldown persistence, 429/418, endpoint restrictions, spacing and weight limits. Tests mock Binance and Telegram. A separate read-only live WebSocket smoke check received an array of 153 ticker updates; this does not validate deployed service behavior.
 
 ## Virtual outcome tracking and research exports
-- Every 180s bulk ticker snapshot also updates all pending/open crash signals, including coins outside the current top 20. This adds no Binance request.
+- Every 180s the fresh WebSocket ticker cache also updates all pending/open crash signals, including coins outside the current top 20. This adds no Binance request.
 - Model: sampled_limit_touch_v1. Only AFTER signal creation, an observed last price <= planned entry is a hypothetical limit fill at planned entry. This does not verify the reversal confirmation in the alert or actual execution.
 - A later sample >= planned TP labels TP. The entry snapshot cannot also label TP.
 - Entry wait expires after 72h: NO_ENTRY_OBSERVED. Once entered, another 72h is allowed for TP: otherwise TIMEOUT.
@@ -37,3 +37,15 @@ python -m unittest discover -p 'test_crash*.py' -v
 - Pending export and schedule are durable. Failed Telegram upload retries the SAME export at most every 30min. A lost acknowledgement can cause a duplicate delivery.
 - Exports over 49 MiB are retained locally and logged, not sent; export failure cannot disable market scanning.
 - AI analysis should compare candidate rules on chronological holdout data, distinguish resolved from censored/open signals, account for observation gaps and execution costs, and never use future outcomes as entry features. This code collects data; it does not automatically find or deploy an optimized algorithm.
+
+## WebSocket transport
+- Routed combined endpoint: wss://fstream.binance.com/market/stream?streams=!ticker@arr.
+- Ticker arrays contain changed symbols only: updates merge into the cache. USDT-M events are accepted; Coin-M events are excluded. Ranking covers eligible symbols with fresh observed quotes.
+- After connecting, allow 20 seconds of warmup. Quotes older than 120 seconds are excluded. Disconnect clears prices, preventing signals from stale quotes. There is no REST price fallback.
+- Automatic reconnect uses backoff and restores subscriptions; WebSocket ping/pong is handled by websocket-client.
+- Subscribe to 15m candles for the current top 20. Only closed candles are stored, deduplicated by open time, retaining 64 per symbol in crash_bounce_ws_candles.json.
+- A missing/invalid candle cache may bootstrap 64 candles by REST. Budget: at most 24 attempts per rolling hour, with 30 minutes between attempts for a symbol. Valid cached candles work during REST cooldown.
+- Metadata is cached in crash_bounce_market_cache.json, refreshed every 24 hours, and accepted for up to 7 days. Failed metadata refresh retries hourly. New listings can await the next metadata refresh.
+- With no usable metadata and REST blocked, signals wait for metadata. If initial candle bootstrap is blocked, a continuously subscribed symbol can need approximately four hours to accumulate 16 closed candles.
+- REST weight guards are protective pauses, not evidence of an actual HTTP ban. Actual HTTP limit responses are logged separately. Neither stops WebSocket price processing.
+- Signal rules, virtual tracking and daily research exports remain unchanged. Shared-IP or connection restrictions can still affect operation; WebSocket does not guarantee ban-free service.
