@@ -6318,6 +6318,8 @@ CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
 CRASH_BOUNCE_ONLY_TELEGRAM = True
 CRASH_BOUNCE_RESEARCH_DIR = os.path.join(DATA_DIR, "crash_research")
+CRASH_BOUNCE_CANDLES_FILE = os.path.join(DATA_DIR, "crash_bounce_ws_candles.json")
+CRASH_BOUNCE_MARKET_FILE = os.path.join(DATA_DIR, "crash_bounce_market_cache.json")
 CRASH_BOUNCE_REST_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_rest_cooldown.json")
 _crash_cooldown_until = 0.0
 _crash_next_request = 0.0
@@ -6376,11 +6378,11 @@ def _crash_set_cooldown(until):
 
 def _crash_public_get(path, params=None):
     global _crash_next_request, _crash_weight_window, _crash_weight_used, _crash_backoff
-    if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/ticker/24hr", "/fapi/v1/klines"):
+    if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/klines"):
         raise ValueError("Crash-only endpoint not allowed")
     if time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned():
         raise RuntimeError("Binance REST cooldown active")
-    weight = 40 if path.endswith("/24hr") else 5
+    weight = 5
     window = int(time.time() // 60)
     if window != _crash_weight_window:
         _crash_weight_window, _crash_weight_used = window, 0
@@ -6409,6 +6411,7 @@ def _crash_public_get(path, params=None):
                 until = max(until, (stamp / 1000 if stamp > 1e11 else stamp) + 5)
         except (ValueError, AttributeError, TypeError):
             pass
+        log(f"[CRASH REST HTTP LIMIT] status={response.status_code}; pausing bootstrap only")
         _crash_set_cooldown(until)
         response.raise_for_status()
     response.raise_for_status()
@@ -6422,6 +6425,7 @@ def _crash_public_get(path, params=None):
     try:
         used = float(response.headers.get("X-MBX-USED-WEIGHT-1M", 0))
         if used >= _crash_ip_weight_limit * 0.5:
+            log(f"[CRASH REST WEIGHT GUARD] IP used weight={used}; protective pause, not a 429")
             _crash_set_cooldown((int(time.time() // 60) + 1) * 60 + 5)
     except (ValueError, TypeError):
         pass
@@ -6699,12 +6703,276 @@ def _crash_daily_report(state, now):
 
 
 
-def run_crash_bounce_alerts(state, market, now=None):
+class CrashBounceWebSocketCache:
+    """One routed futures socket; delta ticker cache + closed 15m candles."""
+    URL = "wss://fstream.binance.com/market/stream?streams=!ticker@arr"
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.send_lock = threading.Lock()
+        self.tickers = {}
+        self.rows = {}
+        self.wanted = set()
+        self.connected = False
+        self.opened_at = 0.
+        self.ws = None
+        self.thread = None
+        self.dirty = False
+        self.last_warning = 0.
+
+    def load(self):
+        if not os.path.exists(CRASH_BOUNCE_CANDLES_FILE):
+            return
+        try:
+            with open(CRASH_BOUNCE_CANDLES_FILE, encoding="utf-8") as handle:
+                saved = json.load(handle)
+            if not isinstance(saved, dict):
+                raise ValueError("Invalid candle cache")
+            for symbol, rows in saved.items():
+                if isinstance(rows, list):
+                    self.merge_candles(symbol, rows)
+            self.dirty = False
+        except Exception as error:
+            log(f"[CRASH WS CACHE] rebuilding invalid cache: {type(error).__name__}")
+
+    def merge_candles(self, symbol, rows):
+        with self.lock:
+            merged = {int(r[0]): list(r) for r in self.rows.get(symbol, [])}
+            for row in rows:
+                try:
+                    if len(row) < 7 or int(row[6]) >= int(time.time()*1000):
+                        continue
+                    values = [float(row[i]) for i in (1,2,3,4)]
+                    if any(not math.isfinite(v) or v <= 0 for v in values):
+                        continue
+                    volume = float(row[5])
+                    if not math.isfinite(volume) or volume < 0:
+                        continue
+                    if int(row[6])-int(row[0]) != 900000-1:
+                        continue
+                    merged[int(row[0])] = list(row)
+                except (ValueError, TypeError, IndexError):
+                    continue
+            self.rows[symbol] = [merged[t] for t in sorted(merged)][-64:]
+            self.dirty = True
+
+    def candles(self, symbol):
+        with self.lock:
+            return [list(r) for r in self.rows.get(symbol, [])]
+
+    def flush(self):
+        with self.lock:
+            if not self.dirty:
+                return
+            saved = {s:[list(r) for r in rows] for s,rows in self.rows.items()}
+            self.dirty = False
+        try:
+            _crash_write_json(CRASH_BOUNCE_CANDLES_FILE, saved)
+        except Exception:
+            with self.lock:
+                self.dirty = True
+            raise
+
+    def on_message(self, ws, message):
+        try:
+            payload = json.loads(message)
+            data = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if isinstance(data, list):
+                for item in data:
+                    try:
+                        symbol = item["s"]
+                        if int(item.get("st",1)) != 1 or not symbol.endswith("USDT"):
+                            continue
+                        price, change = float(item["c"]), float(item["P"])
+                        event_time = int(item["E"])/1000
+                        if not math.isfinite(price) or price<=0 or not math.isfinite(change):
+                            continue
+                        if abs(time.time()-event_time)>120:
+                            continue
+                        ticker = {"symbol":symbol, "lastPrice":item["c"],
+                                  "priceChangePercent":item["P"], "closeTime":item["E"],
+                                  "highPrice":item.get("h"), "lowPrice":item.get("l"),
+                                  "volume":item.get("v"), "quoteVolume":item.get("q"),
+                                  "count":item.get("n"), "source":"BINANCE_FUTURES_WS"}
+                        with self.lock:
+                            old = self.tickers.get(symbol)
+                            if old is None or event_time >= old["event_time"]:
+                                self.tickers[symbol] = {"ticker":ticker, "event_time":event_time,
+                                                        "received_at":time.time()}
+                    except (KeyError,ValueError,TypeError,AttributeError):
+                        continue
+            elif isinstance(data, dict) and data.get("e") == "kline":
+                k = data["k"]
+                if k.get("i") != "15m" or k.get("x") is not True:
+                    return
+                symbol = data["s"]
+                if int(data.get("st",1))!=1 or not symbol.endswith("USDT"):
+                    return
+                row = [k["t"],k["o"],k["h"],k["l"],k["c"],k["v"],k["T"],
+                       k.get("q","0"),k.get("n",0),k.get("V","0"),k.get("Q","0"),"0"]
+                self.merge_candles(symbol, [row])
+            elif isinstance(data, dict) and "code" in data:
+                log(f"[CRASH WS SERVER ERR] code={data['code']}")
+        except (ValueError,TypeError,KeyError,AttributeError):
+            if time.time()-self.last_warning>60:
+                self.last_warning=time.time()
+                log("[CRASH WS] invalid event ignored")
+
+    def snapshot(self, now):
+        with self.lock:
+            if not self.connected or now-self.opened_at<20:
+                return []
+            return [dict(r["ticker"]) for r in self.tickers.values()
+                    if 0<=now-r["event_time"]<=120 and now-r["received_at"]<=120]
+
+    def _send(self, method, symbols):
+        if not symbols:
+            return
+        with self.send_lock:
+            with self.lock:
+                ws, connected = self.ws, self.connected
+            if not ws or not connected:
+                return
+            try:
+                ws.send(json.dumps({"method":method,
+                    "params":[s.lower()+"@kline_15m" for s in sorted(symbols)],
+                    "id":str(time.time_ns())}))
+            except Exception:
+                # Reconnect restores the entire desired subscription set.
+                ws.close()
+
+    def reconcile(self, symbols):
+        wanted = set(symbols)
+        if len(wanted)>100:
+            raise ValueError("Too many crash candle streams")
+        with self.lock:
+            old, self.wanted = self.wanted, wanted
+        self._send("UNSUBSCRIBE", old-wanted)
+        self._send("SUBSCRIBE", wanted-old)
+
+    def on_open(self, ws):
+        with self.lock:
+            self.connected=True
+            self.ws=ws
+            self.opened_at=time.time()
+            self.tickers={}  # Never carry pre-disconnect prices into a new session.
+            wanted=set(self.wanted)
+        self._send("SUBSCRIBE", wanted)
+        log("[CRASH WS OPEN] futures ticker stream connected")
+
+    def on_close(self, ws, code, message):
+        with self.lock:
+            self.connected=False
+            self.tickers={}
+        log(f"[CRASH WS CLOSED] code={code}; reconnecting with backoff")
+
+    def on_error(self, ws, error):
+        log(f"[CRASH WS ERR] {type(error).__name__}")
+
+    def _run(self):
+        import random
+        delay=5
+        while True:
+            started=time.time()
+            try:
+                self.ws = _websocket_lib.WebSocketApp(self.URL, on_open=self.on_open,
+                    on_message=self.on_message, on_close=self.on_close, on_error=self.on_error)
+                # websocket-client automatically replies to server PING frames.
+                self.ws.run_forever(ping_interval=60, ping_timeout=20)
+            except Exception as error:
+                log(f"[CRASH WS CONNECT ERR] {type(error).__name__}")
+            finally:
+                with self.lock:
+                    self.connected=False
+                    self.tickers={}
+            if time.time()-started>300:
+                delay=5
+            time.sleep(min(60,delay)+random.uniform(0,3))
+            delay=min(60,delay*2)
+
+    def start(self):
+        if self.thread and self.thread.is_alive():
+            return
+        self.load()
+        self.thread=threading.Thread(target=self._run,name="crash-futures-ws",daemon=True)
+        self.thread.start()
+
+
+_CRASH_WS_CACHE = CrashBounceWebSocketCache()
+_crash_seed_retry = {}
+_crash_seed_attempts = []
+
+
+def _crash_write_json(path, data):
+    with SAVE_LOCK:
+        tmp=path+".tmp"
+        with open(tmp,"w",encoding="utf-8") as handle:
+            json.dump(data,handle,ensure_ascii=False,allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp,path)
+
+
+def _crash_cached_candles_valid(rows, now):
+    if len(rows)<16:
+        return False
+    recent=rows[-16:]
+    return (0<=now*1000-int(recent[-1][6])<=1800000 and
+            all(int(b[0])-int(a[0])==900000 for a,b in zip(recent,recent[1:])))
+
+
+def _crash_get_candles(symbol):
+    now=time.time()
+    rows=_CRASH_WS_CACHE.candles(symbol)
+    if _crash_cached_candles_valid(rows,now):
+        return rows
+    if now<_crash_cooldown_until or BinanceRateLimiter.is_banned():
+        return rows
+    if now<_crash_seed_retry.get(symbol,0):
+        return rows
+    _crash_seed_attempts[:]=[t for t in _crash_seed_attempts if now-t<3600]
+    if len(_crash_seed_attempts)>=24:
+        return rows
+    _crash_seed_retry[symbol]=now+1800
+    _crash_seed_attempts.append(now)
+    try:
+        seed=_crash_public_get("/fapi/v1/klines",{"symbol":symbol,"interval":"15m","limit":64})
+        _CRASH_WS_CACHE.merge_candles(symbol,seed)
+        log(f"[CRASH WS SEED] {symbol}: historical candles cached")
+    except Exception as error:
+        log(f"[CRASH WS SEED DEFERRED] {symbol}: {type(error).__name__}")
+    return _CRASH_WS_CACHE.candles(symbol)
+
+
+def _crash_load_market_cache():
+    if not os.path.exists(CRASH_BOUNCE_MARKET_FILE):
+        return {},0
+    try:
+        with open(CRASH_BOUNCE_MARKET_FILE,encoding="utf-8") as handle:
+            saved=json.load(handle)
+        market=saved["market"]; at=float(saved["updated_at"])
+        if not isinstance(market,dict) or time.time()-at>7*86400:
+            return {},0
+        for symbol,tick in market.items():
+            if not symbol.endswith("USDT") or not Decimal(str(tick)).is_finite() or Decimal(str(tick))<=0:
+                raise ValueError("Invalid market cache")
+        return market,at
+    except Exception:
+        log("[CRASH WS MARKET CACHE] invalid/stale metadata; awaiting refresh")
+        return {},0
+
+
+
+def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
     now = time.time() if now is None else now
-    tickers = _crash_public_get("/fapi/v1/ticker/24hr")
+    tickers = _CRASH_WS_CACHE.snapshot(now) if tickers is None else tickers
+    candles_get = _crash_get_candles if candles_get is None else candles_get
     if not isinstance(tickers, list):
         raise ValueError("Invalid futures ticker response")
     _crash_track_results(state, tickers, now)
+    if not tickers:
+        log("[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data")
+        return
     _crash_send_pending(state, now)
     # Rank the trading futures universe before applying threshold/cooldown.
     # Do not replace a cooldown coin with the 21st loser.
@@ -6720,6 +6988,7 @@ def run_crash_bounce_alerts(state, market, now=None):
             ranked.append((change, ticker["symbol"], ticker))
     ranked.sort(key=lambda item: (item[0], item[1]))
     top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
+    _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in top])
     _crash_append_data({"type":"scan", "observed_at":now,
         "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1},
         "top20":[{"rank":i+1, "ticker":t,
@@ -6734,15 +7003,14 @@ def run_crash_bounce_alerts(state, market, now=None):
             previous = state["symbols"].get(symbol)
             if previous and now - previous["created_at"] < CRASH_BOUNCE_COOLDOWN_SECONDS:
                 continue
-            klines = _crash_public_get("/fapi/v1/klines", {
-                "symbol": symbol, "interval": "15m", "limit": 64})
+            klines = candles_get(symbol)
             plan = crash_bounce_plan(klines, ticker["lastPrice"], market[symbol], int(time.time() * 1000))
             if plan is None:
                 log(f"[CRASH BOUNCE WAIT] {symbol}: insufficient/fresh data")
                 continue
             record = dict(plan, symbol=symbol, change_24h=change,
                           created_at=now, sent=False, delivery_status="PENDING",
-                          schema_version=2, loser_rank=rank,
+                          schema_version=3, loser_rank=rank, price_source="BINANCE_FUTURES_WS",
                           features=_crash_features(klines,ticker,now))
             _crash_initialize_tracking(record)
             state["symbols"][symbol] = record
@@ -6761,40 +7029,55 @@ def run_crash_bounce_alerts(state, market, now=None):
 
 def _crash_bounce_worker():
     state = None
-    market, refreshed, next_scan = {}, 0, 0
+    market, refreshed = _crash_load_market_cache()
+    next_metadata = refreshed + 86400 if market else 0
+    next_scan = 0
+    _CRASH_WS_CACHE.start()
     while True:
         try:
             if state is None:
                 state = _crash_load_state()
                 state.setdefault("report", {"last_success_at":time.time(), "next_due_at":time.time()+86400})
                 _crash_save_state(state)
-            # Telegram report schedule remains alive during Binance cooldown.
             try:
                 _crash_daily_report(state, time.time())
             except Exception as error:
                 log(f"[CRASH REPORT ERR] {type(error).__name__}: {error}")
-            wait = max(next_scan, _crash_cooldown_until) - time.time()
-            if wait > 0:
-                time.sleep(min(60, wait))
-                continue
-            started = time.time()
-            next_scan = started + CRASH_BOUNCE_SCAN_SECONDS
-            if not market or time.time() - refreshed >= 3600:
-                info = _crash_public_get("/fapi/v1/exchangeInfo")
-                market = {
-                    s["symbol"]: next(f["tickSize"] for f in s["filters"]
-                                      if f["filterType"] == "PRICE_FILTER")
-                    for s in info["symbols"]
-                    if s.get("quoteAsset") == "USDT"
-                    and s.get("contractType") == "PERPETUAL"
-                    and s.get("status") == "TRADING"
-                }
-                refreshed = time.time()
-            run_crash_bounce_alerts(state, market)
+            now = time.time()
+            if now >= next_metadata:
+                next_metadata = now + 3600
+                if now >= _crash_cooldown_until and not BinanceRateLimiter.is_banned():
+                    try:
+                        info = _crash_public_get("/fapi/v1/exchangeInfo")
+                        updated = {
+                            s["symbol"]: next(f["tickSize"] for f in s["filters"]
+                                              if f["filterType"] == "PRICE_FILTER")
+                            for s in info["symbols"]
+                            if s.get("quoteAsset") == "USDT"
+                            and s.get("contractType") == "PERPETUAL"
+                            and s.get("status") == "TRADING"
+                        }
+                        if not updated:
+                            raise ValueError("Empty futures metadata")
+                        _crash_write_json(CRASH_BOUNCE_MARKET_FILE, {"market":updated,"updated_at":now})
+                        market, refreshed = updated, now
+                        next_metadata = now + 86400
+                    except Exception as error:
+                        log(f"[CRASH WS METADATA DEFERRED] {type(error).__name__}")
+            if market and now-refreshed>7*86400:
+                market = {}
+            if now >= next_scan:
+                next_scan = now + CRASH_BOUNCE_SCAN_SECONDS
+                if market:
+                    run_crash_bounce_alerts(state, market)
+                else:
+                    _crash_track_results(state, [], now)
+                    log("[CRASH WS WAIT] awaiting validated USDT perpetual metadata")
+                _CRASH_WS_CACHE.flush()
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")
             next_scan = max(next_scan, time.time()+60)
-        time.sleep(1)
+        time.sleep(max(1,min(60,next_scan-time.time())))
 
 
 def start_crash_bounce_alerts():
@@ -10244,7 +10527,7 @@ class BinanceRateLimiter:
             else:
                 _rl_ban_until_ts = max(_rl_ban_until_ts, time.time() + duration_sec)
             _rl_spot_scan_banned = True
-            log(f"[REST COOLDOWN ACTIVE] banned until {datetime.fromtimestamp(_rl_ban_until_ts, tz=timezone.utc).isoformat()}")
+            log(f"[REST PAUSE ACTIVE] until {datetime.fromtimestamp(_rl_ban_until_ts, tz=timezone.utc).isoformat()}")
 
     @staticmethod
     def clear_ban():
@@ -13792,8 +14075,7 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     log("[START] CRASH ONLY: 24h <= -12%, TP +1%, one signal/coin/24h; no orders")
-    # Let requests from the previous deployed process age out before polling.
-    _crash_wait_until(max(time.time() + 120, _crash_cooldown_until))
+    # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()
 
 # ===================== ENTRY =====================
