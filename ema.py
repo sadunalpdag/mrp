@@ -6310,7 +6310,8 @@ def update_max_profit_tracking():
 
 # ===================== CRASH-BOUNCE ALERTS (SIGNAL ONLY) =====================
 CRASH_BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_state.json")
-CRASH_BOUNCE_SCAN_SECONDS = 60
+CRASH_BOUNCE_SCAN_SECONDS = 180
+CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
 CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
@@ -6481,14 +6482,21 @@ def run_crash_bounce_alerts(state, market, now=None):
     if not isinstance(tickers, list):
         raise ValueError("Invalid futures ticker response")
     _crash_send_pending(state, now)
+    # Rank the trading futures universe before applying threshold/cooldown.
+    # Do not replace a cooldown coin with the 21st loser.
+    ranked = []
     for ticker in tickers:
-        if not isinstance(ticker, dict):
-            continue
-        symbol = ticker.get("symbol")
-        if symbol not in market:
+        if not isinstance(ticker, dict) or ticker.get("symbol") not in market:
             continue
         try:
             change = float(ticker["priceChangePercent"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(change):
+            ranked.append((change, ticker["symbol"], ticker))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    for change, symbol, ticker in ranked[:CRASH_BOUNCE_TOP_LOSERS]:
+        try:
             if not math.isfinite(change) or change > -CRASH_BOUNCE_DROP_PCT:
                 continue
             previous = state["symbols"].get(symbol)
