@@ -6317,6 +6317,7 @@ CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
 CRASH_BOUNCE_ONLY_TELEGRAM = True
+CRASH_BOUNCE_RESEARCH_DIR = os.path.join(DATA_DIR, "crash_research")
 CRASH_BOUNCE_REST_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_rest_cooldown.json")
 _crash_cooldown_until = 0.0
 _crash_next_request = 0.0
@@ -6448,6 +6449,10 @@ def _crash_load_state():
     if not isinstance(state, dict) or not isinstance(state.get("symbols"), dict):
         raise ValueError("Invalid crash-bounce state")
     state.setdefault("history", [])
+    for record in state["history"]:
+        if "tracking_status" not in record:
+            record["tracking_status"] = "LEGACY_UNKNOWN"
+    state.setdefault("report", {"last_success_at":time.time(), "next_due_at":time.time()+86400})
     return state
 
 
@@ -6473,7 +6478,225 @@ def _crash_send_pending(state, now):
         if tg_send(text, source="CRASH_BOUNCE"):
             record["sent"] = True
             record["delivery_status"] = "SENT"
+            for historical in state["history"]:
+                if historical.get("signal_id") == record.get("signal_id") and historical.get("created_at") == record["created_at"]:
+                    historical.update(sent=True, delivery_status="SENT")
             _crash_save_state(state)
+
+
+def _crash_append_data(event, now):
+    """Append-only UTC daily research log; never includes credentials."""
+    os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
+    day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+    path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day + ".jsonl")
+    with SAVE_LOCK, open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _crash_features(klines, ticker, now):
+    rows = [r for r in klines if int(r[6]) < int(now * 1000)][-64:]
+    closes = [float(r[4]) for r in rows]
+    volumes = [float(r[5]) for r in rows]
+    def ema(period):
+        if len(closes) < period:
+            return None, None
+        value = sum(closes[:period]) / period
+        previous = value
+        for close in closes[period:]:
+            previous = value
+            value += (close - value) * 2 / (period + 1)
+        return value, (value / previous - 1) * 100 if previous else None
+    e7, slope7 = ema(7)
+    e25, slope25 = ema(25)
+    rsi = None
+    if len(closes) >= 15:
+        changes = [b-a for a,b in zip(closes, closes[1:])]
+        gain = sum(max(d, 0) for d in changes[:14]) / 14
+        loss = sum(max(-d, 0) for d in changes[:14]) / 14
+        for d in changes[14:]:
+            gain = (gain * 13 + max(d, 0)) / 14
+            loss = (loss * 13 + max(-d, 0)) / 14
+        rsi = 100 - 100 / (1 + gain / loss) if loss else (100 if gain else 50)
+    baseline = sum(volumes[-21:-1]) / len(volumes[-21:-1]) if len(volumes) > 1 else 0
+    return {"closed_15m_ohlcv": rows, "rsi14_wilder": rsi,
+            "ema7": e7, "ema25": e25, "ema7_slope_pct": slope7,
+            "ema25_slope_pct": slope25,
+            "volume_ratio_last_vs_previous20": volumes[-1] / baseline if baseline else None,
+            "return_1h_pct": (closes[-1] / closes[-5] - 1) * 100 if len(closes) >= 5 else None,
+            "ticker_24h": {k:ticker.get(k) for k in
+                           ("priceChangePercent", "lastPrice", "highPrice", "lowPrice",
+                            "quoteVolume", "volume", "count", "closeTime")}}
+
+
+def _crash_initialize_tracking(record):
+    if "signal_id" not in record:
+        record["signal_id"] = f"{record['symbol']}-{int(record['created_at'] * 1000)}"
+    record.setdefault("tracking_status", "WAIT_ENTRY")
+    record.setdefault("tracking_model", "sampled_limit_touch_v1")
+    record.setdefault("samples", 0)
+    record.setdefault("coverage_gaps", 0)
+    record.setdefault("max_gap_seconds", 0)
+
+
+def _crash_track_results(state, tickers, now):
+    prices = {}
+    for ticker in tickers:
+        try:
+            price = float(ticker["lastPrice"])
+            close_time = float(ticker.get("closeTime", now * 1000)) / 1000
+            if math.isfinite(price) and price > 0 and abs(now-close_time) <= 600:
+                prices[ticker["symbol"]] = price
+        except (KeyError, ValueError, TypeError):
+            continue
+    active_samples = []
+    for record in state["history"]:
+        _crash_initialize_tracking(record)
+        status = record["tracking_status"]
+        if status not in ("WAIT_ENTRY", "OPEN"):
+            # Continue research trajectories after TP, for alternate TP/SL tests.
+            price = prices.get(record["symbol"])
+            if status != "LEGACY_UNKNOWN" and price is not None and now-record["created_at"] <= 6*86400:
+                active_samples.append({"signal_id":record["signal_id"], "symbol":record["symbol"],
+                                       "price":price, "status":status, "after_result":True})
+            continue
+        since = record.get("entered_at", record["created_at"])
+        deadline = since + 72 * 3600
+        if now > deadline:
+            record["tracking_status"] = "NO_ENTRY_OBSERVED" if status == "WAIT_ENTRY" else "TIMEOUT"
+            record["finished_at"] = deadline
+            record["observed_exit_price"] = record.get("last_observed_price")
+            if status == "OPEN" and record.get("last_observed_price"):
+                record["observed_return_pct"] = (record["last_observed_price"] / float(record["entry"]) - 1) * 100
+            record["coverage_gaps"] += int(now-record.get("last_observed_at", since) > 540)
+            _crash_append_data({"type":"result", "observed_at":now, "record":record}, now)
+            continue
+        price = prices.get(record["symbol"])
+        if price is None or now <= record["created_at"]:
+            continue
+        previous = record.get("last_observed_at", record["created_at"])
+        gap = now - previous
+        if gap <= 0:
+            continue
+        record["max_gap_seconds"] = max(record["max_gap_seconds"], gap)
+        record["coverage_gaps"] += int(gap > 540)
+        record["samples"] += 1
+        record["last_observed_at"] = now
+        record["last_observed_price"] = price
+        entry = float(record["entry"])
+        if status == "WAIT_ENTRY" and price <= entry:
+            record.update(tracking_status="OPEN", entered_at=now,
+                          observed_entry_price=price, virtual_fill_price=entry,
+                          max_favorable_pct=0., max_adverse_pct=min(0.,(price/entry-1)*100))
+            # TP must be observed in a later snapshot, never at entry snapshot.
+        if status == "OPEN":
+            ret = (price / entry - 1) * 100
+            record["max_favorable_pct"] = max(record.get("max_favorable_pct",0.), ret)
+            record["max_adverse_pct"] = min(record.get("max_adverse_pct",0.), ret)
+            if price >= float(record["tp"]):
+                record.update(tracking_status="TP", finished_at=now,
+                              tp_hours=(now-record["entered_at"])/3600,
+                              observed_return_pct=(float(record["tp"])/entry-1)*100)
+                _crash_append_data({"type":"result", "observed_at":now, "record":record}, now)
+        active_samples.append({"signal_id":record["signal_id"], "symbol":record["symbol"],
+                               "price":price, "status":record["tracking_status"]})
+    if active_samples:
+        _crash_append_data({"type":"tracking_samples", "observed_at":now,
+                            "samples":active_samples}, now)
+    for record in state["history"]:
+        latest = state["symbols"].get(record["symbol"])
+        if latest and latest.get("created_at") == record["created_at"]:
+            latest.update(record)
+    _crash_save_state(state)
+
+
+def _crash_summary(records):
+    counts = {key:sum(r.get("tracking_status")==key for r in records)
+              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "LEGACY_UNKNOWN")}
+    resolved = counts["TP"] + counts["TIMEOUT"]
+    hours = [r["tp_hours"] for r in records if r.get("tracking_status")=="TP"]
+    return dict(counts, signals=len(records),
+                entered=counts["OPEN"]+resolved,
+                observed_tp_rate_resolved_pct=100*counts["TP"]/resolved if resolved else None,
+                average_tp_hours=sum(hours)/len(hours) if hours else None,
+                records_with_gaps=sum(r.get("coverage_gaps",0)>0 for r in records))
+
+
+def _crash_send_report_file(path, caption):
+    if not BOT_TOKEN or not CHAT_ID:
+        return False
+    try:
+        with open(path, "rb") as handle:
+            response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                data={"chat_id":CHAT_ID, "caption":caption},
+                files={"document":(os.path.basename(path),handle)}, timeout=60)
+        response.raise_for_status()
+        return bool(response.json().get("ok"))
+    except Exception as error:
+        log(f"[CRASH REPORT SEND ERR] {type(error).__name__}")
+        return False
+
+
+def _crash_daily_report(state, now):
+    import zipfile
+    report = state.setdefault("report", {"last_success_at":now, "next_due_at":now+86400})
+    if now < report["next_due_at"]:
+        return
+    if now < report.get("retry_after", 0):
+        return
+    pending = report.get("pending")
+    if pending is None:
+        since = report["last_success_at"]
+        # Include previous entries whose labels may have matured today.
+        records = [r for r in state["history"] if now-r["created_at"] <= 7*86400]
+        daily = [r for r in records if r["created_at"] >= since]
+        summary = _crash_summary(daily)
+        rolling = _crash_summary(records)
+        os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
+        path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
+        notes = ("Sanal sampled_limit_touch_v1: sinyalden sonra örnek fiyat <= giriş ise sanal giriş; "
+                 "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme ve giriş sonrası takip 72h. "
+                 "Gerçek emir, dönüş teyidi, komisyon, kayma, funding ve kaldıraç modellenmez. "
+                 "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
+                 "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
+                 "Eski kayıtlarda geçmiş sonuçlar bilinmez. UTC epoch saniye; kline zamanları milisaniye. "
+                 "Yeni algoritmaları zaman bazlı eğitim/test ayrımıyla karşılaştırın; gelecek verilerini giriş özelliklerine katmayın.")
+        with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("report.json", json.dumps({"schema_version":2,
+                "period_start":since, "period_end":now, "daily_cohort":summary,
+                "rolling_7d_cohort":rolling, "notes":notes}, ensure_ascii=False, indent=2))
+            archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
+            # Last 7 UTC days covers up to 72h entry wait + 72h outcome window.
+            for offset in range(8):
+                day = datetime.fromtimestamp(now-offset*86400, tz=timezone.utc).strftime("%Y-%m-%d")
+                source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
+                if os.path.exists(source):
+                    archive.write(source, "observations/"+day+".jsonl")
+            archive.writestr("README.txt", notes)
+        os.replace(path+".tmp",path)
+        rate = rolling["observed_tp_rate_resolved_pct"]
+        avg = rolling["average_tp_hours"]
+        caption = (f"📊 CRASH BOUNCE — 24h data\nYeni sinyal: {summary['signals']}\n"
+                   f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
+                   f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
+                   f"Sonuçlananlarda gözlenen TP: {f'%{rate:.1f}' if rate is not None else 'henüz yok'}\n"
+                   f"Ort. TP: {f'{avg:.2f} saat' if avg is not None else 'henüz yok'} | veri boşluğu: {rolling['records_with_gaps']}\n"
+                   "Sanal 3dk fiyat takibi; gerçek işlem sonucu değildir. ZIP: mumlar, özellikler, fiyatlar ve sonuçlar.")
+        pending = report["pending"] = {"path":path,"caption":caption,"period_end":now}
+        _crash_save_state(state)
+    report["retry_after"] = now + 1800
+    _crash_save_state(state)
+    if os.path.getsize(pending["path"]) > 49*1024*1024:
+        log("[CRASH REPORT ERR] export exceeds Telegram document limit")
+        return
+    if _crash_send_report_file(pending["path"], pending["caption"]):
+        report.update(last_success_at=pending["period_end"], next_due_at=now+86400)
+        report.pop("pending",None)
+        report.pop("retry_after",None)
+        _crash_save_state(state)
+        log("[CRASH REPORT] daily data sent")
+
 
 
 def run_crash_bounce_alerts(state, market, now=None):
@@ -6481,6 +6704,7 @@ def run_crash_bounce_alerts(state, market, now=None):
     tickers = _crash_public_get("/fapi/v1/ticker/24hr")
     if not isinstance(tickers, list):
         raise ValueError("Invalid futures ticker response")
+    _crash_track_results(state, tickers, now)
     _crash_send_pending(state, now)
     # Rank the trading futures universe before applying threshold/cooldown.
     # Do not replace a cooldown coin with the 21st loser.
@@ -6495,7 +6719,15 @@ def run_crash_bounce_alerts(state, market, now=None):
         if math.isfinite(change):
             ranked.append((change, ticker["symbol"], ticker))
     ranked.sort(key=lambda item: (item[0], item[1]))
-    for change, symbol, ticker in ranked[:CRASH_BOUNCE_TOP_LOSERS]:
+    top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
+    _crash_append_data({"type":"scan", "observed_at":now,
+        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1},
+        "top20":[{"rank":i+1, "ticker":t,
+                   "threshold_pass":c <= -CRASH_BOUNCE_DROP_PCT,
+                   "cooldown_active":now-state["symbols"].get(sym,{}).get("created_at",0) < 86400}
+                  for i,(c,sym,t) in enumerate(top)],
+        "market_context":[t for t in tickers if t.get("symbol") in ("BTCUSDT","ETHUSDT")]}, now)
+    for rank, (change, symbol, ticker) in enumerate(top, 1):
         try:
             if not math.isfinite(change) or change > -CRASH_BOUNCE_DROP_PCT:
                 continue
@@ -6503,18 +6735,22 @@ def run_crash_bounce_alerts(state, market, now=None):
             if previous and now - previous["created_at"] < CRASH_BOUNCE_COOLDOWN_SECONDS:
                 continue
             klines = _crash_public_get("/fapi/v1/klines", {
-                "symbol": symbol, "interval": "15m", "limit": 20})
+                "symbol": symbol, "interval": "15m", "limit": 64})
             plan = crash_bounce_plan(klines, ticker["lastPrice"], market[symbol], int(time.time() * 1000))
             if plan is None:
                 log(f"[CRASH BOUNCE WAIT] {symbol}: insufficient/fresh data")
                 continue
             record = dict(plan, symbol=symbol, change_24h=change,
-                          created_at=now, sent=False, delivery_status="PENDING")
+                          created_at=now, sent=False, delivery_status="PENDING",
+                          schema_version=2, loser_rank=rank,
+                          features=_crash_features(klines,ticker,now))
+            _crash_initialize_tracking(record)
             state["symbols"][symbol] = record
             state["history"].append(dict(record))
             state["history"] = [r for r in state["history"]
-                                if now - r["created_at"] <= 30 * 86400]
+                                if now - r["created_at"] <= 180 * 86400]
             _crash_save_state(state)
+            _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
             log(f"[CRASH BOUNCE] {symbol} entry={plan['entry']} tp={plan['tp']}")
             _crash_send_pending(state, now)
         except Exception as error:
@@ -6525,13 +6761,24 @@ def run_crash_bounce_alerts(state, market, now=None):
 
 def _crash_bounce_worker():
     state = None
-    market, refreshed = {}, 0
+    market, refreshed, next_scan = {}, 0, 0
     while True:
-        _crash_wait_until(_crash_cooldown_until)
-        started = time.time()
         try:
             if state is None:
                 state = _crash_load_state()
+                state.setdefault("report", {"last_success_at":time.time(), "next_due_at":time.time()+86400})
+                _crash_save_state(state)
+            # Telegram report schedule remains alive during Binance cooldown.
+            try:
+                _crash_daily_report(state, time.time())
+            except Exception as error:
+                log(f"[CRASH REPORT ERR] {type(error).__name__}: {error}")
+            wait = max(next_scan, _crash_cooldown_until) - time.time()
+            if wait > 0:
+                time.sleep(min(60, wait))
+                continue
+            started = time.time()
+            next_scan = started + CRASH_BOUNCE_SCAN_SECONDS
             if not market or time.time() - refreshed >= 3600:
                 info = _crash_public_get("/fapi/v1/exchangeInfo")
                 market = {
@@ -6546,8 +6793,8 @@ def _crash_bounce_worker():
             run_crash_bounce_alerts(state, market)
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")
-        _crash_wait_until(max(started + CRASH_BOUNCE_SCAN_SECONDS,
-                              time.time() + 1, _crash_cooldown_until))
+            next_scan = max(next_scan, time.time()+60)
+        time.sleep(1)
 
 
 def start_crash_bounce_alerts():
