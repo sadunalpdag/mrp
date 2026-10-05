@@ -6308,19 +6308,196 @@ def update_max_profit_tracking():
         # Return cached value on exception
         return STATE.get("avg_max_profit", 0.0)
 
+# ===================== CRASH-BOUNCE ALERTS (SIGNAL ONLY) =====================
+CRASH_BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_state.json")
+CRASH_BOUNCE_SCAN_SECONDS = 60
+CRASH_BOUNCE_DROP_PCT = 12.0
+CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
+CRASH_BOUNCE_TP_PCT = Decimal("0.01")
+CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
+CRASH_BOUNCE_ONLY_TELEGRAM = True
+_TG_COMMAND_CONTEXT = threading.local()
+
+
+def crash_bounce_plan(klines, last_price, tick_size, now_ms):
+    """4h CLOSED-candle low + 0.3%; levels only, never an order/fill."""
+    closed = [r for r in klines if len(r) > 6 and int(r[6]) < now_ms]
+    if len(closed) < 16:
+        return None
+    closed = closed[-16:]
+    if now_ms - int(closed[-1][6]) > 30 * 60 * 1000:
+        return None
+    if any(int(b[0]) - int(a[0]) != 15 * 60 * 1000
+           for a, b in zip(closed, closed[1:])):
+        return None
+    lows = [Decimal(str(r[3])) for r in closed]
+    price, tick = Decimal(str(last_price)), Decimal(str(tick_size))
+    if any(not x.is_finite() or x <= 0 for x in lows + [price, tick]):
+        return None
+    # Include a currently observed lower price without using an unfinished
+    # candle's high/low as confirmed support.
+    low = min(min(lows), price)
+    entry = ((low * (1 + CRASH_BOUNCE_ENTRY_BUFFER) / tick)
+             .to_integral_value(rounding="ROUND_CEILING") * tick)
+    tp = ((entry * (1 + CRASH_BOUNCE_TP_PCT) / tick)
+          .to_integral_value(rounding="ROUND_CEILING") * tick)
+    return {"entry": format(entry, "f"), "tp": format(tp, "f"),
+            "reference_low": format(low, "f"), "tick_size": format(tick, "f"),
+            "last_price": format(price, "f"),
+            "confirmation": "Dip korunmalı; 15m dönüş kapanışı beklenmeli."}
+
+
+def _crash_public_get(path, params=None):
+    if BinanceRateLimiter.is_banned():
+        raise RuntimeError("Binance REST cooldown active")
+    BinanceRateLimiter.wait_for_slot()
+    response = requests.get(BINANCE_FAPI + path, params=params, timeout=10)
+    if response.status_code in (418, 429):
+        BinanceRateLimiter.set_ban(duration_sec=max(
+            60, float(response.headers.get("Retry-After", 60))))
+    response.raise_for_status()
+    return response.json()
+
+
+def _crash_save_state(state):
+    # Unlike the legacy safe_save helper, propagate persistence failures:
+    # never send an alert unless its cooldown/pending record is durable.
+    with SAVE_LOCK:
+        tmp = CRASH_BOUNCE_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, CRASH_BOUNCE_STATE_FILE)
+
+
+def _crash_load_state():
+    if not os.path.exists(CRASH_BOUNCE_STATE_FILE):
+        return {"symbols": {}, "history": []}
+    # Fail closed on corrupt state so a restart cannot repeat every alert.
+    with open(CRASH_BOUNCE_STATE_FILE, encoding="utf-8") as handle:
+        state = json.load(handle)
+    if not isinstance(state, dict) or not isinstance(state.get("symbols"), dict):
+        raise ValueError("Invalid crash-bounce state")
+    state.setdefault("history", [])
+    return state
+
+
+def _crash_send_pending(state, now):
+    for symbol, record in state["symbols"].items():
+        if record.get("sent"):
+            continue
+        if now - record["created_at"] > 15 * 60:
+            record["sent"] = True
+            record["delivery_status"] = "STALE_NOT_SENT"
+            _crash_save_state(state)
+            continue
+        text = (f"📉 CRASH BOUNCE | {symbol} | LONG adayı\n"
+                f"24h değişim: %{record['change_24h']:.2f}\n"
+                f"Gözlenen fiyat: {record['last_price']}\n"
+                f"Giriş adayı: {record['entry']}\n"
+                f"TP +%1 (brüt): {record['tp']}\n"
+                f"Dip referansı: {record['reference_low']}\n"
+                f"{record['confirmation']}\n"
+                "Giriş = son 4h dip + %0,3. Seviye tek başına dönüş teyidi değildir.\n"
+                "Uyarıdır; emir açılmadı. Aynı coin: 24h tek uyarı.")
+        _crash_save_state(state)  # Retry persistence before any pending delivery.
+        if tg_send(text, source="CRASH_BOUNCE"):
+            record["sent"] = True
+            record["delivery_status"] = "SENT"
+            _crash_save_state(state)
+
+
+def run_crash_bounce_alerts(state, market, now=None):
+    now = time.time() if now is None else now
+    tickers = _crash_public_get("/fapi/v1/ticker/24hr")
+    if not isinstance(tickers, list):
+        raise ValueError("Invalid futures ticker response")
+    _crash_send_pending(state, now)
+    for ticker in tickers:
+        if not isinstance(ticker, dict):
+            continue
+        symbol = ticker.get("symbol")
+        if symbol not in market:
+            continue
+        try:
+            change = float(ticker["priceChangePercent"])
+            if not math.isfinite(change) or change > -CRASH_BOUNCE_DROP_PCT:
+                continue
+            previous = state["symbols"].get(symbol)
+            if previous and now - previous["created_at"] < CRASH_BOUNCE_COOLDOWN_SECONDS:
+                continue
+            klines = _crash_public_get("/fapi/v1/klines", {
+                "symbol": symbol, "interval": "15m", "limit": 20})
+            plan = crash_bounce_plan(klines, ticker["lastPrice"], market[symbol], int(time.time() * 1000))
+            if plan is None:
+                log(f"[CRASH BOUNCE WAIT] {symbol}: insufficient/fresh data")
+                continue
+            record = dict(plan, symbol=symbol, change_24h=change,
+                          created_at=now, sent=False, delivery_status="PENDING")
+            state["symbols"][symbol] = record
+            state["history"].append(dict(record))
+            state["history"] = [r for r in state["history"]
+                                if now - r["created_at"] <= 30 * 86400]
+            _crash_save_state(state)
+            log(f"[CRASH BOUNCE] {symbol} entry={plan['entry']} tp={plan['tp']}")
+            _crash_send_pending(state, now)
+        except Exception as error:
+            log(f"[CRASH BOUNCE ERR] {symbol}: {error}")
+            if BinanceRateLimiter.is_banned():
+                break
+
+
+def _crash_bounce_worker():
+    state = None
+    market, refreshed = {}, 0
+    while True:
+        try:
+            if state is None:
+                state = _crash_load_state()
+            if not market or time.time() - refreshed >= 3600:
+                info = _crash_public_get("/fapi/v1/exchangeInfo")
+                market = {
+                    s["symbol"]: next(f["tickSize"] for f in s["filters"]
+                                      if f["filterType"] == "PRICE_FILTER")
+                    for s in info["symbols"]
+                    if s.get("quoteAsset") == "USDT"
+                    and s.get("contractType") == "PERPETUAL"
+                    and s.get("status") == "TRADING"
+                }
+                refreshed = time.time()
+            run_crash_bounce_alerts(state, market)
+        except Exception as error:
+            log(f"[CRASH BOUNCE LOOP ERR] {error}")
+        time.sleep(CRASH_BOUNCE_SCAN_SECONDS)
+
+
+def start_crash_bounce_alerts():
+    threading.Thread(target=_crash_bounce_worker,
+                     name="crash-bounce-alerts", daemon=True).start()
+
+
+
 # ===================== TELEGRAM HELPERS =====================
 
-def tg_send(t):
-    if not BOT_TOKEN or not CHAT_ID: return
+def tg_send(t, source=None):
+    if CRASH_BOUNCE_ONLY_TELEGRAM and source != "CRASH_BOUNCE" and not getattr(_TG_COMMAND_CONTEXT, "active", False):
+        return False
+    if not BOT_TOKEN or not CHAT_ID: return False
     try:
-        requests.post(
+        response = requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id":CHAT_ID,"text":t},
             timeout=10
         )
-    except: pass
+        response.raise_for_status()
+        return bool(response.json().get("ok"))
+    except Exception:
+        return False
 
 def tg_send_file(p, cap):
+    if CRASH_BOUNCE_ONLY_TELEGRAM and not getattr(_TG_COMMAND_CONTEXT, "active", False):
+        return False
     if not BOT_TOKEN or not CHAT_ID or not os.path.exists(p): return
     try:
         with open(p,"rb") as f:
@@ -13291,6 +13468,7 @@ def main():
             "🎛️ Use /strategies to see all")
     log("[START] EMA ULTRA v15.11.0 - Fibonacci LONG only, $750 per trade, max 3 positions")
 
+    start_crash_bounce_alerts()
     symbols=auto_init_symbols()
     
     # Populate validated futures symbols set for scanner filtering
@@ -13302,7 +13480,11 @@ def main():
     while True:
         try:
             # Telegram komutları
-            check_telegram_commands()
+            _TG_COMMAND_CONTEXT.active = True
+            try:
+                check_telegram_commands()
+            finally:
+                _TG_COMMAND_CONTEXT.active = False
 
             # bar index
             STATE["bar_index"]=STATE.get("bar_index",0)+1
