@@ -23,7 +23,9 @@ class CrashBounceTests(unittest.TestCase):
                       CRASH_BOUNCE_TOP_LOSERS=20,
                       CRASH_BOUNCE_ONLY_TELEGRAM=True, _TG_COMMAND_CONTEXT=threading.local(),
                       BOT_TOKEN="test", CHAT_ID="test", requests=Mock(), log=Mock(),
-                      _crash_save_state=Mock(), BinanceRateLimiter=SimpleNamespace(is_banned=lambda: False))
+                      _crash_save_state=Mock(), BinanceRateLimiter=SimpleNamespace(is_banned=lambda: False),
+                      _crash_track_results=Mock(), _crash_features=Mock(return_value={}),
+                      _crash_initialize_tracking=Mock(), _crash_append_data=Mock())
         exec(compile(subset, "ema.py", "exec"), self.g)
         self.rows = [[int((self.now - (16-i)*900)*1000), "1", "1.1", "0.99", "1", "1", int((self.now-(15-i)*900)*1000)-1] for i in range(16)]
         self.g['_crash_public_get'] = lambda path, params=None: self.rows if 'klines' in path else self.tickers
