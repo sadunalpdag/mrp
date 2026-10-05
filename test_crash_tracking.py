@@ -119,7 +119,8 @@ class TrackingTests(unittest.TestCase):
         def get(path,params=None):
             calls.append(path)
             return rows if 'klines' in path else [dict(symbol='AUSDT',priceChangePercent='-20',lastPrice=price[0])]
-        self.g['_crash_public_get']=get
+        self.g['_CRASH_WS_CACHE']=SimpleNamespace(snapshot=lambda now:get('WS_SNAPSHOT'),reconcile=Mock())
+        self.g['_crash_get_candles']=lambda symbol:get('/fapi/v1/klines')
         for elapsed,value in [(0,'1'),(180,'.9'),(360,'.92')]:
             price[0]=value
             self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now+elapsed)
@@ -127,7 +128,8 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(state['history'][0]['tracking_status'],'TP')
         self.assertEqual(len(state['history'][0]['features']['closed_15m_ohlcv']),64)
         self.assertEqual(calls.count('/fapi/v1/klines'),1)
-        self.assertEqual(calls.count('/fapi/v1/ticker/24hr'),3)
+        self.assertEqual(calls.count('WS_SNAPSHOT'),3)
+        self.assertNotIn('/fapi/v1/ticker/24hr',calls)
 
     def test_document_ack_controls_success_and_no_token_no_send(self):
         tree=ast.parse(Path(__file__).with_name('ema.py').read_text())
