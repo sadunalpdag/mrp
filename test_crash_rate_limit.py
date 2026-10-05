@@ -45,14 +45,15 @@ class RateTests(unittest.TestCase):
         Path(self.g['CRASH_BOUNCE_REST_STATE_FILE']).write_text(json.dumps({'until':self.now+800}))
         before=self.now
         self.g['main']()
-        self.assertEqual(self.now, before+800)
+        self.assertEqual(self.now, before)
+        self.assertEqual(self.g['_crash_cooldown_until'], before+800)
         self.g['_crash_bounce_worker'].assert_called_once()
         self.g['requests'].get.assert_not_called()
 
     def test_429_blocks_every_request_and_persists_retry_after(self):
         self.response(429, {'Retry-After':'900'})
         before=self.now
-        with self.assertRaises(RuntimeError): self.g['_crash_public_get']('/fapi/v1/ticker/24hr')
+        with self.assertRaises(RuntimeError): self.g['_crash_public_get']('/fapi/v1/klines')
         self.assertGreaterEqual(self.g['_crash_cooldown_until'], before+905)
         with self.assertRaises(RuntimeError): self.g['_crash_public_get']('/fapi/v1/klines')
         self.assertEqual(self.g['requests'].get.call_count,1)
@@ -61,13 +62,13 @@ class RateTests(unittest.TestCase):
     def test_418_honors_ban_timestamp_and_invalid_header(self):
         before=self.now
         self.response(418, {'Retry-After':'invalid'}, {'msg':f'IP banned until {int((before+7200)*1000)}'})
-        with self.assertRaises(RuntimeError): self.g['_crash_public_get']('/fapi/v1/ticker/24hr')
+        with self.assertRaises(RuntimeError): self.g['_crash_public_get']('/fapi/v1/klines')
         self.assertGreaterEqual(self.g['_crash_cooldown_until'],before+7205)
 
     def test_weight_budget_spacing_and_ip_header(self):
         self.response()
         before=self.now
-        for _ in range(4): self.g['_crash_public_get']('/fapi/v1/ticker/24hr')
+        for _ in range(25): self.g['_crash_public_get']('/fapi/v1/klines')
         self.assertGreater(self.now,before+10)
         self.response(headers={'X-MBX-USED-WEIGHT-1M':'1300'})
         self.g['_crash_public_get']('/fapi/v1/klines')
@@ -75,6 +76,7 @@ class RateTests(unittest.TestCase):
 
     def test_endpoint_allowlist_and_cooldown_corruption_fail_closed(self):
         with self.assertRaises(ValueError): self.g['_crash_public_get']('/fapi/v1/ticker/price')
+        with self.assertRaises(ValueError): self.g['_crash_public_get']('/fapi/v1/ticker/24hr')
         Path(self.g['CRASH_BOUNCE_REST_STATE_FILE']).write_text('broken')
         with self.assertRaises(ValueError): self.g['main']()
         self.g['_crash_bounce_worker'].assert_not_called()
