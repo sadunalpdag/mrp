@@ -6316,6 +6316,13 @@ CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
 CRASH_BOUNCE_ONLY_TELEGRAM = True
+CRASH_BOUNCE_REST_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_rest_cooldown.json")
+_crash_cooldown_until = 0.0
+_crash_next_request = 0.0
+_crash_weight_window = -1
+_crash_weight_used = 0
+_crash_ip_weight_limit = 2400
+_crash_backoff = 0
 _TG_COMMAND_CONTEXT = threading.local()
 
 
@@ -6347,16 +6354,76 @@ def crash_bounce_plan(klines, last_price, tick_size, now_ms):
             "confirmation": "Dip korunmalı; 15m dönüş kapanışı beklenmeli."}
 
 
+def _crash_wait_until(until):
+    while time.time() < until:
+        time.sleep(min(60, until - time.time()))
+
+
+def _crash_set_cooldown(until):
+    global _crash_cooldown_until
+    _crash_cooldown_until = max(_crash_cooldown_until, until)
+    with SAVE_LOCK:
+        tmp = CRASH_BOUNCE_REST_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"until": _crash_cooldown_until}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, CRASH_BOUNCE_REST_STATE_FILE)
+    BinanceRateLimiter.set_ban(until_ts=_crash_cooldown_until)
+
+
 def _crash_public_get(path, params=None):
-    if BinanceRateLimiter.is_banned():
+    global _crash_next_request, _crash_weight_window, _crash_weight_used, _crash_backoff
+    if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/ticker/24hr", "/fapi/v1/klines"):
+        raise ValueError("Crash-only endpoint not allowed")
+    if time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned():
         raise RuntimeError("Binance REST cooldown active")
-    BinanceRateLimiter.wait_for_slot()
+    weight = 40 if path.endswith("/24hr") else 5
+    window = int(time.time() // 60)
+    if window != _crash_weight_window:
+        _crash_weight_window, _crash_weight_used = window, 0
+    if _crash_weight_used + weight > 120:
+        _crash_wait_until((window + 1) * 60 + 1)
+        _crash_weight_window, _crash_weight_used = int(time.time() // 60), 0
+    _crash_wait_until(_crash_next_request)
+    _crash_next_request = time.time() + 1.0
+    _crash_weight_used += weight
     response = requests.get(BINANCE_FAPI + path, params=params, timeout=10)
-    if response.status_code in (418, 429):
-        BinanceRateLimiter.set_ban(duration_sec=max(
-            60, float(response.headers.get("Retry-After", 60))))
+    if response.status_code in (403, 418, 429):
+        floor = 900 if response.status_code in (403, 418) else 120
+        _crash_backoff = min(86400, max(floor, _crash_backoff * 2))
+        try:
+            retry = float(response.headers.get("Retry-After", 0))
+            if not math.isfinite(retry):
+                retry = 0
+        except (TypeError, ValueError):
+            retry = 0
+        until = time.time() + max(_crash_backoff, retry) + 5
+        try:
+            message = response.json().get("msg", "")
+            match = re.search(r"banned until (\d{10,16})", message)
+            if match:
+                stamp = float(match.group(1))
+                until = max(until, (stamp / 1000 if stamp > 1e11 else stamp) + 5)
+        except (ValueError, AttributeError, TypeError):
+            pass
+        _crash_set_cooldown(until)
+        response.raise_for_status()
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+    if path.endswith("/exchangeInfo"):
+        limits = [float(r["limit"]) for r in data.get("rateLimits", [])
+                  if r.get("rateLimitType") == "REQUEST_WEIGHT"
+                  and r.get("interval") == "MINUTE" and r.get("intervalNum") == 1]
+        if limits:
+            globals()["_crash_ip_weight_limit"] = min(limits)
+    try:
+        used = float(response.headers.get("X-MBX-USED-WEIGHT-1M", 0))
+        if used >= _crash_ip_weight_limit * 0.5:
+            _crash_set_cooldown((int(time.time() // 60) + 1) * 60 + 5)
+    except (ValueError, TypeError):
+        pass
+    return data
 
 
 def _crash_save_state(state):
@@ -6452,6 +6519,8 @@ def _crash_bounce_worker():
     state = None
     market, refreshed = {}, 0
     while True:
+        _crash_wait_until(_crash_cooldown_until)
+        started = time.time()
         try:
             if state is None:
                 state = _crash_load_state()
@@ -6469,7 +6538,8 @@ def _crash_bounce_worker():
             run_crash_bounce_alerts(state, market)
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")
-        time.sleep(CRASH_BOUNCE_SCAN_SECONDS)
+        _crash_wait_until(max(started + CRASH_BOUNCE_SCAN_SECONDS,
+                              time.time() + 1, _crash_cooldown_until))
 
 
 def start_crash_bounce_alerts():
@@ -13457,268 +13527,19 @@ def scan_top_gainers_and_alert():
 
 
 def main():
-    # Initialize hourly statistics tracking
-    initialize_hourly_stats()
-    test_google_sheets_connection()
-    
-    tg_send("🚀 EMA ULTRA v15.11.0 active — Fibonacci LONG only mode\n"
-            "📐 Aktif strateji: FIBONACCI RETRACEMENT (LONG only)\n"
-            "💰 Trade size: $750 | Maks 3 long pozisyon\n"
-            "🔎 Tarama: Top 25 vadeli işlem sembolü (hacime göre)\n"
-            "🎛️ Use /strategies to see all")
-    log("[START] EMA ULTRA v15.11.0 - Fibonacci LONG only, $750 per trade, max 3 positions")
-
-    start_crash_bounce_alerts()
-    symbols=auto_init_symbols()
-    
-    # Populate validated futures symbols set for scanner filtering
-    VALID_FUTURES_SYMBOLS.update(symbols)
-    
-    # Initialize top volume list
-    update_top_volume_symbols(symbols)
-
-    while True:
-        try:
-            # Telegram komutları
-            _TG_COMMAND_CONTEXT.active = True
-            try:
-                check_telegram_commands()
-            finally:
-                _TG_COMMAND_CONTEXT.active = False
-
-            # bar index
-            STATE["bar_index"]=STATE.get("bar_index",0)+1
-            bar_i=STATE["bar_index"]
-            
-            # Update top volume list every 6 hours (timestamp-based, not bar count)
-            # This is handled internally by update_top_volume_symbols checking TOP_VOLUME_LAST_UPDATE
-            update_top_volume_symbols(symbols)
-
-            # Parallel PRE-SIGNAL system (all futures, liquidity-filtered)
-            run_pre_signal_scan(symbols)
-            update_open_pre_signals_tp()
-            generate_pre_signal_daily_reports_if_due()
-            run_pump_watch_scan()
-            send_pump_watch_report_if_due()
-            update_open_pre_signal_performance()
-            close_finished_pre_signal_performance()
-            generate_pre_signal_performance_summary()
-            export_pre_signal_ai_analysis_files()
-            send_pre_signal_performance_report()
-
-            # 1) Sinyal tarama
-            sigs=run_parallel(symbols,bar_i)
-
-            # 2) Sinyal kayıt + Gerçek trade
-            # Update limits once before processing batch
-            update_directional_limits()
-            
-            # Track positions opened in this batch to update local counts
-            batch_opened = {"cest_long": 0, "cest_short": 0, "general_long": 0, "general_short": 0}
-            
-            for sig in sigs:
-                ai_log_signal(sig)
-                
-                # Execute real trade for all strategies
-                trade_opened = execute_real_trade(sig)
-                
-                # If trade was opened, update ALL counts immediately to prevent exceeding limits
-                if trade_opened:
-                    kind = sig.get("kind", "")
-                    direction = sig["dir"]
-                    
-                    # Update strategy-specific counts for all strategies
-                    current_count = 0
-                    if kind == "MACD":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "MACD" and s.get("direction") == "UP"])
-                            STATE["macd_long_blocked"] = (current_count >= PARAM.get("MAX_MACD_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "MACD" and s.get("direction") == "DOWN"])
-                            STATE["macd_short_blocked"] = (current_count >= PARAM.get("MAX_MACD_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "FVG":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG" and s.get("direction") == "UP"])
-                            STATE["fvg_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG" and s.get("direction") == "DOWN"])
-                            STATE["fvg_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "EMA_PULLBACK":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "EMA_PULLBACK" and s.get("direction") == "UP"])
-                            STATE["ema_pullback_long_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "EMA_PULLBACK" and s.get("direction") == "DOWN"])
-                            STATE["ema_pullback_short_blocked"] = (current_count >= PARAM.get("MAX_EMA_PULLBACK_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "CEST":
-                        if direction == "UP":
-                            batch_opened["cest_long"] += 1
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "UP"])
-                            STATE["cest_long_blocked"] = (current_count >= PARAM.get("MAX_CEST_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            batch_opened["cest_short"] += 1
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "CEST" and s.get("direction") == "DOWN"])
-                            STATE["cest_short_blocked"] = (current_count >= PARAM.get("MAX_CEST_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "ORB_FVG_CONFIRM":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ORB_FVG_CONFIRM" and s.get("direction") == "UP"])
-                            STATE["orb_fvg_long_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ORB_FVG_CONFIRM" and s.get("direction") == "DOWN"])
-                            STATE["orb_fvg_short_blocked"] = (current_count >= PARAM.get("MAX_ORB_FVG_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "NY_REVERSAL":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "NY_REVERSAL" and s.get("direction") == "UP"])
-                            STATE["ny_reversal_long_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "NY_REVERSAL" and s.get("direction") == "DOWN"])
-                            STATE["ny_reversal_short_blocked"] = (current_count >= PARAM.get("MAX_NY_REVERSAL_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "ICT_POWER_OF_3":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ICT_POWER_OF_3" and s.get("direction") == "UP"])
-                            STATE["ict_power_of_3_long_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "ICT_POWER_OF_3" and s.get("direction") == "DOWN"])
-                            STATE["ict_power_of_3_short_blocked"] = (current_count >= PARAM.get("MAX_ICT_POWER_OF_3_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "FVG_BREAKER_BLOCK":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_BREAKER_BLOCK" and s.get("direction") == "UP"])
-                            STATE["fvg_breaker_block_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_BREAKER_BLOCK" and s.get("direction") == "DOWN"])
-                            STATE["fvg_breaker_block_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_BREAKER_BLOCK_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "REENTRY_4H_5M":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "UP"])
-                            STATE["reentry_4h_5m_long_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "REENTRY_4H_5M" and s.get("direction") == "DOWN"])
-                            STATE["reentry_4h_5m_short_blocked"] = (current_count >= PARAM.get("MAX_REENTRY_4H_5M_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "FVG_MSS_ENTRY":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_MSS_ENTRY" and s.get("direction") == "UP"])
-                            STATE["fvg_mss_entry_long_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FVG_MSS_ENTRY" and s.get("direction") == "DOWN"])
-                            STATE["fvg_mss_entry_short_blocked"] = (current_count >= PARAM.get("MAX_FVG_MSS_ENTRY_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "BOLLINGER_BANDS":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "UP"])
-                            STATE["bb_long_blocked"] = (current_count >= PARAM.get("MAX_BB_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "BOLLINGER_BANDS" and s.get("direction") == "DOWN"])
-                            STATE["bb_short_blocked"] = (current_count >= PARAM.get("MAX_BB_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "STOCHASTIC_RSI":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "UP"])
-                            STATE["stoch_rsi_long_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "STOCHASTIC_RSI" and s.get("direction") == "DOWN"])
-                            STATE["stoch_rsi_short_blocked"] = (current_count >= PARAM.get("MAX_STOCH_RSI_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    elif kind == "FIBONACCI_RETRACEMENT":
-                        if direction == "UP":
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "UP"])
-                            STATE["fib_long_blocked"] = (current_count >= PARAM.get("MAX_FIB_BUY", DEFAULT_STRATEGY_POSITION_LIMIT))
-                        else:
-                            current_count = len([s for s in REAL_POSITIONS_TRACKER.values() if s.get("kind") == "FIBONACCI_RETRACEMENT" and s.get("direction") == "DOWN"])
-                            STATE["fib_short_blocked"] = (current_count >= PARAM.get("MAX_FIB_SELL", DEFAULT_STRATEGY_POSITION_LIMIT))
-                    
-                    # Log the current counts for monitoring
-                    log(f"[LIMIT CHECK] {kind}: {current_count}/3")
-            
-            # Update limits once after batch to sync with exchange state
-            if any(batch_opened.values()):
-                update_directional_limits()
-            
-            # 3.1) Check and log real closed trades (disabled)
-            # check_and_log_real_closed_trades()
-            
-            # 3.2) Update max profit tracking for open positions (disabled - causes Binance 429/418 bans)
-            # avg_max_profit = update_max_profit_tracking()
-            # if round(avg_max_profit, 2) != round(STATE.get("avg_max_profit", 0.0), 2):
-            #     STATE["avg_max_profit"] = avg_max_profit
-            #     safe_save(STATE_FILE, STATE)
-            
-            # 3.3) Check profit target (cash out feature) (disabled - causes Binance 429/418 bans)
-            # check_profit_target()
-            
-            # 3.4) Send hourly margin progress log (disabled - causes Binance 429/418 bans)
-            # send_hourly_margin_log()
-            
-            # 3.5) Check and activate hourly analysis if 2 weeks have passed (disabled)
-            # check_and_activate_hourly_analysis()
-
-            # 3.6) Spot/top-gainer scanner disabled.
-
-            # 3.7) Process signal follow-up evaluations
-            try:
-                SIGNAL_TRACKER.process_signals()
-            except Exception as _st_err:
-                log(f"[SIGNAL TRACKER ERR] {_st_err}")
-
-            # 3.8) Breakout setup state machine disabled with spot scanner.
-
-            # 3.9) Clean up old virtual entry trades (>15 days)
-            try:
-                cleanup_old_trades()
-            except Exception as _cleanup_err:
-                log(f"[VIRTUAL CLEANUP ERR] {_cleanup_err}")
-
-            # 4) 4 saatlik auto-backup
-            auto_report_if_due()
-
-            # 4b) 12 saatlik virtual trades JSON gönderimi
-            send_virtual_json_if_due()
-
-            # 4c) 12 saatlik pre-signal context JSON gönderimi
-            send_pre_signal_context_if_due()
-
-            # 5) Heartbeat (10 dk)
-            heartbeat_and_status_check({})
-
-            # 6) TrendLock cooldown temizliği
-            _cleanup_trend_lock_expired()
-
-            # 7) state save & sleep
-            update_sheets_heartbeat(
-                symbol_count=STATE.get("last_pre_signal_symbol_count", 0),
-                last_scan_time=STATE.get("last_pre_signal_scan_time", "N/A"),
-                last_error=STATE.get("last_pre_signal_error", "NONE"),
-            )
-            safe_save(STATE_FILE,STATE)
-            time.sleep(30)
-
-        except TypeError as te:
-            # Catch type errors (like str/float division) with detailed logging
-            log(f"[LOOP TYPE ERR] {te}")
-            log(f"[LOOP TYPE ERR TRACE] {traceback.format_exc()}")
-            STATE["last_pre_signal_error"] = str(te)
-            update_sheets_heartbeat(
-                last_scan_time=STATE.get("last_pre_signal_scan_time", "N/A"),
-                last_error=te,
-            )
-            time.sleep(10)
-        except Exception as e:
-            log(f"[LOOP ERR]{e}")
-            log(f"[LOOP ERR TRACE] {traceback.format_exc()}")
-            STATE["last_pre_signal_error"] = str(e)
-            update_sheets_heartbeat(
-                last_scan_time=STATE.get("last_pre_signal_scan_time", "N/A"),
-                last_error=e,
-            )
-            time.sleep(10)
+    # Only this foreground loop can fetch market data. Legacy scanners,
+    # price/TP tracking, account polling and command handlers are not started.
+    global _crash_cooldown_until
+    if os.path.exists(CRASH_BOUNCE_REST_STATE_FILE):
+        with open(CRASH_BOUNCE_REST_STATE_FILE, encoding="utf-8") as handle:
+            until = float(json.load(handle)["until"])
+        if not math.isfinite(until):
+            raise ValueError("Invalid persisted REST cooldown")
+        _crash_cooldown_until = until
+    log("[START] CRASH ONLY: 24h <= -12%, TP +1%, one signal/coin/24h; no orders")
+    # Let requests from the previous deployed process age out before polling.
+    _crash_wait_until(max(time.time() + 120, _crash_cooldown_until))
+    _crash_bounce_worker()
 
 # ===================== ENTRY =====================
 
