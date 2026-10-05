@@ -29,6 +29,8 @@ class CrashBounceTests(unittest.TestCase):
         exec(compile(subset, "ema.py", "exec"), self.g)
         self.rows = [[int((self.now - (16-i)*900)*1000), "1", "1.1", "0.99", "1", "1", int((self.now-(15-i)*900)*1000)-1] for i in range(16)]
         self.g['_crash_public_get'] = lambda path, params=None: self.rows if 'klines' in path else self.tickers
+        self.g['_CRASH_WS_CACHE'] = SimpleNamespace(snapshot=lambda now: self.tickers, reconcile=Mock())
+        self.g['_crash_get_candles'] = lambda symbol: self.rows
         self.g['tg_send'] = Mock(return_value=True)
         self.tickers = []
 
