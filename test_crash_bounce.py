@@ -20,6 +20,7 @@ class CrashBounceTests(unittest.TestCase):
         self.g = dict(Decimal=Decimal, math=math, time=SimpleNamespace(time=lambda: self.now),
                       CRASH_BOUNCE_ENTRY_BUFFER=Decimal("0.003"), CRASH_BOUNCE_TP_PCT=Decimal("0.01"),
                       CRASH_BOUNCE_DROP_PCT=12., CRASH_BOUNCE_COOLDOWN_SECONDS=86400,
+                      CRASH_BOUNCE_TOP_LOSERS=20,
                       CRASH_BOUNCE_ONLY_TELEGRAM=True, _TG_COMMAND_CONTEXT=threading.local(),
                       BOT_TOKEN="test", CHAT_ID="test", requests=Mock(), log=Mock(),
                       _crash_save_state=Mock(), BinanceRateLimiter=SimpleNamespace(is_banned=lambda: False))
@@ -28,6 +29,16 @@ class CrashBounceTests(unittest.TestCase):
         self.g['_crash_public_get'] = lambda path, params=None: self.rows if 'klines' in path else self.tickers
         self.g['tg_send'] = Mock(return_value=True)
         self.tickers = []
+
+    def test_only_top_20_futures_ranked_before_cooldown(self):
+        self.tickers = [dict(symbol=f'C{i:02}USDT', priceChangePercent=str(-40+i), lastPrice='1') for i in range(25)]
+        self.tickers += [dict(symbol='SPOTUSDT', priceChangePercent='-99', lastPrice='1'),
+                         dict(symbol='BADUSDT', priceChangePercent='NaN', lastPrice='1')]
+        market = {t['symbol']:'.001' for t in self.tickers if t['symbol']!='SPOTUSDT'}
+        state={'symbols':{'C00USDT':{'created_at':self.now, 'sent':True}}, 'history':[]}
+        self.g['run_crash_bounce_alerts'](state, market, self.now)
+        self.assertEqual(len(state['history']),19)
+        self.assertEqual(set(state['symbols']), {f'C{i:02}USDT' for i in range(20)})
 
     def test_entry_and_tp_are_tick_aligned(self):
         plan = self.g['crash_bounce_plan'](self.rows, "1", "0.001", self.now*1000)
