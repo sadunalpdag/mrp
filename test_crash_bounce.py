@@ -57,7 +57,7 @@ class CrashBounceTests(unittest.TestCase):
         self.assertIsNone(self.g['crash_bounce_plan'](self.rows[:15], '1', '.001', self.now*1000))
         self.assertIsNone(self.g['crash_bounce_plan'](self.rows, '1', '.001', (self.now+3600)*1000))
 
-    def test_threshold_universe_and_rolling_24h_restart_cooldown(self):
+    def test_threshold_universe_and_restart_duplicate_floor(self):
         self.tickers = [dict(symbol=s, priceChangePercent=d, lastPrice='1') for s,d in [('AUSDT','-12'),('BUSDT','-11.99'),('SPOTUSDT','-40')]]
         state = {'symbols':{}, 'history':[]}
         self.g['run_crash_bounce_alerts'](state, {'AUSDT':'.001','BUSDT':'.001'}, self.now)
@@ -67,7 +67,7 @@ class CrashBounceTests(unittest.TestCase):
         self.g['run_crash_bounce_alerts'](restarted, {'AUSDT':'.001'}, self.now+86399)
         self.assertEqual(self.g['tg_send'].call_count, 1)
         self.g['run_crash_bounce_alerts'](restarted, {'AUSDT':'.001'}, self.now+86400)
-        self.assertEqual(self.g['tg_send'].call_count, 2)
+        self.assertEqual(self.g['tg_send'].call_count, 1)
 
     def test_failed_delivery_retries_same_plan_not_new_signal(self):
         self.tickers = [dict(symbol='AUSDT', priceChangePercent='-15', lastPrice='1')]
@@ -79,6 +79,63 @@ class CrashBounceTests(unittest.TestCase):
         self.g['run_crash_bounce_alerts'](state, {'AUSDT':'.001'}, self.now+60)
         self.assertTrue(state['symbols']['AUSDT']['sent'])
         self.assertEqual(len(state['history']), 1)
+
+    def revision_fixture(self):
+        self.tickers = [dict(symbol='AUSDT', priceChangePercent='-15', lastPrice='1')]
+        state = {'symbols':{}, 'history':[]}
+        self.g['run_crash_bounce_alerts'](state, {'AUSDT':'.001'}, self.now)
+        return state
+
+    def force_level(self, entry):
+        self.g['crash_bounce_plan'] = Mock(return_value=dict(entry=entry, tp=str(float(entry)*1.01),
+            reference_low=str(float(entry)/1.003), last_price='1', confirmation='test'))
+
+    def test_revision_floor_exact_two_percent_and_restart(self):
+        state = self.revision_fixture()
+        old = Decimal(state['symbols']['AUSDT']['entry'])
+        self.force_level(str(old*Decimal('.981')))
+        self.g['run_crash_bounce_alerts'](state, {'AUSDT':'.001'}, self.now+180)
+        self.assertEqual(len(state['history']),1)
+        self.force_level(str(old*Decimal('.98')))
+        self.g['run_crash_bounce_alerts'](state, {'AUSDT':'.001'}, self.now+360)
+        self.assertEqual(len(state['history']),2)
+        self.assertEqual(state['history'][-1]['daily_signal_number'],2)
+        self.assertIn('#2',self.g['tg_send'].call_args.args[0])
+        restarted = json.loads(json.dumps(state))
+        self.g['run_crash_bounce_alerts'](restarted, {'AUSDT':'.001'}, self.now+540)
+        self.assertEqual(len(restarted['history']),2)
+        self.assertEqual(self.g['tg_send'].call_count,2)
+
+    def test_after_tp_outside_top20_and_recovered_threshold_still_watched(self):
+        state = self.revision_fixture()
+        state['symbols']['AUSDT']['tracking_status']='TP'
+        self.force_level('.95')
+        self.tickers = [dict(symbol=f'C{i}USDT',priceChangePercent='-20',lastPrice='1') for i in range(20)]
+        self.tickers.append(dict(symbol='AUSDT',priceChangePercent='-5',lastPrice='.94'))
+        market={t['symbol']:'.001' for t in self.tickers}
+        self.g['run_crash_bounce_alerts'](state,market,self.now+180)
+        a=[r for r in state['history'] if r['symbol']=='AUSDT']
+        self.assertEqual(len(a),2)
+        self.assertEqual(a[-1]['previous_entry'],a[0]['entry'])
+        self.assertIsNone(a[-1]['loser_rank'])
+        self.assertIn('AUSDT',self.g['_CRASH_WS_CACHE'].reconcile.call_args.args[0])
+
+    def test_paris_daily_number_resets_without_duplicate_floor_reset(self):
+        state=self.revision_fixture()
+        self.force_level('.95')
+        self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now+86400)
+        self.assertEqual(state['history'][-1]['daily_signal_number'],1)
+        self.assertNotEqual(state['history'][0]['signal_day'],state['history'][-1]['signal_day'])
+        self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now+86580)
+        self.assertEqual(len(state['history']),2)
+
+    def test_pending_delivery_is_not_overwritten_by_lower_revision(self):
+        self.g['tg_send'].return_value=False
+        state=self.revision_fixture()
+        self.force_level('.9')
+        self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now+180)
+        self.assertEqual(len(state['history']),1)
+        self.assertNotEqual(state['symbols']['AUSDT']['entry'],'.9')
 
     def test_only_crash_automatic_messages_but_command_replies_work(self):
         tree = ast.parse(Path(__file__).with_name('ema.py').read_text())
