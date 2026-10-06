@@ -19,7 +19,7 @@ Offline validation:
 python -m py_compile ema.py
 python -m unittest discover -p 'test_crash*.py' -v
 
-36 tests cover top-20 ranking, threshold, price rounding, daily deduplication, Telegram routing/retries, persistence failures, startup isolation, cooldown persistence, 429/418, endpoint restrictions, spacing and weight limits. Tests mock Binance and Telegram. A separate read-only live WebSocket smoke check received an array of 153 ticker updates; this does not validate deployed service behavior.
+44 tests cover top-20 ranking, threshold, price rounding, daily deduplication, Telegram routing/retries, persistence failures, startup isolation, cooldown persistence, 429/418, endpoint restrictions, spacing and weight limits. Tests mock Binance and Telegram. A separate read-only live WebSocket smoke check received an array of 153 ticker updates; this does not validate deployed service behavior.
 
 ## Virtual outcome tracking and research exports
 - Every 180s the fresh WebSocket ticker cache also updates all pending/open crash signals, including coins outside the current top 20. This adds no Binance request.
@@ -59,5 +59,17 @@ python -m unittest discover -p 'test_crash*.py' -v
 - A candidate notification is immediate, not an instruction to buy while falling. New virtual results wait for an observed upward crossing; breaking the reference low before entry labels INVALIDATED_BEFORE_ENTRY.
 - Each revision has its own immutable level, parent signal ID, daily number and outcome. Already OPEN or TP records keep their own result; older records are not reinterpreted.
 - The ZIP report includes invalidated candidates and rolling summaries per tracking model. Aggregate cohorts can contain both models; use the per-model results for comparisons.
-- No automated order or additional entry-confirmed Telegram message. Prices are evaluated every 180 seconds; intraperiod crossings and low breaks can be missed. The 15m confirmation wording remains a condition for the user, not a verified filter.
+- No automated orders. Prices are evaluated every 180 seconds; intraperiod crossings and low breaks can be missed. A separate reversal-confirmation subsystem is described below.
 - Lost Telegram acknowledgements may still cause delivery duplicates; durable level deduplication cannot guarantee exactly-once delivery across a network failure.
+
+## Reversal confirmation messages and outcomes
+- Enabled only for candidates created by this version. Existing candidates/outcomes are preserved and do not receive retrospective confirmations.
+- First message is labeled IZLEME ADAYI. After a fully closed green 15m candle that started at/after the candidate, observe two post-close price samples: one <= candle high, then one > candle high. The chosen green candle must have closed within the preceding 30 minutes.
+- Current sampled price and available closed candle lows since the candidate must preserve its reference low. A detected lower low permanently invalidates confirmation for that candidate. A newer candidate supersedes an older unconfirmed candidate.
+- Confirm only candidates whose initial Telegram delivery was acknowledged. Confirmation remains eligible up to 72h after candidate creation.
+- Second message is labeled DONUS ONAYI, includes the parent daily number, old candidate entry, observed confirmation price, tick-rounded confirmation reference and gross +1% TP.
+- Confirmation decisions are durably recorded before delivery. Retry the same message for at most 15 minutes. Suppress pending delivery when fresh price is unavailable, below reference low, or already at/above its TP. Lost acknowledgements can still cause delivery duplicates.
+- Confirmation results use sampled_reversal_confirmation_v1, independently of candidate results: virtual entry reference is the tick-rounded confirmation price, TP requires a later sample, and timeout is 72h after confirmation. Track sampled favorable/adverse moves and coverage gaps.
+- Reports retain original candidate outcomes and add confirmed_7d_cohort, confirmation_states, nested confirmation records, and confirmation events/results in JSONL. Telegram caption includes confirmation count and post-confirmation TP/open counts.
+- This rule verifies a particular sampled reversal pattern; it does not guarantee price continuation, fills or profitability. In-progress lows and intraperiod breaks can be missed; 3-minute sampling can delay or miss confirmation. Fees, slippage, funding and leverage remain unmodeled.
+- 44 offline tests cover candle close timing, upward high crossing, low invalidation, supersession, duplicate suppression, restart/retry, disk failure and independent confirmation outcomes alongside the earlier transport tests. No live messages or orders are sent by tests.
