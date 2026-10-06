@@ -6477,7 +6477,10 @@ def _crash_send_pending(state, now):
                 f"Dip referansı: {record['reference_low']}\n"
                 f"{record['confirmation']}\n"
                 "Giriş = son 4h dip + %0,3. Seviye tek başına dönüş teyidi değildir.\n"
-                "Uyarıdır; emir açılmadı. Aynı coin: 24h tek uyarı.")
+                f"Coinin gün içindeki sinyali: #{record.get('daily_signal_number', 1)} "
+                f"({record.get('signal_day', 'eski kayıt')}, Europe/Paris).\n"
+                "Yeni aday yalnız önceki seviyeden en az %2 aşağıda.\n"
+                "Uyarıdır; emir açılmadı. Düşerken temas giriş sayılmaz.")
         _crash_save_state(state)  # Retry persistence before any pending delivery.
         if tg_send(text, source="CRASH_BOUNCE"):
             record["sent"] = True
@@ -6589,7 +6592,16 @@ def _crash_track_results(state, tickers, now):
         record["last_observed_at"] = now
         record["last_observed_price"] = price
         entry = float(record["entry"])
-        if status == "WAIT_ENTRY" and price <= entry:
+        upward_model = record.get("tracking_model") == "sampled_upward_cross_v2"
+        prior_price = record.get("previous_watch_price", float(record.get("last_price", entry)))
+        record["previous_watch_price"] = price
+        if status == "WAIT_ENTRY" and upward_model and price < float(record["reference_low"]):
+            record.update(tracking_status="INVALIDATED_BEFORE_ENTRY", finished_at=now,
+                          invalidation_price=price)
+            _crash_append_data({"type":"result", "observed_at":now, "record":record}, now)
+            continue
+        crossed = prior_price < entry <= price if upward_model else price <= entry
+        if status == "WAIT_ENTRY" and crossed:
             record.update(tracking_status="OPEN", entered_at=now,
                           observed_entry_price=price, virtual_fill_price=entry,
                           max_favorable_pct=0., max_adverse_pct=min(0.,(price/entry-1)*100))
@@ -6617,7 +6629,7 @@ def _crash_track_results(state, tickers, now):
 
 def _crash_summary(records):
     counts = {key:sum(r.get("tracking_status")==key for r in records)
-              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "LEGACY_UNKNOWN")}
+              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "INVALIDATED_BEFORE_ENTRY", "LEGACY_UNKNOWN")}
     resolved = counts["TP"] + counts["TIMEOUT"]
     hours = [r["tp_hours"] for r in records if r.get("tracking_status")=="TP"]
     return dict(counts, signals=len(records),
@@ -6659,7 +6671,9 @@ def _crash_daily_report(state, now):
         rolling = _crash_summary(records)
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
-        notes = ("Sanal sampled_limit_touch_v1: sinyalden sonra örnek fiyat <= giriş ise sanal giriş; "
+        notes = ("Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
+                 "giriş öncesi dip kırılırsa INVALIDATED_BEFORE_ENTRY. Eski sampled_limit_touch_v1 kayıtları "
+                 "değiştirilmez: fiyat <= giriş sanal giriş sayılır. Modelleri ayrı karşılaştırın. "
                  "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme ve giriş sonrası takip 72h. "
                  "Gerçek emir, dönüş teyidi, komisyon, kayma, funding ve kaldıraç modellenmez. "
                  "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
@@ -6669,7 +6683,11 @@ def _crash_daily_report(state, now):
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("report.json", json.dumps({"schema_version":2,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
-                "rolling_7d_cohort":rolling, "notes":notes}, ensure_ascii=False, indent=2))
+                "rolling_7d_cohort":rolling,
+                "rolling_7d_by_model":{model:_crash_summary([r for r in records
+                    if r.get("tracking_model", "legacy_unknown")==model])
+                    for model in sorted({r.get("tracking_model", "legacy_unknown") for r in records})},
+                "notes":notes}, ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
             # Last 7 UTC days covers up to 72h entry wait + 72h outcome window.
             for offset in range(8):
@@ -6684,6 +6702,7 @@ def _crash_daily_report(state, now):
         caption = (f"📊 CRASH BOUNCE — 24h data\nYeni sinyal: {summary['signals']}\n"
                    f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
+                   f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
                    f"Sonuçlananlarda gözlenen TP: {f'%{rate:.1f}' if rate is not None else 'henüz yok'}\n"
                    f"Ort. TP: {f'{avg:.2f} saat' if avg is not None else 'henüz yok'} | veri boşluğu: {rolling['records_with_gaps']}\n"
                    "Sanal 3dk fiyat takibi; gerçek işlem sonucu değildir. ZIP: mumlar, özellikler, fiyatlar ve sonuçlar.")
@@ -6988,29 +7007,57 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             ranked.append((change, ticker["symbol"], ticker))
     ranked.sort(key=lambda item: (item[0], item[1]))
     top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
-    _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in top])
+    # Keep previously alerted coins under observation for 72h, including after TP
+    # and after they leave the top 20 / recover above the -12% threshold.
+    watching = {sym for sym, rec in state["symbols"].items()
+                if now - rec.get("created_at", 0) < 72*3600 and sym in market}
+    selected = list(top)
+    selected_symbols = {sym for _, sym, _ in top}
+    selected.extend((change, sym, ticker) for change, sym, ticker in ranked
+                    if sym in watching and sym not in selected_symbols)
+    _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100])
     _crash_append_data({"type":"scan", "observed_at":now,
-        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1},
+        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"sampled_upward_cross_v2"},
         "top20":[{"rank":i+1, "ticker":t,
                    "threshold_pass":c <= -CRASH_BOUNCE_DROP_PCT,
-                   "cooldown_active":now-state["symbols"].get(sym,{}).get("created_at",0) < 86400}
+                   "previous_signal_entry":state["symbols"].get(sym,{}).get("entry")}
                   for i,(c,sym,t) in enumerate(top)],
         "market_context":[t for t in tickers if t.get("symbol") in ("BTCUSDT","ETHUSDT")]}, now)
-    for rank, (change, symbol, ticker) in enumerate(top, 1):
+    for rank, (change, symbol, ticker) in enumerate(selected, 1):
         try:
-            if not math.isfinite(change) or change > -CRASH_BOUNCE_DROP_PCT:
+            if not math.isfinite(change):
                 continue
             previous = state["symbols"].get(symbol)
-            if previous and now - previous["created_at"] < CRASH_BOUNCE_COOLDOWN_SECONDS:
+            if change > -CRASH_BOUNCE_DROP_PCT and symbol not in watching:
+                continue
+            # Never overwrite an unacknowledged delivery with another level.
+            if previous and not previous.get("sent", False):
+                continue
+            # Malformed legacy records cannot safely establish a duplicate floor.
+            if previous and "entry" not in previous:
                 continue
             klines = candles_get(symbol)
             plan = crash_bounce_plan(klines, ticker["lastPrice"], market[symbol], int(time.time() * 1000))
             if plan is None:
                 log(f"[CRASH BOUNCE WAIT] {symbol}: insufficient/fresh data")
                 continue
+            if previous and Decimal(plan["entry"]) > Decimal(str(previous["entry"])) * Decimal("0.98"):
+                continue
+            from zoneinfo import ZoneInfo
+            from datetime import datetime as _crash_datetime
+            day = _crash_datetime.fromtimestamp(now, ZoneInfo("Europe/Paris")).date().isoformat()
+            number = 1 + sum(1 for r in state["history"] if r.get("symbol") == symbol
+                             and r.get("signal_day", _crash_datetime.fromtimestamp(
+                                 r["created_at"], ZoneInfo("Europe/Paris")).date().isoformat()) == day)
             record = dict(plan, symbol=symbol, change_24h=change,
                           created_at=now, sent=False, delivery_status="PENDING",
-                          schema_version=3, loser_rank=rank, price_source="BINANCE_FUTURES_WS",
+                          schema_version=4, loser_rank=rank if symbol in selected_symbols else None,
+                          price_source="BINANCE_FUTURES_WS", signal_day=day,
+                          daily_signal_number=number,
+                          previous_signal_id=previous.get("signal_id") if previous else None,
+                          previous_entry=previous.get("entry") if previous else None,
+                          tracking_model="sampled_upward_cross_v2",
+                          previous_watch_price=float(ticker["lastPrice"]),
                           features=_crash_features(klines,ticker,now))
             _crash_initialize_tracking(record)
             state["symbols"][symbol] = record
