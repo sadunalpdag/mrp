@@ -2,7 +2,7 @@
 ema.py now runs only the foreground crash-bounce loop. Legacy strategy data collection, per-symbol price polling, account/trading routines, Google Sheets heartbeat and Telegram command handlers are not started. No orders are opened.
 
 - Eligible: rank trading USDT-M perpetuals by current rolling 24h change, select the 20 biggest losers, then require change <= -12%. Coins on cooldown are not replaced with the 21st loser.
-- One new signal per coin per rolling 24h, persisted in DATA_DIR/crash_bounce_state.json.
+- Repeated signals require an entry at least 2% below the preceding recorded candidate. Identical/higher levels are suppressed across restarts and days, persisted in DATA_DIR/crash_bounce_state.json.
 - Entry candidate: minimum of last 16 fully closed 15m lows and observed price, plus 0.3%, rounded up to tick. Gross TP: entry plus 1%, rounded up to tick.
 - Levels are conditional, unbacktested reference levels; notifications do not verify a reversal or execution.
 - Prices and rolling 24h changes arrive over one Futures WebSocket. exchangeInfo refreshes daily; missing candle history uses a capped REST bootstrap.
@@ -19,11 +19,11 @@ Offline validation:
 python -m py_compile ema.py
 python -m unittest discover -p 'test_crash*.py' -v
 
-29 tests cover top-20 ranking, threshold, price rounding, daily deduplication, Telegram routing/retries, persistence failures, startup isolation, cooldown persistence, 429/418, endpoint restrictions, spacing and weight limits. Tests mock Binance and Telegram. A separate read-only live WebSocket smoke check received an array of 153 ticker updates; this does not validate deployed service behavior.
+36 tests cover top-20 ranking, threshold, price rounding, daily deduplication, Telegram routing/retries, persistence failures, startup isolation, cooldown persistence, 429/418, endpoint restrictions, spacing and weight limits. Tests mock Binance and Telegram. A separate read-only live WebSocket smoke check received an array of 153 ticker updates; this does not validate deployed service behavior.
 
 ## Virtual outcome tracking and research exports
 - Every 180s the fresh WebSocket ticker cache also updates all pending/open crash signals, including coins outside the current top 20. This adds no Binance request.
-- Model: sampled_limit_touch_v1. Only AFTER signal creation, an observed last price <= planned entry is a hypothetical limit fill at planned entry. This does not verify the reversal confirmation in the alert or actual execution.
+- Existing records retain sampled_limit_touch_v1. New records use sampled_upward_cross_v2: a later observed price crosses upward from below planned entry to at/above entry. This is a hypothetical fill at entry; gaps, slippage and actual execution are unknown. A new low below the reference before entry invalidates that candidate. Neither model verifies a 15m reversal candle.
 - A later sample >= planned TP labels TP. The entry snapshot cannot also label TP.
 - Entry wait expires after 72h: NO_ENTRY_OBSERVED. Once entered, another 72h is allowed for TP: otherwise TIMEOUT.
 - Track observed TP hours, sampled favorable/adverse excursion, last observed return and gaps >540 seconds. TP rate denominator is TP + TIMEOUT; OPEN/WAIT_ENTRY/no-entry/legacy records are separately shown.
@@ -48,4 +48,16 @@ python -m unittest discover -p 'test_crash*.py' -v
 - Metadata is cached in crash_bounce_market_cache.json, refreshed every 24 hours, and accepted for up to 7 days. Failed metadata refresh retries hourly. New listings can await the next metadata refresh.
 - With no usable metadata and REST blocked, signals wait for metadata. If initial candle bootstrap is blocked, a continuously subscribed symbol can need approximately four hours to accumulate 16 closed candles.
 - REST weight guards are protective pauses, not evidence of an actual HTTP ban. Actual HTTP limit responses are logged separately. Neither stops WebSocket price processing.
-- Signal rules, virtual tracking and daily research exports remain unchanged. Shared-IP or connection restrictions can still affect operation; WebSocket does not guarantee ban-free service.
+- WebSocket transport and daily research export schedule are unchanged; the revision update below replaces signal deduplication and the tracking model for new records. Shared-IP or connection restrictions can still affect operation; WebSocket does not guarantee ban-free service.
+
+## Lower-entry revisions
+- First qualification still requires a top-20 USDT-M coin with rolling 24h loss >=12%.
+- After an alert, observe that coin for 72 hours from its latest candidate, including outside the top 20, above the threshold, and after a TP. A new qualifying lower candidate starts another 72h window.
+- Entry remains last four hours' closed 15m low, including the current observed lower price, plus 0.3%, rounded up to tick. TP is entry +1% gross, rounded up.
+- Send a revised candidate only when its rounded entry <= preceding recorded entry *0.98. The previous reference is durable; midnight does not reset the price floor. No new message for smaller changes.
+- Messages number each coin's candidates per Europe/Paris calendar day (#1, #2, ...). Pending retries retain their number and level; new candidates cannot overwrite an unacknowledged delivery.
+- A candidate notification is immediate, not an instruction to buy while falling. New virtual results wait for an observed upward crossing; breaking the reference low before entry labels INVALIDATED_BEFORE_ENTRY.
+- Each revision has its own immutable level, parent signal ID, daily number and outcome. Already OPEN or TP records keep their own result; older records are not reinterpreted.
+- The ZIP report includes invalidated candidates and rolling summaries per tracking model. Aggregate cohorts can contain both models; use the per-model results for comparisons.
+- No automated order or additional entry-confirmed Telegram message. Prices are evaluated every 180 seconds; intraperiod crossings and low breaks can be missed. The 15m confirmation wording remains a condition for the user, not a verified filter.
+- Lost Telegram acknowledgements may still cause delivery duplicates; durable level deduplication cannot guarantee exactly-once delivery across a network failure.
