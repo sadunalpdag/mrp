@@ -6469,7 +6469,7 @@ def _crash_send_pending(state, now):
             record["delivery_status"] = "STALE_NOT_SENT"
             _crash_save_state(state)
             continue
-        text = (f"📉 CRASH BOUNCE | {symbol} | LONG adayı\n"
+        text = (f"📉 CRASH BOUNCE | {symbol} | İZLEME ADAYI\n"
                 f"24h değişim: %{record['change_24h']:.2f}\n"
                 f"Gözlenen fiyat: {record['last_price']}\n"
                 f"Giriş adayı: {record['entry']}\n"
@@ -6488,6 +6488,134 @@ def _crash_send_pending(state, now):
             for historical in state["history"]:
                 if historical.get("signal_id") == record.get("signal_id") and historical.get("created_at") == record["created_at"]:
                     historical.update(sent=True, delivery_status="SENT")
+            _crash_save_state(state)
+
+
+def _crash_confirmation_step(state, tickers, now, candles_get):
+    """Separate sampled confirmation/outcome model; does not alter candidate fills."""
+    prices = {}
+    for t in tickers:
+        try:
+            p = float(t['lastPrice'])
+            at = float(t.get('closeTime', now*1000))/1000
+            if math.isfinite(p) and p > 0 and 0 <= now-at <= 120:
+                prices[t['symbol']] = p
+        except (KeyError, TypeError, ValueError):
+            continue
+    for record in state['history']:
+        if not record.get('confirmation_enabled'):
+            continue
+        confirmation = record.get('reversal_confirmation')
+        price = prices.get(record['symbol'])
+        if confirmation:
+            if confirmation['tracking_status'] == 'OPEN' and now > confirmation['created_at']:
+                if now-confirmation['created_at'] > 72*3600:
+                    confirmation.update(tracking_status='TIMEOUT', finished_at=confirmation['created_at']+72*3600)
+                elif price is not None and now > confirmation.get('last_observed_at', confirmation['created_at']):
+                    gap = now-confirmation.get('last_observed_at', confirmation['created_at'])
+                    confirmation['coverage_gaps'] += int(gap > 540)
+                    ret = (price/float(confirmation['entry'])-1)*100
+                    confirmation.update(last_observed_at=now, last_observed_price=price,
+                        max_favorable_pct=max(confirmation['max_favorable_pct'],ret),
+                        max_adverse_pct=min(confirmation['max_adverse_pct'],ret))
+                    if price >= float(confirmation['tp']):
+                        confirmation.update(tracking_status='TP',finished_at=now,
+                            tp_hours=(now-confirmation['created_at'])/3600)
+                if confirmation['tracking_status'] != 'OPEN':
+                    _crash_append_data({'type':'confirmation_result','observed_at':now,
+                                       'signal_id':record['signal_id'],'record':confirmation},now)
+            continue
+        latest = state['symbols'].get(record['symbol'], {})
+        if latest.get('signal_id') != record.get('signal_id'):
+            record.setdefault('confirmation_status','SUPERSEDED')
+            continue
+        if record.get('confirmation_status') in ('INVALIDATED', 'EXPIRED'):
+            continue
+        if now-record['created_at'] > 72*3600:
+            record['confirmation_status'] = 'EXPIRED'
+            continue
+        if price is None:
+            continue
+        low = float(record['reference_low'])
+        if price < low:
+            record['confirmation_status'] = 'INVALIDATED'
+            _crash_append_data({'type':'confirmation_invalidated','observed_at':now,
+                               'signal_id':record['signal_id'],'price':price},now)
+            continue
+        try:
+            rows = candles_get(record['symbol'])
+        except Exception as error:
+            log(f"[CRASH CONFIRM WAIT] {record['symbol']}: {error}")
+            continue
+        # Only candles that started after the candidate are eligible. Exclude
+        # pre-candidate lows and unfinished candles from confirmation evidence.
+        rows = sorted([r for r in rows if len(r)>6 and
+                       int(r[0]) >= record['created_at']*1000 and
+                       int(r[6]) < now*1000], key=lambda r:int(r[0]))
+        if price < low or any(float(r[3]) < low for r in rows):
+            record['confirmation_status'] = 'INVALIDATED'
+            _crash_append_data({'type':'confirmation_invalidated','observed_at':now,
+                               'signal_id':record['signal_id'],'price':price},now)
+            continue
+        green = [r for r in rows if float(r[4]) > float(r[1]) and
+                 now-int(r[6])/1000 <= 1800]
+        previous = record.get('confirmation_previous_sample')
+        record['confirmation_previous_sample'] = {'price':price,'at':now}
+        if not green:
+            continue
+        candle = green[-1]
+        high = float(candle[2]); closed_at = int(candle[6])/1000
+        # Require two post-close samples: below/equal high, then strictly above.
+        if not previous or previous['at'] <= closed_at or not (previous['price'] <= high < price):
+            continue
+        if record.get('delivery_status') != 'SENT':
+            continue
+        tick=Decimal(record['tick_size'])
+        entry=(Decimal(str(price))/tick).to_integral_value(rounding='ROUND_CEILING')*tick
+        tp=(entry*(1+CRASH_BOUNCE_TP_PCT)/tick).to_integral_value(rounding='ROUND_CEILING')*tick
+        record['confirmation_status'] = 'CONFIRMED'
+        record['reversal_confirmation'] = dict(symbol=record['symbol'], created_at=now,
+            signal_id=record['signal_id']+'-CONFIRM',parent_signal_id=record['signal_id'],
+            tracking_model='sampled_reversal_confirmation_v1',tracking_status='OPEN',
+            entry=format(entry,'f'),tp=format(tp,'f'),observed_price=price,
+            candle_open_at=int(candle[0])/1000,candle_closed_at=closed_at,candle_high=high,
+            last_observed_at=now,coverage_gaps=0,max_favorable_pct=0.,max_adverse_pct=0.,
+            delivery_status='PENDING',sent=False)
+        _crash_append_data({'type':'reversal_confirmation','observed_at':now,
+                           'record':record['reversal_confirmation']},now)
+    # Persist both the confirmation decision and latest-symbol projection BEFORE
+    # any Telegram send, including retry paths following a failed disk write.
+    for record in state['history']:
+        latest=state['symbols'].get(record['symbol'])
+        if latest and latest.get('signal_id') == record.get('signal_id'):
+            latest.update(record)
+    _crash_save_state(state)
+    for record in state['history']:
+        c=record.get('reversal_confirmation')
+        if not c or c.get('sent'):
+            continue
+        if now-c['created_at'] > 900 or record.get('confirmation_status') != 'CONFIRMED':
+            c.update(sent=True,delivery_status='STALE_NOT_SENT')
+            _crash_save_state(state)
+            continue
+        current_price = prices.get(record['symbol'])
+        if current_price is None:
+            continue
+        if current_price < float(record['reference_low']) or current_price >= float(c['tp']):
+            c.update(sent=True,delivery_status='STALE_NOT_SENT')
+            _crash_save_state(state)
+            continue
+        text=(f"✅ CRASH BOUNCE | {record['symbol']} | DÖNÜŞ ONAYI\n"
+              f"Aday #{record.get('daily_signal_number',1)} ({record.get('signal_day','')}, Europe/Paris)\n"
+              f"Önceki giriş adayı: {record['entry']}\n"
+              f"Onay anında gözlenen fiyat: {c['observed_price']}\n"
+              f"Onay referansı: {c['entry']} | TP +%1 (brüt): {c['tp']}\n"
+              f"Kapalı yeşil 15m mum tepesi: {c['candle_high']} yukarı aşıldı.\n"
+              f"Dip referansı: {record['reference_low']}\n"
+              "Örneklenen veride dip korundu. Aradaki hareketler kaçabilir.\n"
+              "Uyarıdır; emir açılmadı. Dönüş devamı garanti değildir.")
+        if tg_send(text,source='CRASH_BOUNCE'):
+            c.update(sent=True,delivery_status='SENT')
             _crash_save_state(state)
 
 
@@ -6671,19 +6799,25 @@ def _crash_daily_report(state, now):
         rolling = _crash_summary(records)
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
-        notes = ("Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
+        notes = ("Dönüş onayı sampled_reversal_confirmation_v1 ayrı takip edilir: kapalı yeşil 15m mum sonrası "
+                 "dip korunurken mum tepesi sonraki örneklerle yukarı geçilir; onay anındaki fiyat referanstır. "
+                 "Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
                  "giriş öncesi dip kırılırsa INVALIDATED_BEFORE_ENTRY. Eski sampled_limit_touch_v1 kayıtları "
                  "değiştirilmez: fiyat <= giriş sanal giriş sayılır. Modelleri ayrı karşılaştırın. "
                  "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme ve giriş sonrası takip 72h. "
-                 "Gerçek emir, dönüş teyidi, komisyon, kayma, funding ve kaldıraç modellenmez. "
+                 "Gerçek emir, komisyon, kayma, funding ve kaldıraç modellenmez. "
                  "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
                  "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
                  "Eski kayıtlarda geçmiş sonuçlar bilinmez. UTC epoch saniye; kline zamanları milisaniye. "
                  "Yeni algoritmaları zaman bazlı eğitim/test ayrımıyla karşılaştırın; gelecek verilerini giriş özelliklerine katmayın.")
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("report.json", json.dumps({"schema_version":2,
+            archive.writestr("report.json", json.dumps({"schema_version":3,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
                 "rolling_7d_cohort":rolling,
+                "confirmed_7d_cohort":_crash_summary([r['reversal_confirmation'] for r in records
+                    if r.get('reversal_confirmation')]),
+                "confirmation_states":{status:sum(r.get('confirmation_status')==status for r in records)
+                    for status in ('CONFIRMED','INVALIDATED','EXPIRED','SUPERSEDED')},
                 "rolling_7d_by_model":{model:_crash_summary([r for r in records
                     if r.get("tracking_model", "legacy_unknown")==model])
                     for model in sorted({r.get("tracking_model", "legacy_unknown") for r in records})},
@@ -6697,9 +6831,11 @@ def _crash_daily_report(state, now):
                     archive.write(source, "observations/"+day+".jsonl")
             archive.writestr("README.txt", notes)
         os.replace(path+".tmp",path)
+        confirmed = _crash_summary([r['reversal_confirmation'] for r in records if r.get('reversal_confirmation')])
         rate = rolling["observed_tp_rate_resolved_pct"]
         avg = rolling["average_tp_hours"]
         caption = (f"📊 CRASH BOUNCE — 24h data\nYeni sinyal: {summary['signals']}\n"
+                   f"Dönüş onayı {confirmed['signals']} | onay sonrası TP {confirmed['TP']} | açık {confirmed['OPEN']}\n"
                    f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
@@ -6989,6 +7125,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     if not isinstance(tickers, list):
         raise ValueError("Invalid futures ticker response")
     _crash_track_results(state, tickers, now)
+    _crash_confirmation_step(state, tickers, now, candles_get)
     if not tickers:
         log("[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data")
         return
@@ -7051,7 +7188,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                                  r["created_at"], ZoneInfo("Europe/Paris")).date().isoformat()) == day)
             record = dict(plan, symbol=symbol, change_24h=change,
                           created_at=now, sent=False, delivery_status="PENDING",
-                          schema_version=4, loser_rank=rank if symbol in selected_symbols else None,
+                          schema_version=5, confirmation_enabled=True, loser_rank=rank if symbol in selected_symbols else None,
                           price_source="BINANCE_FUTURES_WS", signal_day=day,
                           daily_signal_number=number,
                           previous_signal_id=previous.get("signal_id") if previous else None,
