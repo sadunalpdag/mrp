@@ -33,6 +33,36 @@ class TrackingTests(unittest.TestCase):
     def sample(self,offset,price):
         self.g['_crash_track_results'](self.state,[{'symbol':'AUSDT','lastPrice':str(price)}],self.now+offset)
 
+    def upward_fixture(self):
+        r=self.state['history'][0]
+        r.update(tracking_model='sampled_upward_cross_v2',reference_low='.95',
+                 last_price='.96',previous_watch_price=.96)
+        return r
+
+    def test_upward_cross_enters_then_later_tp(self):
+        r=self.upward_fixture()
+        self.sample(180,.97)
+        self.assertEqual(r['tracking_status'],'WAIT_ENTRY')
+        self.sample(360,1.02)
+        self.assertEqual(r['tracking_status'],'OPEN')
+        self.sample(540,1.02)
+        self.assertEqual(r['tracking_status'],'TP')
+
+    def test_new_low_invalidates_waiting_upward_entry(self):
+        r=self.upward_fixture()
+        self.sample(180,.94)
+        self.assertEqual(r['tracking_status'],'INVALIDATED_BEFORE_ENTRY')
+        self.sample(360,1.02)
+        self.assertEqual(r['tracking_status'],'INVALIDATED_BEFORE_ENTRY')
+        self.assertEqual(self.g['_crash_summary']([r])['INVALIDATED_BEFORE_ENTRY'],1)
+
+    def test_already_above_entry_needs_observed_below_then_cross(self):
+        r=self.upward_fixture();r['previous_watch_price']=1.02
+        self.sample(180,1.03)
+        self.assertEqual(r['tracking_status'],'WAIT_ENTRY')
+        self.sample(360,.98);self.sample(540,1.01)
+        self.assertEqual(r['tracking_status'],'OPEN')
+
     def test_entry_then_later_tp_and_no_same_snapshot_tp(self):
         self.sample(180,.99)
         self.assertEqual(self.r['tracking_status'],'OPEN')
@@ -121,14 +151,14 @@ class TrackingTests(unittest.TestCase):
             return rows if 'klines' in path else [dict(symbol='AUSDT',priceChangePercent='-20',lastPrice=price[0])]
         self.g['_CRASH_WS_CACHE']=SimpleNamespace(snapshot=lambda now:get('WS_SNAPSHOT'),reconcile=Mock())
         self.g['_crash_get_candles']=lambda symbol:get('/fapi/v1/klines')
-        for elapsed,value in [(0,'1'),(180,'.9'),(360,'.92')]:
+        for elapsed,value in [(0,'1'),(180,'.9'),(360,'.905'),(540,'.92')]:
             price[0]=value
             self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now+elapsed)
         self.assertEqual(len(state['history']),1)
         self.assertEqual(state['history'][0]['tracking_status'],'TP')
         self.assertEqual(len(state['history'][0]['features']['closed_15m_ohlcv']),64)
         self.assertEqual(calls.count('/fapi/v1/klines'),1)
-        self.assertEqual(calls.count('WS_SNAPSHOT'),3)
+        self.assertEqual(calls.count('WS_SNAPSHOT'),4)
         self.assertNotIn('/fapi/v1/ticker/24hr',calls)
 
     def test_document_ack_controls_success_and_no_token_no_send(self):
