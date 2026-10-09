@@ -13,18 +13,18 @@ from unittest.mock import Mock
 
 class CrashBounceTests(unittest.TestCase):
     def setUp(self):
-        names = {"crash_bounce_plan", "run_crash_bounce_alerts", "_crash_send_pending", "tg_send", "tg_send_file"}
+        names = {"_crash_signal_score", "_crash_score_text", "crash_bounce_plan", "run_crash_bounce_alerts", "_crash_send_pending", "tg_send", "tg_send_file"}
         tree = ast.parse(Path(__file__).with_name("ema.py").read_text())
         subset = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
         self.now = 2_000_000_000
         self.g = dict(Decimal=Decimal, math=math, time=SimpleNamespace(time=lambda: self.now),
                       CRASH_BOUNCE_ENTRY_BUFFER=Decimal("0.003"), CRASH_BOUNCE_TP_PCT=Decimal("0.01"),
                       CRASH_BOUNCE_DROP_PCT=12., CRASH_BOUNCE_COOLDOWN_SECONDS=86400,
-                      CRASH_BOUNCE_TOP_LOSERS=20,
+                      CRASH_BOUNCE_TOP_LOSERS=20, CRASH_BOUNCE_FILTER_VERSION="rsi_ema_score_v2",
                       CRASH_BOUNCE_ONLY_TELEGRAM=True, _TG_COMMAND_CONTEXT=threading.local(),
                       BOT_TOKEN="test", CHAT_ID="test", requests=Mock(), log=Mock(),
                       _crash_save_state=Mock(), BinanceRateLimiter=SimpleNamespace(is_banned=lambda: False),
-                      _crash_confirmation_step=Mock(), _crash_track_results=Mock(), _crash_features=Mock(return_value={}),
+                      _crash_execute_entries=Mock(), _crash_apply_filter_migration=Mock(), _crash_track_results=Mock(), _crash_features=Mock(return_value={"rsi14_wilder":24,"ema25_slope_pct":-.1}),
                       _crash_initialize_tracking=Mock(), _crash_append_data=Mock())
         exec(compile(subset, "ema.py", "exec"), self.g)
         self.rows = [[int((self.now - (16-i)*900)*1000), "1", "1.1", "0.99", "1", "1", int((self.now-(15-i)*900)*1000)-1] for i in range(16)]
@@ -162,3 +162,4 @@ class CrashBounceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

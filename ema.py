@@ -6313,7 +6313,7 @@ CRASH_BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_state.json")
 CRASH_BOUNCE_SCAN_SECONDS = 180
 CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
-CRASH_BOUNCE_FILTER_VERSION = "rsi25_ema25_negative_v1"
+CRASH_BOUNCE_FILTER_VERSION = "rsi_ema_score_v2"
 CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
@@ -6465,10 +6465,6 @@ def _crash_send_pending(state, now):
     for symbol, record in state["symbols"].items():
         if record.get("sent"):
             continue
-        if not _crash_signal_filter_passes(record.get("features") or {}):
-            record.update(sent=True, delivery_status="FILTERED_NOT_SENT")
-            _crash_save_state(state)
-            continue
         if now - record["created_at"] > 15 * 60:
             record["sent"] = True
             record["delivery_status"] = "STALE_NOT_SENT"
@@ -6480,7 +6476,7 @@ def _crash_send_pending(state, now):
                 f"Giriş adayı: {record['entry']}\n"
                 f"TP +%1 (brüt): {record['tp']}\n"
                 f"Dip referansı: {record['reference_low']}\n"
-                "Filtre: RSI14 < 25 ve EMA25 eğimi < 0 (sinyal anı).\n"
+                f"{_crash_score_text(record.get('features') or {})}\n"
                 "Dip korunmalı; giriş seviyesi aşağıdan yukarı geçilmeli.\n"
                 "Giriş = son 4h dip + %0,3. Seviye tek başına dönüş teyidi değildir.\n"
                 f"Coinin gün içindeki sinyali: #{record.get('daily_signal_number', 1)} "
@@ -6497,18 +6493,43 @@ def _crash_send_pending(state, now):
             _crash_save_state(state)
 
 
-def _crash_signal_filter_passes(features):
-    """Fixed signal-time filter on closed 15m candles; missing values fail closed."""
-    rsi = features.get("rsi14_wilder")
-    slope = features.get("ema25_slope_pct")
-    return (isinstance(rsi, (int, float)) and not isinstance(rsi, bool)
-            and isinstance(slope, (int, float)) and not isinstance(slope, bool)
-            and math.isfinite(rsi) and math.isfinite(slope)
-            and 0 <= rsi < 25 and slope < 0)
+def _crash_signal_score(features):
+    """Signal-time condition score, never a delivery gate or win probability."""
+    def number(key, low=None, high=None):
+        value = features.get(key)
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not math.isfinite(value)
+                or (low is not None and value < low)
+                or (high is not None and value > high)):
+            return None
+        return value
+    rsi = number("rsi14_wilder", 0, 100)
+    slope = number("ema25_slope_pct")
+    ema = number("ema25", 0)
+    rsi_ok = rsi is not None and rsi < 25
+    slope_ok = slope is not None and slope < 0
+    return dict(score=50 * (int(rsi_ok) + int(slope_ok)),
+                rsi14=rsi, ema25=ema, ema25_slope_pct=slope,
+                rsi_pass=rsi_ok, ema25_slope_pass=slope_ok,
+                complete=rsi is not None and slope is not None)
+
+
+def _crash_score_text(features):
+    result = _crash_signal_score(features)
+    rsi = f"{result['rsi14']:.2f}" if result['rsi14'] is not None else "veri yok"
+    ema = f"{result['ema25']:.8g}" if result['ema25'] is not None else "veri yok"
+    slope = f"%{result['ema25_slope_pct']:+.4f}" if result['ema25_slope_pct'] is not None else "veri yok"
+    level = {100: "iki koşul uygun", 50: "bir koşul uygun", 0: "uygun koşul yok"}[result['score']]
+    missing = " | eksik gösterge" if not result['complete'] else ""
+    return (f"Koşul puanı: {result['score']}/100 — {level}{missing}\n"
+            f"RSI14 (15m): {rsi} | <25: {'✅' if result['rsi_pass'] else '❌'}\n"
+            f"EMA25 (15m): {ema}\n"
+            f"EMA25 eğimi: {slope} | <0: {'✅' if result['ema25_slope_pass'] else '❌'}\n"
+            "Kapalı 15m mum, sinyal anı. Puan başarı olasılığı değildir.")
 
 
 def _crash_apply_filter_migration(state, now):
-    """Stop legacy confirmations/pending ineligible entries without erasing history."""
+    """Keep confirmation removed; switch new signals to non-blocking scores."""
     if state.get("signal_filter_version") == CRASH_BOUNCE_FILTER_VERSION:
         return
     for record in state["history"]:
@@ -6519,17 +6540,11 @@ def _crash_apply_filter_migration(state, now):
                                 discontinued_reason="confirmation_system_removed")
         if confirmation and not confirmation.get("sent"):
             confirmation.update(sent=True, delivery_status="CANCELLED_NOT_SENT")
-        if (record.get("tracking_status") == "WAIT_ENTRY"
-                and not _crash_signal_filter_passes(record.get("features") or {})):
-            record.update(tracking_status="FILTERED_OUT", finished_at=now,
-                          filter_reason=CRASH_BOUNCE_FILTER_VERSION)
         latest = state["symbols"].get(record.get("symbol"))
         if latest and latest.get("signal_id") == record.get("signal_id"):
             latest.update(record)
     for record in state["symbols"].values():
         record["confirmation_enabled"] = False
-        if not record.get("sent") and not _crash_signal_filter_passes(record.get("features") or {}):
-            record.update(sent=True, delivery_status="FILTERED_NOT_SENT")
         record["confirmation"] = "Dip korunmalı; giriş seviyesi aşağıdan yukarı geçilmeli."
     state["signal_filter_version"] = CRASH_BOUNCE_FILTER_VERSION
     # Rebuild an unsent report so it cannot advertise the removed confirmation model.
@@ -6719,11 +6734,12 @@ def _crash_daily_report(state, now):
         rolling = _crash_summary(filtered)
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
-        notes = ("Yeni sinyaller: sinyal anındaki kapalı 15m mumlarda RSI14 < 25 ve EMA25 eğimi < 0. "
-                 "Eksik/geçersiz gösterge reddedilir. Dönüş onayı kaldırılmıştır. "
+        notes = ("Yeni sinyaller: kapalı 15m mumlarda RSI14 < 25 için 50, EMA25 eğimi < 0 için 50 puan. "
+                 "Puan sinyali engellemez ve başarı olasılığı değildir. Eksik gösterge 0 puan alır ve belirtilir. "
+                 "Dönüş onayı kaldırılmıştır. "
                  "Eski onaylı açıklar DISCONTINUED olarak arşivlenir; TP veya kayıp sayılmaz. "
-                 "Eski bekleyen uygunsuz adaylar FILTERED_OUT; eski açık ilk-model işlemleri takip edilir. "
-                 "Ana özetler yalnız yeni filtre sürümündeki sinyalleri içerir; eski kayıtlar ayrıca tutulur. "
+                 "Önceki sürümde FILTERED_OUT olan kayıtlar yeniden açılmaz; eski açık ilk-model işlemleri takip edilir. "
+                 "Ana özetler yalnız yeni puan sürümündeki sinyalleri içerir; eski kayıtlar ayrıca tutulur. "
                  "Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
                  "giriş öncesi dip kırılırsa INVALIDATED_BEFORE_ENTRY. Eski sampled_limit_touch_v1 kayıtları "
                  "değiştirilmez: fiyat <= giriş sanal giriş sayılır. Modelleri ayrı karşılaştırın. "
@@ -6756,7 +6772,7 @@ def _crash_daily_report(state, now):
         rate = rolling["observed_tp_rate_resolved_pct"]
         avg = rolling["average_tp_hours"]
         caption = (f"📊 CRASH BOUNCE — 24h data\nYeni sinyal: {summary['signals']}\n"
-                   "Filtre: RSI14 < 25 ve EMA25 eğimi < 0; yalnız yeni filtreli sinyaller.\n"
+                   "Puan: RSI14 < 25 → 50, EMA25 eğimi < 0 → 50; sinyali engellemez. Yalnız yeni sürüm.\n"
                    f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
@@ -7076,7 +7092,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100])
     _crash_append_data({"type":"scan", "observed_at":now,
         "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"sampled_upward_cross_v2",
-                         "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0},
+                         "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":False,"condition_points":50},
         "top20":[{"rank":i+1, "ticker":t,
                    "threshold_pass":c <= -CRASH_BOUNCE_DROP_PCT,
                    "previous_signal_entry":state["symbols"].get(sym,{}).get("entry")}
@@ -7103,8 +7119,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             if previous and Decimal(plan["entry"]) > Decimal(str(previous["entry"])) * Decimal("0.98"):
                 continue
             features = _crash_features(klines, ticker, now)
-            if not _crash_signal_filter_passes(features):
-                continue
+            condition_score = _crash_signal_score(features)
             from zoneinfo import ZoneInfo
             from datetime import datetime as _crash_datetime
             day = _crash_datetime.fromtimestamp(now, ZoneInfo("Europe/Paris")).date().isoformat()
@@ -7113,7 +7128,8 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                                  r["created_at"], ZoneInfo("Europe/Paris")).date().isoformat()) == day)
             record = dict(plan, symbol=symbol, change_24h=change,
                           created_at=now, sent=False, delivery_status="PENDING",
-                          schema_version=6, confirmation_enabled=False,
+                          schema_version=7, confirmation_enabled=False,
+                          condition_score=condition_score,
                           signal_filter_version=CRASH_BOUNCE_FILTER_VERSION, loser_rank=rank if symbol in selected_symbols else None,
                           price_source="BINANCE_FUTURES_WS", signal_day=day,
                           daily_signal_number=number,
@@ -14198,4 +14214,5 @@ if __name__=="__main__":
 
 
     
+
 
