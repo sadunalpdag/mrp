@@ -6599,6 +6599,42 @@ def _crash_features(klines, ticker, now):
                             "quoteVolume", "volume", "count", "closeTime")}}
 
 
+_CRASH_HISTORY_COLLECTOR = None
+
+
+def _crash_queue_history(record, phase, now):
+    """Queue public research data; never block a signal on a REST download."""
+    global _CRASH_HISTORY_COLLECTOR
+    try:
+        if _CRASH_HISTORY_COLLECTOR is None:
+            from crash_history import HistoryCollector
+            _CRASH_HISTORY_COLLECTOR = HistoryCollector(
+                os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
+                _crash_public_get, _crash_append_data,
+                lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned(), log)
+        key = phase + "_history_queued"
+        if not record.get(key):
+            _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
+            record[key] = True
+        _CRASH_HISTORY_COLLECTOR.start()
+    except Exception as error:
+        log(f"[CRASH HISTORY QUEUE ERR] {type(error).__name__}")
+
+
+def _crash_entry_features(record, tickers, now):
+    try:
+        rows = _CRASH_WS_CACHE.candles(record['symbol'])
+        ticker = next((t for t in tickers if t.get('symbol') == record['symbol']), {})
+        record['entry_features'] = _crash_features(rows, ticker, now)
+        record['entry_features_status'] = ('fresh' if _crash_cached_candles_valid(rows, now)
+                                           else 'missing_or_stale')
+        record['entry_features_at'] = now
+    except Exception as error:
+        record['entry_features_status'] = 'unavailable'
+        log(f"[CRASH ENTRY FEATURES ERR] {type(error).__name__}")
+    _crash_queue_history(record, 'entry', now)
+
+
 def _crash_initialize_tracking(record):
     if "signal_id" not in record:
         record["signal_id"] = f"{record['symbol']}-{int(record['created_at'] * 1000)}"
@@ -6667,6 +6703,7 @@ def _crash_track_results(state, tickers, now):
             record.update(tracking_status="OPEN", entered_at=now,
                           observed_entry_price=price, virtual_fill_price=entry,
                           max_favorable_pct=0., max_adverse_pct=min(0.,(price/entry-1)*100))
+            _crash_entry_features(record, tickers, now)
             # TP must be observed in a later snapshot, never at entry snapshot.
         if status == "OPEN":
             ret = (price / entry - 1) * 100
@@ -6734,7 +6771,10 @@ def _crash_daily_report(state, now):
         rolling = _crash_summary(filtered)
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
-        notes = ("Yeni sinyaller: kapalı 15m mumlarda RSI14 < 25 için 50, EMA25 eğimi < 0 için 50 puan. "
+        notes = ("observations/*.jsonl içindeki history_5d olayları sinyal/ giriş anından önceki en fazla 480 kapalı 15m mumu içerir. "
+                 "as_of olay zamanı, fetched_at indirme zamanıdır; complete/missing_candles eksik geçmişi gösterir. "
+                 "Eski girişlere sonradan entry_features üretilmez; geçmiş mumlar indirilebilir. "
+                 "Yeni sinyaller: kapalı 15m mumlarda RSI14 < 25 için 50, EMA25 eğimi < 0 için 50 puan. "
                  "Puan sinyali engellemez ve başarı olasılığı değildir. Eksik gösterge 0 puan alır ve belirtilir. "
                  "Dönüş onayı kaldırılmıştır. "
                  "Eski onaylı açıklar DISCONTINUED olarak arşivlenir; TP veya kayıp sayılmaz. "
@@ -7147,6 +7187,9 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
             log(f"[CRASH BOUNCE] {symbol} entry={plan['entry']} tp={plan['tp']}")
             _crash_send_pending(state, now)
+            _crash_queue_history(record, 'signal', now)
+            state['history'][-1].update(record)
+            _crash_save_state(state)
         except Exception as error:
             log(f"[CRASH BOUNCE ERR] {symbol}: {error}")
             if BinanceRateLimiter.is_banned():
@@ -7171,6 +7214,12 @@ def _crash_bounce_worker():
             except Exception as error:
                 log(f"[CRASH REPORT ERR] {type(error).__name__}: {error}")
             now = time.time()
+            # Recover queued downloads after restart; retain original event cutoffs.
+            for historical in state['history']:
+                if now - historical['created_at'] <= 7*86400:
+                    _crash_queue_history(historical, 'signal', historical['created_at'])
+                    if historical.get('entered_at'):
+                        _crash_queue_history(historical, 'entry', historical['entered_at'])
             if now >= next_metadata:
                 next_metadata = now + 3600
                 if now >= _crash_cooldown_until and not BinanceRateLimiter.is_banned():

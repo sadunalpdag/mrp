@@ -23,7 +23,7 @@ class CrashBounceTests(unittest.TestCase):
                       CRASH_BOUNCE_TOP_LOSERS=20, CRASH_BOUNCE_FILTER_VERSION="rsi_ema_score_v2",
                       CRASH_BOUNCE_ONLY_TELEGRAM=True, _TG_COMMAND_CONTEXT=threading.local(),
                       BOT_TOKEN="test", CHAT_ID="test", requests=Mock(), log=Mock(),
-                      _crash_save_state=Mock(), BinanceRateLimiter=SimpleNamespace(is_banned=lambda: False),
+                      _crash_save_state=Mock(), _crash_queue_history=Mock(), BinanceRateLimiter=SimpleNamespace(is_banned=lambda: False),
                       _crash_execute_entries=Mock(), _crash_apply_filter_migration=Mock(), _crash_track_results=Mock(), _crash_features=Mock(return_value={"rsi14_wilder":24,"ema25_slope_pct":-.1}),
                       _crash_initialize_tracking=Mock(), _crash_append_data=Mock())
         exec(compile(subset, "ema.py", "exec"), self.g)
