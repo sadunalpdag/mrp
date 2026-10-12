@@ -6377,7 +6377,16 @@ def _crash_set_cooldown(until):
     BinanceRateLimiter.set_ban(until_ts=_crash_cooldown_until)
 
 
+_CRASH_PUBLIC_LOCK = threading.RLock()
+
+
 def _crash_public_get(path, params=None):
+    # All research workers share one REST pacing/cooldown budget.
+    with _CRASH_PUBLIC_LOCK:
+        return _crash_public_get_locked(path, params)
+
+
+def _crash_public_get_locked(path, params=None):
     global _crash_next_request, _crash_weight_window, _crash_weight_used, _crash_backoff
     if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/klines"):
         raise ValueError("Crash-only endpoint not allowed")
@@ -7265,7 +7274,7 @@ def start_crash_bounce_alerts():
 # ===================== TELEGRAM HELPERS =====================
 
 def tg_send(t, source=None):
-    if CRASH_BOUNCE_ONLY_TELEGRAM and source != "CRASH_BOUNCE" and not getattr(_TG_COMMAND_CONTEXT, "active", False):
+    if CRASH_BOUNCE_ONLY_TELEGRAM and source not in ("CRASH_BOUNCE", "FIBONACCI") and not getattr(_TG_COMMAND_CONTEXT, "active", False):
         return False
     if not BOT_TOKEN or not CHAT_ID: return False
     try:
@@ -14241,8 +14250,7 @@ def scan_top_gainers_and_alert():
 
 
 def main():
-    # Only this foreground loop can fetch market data. Legacy scanners,
-    # price/TP tracking, account polling and command handlers are not started.
+    # Independent public-data signal workers; legacy trading is not started.
     global _crash_cooldown_until
     if os.path.exists(CRASH_BOUNCE_REST_STATE_FILE):
         with open(CRASH_BOUNCE_REST_STATE_FILE, encoding="utf-8") as handle:
@@ -14250,7 +14258,14 @@ def main():
         if not math.isfinite(until):
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
-    log("[START] CRASH ONLY: 24h <= -12%, TP +1%, one signal/coin/24h; no orders")
+    from fibonacci_signals import FibonacciEngine
+    fibonacci = FibonacciEngine(
+        os.path.join(DATA_DIR, "fibonacci_research"), _crash_public_get,
+        _CRASH_WS_CACHE.snapshot, lambda: _crash_load_market_cache()[0],
+        lambda message: tg_send(message, source="FIBONACCI"), _crash_send_report_file,
+        lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned(), log)
+    fibonacci.start()
+    log("[START] CRASH + FIBONACCI signals; public data and virtual tracking only; no orders")
     # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()
 
