@@ -1,3 +1,11 @@
+# CRASH BOUNCE V2 ONLY (2026-10-15)
+
+Current version: `five_day_entry_v2_only`. Telegram candidate, legacy RSI/EMA scoring and old confirmation notifications are suppressed. Initial candidates remain internal tracking records. A Telegram alert is sent **only after a sampled upward crossing** of the existing candidate entry, and only when a contiguous 480 fully closed 15-minute candle history is available and last closed candle RSI14 >=20 and (last closed close / last 4h candle low - 1)*100 >=1%. TP reference remains +1% (gross). An entry observation already at/above the TP is suppressed. Missing/late history fails closed and is logged as `V2_FILTERED`; there is no retroactive V2 alert or REST call at entry. The existing 24h-drop/top-20 selection, 4h-low +0.3% entry, 2% lower revision, market WebSocket, 3-minute scan, 5-day research cache, and 24h data ZIP report remain. All alerts remain virtual; no automatic orders.
+
+Historical records retain their prior results and are not reinterpreted as V2. Note that existing offline tests which explicitly assert legacy 0/50/100 candidate messages must be updated for the changed notification contract. A GitHub push alone does not confirm Render deployment or runtime health. V2 is exploratory: the previously observed 95% two-hour TP figure is in-sample, not an independently validated expectation.
+
+---
+
 # Crash-only alerts
 ema.py now runs only the foreground crash-bounce loop. Legacy strategy data collection, per-symbol price polling, account/trading routines, Google Sheets heartbeat and Telegram command handlers are not started. No orders are opened.
 
