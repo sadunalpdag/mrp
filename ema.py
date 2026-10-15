@@ -6313,7 +6313,7 @@ CRASH_BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_state.json")
 CRASH_BOUNCE_SCAN_SECONDS = 180
 CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
-CRASH_BOUNCE_FILTER_VERSION = "rsi_ema_score_v2"
+CRASH_BOUNCE_FILTER_VERSION = "five_day_entry_v2_only"
 CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
@@ -6471,35 +6471,50 @@ def _crash_load_state():
 
 
 def _crash_send_pending(state, now):
-    for symbol, record in state["symbols"].items():
-        if record.get("sent"):
+    """V2-only delivery. Never deliver an initial candidate."""
+    for record in state["history"]:
+        if (record.get("signal_filter_version") != CRASH_BOUNCE_FILTER_VERSION
+                or record.get("v2_status") != "STRONG_V2" or record.get("v2_sent")):
             continue
-        if now - record["created_at"] > 15 * 60:
-            record["sent"] = True
-            record["delivery_status"] = "STALE_NOT_SENT"
+        if now - record.get("entered_at", now) > 900:
+            record["v2_sent"] = True
+            record["v2_delivery_status"] = "STALE_NOT_SENT"
             _crash_save_state(state)
             continue
-        text = (f"📉 CRASH BOUNCE | {symbol} | İZLEME ADAYI\n"
-                f"24h değişim: %{record['change_24h']:.2f}\n"
-                f"Gözlenen fiyat: {record['last_price']}\n"
-                f"Giriş adayı: {record['entry']}\n"
-                f"TP +%1 (brüt): {record['tp']}\n"
-                f"Dip referansı: {record['reference_low']}\n"
-                f"{_crash_score_text(record.get('features') or {})}\n"
-                "Dip korunmalı; giriş seviyesi aşağıdan yukarı geçilmeli.\n"
-                "Giriş = son 4h dip + %0,3. Seviye tek başına dönüş teyidi değildir.\n"
-                f"Coinin gün içindeki sinyali: #{record.get('daily_signal_number', 1)} "
-                f"({record.get('signal_day', 'eski kayıt')}, Europe/Paris).\n"
-                "Yeni aday yalnız önceki seviyeden en az %2 aşağıda.\n"
-                "Uyarıdır; emir açılmadı. Düşerken temas giriş sayılmaz.")
-        _crash_save_state(state)  # Retry persistence before any pending delivery.
-        if tg_send(text, source="CRASH_BOUNCE"):
-            record["sent"] = True
-            record["delivery_status"] = "SENT"
-            for historical in state["history"]:
-                if historical.get("signal_id") == record.get("signal_id") and historical.get("created_at") == record["created_at"]:
-                    historical.update(sent=True, delivery_status="SENT")
+        d = record["v2_features"]
+        message = (f"✅ CRASH BOUNCE V2 | GÜÇLÜ LONG | {record['symbol']}\n"
+                   f"24h düşüş: %{record['change_24h']:.2f}\n"
+                   f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
+                   f"RSI14 (15m): {d['rsi14']:.2f}\n"
+                   f"5 günlük veri: {d['candles']}/480 kapanmış mum\n"
+                   f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
+                   f"Giriş: {record['entry']} | gözlenen: {record.get('observed_entry_price')}\n"
+                   f"TP +%1 (brüt): {record['tp']}\n"
+                   "Sanal sinyal; emir açılmadı. Örneklemli fiyat takibi.")
+        _crash_save_state(state)
+        if tg_send(message, source="CRASH_BOUNCE"):
+            record["v2_sent"] = True
+            record["v2_delivery_status"] = "SENT"
+            latest = state["symbols"].get(record["symbol"])
+            if latest and latest.get("signal_id") == record.get("signal_id"):
+                latest.update(record)
             _crash_save_state(state)
+
+
+def _crash_v2_validate_entry(record, now):
+    from crash_v2 import assess_entry
+    path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache", record["symbol"] + ".json")
+    rows = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            rows = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        return assess_entry(rows, _CRASH_WS_CACHE.candles(record["symbol"]), now)
+    except (ValueError, TypeError, OverflowError, AttributeError) as error:
+        log(f"[CRASH V2 HISTORY ERR] {record['symbol']}: {type(error).__name__}")
+        return {"status":"MISSING_5D_HISTORY", "qualified":False, "candles":0}
 
 
 def _crash_signal_score(features):
@@ -6555,6 +6570,14 @@ def _crash_apply_filter_migration(state, now):
     for record in state["symbols"].values():
         record["confirmation_enabled"] = False
         record["confirmation"] = "Dip korunmalı; giriş seviyesi aşağıdan yukarı geçilmeli."
+    for record in state["history"]:
+        if not record.get("sent"):
+            record["sent"] = True
+            record["delivery_status"] = "V2_LEGACY_SUPPRESSED"
+    for record in state["symbols"].values():
+        if not record.get("sent"):
+            record["sent"] = True
+            record["delivery_status"] = "V2_LEGACY_SUPPRESSED"
     state["signal_filter_version"] = CRASH_BOUNCE_FILTER_VERSION
     # Rebuild an unsent report so it cannot advertise the removed confirmation model.
     if "report" in state:
@@ -6709,6 +6732,15 @@ def _crash_track_results(state, tickers, now):
             continue
         crossed = prior_price < entry <= price if upward_model else price <= entry
         if status == "WAIT_ENTRY" and crossed:
+            if record.get("signal_filter_version") == CRASH_BOUNCE_FILTER_VERSION:
+                result = _crash_v2_validate_entry(record, now)
+                record["v2_features"] = result
+                record["v2_status"] = result["status"]
+                if not result["qualified"] or price >= float(record["tp"]):
+                    record.update(tracking_status="V2_FILTERED", finished_at=now,
+                                  v2_reason=("ENTRY_ABOVE_TP" if price >= float(record["tp"]) else result["status"]))
+                    _crash_append_data({"type":"v2_filtered", "observed_at":now, "record":record}, now)
+                    continue
             record.update(tracking_status="OPEN", entered_at=now,
                           observed_entry_price=price, virtual_fill_price=entry,
                           max_favorable_pct=0., max_adverse_pct=min(0.,(price/entry-1)*100))
@@ -6737,7 +6769,7 @@ def _crash_track_results(state, tickers, now):
 
 def _crash_summary(records):
     counts = {key:sum(r.get("tracking_status")==key for r in records)
-              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "INVALIDATED_BEFORE_ENTRY", "FILTERED_OUT", "LEGACY_UNKNOWN")}
+              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "INVALIDATED_BEFORE_ENTRY", "FILTERED_OUT", "V2_FILTERED", "LEGACY_UNKNOWN")}
     resolved = counts["TP"] + counts["TIMEOUT"]
     hours = [r["tp_hours"] for r in records if r.get("tracking_status")=="TP"]
     return dict(counts, signals=len(records),
@@ -7112,10 +7144,10 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
         raise ValueError("Invalid futures ticker response")
     _crash_apply_filter_migration(state, now)
     _crash_track_results(state, tickers, now)
+    _crash_send_pending(state, now)
     if not tickers:
         log("[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data")
         return
-    _crash_send_pending(state, now)
     # Rank the trading futures universe before applying threshold/cooldown.
     # Do not replace a cooldown coin with the 21st loser.
     ranked = []
@@ -7141,7 +7173,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100])
     _crash_append_data({"type":"scan", "observed_at":now,
         "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"sampled_upward_cross_v2",
-                         "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":False,"condition_points":50},
+                         "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480},
         "top20":[{"rank":i+1, "ticker":t,
                    "threshold_pass":c <= -CRASH_BOUNCE_DROP_PCT,
                    "previous_signal_entry":state["symbols"].get(sym,{}).get("entry")}
@@ -7176,7 +7208,8 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                              and r.get("signal_day", _crash_datetime.fromtimestamp(
                                  r["created_at"], ZoneInfo("Europe/Paris")).date().isoformat()) == day)
             record = dict(plan, symbol=symbol, change_24h=change,
-                          created_at=now, sent=False, delivery_status="PENDING",
+                          created_at=now, sent=True, delivery_status="V2_CANDIDATE_SILENT",
+                          v2_sent=False, v2_status="WAIT_ENTRY",
                           schema_version=7, confirmation_enabled=False,
                           condition_score=condition_score,
                           signal_filter_version=CRASH_BOUNCE_FILTER_VERSION, loser_rank=rank if symbol in selected_symbols else None,
@@ -7195,7 +7228,6 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             _crash_save_state(state)
             _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
             log(f"[CRASH BOUNCE] {symbol} entry={plan['entry']} tp={plan['tp']}")
-            _crash_send_pending(state, now)
             _crash_queue_history(record, 'signal', now)
             state['history'][-1].update(record)
             _crash_save_state(state)
