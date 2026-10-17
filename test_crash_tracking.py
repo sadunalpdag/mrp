@@ -23,7 +23,8 @@ class TrackingTests(unittest.TestCase):
         self.g=dict(math=math,os=os,json=json,datetime=datetime,timezone=timezone,
                     CRASH_BOUNCE_FILTER_VERSION='five_day_entry_v2_only',
                     CRASH_BOUNCE_RESEARCH_DIR=self.tmp.name,_crash_save_state=Mock(),
-                    _crash_append_data=Mock(),_crash_send_report_file=Mock(return_value=True),
+                    _crash_append_data=Mock(),_crash_entry_features=Mock(),
+                    _crash_send_report_file=Mock(return_value=True),
                     log=Mock(),BOT_TOKEN='test',CHAT_ID='test',requests=Mock())
         exec(compile(subset,'ema.py','exec'),self.g)
         self.g['_crash_send_report_file']=Mock(return_value=True)
