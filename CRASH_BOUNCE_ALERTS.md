@@ -12,6 +12,30 @@ Fibonacci's worker is **disabled** (the historical module remains in the reposit
 
 ---
 
+## Continuous strength score — research-only
+
+Crash Bounce V2 eligibility **does not change**: top-20 USDT-M losers, at least 12% 24h loss, 480 closed 15m candles, RSI14 >= 20 and 4h recovery >= 1%. A qualifying candidate is still sent to Telegram immediately. No Fibonacci, live order placement or score-based filtering.
+
+The optional `continuous_7factor_v1` score takes values from 0 to 100 and uses **fractional** component points, not binary awards:
+
+| Component | Max contribution | Proportional measurement |
+|---|---:|---|
+| Dip stability | 25 | Count of newly broken supports over last 4h and bars since last low |
+| RSI momentum | 20 | RSI14 change over last hour, with overbought penalty |
+| Volume confirmation | 20 | Last-hour volume / prior 12h median, plus volume on green 15m candles (proxy only, *not* actual buy/sell flow) |
+| EMA25 improvement | 15 | EMA25 slope change and latest EMA25 slope |
+| ATR / TP capacity | 10 | ATR14 as percent of current price; excessive volatility penalized |
+| Selling slowdown | 5 | Last-hour return versus previous 4-hour decline rate |
+| BTC context | 5 | BTCUSDT 24-hour futures change at candidate time; absent if not fresh |
+
+Each component receives an interpolated share between 0 and its maximum, such as **Dip 13.7/25** or **RSI 8.9/20**. Available components are normalized to 100 and the **data coverage percentage** is always shown. For example, unavailable BTC means 95% coverage, not an invented BTC value. No score is computed on incomplete five-day candle history. The output is a research ranking, **not a calibrated probability of TP**.
+
+Candidate Telegram alerts include the overall score, each component and coverage. `strength_score` (including measurements and score version) is kept on the signal and included in daily ZIP exports. Daily captions include average score, count scored and count at least 75 (a **descriptive reporting bin**, not a trade threshold).
+
+Next step before using score to decide entries systematically: compare score bins against subsequent TP, timeout, pre-entry dip-break and ENTRY_ABOVE_TP labels with chronology held out, slippage/fees accounted for, and missing WebSocket observations separated. Scoring weights are preliminary, not statistically optimized.
+
+---
+
 ## Historical design notes (superseded where they conflict with current V2)
 
 # CRASH BOUNCE V2 ONLY (2026-10-15)
