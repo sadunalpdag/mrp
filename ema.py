@@ -26,19 +26,12 @@ except Exception:
 
 # ==============================================================================
 # 📘 EMA ULTRA — CRASH BOUNCE V2 ONLY (signal / research mode)
-#  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
-#  - Aktif strateji: SADECE 📐 FIBONACCI RETRACEMENT (LONG only)
-#  - Diğer tüm stratejiler devre dışı (all other strategies disabled)
-#  - MIN_POWER_THRESHOLD: 68.0
-#  - TRADE_SIZE_USDT: 750.0
-#  - FIBONACCI: Maks 3 LONG pozisyon, SHORT tamamen kapalı (MAX_FIB_SELL=0)
-#  - Tarama: Top 25 vadeli işlem sembolü (hacime göre)
-#  - ASIAN SESSION & LONDON BREAKOUT disabled per user request
-#  - PER-STRATEGY LIMITS: Fibonacci max 3 long / 0 short
-#  - Strategy enable/disable via  commands
-#  - CEST improvements: Multi-timeframe, RSI filter, body quality, session filter
-#  - TAKE_PROFIT_MARKET order type uses Algo Order API endpoint (/fapi/v1/algoOrder) to fix API error -4120
-#  - Smart TP, 6h TrendLock, Guards,  sistemi aynı
+#  - Only Crash Bounce V2 starts in main(); Fibonacci is not started.
+#  - Scan every 180 seconds, top 20 USDT-M losers with 24h drop >= 12%.
+#  - As-of candidate: strict 480 closed 15m candles, RSI14 >= 20, 4h recovery >= 1%.
+#  - Telegram is sent on qualified candidate, before the simulated entry.
+#  - Binance Futures aggTrade WS events track ordered hypothetical entry and TP.
+#  - No live order placement, leverage, SL, or legacy strategy worker is started.
 # ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -6945,7 +6938,13 @@ def _crash_daily_report(state, now):
         rolling = _crash_summary(filtered)
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
-        notes = ("observations/*.jsonl içindeki history_5d olayları sinyal/ giriş anından önceki en fazla 480 kapalı 15m mumu içerir. "
+        notes = ("GÜNCEL V2: yalnız Crash Bounce çalışır, Fibonacci devre dışıdır. "
+                 "3 dk aday taraması; tam 480 kapalı 15m mumla aday anında filtre. "
+                 "Uygun aday Telegram'a giriş beklenmeden gönderilir; kabul zamanı, message_id, hata kaydedilir. "
+                 "Yeni sanal giriş/TP yalnız sıralı futures aggTrade WS olaylarıyla izlenir. "
+                 "ENTRY_ABOVE_TP ayrı MISSED_SIGNAL sayılır, TP sayılmaz. "
+                 "Eski sampled_upward_cross_v2 kayıtları tarihsel olarak ayrı tutulur. "
+                 "observations/*.jsonl içindeki history_5d olayları sinyal/ giriş anından önceki en fazla 480 kapalı 15m mumu içerir. "
                  "as_of olay zamanı, fetched_at indirme zamanıdır; complete/missing_candles eksik geçmişi gösterir. "
                  "Eski girişlere sonradan entry_features üretilmez; geçmiş mumlar indirilebilir. "
                  "Yeni sinyaller: kapalı 15m mumlarda RSI14 < 25 için 50, EMA25 eğimi < 0 için 50 puan. "
