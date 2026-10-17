@@ -7,6 +7,7 @@ on:
       - 'crash_v2.py'
       - 'crash_history.py'
       - 'crash_live_v2.py'
+      - 'crash_score_v3.py'
       - 'test_crash*.py'
       - '.github/workflows/crash-bounce-checks.yml'
   workflow_dispatch:
@@ -23,6 +24,6 @@ jobs:
         with:
           python-version: '3.11'
       - name: Check Python syntax
-        run: python -m py_compile ema.py crash_v2.py crash_history.py crash_live_v2.py
+        run: python -m py_compile ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py
       - name: Run offline Crash Bounce tests
         run: python -m unittest discover -p 'test_crash*.py' -v
