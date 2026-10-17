@@ -1,0 +1,28 @@
+name: Crash Bounce V2 checks
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'ema.py'
+      - 'crash_v2.py'
+      - 'crash_history.py'
+      - 'crash_live_v2.py'
+      - 'test_crash*.py'
+      - '.github/workflows/crash-bounce-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check Python syntax
+        run: python -m py_compile ema.py crash_v2.py crash_history.py crash_live_v2.py
+      - name: Run offline Crash Bounce tests
+        run: python -m unittest discover -p 'test_crash*.py' -v
