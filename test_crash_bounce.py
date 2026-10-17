@@ -51,7 +51,7 @@ class CrashBounceTests(unittest.TestCase):
 
     def test_tick_rounding_and_closed_low(self):
         plan=self.g["crash_bounce_plan"](self.rows,"1",".001",self.now*1000)
-        self.assertEqual(plan["entry"],".993")
+        self.assertEqual(plan["entry"],"0.993")
         self.assertEqual(plan["tp"],"1.003")
         self.assertGreaterEqual(Decimal(plan["tp"])/Decimal(plan["entry"]),Decimal("1.01"))
 
