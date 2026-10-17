@@ -25,7 +25,9 @@ class WebSocketTests(unittest.TestCase):
             CRASH_BOUNCE_CANDLES_FILE=self.tmp.name+'/candles.json',
             CRASH_BOUNCE_MARKET_FILE=self.tmp.name+'/market.json',
             _crash_cooldown_until=0.,_crash_seed_retry={},_crash_seed_attempts=[],
-            _crash_public_get=Mock(),BinanceRateLimiter=SimpleNamespace(is_banned=lambda:False))
+            _crash_public_get=Mock(),BinanceRateLimiter=SimpleNamespace(is_banned=lambda:False),
+            _CRASH_STATE_LOCK=threading.RLock(),_CRASH_ACTIVE_STATE=None,
+            _crash_trade_consumer=lambda:None)
         exec(compile(subset,'ema.py','exec'),self.g)
         self.cache=self.g['CrashBounceWebSocketCache']()
         self.g['_CRASH_WS_CACHE']=self.cache
