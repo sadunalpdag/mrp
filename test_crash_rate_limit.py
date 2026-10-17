@@ -30,6 +30,7 @@ class RateTests(unittest.TestCase):
                       _crash_cooldown_until=0., _crash_next_request=0.,
                       _crash_weight_window=-1, _crash_weight_used=0,
                       _crash_ip_weight_limit=2400, _crash_backoff=0,
+                      _CRASH_PUBLIC_LOCK=threading.RLock(),
                       _crash_bounce_worker=Mock())
         exec(compile(subset,'ema.py','exec'), self.g)
 
