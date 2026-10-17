@@ -29,21 +29,27 @@ class ScoreTests(unittest.TestCase):
         state={'history':records,'symbols':{r['symbol']:dict(r) for r in records},'report':{'pending':{}}}
         self.g['_crash_apply_filter_migration'](state,123)
         self.assertEqual([r['tracking_status'] for r in records],['WAIT_ENTRY','OPEN','FILTERED_OUT'])
-        self.assertTrue(all(not r['sent'] for r in state['symbols'].values()))
+        self.assertTrue(all(r['sent'] for r in state['symbols'].values()))
+        self.assertTrue(all(r['delivery_status']=='V2_LEGACY_SUPPRESSED' for r in state['symbols'].values()))
         self.assertNotIn('pending',state['report'])
 
-    def test_all_scores_create_and_deliver_signals(self):
-        for features,score in [({'rsi14_wilder':24,'ema25_slope_pct':-.1,'ema25':1.02},100),({'rsi14_wilder':60,'ema25_slope_pct':-.1},50),({'rsi14_wilder':60,'ema25_slope_pct':.1},0),({},0)]:
+    def test_score_is_informational_and_v2_delivery_uses_candle_filter(self):
+        for features,score in [
+            ({'rsi14_wilder':24,'ema25_slope_pct':-.1,'ema25':1.02},100),
+            ({'rsi14_wilder':60,'ema25_slope_pct':-.1},50),
+            ({'rsi14_wilder':60,'ema25_slope_pct':.1},0),
+            ({},0),
+        ]:
             fixture=test_crash_bounce.CrashBounceTests()
             fixture.setUp()
             fixture.g['_crash_features'].return_value=features
-            state=fixture.revision_fixture()
+            fixture.tickers=[dict(symbol='AUSDT',priceChangePercent='-15',lastPrice='1')]
+            state={'history':[],'symbols':{}}
+            fixture.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},fixture.now)
             self.assertEqual(len(state['history']),1)
             self.assertEqual(state['history'][0]['condition_score']['score'],score)
-            self.assertTrue(state['symbols']['AUSDT']['sent'])
-            message=fixture.g['tg_send'].call_args.args[0]
-            for text in [f'{score}/100','RSI14','EMA25 eğimi','başarı olasılığı değildir']:
-                self.assertIn(text,message)
+            self.assertTrue(state['symbols']['AUSDT']['v2_sent'])
+            self.assertIn('LONG ADAYI',fixture.receipt.call_args.args[0])
 
 if __name__=='__main__':
     unittest.main()
