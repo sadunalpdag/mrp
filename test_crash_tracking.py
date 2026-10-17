@@ -214,34 +214,46 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(self.state['report']['next_due_at'],due+1800+86400)
         self.assertEqual(self.g['_crash_send_report_file'].call_args.args[0],pending['path'])
 
-    def test_scan_tracking_integration_reuses_bulk_ticker_without_tracking_calls(self):
+    def test_new_ws_model_does_not_count_three_minute_snapshot_as_tp(self):
+        r=self.upward_fixture()
+        r.update(tracking_model='ws_aggtrade_upcross_v3', v2_status='STRONG_V2')
+        self.sample(180,.97)
+        self.sample(360,1.03)
+        self.sample(540,1.04)
+        self.assertEqual(r['tracking_status'],'WAIT_ENTRY')
+        self.assertNotIn('entered_at',r)
+
+    def test_scan_records_candidate_but_waits_for_ws_execution(self):
         tree=ast.parse(Path(__file__).with_name('ema.py').read_text())
         names={'run_crash_bounce_alerts','crash_bounce_plan'}
-        subset=ast.Module(body=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names],type_ignores=[])
+        subset=ast.Module(body=[n for n in tree.body
+            if isinstance(n,ast.FunctionDef) and n.name in names],type_ignores=[])
         self.g.update(Decimal=Decimal,time=SimpleNamespace(time=lambda:self.now),
             CRASH_BOUNCE_ENTRY_BUFFER=Decimal('.003'),CRASH_BOUNCE_TP_PCT=Decimal('.01'),
             CRASH_BOUNCE_TOP_LOSERS=20,CRASH_BOUNCE_DROP_PCT=12,
-            CRASH_BOUNCE_COOLDOWN_SECONDS=86400,_crash_send_pending=Mock(),_crash_confirmation_step=Mock(),
+            CRASH_BOUNCE_COOLDOWN_SECONDS=86400,
+            _crash_send_pending=Mock(),_crash_review_pending_v2=Mock(),
+            _crash_apply_filter_migration=Mock(),_crash_queue_history=Mock(),
+            _crash_review_candidate=Mock(),
+            _crash_initialize_tracking=self.g['_crash_initialize_tracking'],
+            _crash_features=Mock(return_value={'rsi14_wilder':26,'ema25_slope_pct':-.1}),
+            _crash_signal_score=Mock(return_value={'score':50}),
             BinanceRateLimiter=SimpleNamespace(is_banned=lambda:False))
         exec(compile(subset,'ema.py','exec'),self.g)
         rows=[[int((self.now-(64-i)*900)*1000),'1','1.2','.9','1','100',
                int((self.now-(63-i)*900)*1000)-1] for i in range(64)]
-        state={'symbols':{},'history':[]}; calls=[]
-        price=['1']
-        def get(path,params=None):
-            calls.append(path)
-            return rows if 'klines' in path else [dict(symbol='AUSDT',priceChangePercent='-20',lastPrice=price[0])]
-        self.g['_CRASH_WS_CACHE']=SimpleNamespace(snapshot=lambda now:get('WS_SNAPSHOT'),reconcile=Mock())
-        self.g['_crash_get_candles']=lambda symbol:get('/fapi/v1/klines')
-        for elapsed,value in [(0,'1'),(180,'.9'),(360,'.905'),(540,'.92')]:
-            price[0]=value
-            self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now+elapsed)
+        self.g['_CRASH_WS_CACHE']=SimpleNamespace(
+            snapshot=lambda now:[{'symbol':'AUSDT','priceChangePercent':'-20',
+                                  'lastPrice':'1','closeTime':int(now*1000)}],
+            reconcile=Mock())
+        self.g['_crash_get_candles']=lambda symbol:rows
+        state={'symbols':{},'history':[]}
+        self.g['run_crash_bounce_alerts'](state,{'AUSDT':'.001'},self.now)
         self.assertEqual(len(state['history']),1)
-        self.assertEqual(state['history'][0]['tracking_status'],'TP')
-        self.assertEqual(len(state['history'][0]['features']['closed_15m_ohlcv']),64)
-        self.assertEqual(calls.count('/fapi/v1/klines'),1)
-        self.assertEqual(calls.count('WS_SNAPSHOT'),4)
-        self.assertNotIn('/fapi/v1/ticker/24hr',calls)
+        r=state['history'][0]
+        self.assertEqual(r['tracking_model'],'ws_aggtrade_upcross_v3')
+        self.assertEqual(r['v2_status'],'PENDING_5D_HISTORY')
+        self.assertNotIn('entered_at',r)
 
     def test_document_ack_controls_success_and_no_token_no_send(self):
         tree=ast.parse(Path(__file__).with_name('ema.py').read_text())
