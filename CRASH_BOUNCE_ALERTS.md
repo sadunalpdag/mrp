@@ -1,3 +1,19 @@
+# Current deployment configuration — 17 October 2026
+
+**Only Crash Bounce V2** is started by `ema.py`'s `main()`.
+Fibonacci's worker is **disabled** (the historical module remains in the repository).
+
+- Screening remains every 180 seconds: USDT-M top 20 losers, 24h drop at least 12%; a new candidate needs an entry at least 2% below the prior reference.
+- At candidate creation, V2 checks **480 closed 15m candles**, RSI14 >= 20 and 4h low recovery >= 1%. If the cache is missing, it requests those candles with the existing paced Binance REST guard; missing data fail closed. Eligible candidates are sent to Telegram **before** a simulated entry, within the 90-second freshness window.
+- Telegram attempts are durably recorded with API acceptance timestamp and `message_id`; failures and ambiguous timeouts are logged. `SENT` means API-accepted, not guaranteed device delivery. Unknown timeout delivery is not blindly retried.
+- Only fresh, ordered Binance Futures `aggTrade` WebSocket events classify **new** candidate virtual entries, TP and pre-entry low breaks. A crossing that goes straight above TP without a separately observed entry is `MISSED_SIGNAL` / `ENTRY_ABOVE_TP`, **not a TP**. Events are buffered during data/bootstrap operations; buffer loss and timing gaps are marked.
+- The daily ZIP and Telegram caption report missed signals separately. Older sampled models and their outcomes remain archived for research, without retroactive rewrites.
+- No automatic orders are sent. Deploy/restart Render to pick up GitHub updates; a GitHub commit by itself does not verify that a worker is running.
+
+---
+
+## Historical design notes (superseded where they conflict with current V2)
+
 # CRASH BOUNCE V2 ONLY (2026-10-15)
 
 Current version: `five_day_entry_v2_only`. Telegram candidate, legacy RSI/EMA scoring and old confirmation notifications are suppressed. Initial candidates remain internal tracking records. A Telegram alert is sent **only after a sampled upward crossing** of the existing candidate entry, and only when a contiguous 480 fully closed 15-minute candle history is available and last closed candle RSI14 >=20 and (last closed close / last 4h candle low - 1)*100 >=1%. TP reference remains +1% (gross). An entry observation already at/above the TP is suppressed. Missing/late history fails closed and is logged as `V2_FILTERED`; there is no retroactive V2 alert or REST call at entry. The existing 24h-drop/top-20 selection, 4h-low +0.3% entry, 2% lower revision, market WebSocket, 3-minute scan, 5-day research cache, and 24h data ZIP report remain. All alerts remain virtual; no automatic orders.
