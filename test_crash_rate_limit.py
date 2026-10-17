@@ -20,7 +20,7 @@ class RateTests(unittest.TestCase):
         def sleep(seconds):
             self.now += seconds
         tree = ast.parse(Path(__file__).with_name('ema.py').read_text())
-        names = {'main', '_crash_public_get', '_crash_set_cooldown', '_crash_wait_until'}
+        names = {'main', '_crash_public_get', '_crash_public_get_locked', '_crash_set_cooldown', '_crash_wait_until'}
         subset = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
         self.g = dict(time=SimpleNamespace(time=lambda:self.now, sleep=sleep), math=math,
                       json=json, os=os, re=re, SAVE_LOCK=threading.Lock(), log=Mock(),
