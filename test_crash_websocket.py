@@ -115,6 +115,7 @@ class WebSocketTests(unittest.TestCase):
         self.g['time'].sleep=Mock(side_effect=StopIteration)
         self.g.update(_crash_load_market_cache=lambda:({'AUSDT':'.001'},self.now),
             _crash_load_state=lambda:{'history':[],'symbols':{}},_crash_save_state=Mock(),
+            _crash_apply_filter_migration=Mock(),
             _crash_daily_report=Mock(),run_crash_bounce_alerts=Mock(),
             _crash_track_results=Mock(),CRASH_BOUNCE_SCAN_SECONDS=180,
             _crash_cooldown_until=self.now+86400)
