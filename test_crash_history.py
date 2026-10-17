@@ -76,7 +76,8 @@ class EntrySnapshotTests(unittest.TestCase):
         source=ast.parse(Path(__file__).with_name('ema.py').read_text())
         names={'_crash_track_results','_crash_initialize_tracking','_crash_entry_features'}
         queue=Mock();features=Mock(return_value={'rsi14_wilder':31})
-        g=dict(math=math,_crash_queue_history=queue,_crash_features=features,
+        g=dict(math=math,CRASH_BOUNCE_FILTER_VERSION='five_day_entry_v2_only',
+               _crash_queue_history=queue,_crash_features=features,
                _CRASH_WS_CACHE=SimpleNamespace(candles=lambda s:[]),
                _crash_cached_candles_valid=lambda r,n:False,log=Mock(),
                _crash_append_data=Mock(),_crash_save_state=Mock())
