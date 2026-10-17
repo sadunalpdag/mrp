@@ -19,7 +19,7 @@ def _rsi_wilder(closes):
     return 100.0 - 100.0 / (1.0 + gain / loss) if loss else (100.0 if gain else 50.0)
 
 
-def assess_entry(history_rows, ws_rows, at):
+def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
     """Use exactly 480 consecutive CLOSED candles ending before the entry sample.
 
     The cached five-day archive is stitched to a fresh closed-candle WebSocket tail;
@@ -57,7 +57,11 @@ def assess_entry(history_rows, ws_rows, at):
     recovery = 100.0*(closes[-1]/low4h-1.0)
     five_day_return = 100.0*(closes[-1]/ordered[0][0]-1.0)
     qualified = rsi is not None and rsi >= MIN_RSI14 and recovery >= MIN_RECOVERY_PCT
+    # Continuous strength is informational only, not an extra V2 acceptance gate.
+    from crash_score_v3 import score_candidate
+    strength_score = score_candidate(ordered, btc_change_24h=btc_change_24h)
     return {"status":"STRONG_V2" if qualified else "FILTERED_V2",
+            "strength_score":strength_score,
             "qualified":qualified, "candles":present,
             "expected_candles":HISTORY_CANDLES, "rsi14":round(rsi,4),
             "recovery_4h_pct":round(recovery,4),
