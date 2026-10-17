@@ -5,6 +5,7 @@
 
 
 import os, re, time, requests, hmac, hashlib, threading, math, json, traceback, csv, io
+from collections import deque
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -6332,6 +6333,11 @@ _crash_backoff = 0
 _TG_COMMAND_CONTEXT = threading.local()
 _CRASH_STATE_LOCK = threading.RLock()
 _CRASH_ACTIVE_STATE = None
+# Bounded trade-event queue: never block the WebSocket receiver on REST/bootstrap
+# or disk persistence. A full queue is flagged as a tracking gap, not a TP.
+_CRASH_TRADE_BUFFER = deque(maxlen=50000)
+_CRASH_TRADE_BUFFER_LOCK = threading.Lock()
+_CRASH_TRADE_BUFFER_OVERFLOW = False
 
 
 def crash_bounce_plan(klines, last_price, tick_size, now_ms):
@@ -7109,7 +7115,7 @@ class CrashBounceWebSocketCache:
                     event_at = int(data["T"])/1000.0
                     # Do not replay stale prints after reconnect.
                     if 0 <= time.time()-event_at <= 5:
-                        _crash_ws_track_trade(symbol, float(data["p"]), event_at, int(data["a"]))
+                        _crash_enqueue_trade(symbol, float(data["p"]), event_at, int(data["a"]))
             elif isinstance(data, dict) and data.get("e") == "kline":
                 k = data["k"]
                 if k.get("i") != "15m" or k.get("x") is not True:
@@ -7213,7 +7219,34 @@ class CrashBounceWebSocketCache:
 
 
 
-def _crash_ws_track_trade(symbol, price, observed_at, trade_id):
+def _crash_enqueue_trade(symbol, price, observed_at, trade_id):
+    global _CRASH_TRADE_BUFFER_OVERFLOW
+    with _CRASH_TRADE_BUFFER_LOCK:
+        if len(_CRASH_TRADE_BUFFER) == _CRASH_TRADE_BUFFER.maxlen:
+            _CRASH_TRADE_BUFFER.clear()
+            _CRASH_TRADE_BUFFER_OVERFLOW = True
+        _CRASH_TRADE_BUFFER.append((symbol, price, observed_at, trade_id))
+
+
+def _crash_trade_consumer():
+    """Consume WS prints in arrival order without ever blocking socket reception."""
+    global _CRASH_TRADE_BUFFER_OVERFLOW
+    while True:
+        with _CRASH_TRADE_BUFFER_LOCK:
+            event = _CRASH_TRADE_BUFFER.popleft() if _CRASH_TRADE_BUFFER else None
+            overflow = _CRASH_TRADE_BUFFER_OVERFLOW
+            if event is not None:
+                _CRASH_TRADE_BUFFER_OVERFLOW = False
+        if event is None:
+            time.sleep(0.02)
+            continue
+        try:
+            _crash_ws_track_trade(*event, force_gap=overflow)
+        except Exception as error:
+            log(f"[CRASH TRADE CONSUMER ERR] {type(error).__name__}")
+
+
+def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False):
     """Act on ordered live trade transitions; persist only when state changes."""
     with _CRASH_STATE_LOCK:
         state = _CRASH_ACTIVE_STATE
@@ -7227,6 +7260,10 @@ def _crash_ws_track_trade(symbol, price, observed_at, trade_id):
                     record.get("v2_status") != "STRONG_V2" or
                     record.get("tracking_status") not in ("WAIT_ENTRY","OPEN")):
                 continue
+            if force_gap:
+                # Dropped WS prints mean no reliable entry/TP ordering.
+                record["ws_last_event_at"] = observed_at - 60
+                record["coverage_gaps"] = record.get("coverage_gaps",0) + 1
             transition = advance_trade(record, price, observed_at, trade_id)
             if transition:
                 changed.append((record, transition))
@@ -7409,6 +7446,12 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             stored = state["history"][-1]
             stored.update(record)
             _crash_review_candidate(state, stored, now, allow_rest=True)
+            # Restore the live trade stream for THIS candidate before checking
+            # subsequent losers: long REST scans must not defer this subscription.
+            if stored.get("v2_status") == "STRONG_V2":
+                trade_watching.add(symbol)
+                _CRASH_WS_CACHE.reconcile(
+                    [s for _,s,_ in selected][:100], trade_watching)
             _crash_send_pending(state, time.time())
             _crash_save_state(state)
         except Exception as error:
@@ -7430,6 +7473,8 @@ def _crash_bounce_worker():
     market, refreshed = _crash_load_market_cache()
     next_metadata = refreshed + 86400 if market else 0
     next_scan = 0
+    threading.Thread(target=_crash_trade_consumer,
+                     name="crash-trade-consumer",daemon=True).start()
     _CRASH_WS_CACHE.start()
     while True:
         try:
