@@ -6515,12 +6515,34 @@ def _crash_send_pending(state, now):
         if now - record.get("v2_last_attempt_at", -1e9) < 20:
             continue
         d = record["v2_features"]
+        strength = d.get("strength_score") or {}
+        score_message = "📊 Kademeli güç puanı: veri yok\n"
+        if strength.get("score") is not None:
+            components = strength.get("components", {})
+            def show(key, label):
+                item = components.get(key, {})
+                current = item.get("points")
+                value = f"{current:.1f}" if current is not None else "veri yok"
+                return f"{label} {value}/{item.get('max_points', 0):.0f}"
+            score_message = (
+                f"📊 GÜÇ PUANI: {strength['score']:.1f}/100 "
+                f"(veri kapsamı %{strength['coverage_pct']:.0f})\n"
+                + show("dip_stability", "Dip") + " | "
+                + show("rsi_momentum", "RSI") + "\n"
+                + show("volume_confirmation", "Hacim") + " | "
+                + show("ema25_improvement", "EMA25") + "\n"
+                + show("atr_tp_capacity", "ATR") + " | "
+                + show("selling_slowdown", "Düşüş hızı") + " | "
+                + show("btc_context", "BTC") + "\n"
+            )
         message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
                    f"RSI14 (15m): {d['rsi14']:.2f}\n"
                    f"5 günlük veri: {d['candles']}/480 kapalı mum\n"
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
+                   f"{score_message}"
+                   "Puan bilgi amaçlı; TP olasılığı değildir.\n"
                    f"Giriş seviyesi: {record['entry']} | anlık: {record.get('last_price')}\n"
                    f"TP +%1 (brüt): {record['tp']}\n"
                    "Giriş henüz gerçekleşmedi; WebSocket ile sanal izleme. Gerçek emir yok.")
@@ -6561,7 +6583,8 @@ def _crash_v2_validate_entry(record, now):
     except (OSError, ValueError, TypeError):
         pass
     try:
-        return assess_entry(rows, _CRASH_WS_CACHE.candles(record["symbol"]), now)
+        return assess_entry(rows, _CRASH_WS_CACHE.candles(record["symbol"]), now,
+                            btc_change_24h=record.get("btc_change_24h"))
     except (ValueError, TypeError, OverflowError, AttributeError) as error:
         log(f"[CRASH V2 HISTORY ERR] {record['symbol']}: {type(error).__name__}")
         return {"status":"MISSING_5D_HISTORY", "qualified":False, "candles":0}
@@ -6586,7 +6609,8 @@ def _crash_v2_assess_candidate(record, now, allow_rest=False):
             from crash_history import HistoryCollector
             valid = HistoryCollector.validated(rows)
             fresh = [valid[t] for t in sorted(valid) if start <= t < end]
-            result = assess_entry(fresh, _CRASH_WS_CACHE.candles(record["symbol"]), as_of)
+            result = assess_entry(fresh, _CRASH_WS_CACHE.candles(record["symbol"]), as_of,
+                                  btc_change_24h=record.get("btc_change_24h"))
             # The asynchronous HistoryCollector owns persistent history_cache writes.
             # Avoid racing its shared .tmp file while this fast-path scores the candidate.
         except Exception as error:
@@ -6604,6 +6628,8 @@ def _crash_review_candidate(state, record, now, allow_rest=False):
     else:
         result = _crash_v2_assess_candidate(record, now, allow_rest)
         record["v2_features"] = result
+        if result.get("strength_score") is not None:
+            record["strength_score"] = result["strength_score"]
         if result["status"] == "MISSING_5D_HISTORY":
             return
         record["v2_status"] = result["status"]
@@ -6885,6 +6911,8 @@ def _crash_summary(records):
               for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "INVALIDATED_BEFORE_ENTRY", "FILTERED_OUT", "V2_FILTERED", "MISSED_SIGNAL", "LEGACY_UNKNOWN")}
     resolved = counts["TP"] + counts["TIMEOUT"]
     hours = [r["tp_hours"] for r in records if r.get("tracking_status")=="TP"]
+    scored = [r["strength_score"]["score"] for r in records
+              if isinstance((r.get("strength_score") or {}).get("score"), (float, int))]
     return dict(counts, signals=len(records),
                 entered=counts["OPEN"]+resolved,
                 observed_tp_rate_resolved_pct=100*counts["TP"]/resolved if resolved else None,
@@ -6892,7 +6920,10 @@ def _crash_summary(records):
                 records_with_gaps=sum(r.get("coverage_gaps",0)>0 for r in records),
                 sent_candidates=sum(r.get("v2_sent") is True and
                     r.get("v2_delivery_phase")=="CANDIDATE" for r in records),
-                missed_entry_above_tp=sum(r.get("v2_reason")=="ENTRY_ABOVE_TP" for r in records))
+                missed_entry_above_tp=sum(r.get("v2_reason")=="ENTRY_ABOVE_TP" for r in records),
+                scored_candidates=len(scored),
+                mean_strength_score=round(sum(scored)/len(scored),1) if scored else None,
+                score_ge75=sum(v>=75 for v in scored))
 
 
 def _crash_send_report_file(path, caption):
@@ -6929,6 +6960,11 @@ def _crash_daily_report(state, now):
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
         notes = ("GÜNCEL V2: yalnız Crash Bounce çalışır, Fibonacci devre dışıdır. "
+                 "7 faktörlü sürekli 0-100 güç puanı (continuous_7factor_v1); "
+                 "dip, RSI yönü, hacim, EMA eğim iyileşmesi, ATR, düşüş hızı ve BTC. "
+                 "Bileşenler kesirli hesaplanır; eksik veri varsa mevcut ağırlıklara "
+                 "normalize edilir ve kapsam ayrı gösterilir. "
+                 "Puan otomatik emir veya V2 Telegram engeli değildir, olasılık değildir. "
                  "3 dk aday taraması; tam 480 kapalı 15m mumla aday anında filtre. "
                  "Uygun aday Telegram'a giriş beklenmeden gönderilir; kabul zamanı, message_id, hata kaydedilir. "
                  "Yeni sanal giriş/TP yalnız sıralı futures aggTrade WS olaylarıyla izlenir. "
@@ -6957,6 +6993,8 @@ def _crash_daily_report(state, now):
                 "period_start":since, "period_end":now, "daily_cohort":summary,
                 "rolling_7d_cohort":rolling,
                 "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,
+                "strength_score_version":"continuous_7factor_v1",
+                "strength_score_blocks_delivery":False,
                 "legacy_7d_cohort":_crash_summary([r for r in records
                     if r.get("signal_filter_version") != CRASH_BOUNCE_FILTER_VERSION]),
                 "rolling_7d_by_model":{model:_crash_summary([r for r in records
@@ -6974,8 +7012,12 @@ def _crash_daily_report(state, now):
         os.replace(path+".tmp",path)
         rate = rolling["observed_tp_rate_resolved_pct"]
         avg = rolling["average_tp_hours"]
+        mean_score = rolling["mean_strength_score"]
+        mean_score_text = f"{mean_score:.1f}" if mean_score is not None else "veri yok"
         caption = (f"📊 CRASH BOUNCE — 24h data\nYeni sinyal: {summary['signals']}\n"
-                   "Puan: RSI14 < 25 → 50, EMA25 eğimi < 0 → 50; sinyali engellemez. Yalnız yeni sürüm.\n"
+                   "V2 güç puanı 0-100: 7 faktör oransal, sinyali engellemez.\n"
+                   f"Puanlı aday {rolling['scored_candidates']} | Ort. güç {mean_score_text}/100 "
+                   f"| ≥75 puan {rolling['score_ge75']}\n"
                    f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
@@ -7374,7 +7416,9 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                               trade_watching)
     _crash_append_data({"type":"scan", "observed_at":now,
         "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"ws_aggtrade_upcross_v3",
-                         "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480},
+                         "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480,
+                         "strength_score_version":"continuous_7factor_v1",
+                         "strength_score_blocks_signals":False},
         "top20":[{"rank":i+1, "ticker":t,
                    "threshold_pass":c <= -CRASH_BOUNCE_DROP_PCT,
                    "previous_signal_entry":state["symbols"].get(sym,{}).get("entry")}
@@ -7402,6 +7446,8 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                 continue
             features = _crash_features(klines, ticker, now)
             condition_score = _crash_signal_score(features)
+            btc_24h = next((t.get("priceChangePercent") for t in tickers
+                            if t.get("symbol") == "BTCUSDT"), None)
             from zoneinfo import ZoneInfo
             from datetime import datetime as _crash_datetime
             day = _crash_datetime.fromtimestamp(now, ZoneInfo("Europe/Paris")).date().isoformat()
@@ -7412,7 +7458,8 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                           created_at=now, sent=True, delivery_status="V2_CANDIDATE_CREATED",
                           v2_sent=False, v2_status="PENDING_5D_HISTORY",
                           v2_delivery_phase="CANDIDATE",
-                          v2_delivery_status="WAIT_V2", schema_version=8,
+                          v2_delivery_status="WAIT_V2", schema_version=9,
+                          btc_change_24h=btc_24h,
                           confirmation_enabled=False,
                           condition_score=condition_score,
                           signal_filter_version=CRASH_BOUNCE_FILTER_VERSION, loser_rank=rank if symbol in selected_symbols else None,
