@@ -82,6 +82,28 @@ class CrashV2Tests(unittest.TestCase):
         self.assertNotIn("entered_at",record)
         self.assertIn("Giriş henüz gerçekleşmedi",receipt.call_args.args[0])
 
+    def test_fractional_strength_shown_and_does_not_block_telegram(self):
+        env, receipt = self._delivery_context()
+        state, record = self._candidate()
+        weights = {
+            "dip_stability":(14.3,25), "rsi_momentum":(11.7,20),
+            "volume_confirmation":(9.4,20), "ema25_improvement":(8.6,15),
+            "atr_tp_capacity":(5.5,10), "selling_slowdown":(3.2,5),
+            "btc_context":(2.4,5)
+        }
+        record["v2_features"]["strength_score"] = {
+            "score":55.1, "coverage_pct":100.0,
+            "components":{k:{"points":v,"max_points":w} for k,(v,w) in weights.items()}
+        }
+        env["_crash_send_pending"](state,105)
+        message = receipt.call_args.args[0]
+        self.assertIn("GÜÇ PUANI: 55.1/100",message)
+        self.assertIn("Dip 14.3/25",message)
+        self.assertIn("RSI 11.7/20",message)
+        self.assertIn("Hacim 9.4/20",message)
+        self.assertIn("EMA25 8.6/15",message)
+        self.assertTrue(record["v2_sent"])
+
     def test_stale_signal_never_sent_late(self):
         env, receipt = self._delivery_context()
         state, record = self._candidate()
