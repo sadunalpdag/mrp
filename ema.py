@@ -6587,18 +6587,8 @@ def _crash_v2_assess_candidate(record, now, allow_rest=False):
             valid = HistoryCollector.validated(rows)
             fresh = [valid[t] for t in sorted(valid) if start <= t < end]
             result = assess_entry(fresh, _CRASH_WS_CACHE.candles(record["symbol"]), as_of)
-            if fresh:
-                path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR,"history_cache",record["symbol"]+".json")
-                os.makedirs(os.path.dirname(path),exist_ok=True)
-                previous = []
-                try:
-                    with open(path,encoding="utf-8") as handle:
-                        previous = json.load(handle)
-                except (OSError,ValueError,TypeError):
-                    pass
-                merged = {int(r[0]):r for r in previous if len(r)>=7}
-                merged.update({int(r[0]):r for r in fresh})
-                _crash_write_json(path,[merged[t] for t in sorted(merged)[-960:]])
+            # The asynchronous HistoryCollector owns persistent history_cache writes.
+            # Avoid racing its shared .tmp file while this fast-path scores the candidate.
         except Exception as error:
             log(f"[CRASH V2 BOOTSTRAP DEFERRED] {record['symbol']}: {type(error).__name__}")
     return result
