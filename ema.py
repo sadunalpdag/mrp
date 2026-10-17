@@ -24,7 +24,7 @@ except Exception:
     FORMATTING_AVAILABLE = False
 
 # ==============================================================================
-# 📘 EMA ULTRA v15.11.0 — Fibonacci Only (LONG) Mode
+# 📘 EMA ULTRA — CRASH BOUNCE V2 ONLY (signal / research mode)
 #  - PEMA, EARLY, UT/STC, KIVANC CONFIRM tamamen kaldırıldı
 #  - Aktif strateji: SADECE 📐 FIBONACCI RETRACEMENT (LONG only)
 #  - Diğer tüm stratejiler devre dışı (all other strategies disabled)
@@ -6314,6 +6314,7 @@ CRASH_BOUNCE_SCAN_SECONDS = 180
 CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
 CRASH_BOUNCE_FILTER_VERSION = "five_day_entry_v2_only"
+CRASH_V2_SIGNAL_TTL_SECONDS = 90
 CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
@@ -6329,6 +6330,8 @@ _crash_weight_used = 0
 _crash_ip_weight_limit = 2400
 _crash_backoff = 0
 _TG_COMMAND_CONTEXT = threading.local()
+_CRASH_STATE_LOCK = threading.RLock()
+_CRASH_ACTIVE_STATE = None
 
 
 def crash_bounce_plan(klines, last_price, tick_size, now_ms):
@@ -6470,35 +6473,83 @@ def _crash_load_state():
     return state
 
 
+
+def _crash_telegram_receipt(message):
+    """Return Telegram API acceptance metadata; never persist a bot token."""
+    attempt_at = time.time()
+    if not BOT_TOKEN or not CHAT_ID:
+        return {"ok":False, "attempt_at":attempt_at, "error":"MISSING_TELEGRAM_CREDENTIALS"}
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id":CHAT_ID, "text":message}, timeout=10)
+        payload = response.json()
+        if response.ok and payload.get("ok") and isinstance(payload.get("result"), dict):
+            message_id = payload["result"].get("message_id")
+            if not isinstance(message_id, int):
+                return {"ok":False, "attempt_at":attempt_at, "error":"MISSING_MESSAGE_ID"}
+            return {"ok":True, "attempt_at":attempt_at, "accepted_at":time.time(),
+                    "message_id":message_id}
+        return {"ok":False, "attempt_at":attempt_at,
+                "error":f"HTTP_{response.status_code}: " + str(payload.get("description", ""))[:100]}
+    except requests.exceptions.Timeout:
+        # It may have reached Telegram. Do not retry blindly and duplicate alerts.
+        return {"ok":False, "attempt_at":attempt_at, "error":"TIMEOUT_DELIVERY_UNKNOWN",
+                "ambiguous":True}
+    except Exception as error:
+        return {"ok":False, "attempt_at":attempt_at, "error":type(error).__name__}
+
+
 def _crash_send_pending(state, now):
-    """V2-only delivery. Never deliver an initial candidate."""
+    """Send qualified candidates immediately, before any simulated entry."""
     for record in state["history"]:
-        if (record.get("signal_filter_version") != CRASH_BOUNCE_FILTER_VERSION
-                or record.get("v2_status") != "STRONG_V2" or record.get("v2_sent")):
+        if (record.get("v2_delivery_phase") != "CANDIDATE" or
+                record.get("v2_status") != "STRONG_V2" or record.get("v2_sent")):
             continue
-        if now - record.get("entered_at", now) > 900:
-            record["v2_sent"] = True
-            record["v2_delivery_status"] = "STALE_NOT_SENT"
+        if record.get("v2_delivery_status") in ("EXPIRED_NOT_SENT", "UNKNOWN_DELIVERY"):
+            continue
+        age = now - record["created_at"]
+        if age > CRASH_V2_SIGNAL_TTL_SECONDS or record.get("tracking_status") not in ("WAIT_ENTRY", "OPEN"):
+            record["v2_delivery_status"] = "EXPIRED_NOT_SENT"
             _crash_save_state(state)
             continue
+        if now - record.get("v2_last_attempt_at", -1e9) < 20:
+            continue
         d = record["v2_features"]
-        message = (f"✅ CRASH BOUNCE V2 | GÜÇLÜ LONG | {record['symbol']}\n"
+        message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
                    f"RSI14 (15m): {d['rsi14']:.2f}\n"
-                   f"5 günlük veri: {d['candles']}/480 kapanmış mum\n"
+                   f"5 günlük veri: {d['candles']}/480 kapalı mum\n"
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
-                   f"Giriş: {record['entry']} | gözlenen: {record.get('observed_entry_price')}\n"
+                   f"Giriş seviyesi: {record['entry']} | anlık: {record.get('last_price')}\n"
                    f"TP +%1 (brüt): {record['tp']}\n"
-                   "Sanal sinyal; emir açılmadı. Örneklemli fiyat takibi.")
+                   "Giriş henüz gerçekleşmedi; WebSocket ile sanal izleme. Gerçek emir yok.")
+        record["v2_last_attempt_at"] = now
+        record["v2_telegram_attempts"] = record.get("v2_telegram_attempts", 0) + 1
+        record["v2_delivery_status"] = "ATTEMPTING"
         _crash_save_state(state)
-        if tg_send(message, source="CRASH_BOUNCE"):
+        receipt = _crash_telegram_receipt(message)
+        record["v2_telegram_last_error"] = receipt.get("error")
+        record["v2_telegram_response_at"] = time.time()
+        if receipt["ok"]:
             record["v2_sent"] = True
             record["v2_delivery_status"] = "SENT"
-            latest = state["symbols"].get(record["symbol"])
-            if latest and latest.get("signal_id") == record.get("signal_id"):
-                latest.update(record)
-            _crash_save_state(state)
+            record["v2_telegram_sent_at"] = receipt["accepted_at"]
+            record["v2_telegram_message_id"] = receipt["message_id"]
+        else:
+            record["v2_delivery_status"] = ("UNKNOWN_DELIVERY" if receipt.get("ambiguous")
+                                           else "SEND_FAILED_RETRY")
+        latest = state["symbols"].get(record["symbol"])
+        if latest and latest.get("signal_id") == record.get("signal_id"):
+            latest.update(record)
+        _crash_save_state(state)
+        _crash_append_data({"type":"telegram_delivery", "observed_at":time.time(),
+                            "signal_id":record["signal_id"],"symbol":record["symbol"],
+                            "status":record["v2_delivery_status"],
+                            "attempt":record["v2_telegram_attempts"],
+                            "message_id":record.get("v2_telegram_message_id"),
+                            "error":record.get("v2_telegram_last_error")},time.time())
 
 
 def _crash_v2_validate_entry(record, now):
@@ -6515,6 +6566,76 @@ def _crash_v2_validate_entry(record, now):
     except (ValueError, TypeError, OverflowError, AttributeError) as error:
         log(f"[CRASH V2 HISTORY ERR] {record['symbol']}: {type(error).__name__}")
         return {"status":"MISSING_5D_HISTORY", "qualified":False, "candles":0}
+
+
+
+def _crash_v2_assess_candidate(record, now, allow_rest=False):
+    """Compute STRICT V2 from 480 candles as of initial candidate, not entry."""
+    as_of = record["created_at"]
+    result = _crash_v2_validate_entry(record, as_of)
+    if (result.get("status") == "MISSING_5D_HISTORY" and allow_rest
+            and time.time() >= _crash_cooldown_until and not BinanceRateLimiter.is_banned()):
+        # Only NEW candidates trigger one prioritized 5d bootstrap. The existing
+        # global REST weight limiter and 1s pacing are respected.
+        end = int(as_of * 1000) // 900000 * 900000
+        start = end - 480 * 900000
+        try:
+            rows = _crash_public_get("/fapi/v1/klines",
+                   {"symbol":record["symbol"],"interval":"15m","startTime":start,
+                    "endTime":end-1,"limit":499})
+            from crash_v2 import assess_entry
+            from crash_history import HistoryCollector
+            valid = HistoryCollector.validated(rows)
+            fresh = [valid[t] for t in sorted(valid) if start <= t < end]
+            result = assess_entry(fresh, _CRASH_WS_CACHE.candles(record["symbol"]), as_of)
+            if fresh:
+                path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR,"history_cache",record["symbol"]+".json")
+                os.makedirs(os.path.dirname(path),exist_ok=True)
+                previous = []
+                try:
+                    with open(path,encoding="utf-8") as handle:
+                        previous = json.load(handle)
+                except (OSError,ValueError,TypeError):
+                    pass
+                merged = {int(r[0]):r for r in previous if len(r)>=7}
+                merged.update({int(r[0]):r for r in fresh})
+                _crash_write_json(path,[merged[t] for t in sorted(merged)[-960:]])
+        except Exception as error:
+            log(f"[CRASH V2 BOOTSTRAP DEFERRED] {record['symbol']}: {type(error).__name__}")
+    return result
+
+
+def _crash_review_candidate(state, record, now, allow_rest=False):
+    if record.get("v2_status") != "PENDING_5D_HISTORY":
+        return
+    if now-record["created_at"] > CRASH_V2_SIGNAL_TTL_SECONDS:
+        record.update(v2_status="MISSING_5D_HISTORY",v2_delivery_status="EXPIRED_NOT_SENT",
+                      v2_reason="HISTORY_NOT_READY_IN_TIME",tracking_status="V2_FILTERED",
+                      finished_at=now)
+    else:
+        result = _crash_v2_assess_candidate(record, now, allow_rest)
+        record["v2_features"] = result
+        if result["status"] == "MISSING_5D_HISTORY":
+            return
+        record["v2_status"] = result["status"]
+        if not result["qualified"]:
+            record.update(tracking_status="V2_FILTERED", finished_at=now,
+                          v2_reason=result["status"], v2_delivery_status="FILTERED_NOT_SENT")
+    latest = state["symbols"].get(record["symbol"])
+    if latest and latest.get("signal_id") == record.get("signal_id"):
+        latest.update(record)
+    _crash_save_state(state)
+    _crash_append_data({"type":"v2_candidate_decision","observed_at":now,
+                        "signal_id":record["signal_id"],"symbol":record["symbol"],
+                        "v2_status":record["v2_status"],
+                        "delivery_status":record.get("v2_delivery_status")},now)
+
+
+def _crash_review_pending_v2(state, now):
+    for record in state["history"]:
+        if (record.get("v2_delivery_phase") == "CANDIDATE"
+                and record.get("v2_status") == "PENDING_5D_HISTORY"):
+            _crash_review_candidate(state, record, now)
 
 
 def _crash_signal_score(features):
@@ -6709,6 +6830,9 @@ def _crash_track_results(state, tickers, now):
             record["coverage_gaps"] += int(now-record.get("last_observed_at", since) > 540)
             _crash_append_data({"type":"result", "observed_at":now, "record":record}, now)
             continue
+        # Live V2 never infers ordered fills from 3-minute sampled tickers.
+        if record.get("tracking_model") == "ws_aggtrade_upcross_v3":
+            continue
         price = prices.get(record["symbol"])
         if price is None or now <= record["created_at"]:
             continue
@@ -6769,14 +6893,17 @@ def _crash_track_results(state, tickers, now):
 
 def _crash_summary(records):
     counts = {key:sum(r.get("tracking_status")==key for r in records)
-              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "INVALIDATED_BEFORE_ENTRY", "FILTERED_OUT", "V2_FILTERED", "LEGACY_UNKNOWN")}
+              for key in ("WAIT_ENTRY", "OPEN", "TP", "TIMEOUT", "NO_ENTRY_OBSERVED", "INVALIDATED_BEFORE_ENTRY", "FILTERED_OUT", "V2_FILTERED", "MISSED_SIGNAL", "LEGACY_UNKNOWN")}
     resolved = counts["TP"] + counts["TIMEOUT"]
     hours = [r["tp_hours"] for r in records if r.get("tracking_status")=="TP"]
     return dict(counts, signals=len(records),
                 entered=counts["OPEN"]+resolved,
                 observed_tp_rate_resolved_pct=100*counts["TP"]/resolved if resolved else None,
                 average_tp_hours=sum(hours)/len(hours) if hours else None,
-                records_with_gaps=sum(r.get("coverage_gaps",0)>0 for r in records))
+                records_with_gaps=sum(r.get("coverage_gaps",0)>0 for r in records),
+                sent_candidates=sum(r.get("v2_sent") is True and
+                    r.get("v2_delivery_phase")=="CANDIDATE" for r in records),
+                missed_entry_above_tp=sum(r.get("v2_reason")=="ENTRY_ABOVE_TP" for r in records))
 
 
 def _crash_send_report_file(path, caption):
@@ -6857,9 +6984,10 @@ def _crash_daily_report(state, now):
                    f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
+                   f"V2 Telegram kabul edilen: {rolling['sent_candidates']} | giriş/TP atlaması: {rolling['missed_entry_above_tp']}\n"
                    f"Sonuçlananlarda gözlenen TP: {f'%{rate:.1f}' if rate is not None else 'henüz yok'}\n"
                    f"Ort. TP: {f'{avg:.2f} saat' if avg is not None else 'henüz yok'} | veri boşluğu: {rolling['records_with_gaps']}\n"
-                   "Sanal 3dk fiyat takibi; gerçek işlem sonucu değildir. ZIP: mumlar, özellikler, fiyatlar ve sonuçlar.")
+                   "3dk aday taraması; sanal giriş/TP sırası WS aggTrade olaylarından. Gerçek emir değildir. ZIP: fiyatlar ve sonuçlar.")
         pending = report["pending"] = {"path":path,"caption":caption,"period_end":now}
         _crash_save_state(state)
     report["retry_after"] = now + 1800
@@ -6886,6 +7014,7 @@ class CrashBounceWebSocketCache:
         self.tickers = {}
         self.rows = {}
         self.wanted = set()
+        self.trade_wanted = set()
         self.connected = False
         self.opened_at = 0.
         self.ws = None
@@ -6974,6 +7103,13 @@ class CrashBounceWebSocketCache:
                                                         "received_at":time.time()}
                     except (KeyError,ValueError,TypeError,AttributeError):
                         continue
+            elif isinstance(data, dict) and data.get("e") == "aggTrade":
+                symbol = data.get("s","")
+                if symbol.endswith("USDT"):
+                    event_at = int(data["T"])/1000.0
+                    # Do not replay stale prints after reconnect.
+                    if 0 <= time.time()-event_at <= 5:
+                        _crash_ws_track_trade(symbol, float(data["p"]), event_at, int(data["a"]))
             elif isinstance(data, dict) and data.get("e") == "kline":
                 k = data["k"]
                 if k.get("i") != "15m" or k.get("x") is not True:
@@ -6998,7 +7134,7 @@ class CrashBounceWebSocketCache:
             return [dict(r["ticker"]) for r in self.tickers.values()
                     if 0<=now-r["event_time"]<=120 and now-r["received_at"]<=120]
 
-    def _send(self, method, symbols):
+    def _send(self, method, symbols, suffix="@kline_15m"):
         if not symbols:
             return
         with self.send_lock:
@@ -7008,20 +7144,23 @@ class CrashBounceWebSocketCache:
                 return
             try:
                 ws.send(json.dumps({"method":method,
-                    "params":[s.lower()+"@kline_15m" for s in sorted(symbols)],
+                    "params":[s.lower()+suffix for s in sorted(symbols)],
                     "id":str(time.time_ns())}))
             except Exception:
-                # Reconnect restores the entire desired subscription set.
                 ws.close()
 
-    def reconcile(self, symbols):
+    def reconcile(self, symbols, trade_symbols=None):
         wanted = set(symbols)
-        if len(wanted)>100:
-            raise ValueError("Too many crash candle streams")
+        trades = set(trade_symbols or ())
+        if len(wanted)>100 or len(trades)>100:
+            raise ValueError("Too many crash websocket subscriptions")
         with self.lock:
             old, self.wanted = self.wanted, wanted
+            old_trades, self.trade_wanted = self.trade_wanted, trades
         self._send("UNSUBSCRIBE", old-wanted)
         self._send("SUBSCRIBE", wanted-old)
+        self._send("UNSUBSCRIBE", old_trades-trades, "@aggTrade")
+        self._send("SUBSCRIBE", trades-old_trades, "@aggTrade")
 
     def on_open(self, ws):
         with self.lock:
@@ -7030,8 +7169,10 @@ class CrashBounceWebSocketCache:
             self.opened_at=time.time()
             self.tickers={}  # Never carry pre-disconnect prices into a new session.
             wanted=set(self.wanted)
+            trade_wanted=set(self.trade_wanted)
         self._send("SUBSCRIBE", wanted)
-        log("[CRASH WS OPEN] futures ticker stream connected")
+        self._send("SUBSCRIBE", trade_wanted, "@aggTrade")
+        log("[CRASH WS OPEN] futures ticker + trade streams connected")
 
     def on_close(self, ws, code, message):
         with self.lock:
@@ -7069,6 +7210,34 @@ class CrashBounceWebSocketCache:
         self.load()
         self.thread=threading.Thread(target=self._run,name="crash-futures-ws",daemon=True)
         self.thread.start()
+
+
+
+def _crash_ws_track_trade(symbol, price, observed_at, trade_id):
+    """Act on ordered live trade transitions; persist only when state changes."""
+    with _CRASH_STATE_LOCK:
+        state = _CRASH_ACTIVE_STATE
+        if state is None:
+            return
+        from crash_live_v2 import advance_trade
+        changed = []
+        for record in state["history"]:
+            if (record.get("symbol") != symbol or
+                    record.get("tracking_model") != "ws_aggtrade_upcross_v3" or
+                    record.get("v2_status") != "STRONG_V2" or
+                    record.get("tracking_status") not in ("WAIT_ENTRY","OPEN")):
+                continue
+            transition = advance_trade(record, price, observed_at, trade_id)
+            if transition:
+                changed.append((record, transition))
+                latest = state["symbols"].get(symbol)
+                if latest and latest.get("signal_id") == record.get("signal_id"):
+                    latest.update(record)
+        if changed:
+            _crash_save_state(state)
+            for record, transition in changed:
+                _crash_append_data({"type":"ws_trade_transition","observed_at":observed_at,
+                                    "transition":transition,"record":record},observed_at)
 
 
 _CRASH_WS_CACHE = CrashBounceWebSocketCache()
@@ -7144,6 +7313,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
         raise ValueError("Invalid futures ticker response")
     _crash_apply_filter_migration(state, now)
     _crash_track_results(state, tickers, now)
+    _crash_review_pending_v2(state, now)
     _crash_send_pending(state, now)
     if not tickers:
         log("[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data")
@@ -7170,9 +7340,14 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     selected_symbols = {sym for _, sym, _ in top}
     selected.extend((change, sym, ticker) for change, sym, ticker in ranked
                     if sym in watching and sym not in selected_symbols)
-    _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100])
+    trade_watching = {r["symbol"] for r in state["history"] if
+                      r.get("tracking_model")=="ws_aggtrade_upcross_v3"
+                      and r.get("v2_status")=="STRONG_V2"
+                      and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
+    _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
+                              trade_watching)
     _crash_append_data({"type":"scan", "observed_at":now,
-        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"sampled_upward_cross_v2",
+        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"ws_aggtrade_upcross_v3",
                          "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480},
         "top20":[{"rank":i+1, "ticker":t,
                    "threshold_pass":c <= -CRASH_BOUNCE_DROP_PCT,
@@ -7208,16 +7383,18 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                              and r.get("signal_day", _crash_datetime.fromtimestamp(
                                  r["created_at"], ZoneInfo("Europe/Paris")).date().isoformat()) == day)
             record = dict(plan, symbol=symbol, change_24h=change,
-                          created_at=now, sent=True, delivery_status="V2_CANDIDATE_SILENT",
-                          v2_sent=False, v2_status="WAIT_ENTRY",
-                          schema_version=7, confirmation_enabled=False,
+                          created_at=now, sent=True, delivery_status="V2_CANDIDATE_CREATED",
+                          v2_sent=False, v2_status="PENDING_5D_HISTORY",
+                          v2_delivery_phase="CANDIDATE",
+                          v2_delivery_status="WAIT_V2", schema_version=8,
+                          confirmation_enabled=False,
                           condition_score=condition_score,
                           signal_filter_version=CRASH_BOUNCE_FILTER_VERSION, loser_rank=rank if symbol in selected_symbols else None,
                           price_source="BINANCE_FUTURES_WS", signal_day=day,
                           daily_signal_number=number,
                           previous_signal_id=previous.get("signal_id") if previous else None,
                           previous_entry=previous.get("entry") if previous else None,
-                          tracking_model="sampled_upward_cross_v2",
+                          tracking_model="ws_aggtrade_upcross_v3",
                           previous_watch_price=float(ticker["lastPrice"]),
                           features=features)
             _crash_initialize_tracking(record)
@@ -7229,15 +7406,26 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
             log(f"[CRASH BOUNCE] {symbol} entry={plan['entry']} tp={plan['tp']}")
             _crash_queue_history(record, 'signal', now)
-            state['history'][-1].update(record)
+            stored = state["history"][-1]
+            stored.update(record)
+            _crash_review_candidate(state, stored, now, allow_rest=True)
+            _crash_send_pending(state, time.time())
             _crash_save_state(state)
         except Exception as error:
             log(f"[CRASH BOUNCE ERR] {symbol}: {error}")
             if BinanceRateLimiter.is_banned():
                 break
+    # New candidates are eligible for live trade events right away.
+    trade_watching = {r["symbol"] for r in state["history"] if
+                      r.get("tracking_model")=="ws_aggtrade_upcross_v3"
+                      and r.get("v2_status")=="STRONG_V2"
+                      and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
+    _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
+                              trade_watching)
 
 
 def _crash_bounce_worker():
+    global _CRASH_ACTIVE_STATE
     state = None
     market, refreshed = _crash_load_market_cache()
     next_metadata = refreshed + 86400 if market else 0
@@ -7247,6 +7435,8 @@ def _crash_bounce_worker():
         try:
             if state is None:
                 state = _crash_load_state()
+                with _CRASH_STATE_LOCK:
+                    _CRASH_ACTIVE_STATE = state
                 _crash_apply_filter_migration(state, time.time())
                 state.setdefault("report", {"last_success_at":time.time(), "next_due_at":time.time()+86400})
                 _crash_save_state(state)
@@ -7285,16 +7475,21 @@ def _crash_bounce_worker():
                 market = {}
             if now >= next_scan:
                 next_scan = now + CRASH_BOUNCE_SCAN_SECONDS
-                if market:
-                    run_crash_bounce_alerts(state, market)
-                else:
-                    _crash_track_results(state, [], now)
-                    log("[CRASH WS WAIT] awaiting validated USDT perpetual metadata")
-                _CRASH_WS_CACHE.flush()
+                with _CRASH_STATE_LOCK:
+                    if market:
+                        run_crash_bounce_alerts(state, market)
+                    else:
+                        _crash_track_results(state, [], now)
+                        log("[CRASH WS WAIT] awaiting validated USDT perpetual metadata")
+                    _CRASH_WS_CACHE.flush()
+            else:
+                with _CRASH_STATE_LOCK:
+                    _crash_review_pending_v2(state, now)
+                    _crash_send_pending(state, now)
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")
             next_scan = max(next_scan, time.time()+60)
-        time.sleep(max(1,min(60,next_scan-time.time())))
+        time.sleep(max(1,min(15,next_scan-time.time())))
 
 
 def start_crash_bounce_alerts():
@@ -7306,7 +7501,7 @@ def start_crash_bounce_alerts():
 # ===================== TELEGRAM HELPERS =====================
 
 def tg_send(t, source=None):
-    if CRASH_BOUNCE_ONLY_TELEGRAM and source not in ("CRASH_BOUNCE", "FIBONACCI") and not getattr(_TG_COMMAND_CONTEXT, "active", False):
+    if CRASH_BOUNCE_ONLY_TELEGRAM and source != "CRASH_BOUNCE" and not getattr(_TG_COMMAND_CONTEXT, "active", False):
         return False
     if not BOT_TOKEN or not CHAT_ID: return False
     try:
@@ -14290,14 +14485,7 @@ def main():
         if not math.isfinite(until):
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
-    from fibonacci_signals import FibonacciEngine
-    fibonacci = FibonacciEngine(
-        os.path.join(DATA_DIR, "fibonacci_research"), _crash_public_get,
-        _CRASH_WS_CACHE.snapshot, lambda: _crash_load_market_cache()[0],
-        lambda message: tg_send(message, source="FIBONACCI"), _crash_send_report_file,
-        lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned(), log)
-    fibonacci.start()
-    log("[START] CRASH + FIBONACCI signals; public data and virtual tracking only; no orders")
+    log("[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; public data and virtual tracking, no orders")
     # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()
 
