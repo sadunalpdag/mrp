@@ -6768,11 +6768,33 @@ def _crash_features(klines, ticker, now):
 
 
 _CRASH_HISTORY_COLLECTOR = None
+_CRASH_HISTORY_ERRORS = {}
+_CRASH_RISK_RESEARCH = None
+
+
+def _crash_risk_observe(kind, record):
+    """Best-effort paper observer; never change the live transition or send orders."""
+    try:
+        if _CRASH_RISK_RESEARCH is not None:
+            if kind == 'entry':
+                payload = {k: record.get(k) for k in ('signal_id','symbol','entered_at',
+                    'observed_entry_price','virtual_fill_price','strength_score')}
+                payload['features'] = {'ticker_24h': (record.get('features') or {}).get('ticker_24h', {})}
+            else:
+                payload = {'symbol':record['symbol'], 'until':time.time()+60}
+            _CRASH_RISK_RESEARCH.submit(kind, payload)
+    except Exception as error:
+        log(f"[CRASH RESEARCH HOOK ERR] {type(error).__name__}: {str(error)[:160]}")
+
 
 
 def _crash_queue_history(record, phase, now):
     """Queue public research data; never block a signal on a REST download."""
     global _CRASH_HISTORY_COLLECTOR
+    identity = (str(record.get('signal_id')), str(phase))
+    wall = time.time()
+    if wall < _CRASH_HISTORY_ERRORS.get(identity, 0):
+        return
     try:
         if _CRASH_HISTORY_COLLECTOR is None:
             from crash_history import HistoryCollector
@@ -6785,8 +6807,14 @@ def _crash_queue_history(record, phase, now):
             _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
             record[key] = True
         _CRASH_HISTORY_COLLECTOR.start()
+        _CRASH_HISTORY_ERRORS.pop(identity, None)
     except Exception as error:
-        log(f"[CRASH HISTORY QUEUE ERR] {type(error).__name__}")
+        _CRASH_HISTORY_ERRORS[identity] = wall + 300
+        # Only public research fields and a bounded error, never credentials.
+        detail = str(error).replace("\n", " ")[:300]
+        log(f"[CRASH HISTORY QUEUE ERR] symbol={record.get('symbol')!r} "
+            f"signal_id={record.get('signal_id')!r} phase={phase!r} "
+            f"as_of={now!r} error={type(error).__name__}: {detail}; retry=300s")
 
 
 def _crash_entry_features(record, tickers, now):
@@ -7008,7 +7036,17 @@ def _crash_daily_report(state, now):
                 source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
                 if os.path.exists(source):
                     archive.write(source, "observations/"+day+".jsonl")
-            archive.writestr("README.txt", notes)
+            # Research exports are independent of the signal statistics above.
+            risk_dir = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'risk_v1')
+            for name in ('summary.json', 'state.json'):
+                source = os.path.join(risk_dir, name)
+                if os.path.isfile(source):
+                    archive.write(source, 'risk_scenarios/'+name)
+            archive.writestr("README.txt", notes + "\nRisk scenarios: see risk_scenarios/summary.json. "
+                "15-day prospective enrollment + 5-day followup; 50 USDT paper positions, "
+                "1000 USDT reference capital, unlimited slots. Fee 5bps/side and extra slippage "
+                "2bps/side are assumptions. Funding/liquidation excluded. Missing spreads and "
+                "coverage gaps are flagged. Raw quotes/connection logs retained in risk_v1 for 20 days.")
         os.replace(path+".tmp",path)
         rate = rolling["observed_tp_rate_resolved_pct"]
         avg = rolling["average_tp_hours"]
@@ -7215,10 +7253,10 @@ class CrashBounceWebSocketCache:
         with self.lock:
             self.connected=False
             self.tickers={}
-        log(f"[CRASH WS CLOSED] code={code}; reconnecting with backoff")
+        log(f"[CRASH WS CLOSED] code={code} reason={str(message)[:160]}; reconnecting with backoff")
 
     def on_error(self, ws, error):
-        log(f"[CRASH WS ERR] {type(error).__name__}")
+        log(f"[CRASH WS ERR] {type(error).__name__}: {str(error)[:200]}")
 
     def _run(self):
         import random
@@ -7274,7 +7312,7 @@ def _crash_trade_consumer():
         try:
             _crash_ws_track_trade(*event, force_gap=overflow)
         except Exception as error:
-            log(f"[CRASH TRADE CONSUMER ERR] {type(error).__name__}")
+            log(f"[CRASH TRADE CONSUMER ERR] {type(error).__name__}: {str(error)[:200]}")
 
 
 def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False):
@@ -7304,6 +7342,8 @@ def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False)
         if changed:
             _crash_save_state(state)
             for record, transition in changed:
+                if transition == 'OPEN':
+                    _crash_risk_observe('entry', record)
                 _crash_append_data({"type":"ws_trade_transition","observed_at":observed_at,
                                     "transition":transition,"record":record},observed_at)
 
@@ -7504,7 +7544,16 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
 
 
 def _crash_bounce_worker():
-    global _CRASH_ACTIVE_STATE
+    global _CRASH_ACTIVE_STATE, _CRASH_RISK_RESEARCH
+    try:
+        from crash_risk_research import RiskResearch
+        import websocket
+        _CRASH_RISK_RESEARCH = RiskResearch(
+            os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'risk_v1'), websocket, log)
+        _CRASH_RISK_RESEARCH.start()
+        log('[CRASH RESEARCH] 15-day paper enrollment started/resumed; signal rules unchanged')
+    except Exception as error:
+        log(f'[CRASH RESEARCH START ERR] {type(error).__name__}: {str(error)[:200]}')
     state = None
     market, refreshed = _crash_load_market_cache()
     next_metadata = refreshed + 86400 if market else 0
@@ -7528,6 +7577,8 @@ def _crash_bounce_worker():
             now = time.time()
             # Recover queued downloads after restart; retain original event cutoffs.
             for historical in state['history']:
+                if historical.get('v2_status') == 'STRONG_V2' and historical.get('tracking_status') == 'WAIT_ENTRY':
+                    _crash_risk_observe('watch', historical)
                 if now - historical['created_at'] <= 7*86400:
                     _crash_queue_history(historical, 'signal', historical['created_at'])
                     if historical.get('entered_at'):
@@ -14579,5 +14630,6 @@ if __name__=="__main__":
 
 
     
+
 
 

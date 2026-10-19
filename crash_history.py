@@ -36,12 +36,19 @@ class HistoryCollector:
     def submit(self, record, phase, at):
         symbol = record['symbol']
         if not re.fullmatch(r'[A-Z0-9_]{1,40}', symbol):
-            raise ValueError('Invalid research symbol')
+            raise ValueError(f'Invalid research symbol: {symbol!r}; expected ASCII A-Z, 0-9, underscore, 1-40 characters')
+        if phase not in ('signal', 'entry'):
+            raise ValueError(f'Invalid history phase: {phase!r}')
+        if isinstance(at, bool) or not isinstance(at, (float, int)) or not math.isfinite(at) or at <= 0:
+            raise ValueError(f'Invalid history timestamp: {at!r}')
         key = record['signal_id'] + ':' + phase
         with self.lock:
-            self.jobs.setdefault(key, dict(signal_id=record['signal_id'], symbol=symbol,
-                                          phase=phase, as_of=at, retry_after=0))
-            self._write(self.path, self.jobs)
+            updated = dict(self.jobs)
+            updated.setdefault(key, dict(signal_id=record['signal_id'], symbol=symbol,
+                                         phase=phase, as_of=at, retry_after=0))
+            # A failed serialization must not poison the in-memory queue.
+            self._write(self.path, updated)
+            self.jobs = updated
 
     def start(self):
         with self.lock:
@@ -117,12 +124,13 @@ class HistoryCollector:
             with self.lock:
                 self.jobs[key]['retry_after'] = now + 1800
                 self._write(self.path, self.jobs)
-            self.log(f"[CRASH HISTORY DEFERRED] {job['symbol']}: {type(error).__name__}")
+            self.log(f"[CRASH HISTORY DEFERRED] {job['symbol']}: {type(error).__name__}: {str(error)[:200]}")
 
     def _run(self):
         while True:
             try:
                 self.step()
             except Exception as error:
-                self.log(f'[CRASH HISTORY ERR] {type(error).__name__}')
+                self.log(f'[CRASH HISTORY ERR] {type(error).__name__}: {str(error)[:200]}')
             time.sleep(15)
+
