@@ -6535,6 +6535,8 @@ def _crash_send_pending(state, now):
                 + show("selling_slowdown", "Düşüş hızı") + " | "
                 + show("btc_context", "BTC") + "\n"
             )
+        from crash_context import format_context
+        context_message = format_context(d.get("five_day_context"))
         message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
@@ -6542,6 +6544,7 @@ def _crash_send_pending(state, now):
                    f"5 günlük veri: {d['candles']}/480 kapalı mum\n"
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
                    f"{score_message}"
+                   f"{context_message}"
                    "Puan bilgi amaçlı; TP olasılığı değildir.\n"
                    f"Giriş seviyesi: {record['entry']} | anlık: {record.get('last_price')}\n"
                    f"TP +%1 (brüt): {record['tp']}\n"
@@ -6643,6 +6646,7 @@ def _crash_review_candidate(state, record, now, allow_rest=False):
     _crash_append_data({"type":"v2_candidate_decision","observed_at":now,
                         "signal_id":record["signal_id"],"symbol":record["symbol"],
                         "v2_status":record["v2_status"],
+                        "five_day_context":(record.get("v2_features") or {}).get("five_day_context"),
                         "delivery_status":record.get("v2_delivery_status")},now)
 
 
@@ -6971,6 +6975,7 @@ def _crash_send_report_file(path, caption):
 
 def _crash_daily_report(state, now):
     import zipfile
+    from crash_context import summarize_context
     report = state.setdefault("report", {"last_success_at":now, "next_due_at":now+86400})
     if now < report["next_due_at"]:
         return
@@ -7017,9 +7022,11 @@ def _crash_daily_report(state, now):
                  "Eski kayıtlarda geçmiş sonuçlar bilinmez. UTC epoch saniye; kline zamanları milisaniye. "
                  "Yeni algoritmaları zaman bazlı eğitim/test ayrımıyla karşılaştırın; gelecek verilerini giriş özelliklerine katmayın.")
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("report.json", json.dumps({"schema_version":4,
+            archive.writestr("report.json", json.dumps({"schema_version":5,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
                 "rolling_7d_cohort":rolling,
+                "five_day_context_daily":summarize_context(daily),
+                "five_day_context_rolling":summarize_context(filtered),
                 "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,
                 "strength_score_version":"continuous_7factor_v1",
                 "strength_score_blocks_delivery":False,

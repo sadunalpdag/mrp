@@ -29,6 +29,7 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
     end = int(at * 1000) // STEP_MS * STEP_MS
     start = end - HISTORY_CANDLES * STEP_MS
     candles = {}
+    quote_volumes = {}
     for batch in (history_rows, ws_rows):
         if not isinstance(batch, list):
             continue
@@ -44,6 +45,11 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
                         l > min(o,c) or h < max(o,c) or l > h):
                     continue
                 candles[opened] = (o,h,l,c,v)
+                try:
+                    quote = float(row[7])
+                    quote_volumes[opened] = quote if math.isfinite(quote) and quote >= 0 else None
+                except (IndexError, TypeError, ValueError, OverflowError):
+                    quote_volumes[opened] = None
             except (IndexError, TypeError, ValueError, OverflowError):
                 continue
     present = sum(start+i*STEP_MS in candles for i in range(HISTORY_CANDLES))
@@ -60,7 +66,12 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
     # Continuous strength is informational only, not an extra V2 acceptance gate.
     from crash_score_v3 import score_candidate
     strength_score = score_candidate(ordered, btc_change_24h=btc_change_24h)
+    from crash_context import assess_context
+    context = assess_context(ordered,
+        [quote_volumes.get(start+i*STEP_MS) for i in range(HISTORY_CANDLES)],
+        strength_score)
     return {"status":"STRONG_V2" if qualified else "FILTERED_V2",
+            "five_day_context": context,
             "strength_score":strength_score,
             "qualified":qualified, "candles":present,
             "expected_candles":HISTORY_CANDLES, "rsi14":round(rsi,4),

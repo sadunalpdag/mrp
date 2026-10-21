@@ -72,3 +72,37 @@ ValueError'ın kesin kök nedeni mevcut logda yoktur; yeni log bunu ayırt eder.
 
 Çevrimdışı test: `python -m unittest discover -p 'test_crash*.py' -q`.
 15 günlük sonuçlar oluşmadan eşiklerin getiriyi artırdığı sonucuna varılmamalıdır.
+
+## Five-day context v1 (2026-10-21)
+
+`crash_v2.assess_entry` now attaches `five_day_context`, calculated from exactly
+its existing 480 validated, consecutive, closed 15m candles. No additional API
+requests are made. The original V2 acceptance, strength score, entry/TP logic,
+order settings and 15-day enrollment / 5-day research follow-up are unchanged.
+
+The context includes five-day return and drawdown from the window high, price
+position within the window range, previous four-day return, last-day return,
+five rolling 24h block returns, and last-day USDT quote volume divided by the
+previous four days' daily average. Missing/invalid quote volume produces null,
+never an estimated volume or an acceptance failure. These rolling blocks are
+not exchange calendar days. Trend labels describe price history, not predictions.
+
+`weak_green_and_falling_rsi` marks green-candle volume share <0.20 AND RSI
+one-hour change <0, using the existing score metrics. The separate experimental
+selling-pressure index is 100 * (1-green_share) * clip(-RSI_delta/10, 0, 1).
+The scaling is a research hypothesis, not fitted or validated and not a loss
+probability. It does not alter the existing strength score or filter signals.
+Green-candle volume is not a direct measure of aggressive buyer order flow.
+
+Telegram candidate messages include context, volume ratio and pressure. Candidate
+decision logs and signals_and_outcomes preserve the diagnostics. Report schema 5
+adds daily and rolling flagged/not_flagged/unknown outcome cohorts. Records with
+no v1 context remain unknown; historical results are not relabeled. Cohorts show
+all statuses and fraction of entries reaching TP so far, not a closed-only win
+rate. This is descriptive tracking, not a full equity/SL backtest.
+
+Validation: all 81 offline Crash Bounce tests passed. Replaying all 124 candidates
+from crash_data_1792618617.zip preserved every original assessment field and
+strength score. The entered subset reproduced 6 TP / 4 OPEN flagged and 18 TP /
+2 OPEN not flagged. This same-sample result is not prospective evidence. Existing
+stale EPIC observations are not repaired by this change.
