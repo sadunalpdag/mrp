@@ -1,3 +1,14 @@
+# Reliability and tracking update — 27 October 2026
+
+- Entry remains 4h reference low +0.3%, tick-rounded, with the existing upward-cross/dip-protection rule. The proposed lower entry was withdrawn by the user.
+- New candidates, metadata and historical downloads accept only ASCII USDT symbols (A–Z, 0–9, underscore; max 40 characters). Unsupported persisted history jobs are removed once; old records are preserved. Already-open positions retain live trade monitoring.
+- An independent watchdog checks every 5 seconds. A socket without an accepted fresh ticker for over 120 seconds is closed; the existing reconnect loop restores subscriptions with 5–60 second exponential backoff plus jitter. Stale prices are cleared. Logs show connection attempts, retry delay, ticker age and errors. This does not replace missing observations or guarantee uninterrupted connectivity.
+- Active entry waits now allow 150 hours from candidate creation; OPEN records allow another 150 hours from actual virtual entry. Both timer and WS event paths use the same horizon. Previously terminal TIMEOUT/NO_ENTRY_OBSERVED records remain terminal.
+- ZIP records/observation files cover 14 days to include the combined 300-hour window. Rolling headline statistics still describe the last 7 days; existing separate risk-scenario experiments retain their 5-day horizon.
+- No real orders or credentials are used by these changes. Runtime deployment must be checked on Render after the push.
+
+---
+
 # Current deployment configuration — 17 October 2026
 
 **Only Crash Bounce V2** is started by `ema.py`'s `main()`.
@@ -73,7 +84,7 @@ python -m unittest discover -p 'test_crash*.py' -v
 - Every 180s the fresh WebSocket ticker cache also updates all pending/open crash signals, including coins outside the current top 20. This adds no Binance request.
 - Existing records retain sampled_limit_touch_v1. New records use sampled_upward_cross_v2: a later observed price crosses upward from below planned entry to at/above entry. This is a hypothetical fill at entry; gaps, slippage and actual execution are unknown. A new low below the reference before entry invalidates that candidate. Neither model verifies a 15m reversal candle.
 - A later sample >= planned TP labels TP. The entry snapshot cannot also label TP.
-- Entry wait expires after 72h: NO_ENTRY_OBSERVED. Once entered, another 72h is allowed for TP: otherwise TIMEOUT.
+- Entry wait expires after 150h: NO_ENTRY_OBSERVED. Once entered, another 150h is allowed for TP: otherwise TIMEOUT.
 - Track observed TP hours, sampled favorable/adverse excursion, last observed return and gaps >540 seconds. TP rate denominator is TP + TIMEOUT; OPEN/WAIT_ENTRY/no-entry/legacy records are separately shown.
 - Prices between samples are unknown; TIMEOUT means no sampled TP, not proof TP never occurred. Fees, funding, slippage and leverage are unmodeled.
 - Pre-existing records are LEGACY_UNKNOWN. Historical results are not fabricated.
@@ -81,7 +92,7 @@ python -m unittest discover -p 'test_crash*.py' -v
 - UTC daily append-only JSONL stores top-20 selection, threshold/cooldown decisions, BTC/ETH context, new signals, price samples and results. Research price samples continue up to 6 days after each signal, including after TP, for alternative TP/SL comparisons.
 - State retains 180 days of signals; JSONL observations and daily ZIP exports are retained without automatic deletion in DATA_DIR/crash_research. Ensure DATA_DIR is persistent and has capacity.
 - Telegram report is scheduled 24h after first startup of this version, then 24h after each acknowledged report delivery. It runs during Binance cooldown too, while the process is alive.
-- Each ZIP contains report.json, signals_and_outcomes.json, up to 8 UTC observation files covering the last 7 days, and README.txt with model/units/limitations. Caption shows new daily signals and rolling 7d outcome statistics.
+- Each ZIP contains report.json, signals_and_outcomes.json, up to 15 UTC observation files covering the last 14 days, and README.txt with model/units/limitations. Caption shows new daily signals and rolling 7d outcome statistics.
 - Pending export and schedule are durable. Failed Telegram upload retries the SAME export at most every 30min. A lost acknowledgement can cause a duplicate delivery.
 - Exports over 49 MiB are retained locally and logged, not sent; export failure cannot disable market scanning.
 - AI analysis should compare candidate rules on chronological holdout data, distinguish resolved from censored/open signals, account for observation gaps and execution costs, and never use future outcomes as entry features. This code collects data; it does not automatically find or deploy an optimized algorithm.
@@ -100,7 +111,7 @@ python -m unittest discover -p 'test_crash*.py' -v
 
 ## Lower-entry revisions
 - First qualification still requires a top-20 USDT-M coin with rolling 24h loss >=12%.
-- After an alert, observe that coin for 72 hours from its latest candidate, including outside the top 20, above the threshold, and after a TP. A new qualifying lower candidate starts another 72h window.
+- After an alert, observe that coin for 150 hours from its latest candidate, including outside the top 20, above the threshold, and after a TP. A new qualifying lower candidate starts another 150h window.
 - Entry remains last four hours' closed 15m low, including the current observed lower price, plus 0.3%, rounded up to tick. TP is entry +1% gross, rounded up.
 - Send a revised candidate only when its rounded entry <= preceding recorded entry *0.98. The previous reference is durable; midnight does not reset the price floor. No new message for smaller changes.
 - Messages number each coin's candidates per Europe/Paris calendar day (#1, #2, ...). Pending retries retain their number and level; new candidates cannot overwrite an unacknowledged delivery.
@@ -121,3 +132,4 @@ python -m unittest discover -p 'test_crash*.py' -v
 - Reports retain original candidate outcomes and add confirmed_7d_cohort, confirmation_states, nested confirmation records, and confirmation events/results in JSONL. Telegram caption includes confirmation count and post-confirmation TP/open counts.
 - This rule verifies a particular sampled reversal pattern; it does not guarantee price continuation, fills or profitability. In-progress lows and intraperiod breaks can be missed; 3-minute sampling can delay or miss confirmation. Fees, slippage, funding and leverage remain unmodeled.
 - 44 offline tests cover candle close timing, upward high crossing, low invalidation, supersession, duplicate suppression, restart/retry, disk failure and independent confirmation outcomes alongside the earlier transport tests. No live messages or orders are sent by tests.
+

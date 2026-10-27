@@ -2,12 +2,13 @@
 import json
 import math
 import os
-import re
 import threading
 import time
 
 STEP = 900000
 COUNT = 480
+
+from crash_policy import supported_symbol
 
 class HistoryCollector:
     def __init__(self, directory, fetch, emit, blocked, log):
@@ -19,6 +20,13 @@ class HistoryCollector:
         os.makedirs(directory, exist_ok=True)
         self.path = os.path.join(directory, 'pending.json')
         self.jobs = self._read(self.path, {})
+        discarded = [key for key,job in self.jobs.items()
+                     if not isinstance(job, dict) or not supported_symbol(job.get('symbol'))]
+        for key in discarded:
+            self.jobs.pop(key)
+        if discarded:
+            self._write(self.path, self.jobs)
+            self.log(f'[CRASH HISTORY SKIP] removed {len(discarded)} unsupported persisted jobs')
 
     def _read(self, path, default):
         if not os.path.exists(path):
@@ -35,7 +43,7 @@ class HistoryCollector:
 
     def submit(self, record, phase, at):
         symbol = record['symbol']
-        if not re.fullmatch(r'[A-Z0-9_]{1,40}', symbol):
+        if not supported_symbol(symbol):
             raise ValueError(f'Invalid research symbol: {symbol!r}; expected ASCII A-Z, 0-9, underscore, 1-40 characters')
         if phase not in ('signal', 'entry'):
             raise ValueError(f'Invalid history phase: {phase!r}')
@@ -75,6 +83,8 @@ class HistoryCollector:
         return result
 
     def collect(self, job):
+        if not supported_symbol(job.get('symbol')):
+            raise ValueError('Unsupported history symbol')
         # End at the last fully closed candle at the ORIGINAL event time.
         end = int(job['as_of'] * 1000) // STEP * STEP
         start = end - COUNT * STEP
@@ -133,4 +143,5 @@ class HistoryCollector:
             except Exception as error:
                 self.log(f'[CRASH HISTORY ERR] {type(error).__name__}: {str(error)[:200]}')
             time.sleep(15)
+
 

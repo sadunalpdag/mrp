@@ -86,16 +86,43 @@ class TrackingTests(unittest.TestCase):
     def test_no_signal_time_or_above_entry_fill(self):
         self.sample(0,.9); self.sample(180,1.02)
         self.assertEqual(self.r['tracking_status'],'WAIT_ENTRY')
-        self.sample(72*3600+1,.8)
+        self.sample(150*3600+1,.8)
         self.assertEqual(self.r['tracking_status'],'NO_ENTRY_OBSERVED')
         self.assertIsNone(self.g['_crash_summary']([self.r])['observed_tp_rate_resolved_pct'])
 
     def test_timeout_is_not_retroactive_tp_after_deadline(self):
         self.sample(180,.99)
-        self.sample(180+72*3600+1,1.05)
+        self.sample(180+150*3600+1,1.05)
         self.assertEqual(self.r['tracking_status'],'TIMEOUT')
         self.assertGreater(self.r['coverage_gaps'],0)
         self.assertEqual(self.r['observed_exit_price'],.99)
+
+    def test_active_record_keeps_tracking_after_72_hours(self):
+        self.sample(180,.99)
+        self.sample(180+100*3600,1.02)
+        self.assertEqual(self.r['tracking_status'],'TP')
+
+    def test_unsupported_wait_is_filtered_but_existing_open_is_preserved(self):
+        self.r['symbol']='牛来USDT'
+        self.g['_crash_track_results'](self.state,[],self.now+1)
+        self.assertEqual(self.r['tracking_status'],'V2_FILTERED')
+        self.r.update(tracking_status='OPEN',entered_at=self.now)
+        self.g['_crash_track_results'](self.state,[],self.now+2)
+        self.assertEqual(self.r['tracking_status'],'OPEN')
+
+    def test_export_retains_long_running_records_outside_rolling_cohort(self):
+        old=dict(symbol='BUSDT',created_at=self.now-12*86400,entry='1',tp='1.01',
+                 tracking_status='OPEN',entered_at=self.now-6*86400)
+        self.state['history'].append(old)
+        self.state['report']={'last_success_at':self.now-86400,'next_due_at':self.now}
+        self.g['_crash_send_report_file'].return_value=False
+        self.g['_crash_daily_report'](self.state,self.now)
+        with zipfile.ZipFile(self.state['report']['pending']['path']) as z:
+            records=json.loads(z.read('signals_and_outcomes.json'))
+            report=json.loads(z.read('report.json'))
+        self.assertTrue(any(x['symbol']=='BUSDT' for x in records))
+        self.assertEqual(report['legacy_7d_cohort']['signals'],1)
+        self.assertEqual(report['tracking_hours'],150)
 
     def test_stale_missing_prices_and_gap_markers(self):
         self.g['_crash_track_results'](self.state,[{'symbol':'AUSDT','lastPrice':'.99',
@@ -191,3 +218,4 @@ class TrackingTests(unittest.TestCase):
 
 
 if __name__=='__main__': unittest.main()
+

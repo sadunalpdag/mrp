@@ -6501,8 +6501,10 @@ def _crash_telegram_receipt(message):
 
 def _crash_send_pending(state, now):
     """Send qualified candidates immediately, before any simulated entry."""
+    from crash_policy import supported_symbol
     for record in state["history"]:
-        if (record.get("v2_delivery_phase") != "CANDIDATE" or
+        if (not supported_symbol(record.get("symbol")) or
+                record.get("v2_delivery_phase") != "CANDIDATE" or
                 record.get("v2_status") != "STRONG_V2" or record.get("v2_sent")):
             continue
         if record.get("v2_delivery_status") in ("EXPIRED_NOT_SENT", "UNKNOWN_DELIVERY"):
@@ -6622,9 +6624,14 @@ def _crash_v2_assess_candidate(record, now, allow_rest=False):
 
 
 def _crash_review_candidate(state, record, now, allow_rest=False):
+    from crash_policy import supported_symbol
     if record.get("v2_status") != "PENDING_5D_HISTORY":
         return
-    if now-record["created_at"] > CRASH_V2_SIGNAL_TTL_SECONDS:
+    if not supported_symbol(record.get("symbol")):
+        record.update(v2_status="FILTERED_V2", v2_delivery_status="FILTERED_NOT_SENT",
+                      v2_reason="NON_ASCII_OR_INVALID_SYMBOL", tracking_status="V2_FILTERED",
+                      finished_at=now)
+    elif now-record["created_at"] > CRASH_V2_SIGNAL_TTL_SECONDS:
         record.update(v2_status="MISSING_5D_HISTORY",v2_delivery_status="EXPIRED_NOT_SENT",
                       v2_reason="HISTORY_NOT_READY_IN_TIME",tracking_status="V2_FILTERED",
                       finished_at=now)
@@ -6795,6 +6802,12 @@ def _crash_risk_observe(kind, record):
 def _crash_queue_history(record, phase, now):
     """Queue public research data; never block a signal on a REST download."""
     global _CRASH_HISTORY_COLLECTOR
+    from crash_policy import supported_symbol
+    if not supported_symbol(record.get('symbol')):
+        if not record.get('history_excluded'):
+            log(f"[CRASH HISTORY SKIP] symbol={record.get('symbol')!r} reason=NON_ASCII_OR_INVALID_SYMBOL")
+        record['history_excluded'] = 'NON_ASCII_OR_INVALID_SYMBOL'
+        return
     identity = (str(record.get('signal_id')), str(phase))
     wall = time.time()
     if wall < _CRASH_HISTORY_ERRORS.get(identity, 0):
@@ -6846,6 +6859,7 @@ def _crash_initialize_tracking(record):
 
 
 def _crash_track_results(state, tickers, now):
+    from crash_policy import TRACKING_SECONDS, supported_symbol
     prices = {}
     for ticker in tickers:
         try:
@@ -6859,15 +6873,21 @@ def _crash_track_results(state, tickers, now):
     for record in state["history"]:
         _crash_initialize_tracking(record)
         status = record["tracking_status"]
+        if status == "WAIT_ENTRY" and not supported_symbol(record.get("symbol")):
+            record.update(tracking_status="V2_FILTERED", v2_status="FILTERED_V2",
+                          v2_reason="NON_ASCII_OR_INVALID_SYMBOL", finished_at=now)
+            _crash_append_data({"type":"symbol_excluded", "observed_at":now,
+                                "record":record}, now)
+            continue
         if status not in ("WAIT_ENTRY", "OPEN"):
             # Continue research trajectories after TP, for alternate TP/SL tests.
             price = prices.get(record["symbol"])
-            if status != "LEGACY_UNKNOWN" and price is not None and now-record["created_at"] <= 6*86400:
+            if status != "LEGACY_UNKNOWN" and price is not None and now-record["created_at"] <= 14*86400:
                 active_samples.append({"signal_id":record["signal_id"], "symbol":record["symbol"],
                                        "price":price, "status":status, "after_result":True})
             continue
         since = record.get("entered_at", record["created_at"])
-        deadline = since + 72 * 3600
+        deadline = since + TRACKING_SECONDS
         if now > deadline:
             record["tracking_status"] = "NO_ENTRY_OBSERVED" if status == "WAIT_ENTRY" else "TIMEOUT"
             record["finished_at"] = deadline
@@ -6985,8 +7005,9 @@ def _crash_daily_report(state, now):
     if pending is None:
         since = report["last_success_at"]
         # Include previous entries whose labels may have matured today.
-        records = [r for r in state["history"] if now-r["created_at"] <= 7*86400]
-        filtered = [r for r in records if r.get("signal_filter_version") == CRASH_BOUNCE_FILTER_VERSION]
+        records = [r for r in state["history"] if now-r["created_at"] <= 14*86400]
+        recent = [r for r in records if now-r["created_at"] <= 7*86400]
+        filtered = [r for r in recent if r.get("signal_filter_version") == CRASH_BOUNCE_FILTER_VERSION]
         daily = [r for r in filtered if r["created_at"] >= since]
         summary = _crash_summary(daily)
         rolling = _crash_summary(filtered)
@@ -7015,7 +7036,7 @@ def _crash_daily_report(state, now):
                  "Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
                  "giriş öncesi dip kırılırsa INVALIDATED_BEFORE_ENTRY. Eski sampled_limit_touch_v1 kayıtları "
                  "değiştirilmez: fiyat <= giriş sanal giriş sayılır. Modelleri ayrı karşılaştırın. "
-                 "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme ve giriş sonrası takip 72h. "
+                 "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme ve giriş sonrası takip ayrı ayrı 150h. ZIP son 14 günü içerir; özet son 7 gündür. Eski TIMEOUT sonuçları yeniden açılmaz. "
                  "Gerçek emir, komisyon, kayma, funding ve kaldıraç modellenmez. "
                  "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
                  "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
@@ -7024,21 +7045,22 @@ def _crash_daily_report(state, now):
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("report.json", json.dumps({"schema_version":5,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
+                "tracking_hours":150, "export_days":14,
                 "rolling_7d_cohort":rolling,
                 "five_day_context_daily":summarize_context(daily),
                 "five_day_context_rolling":summarize_context(filtered),
                 "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,
                 "strength_score_version":"continuous_7factor_v1",
                 "strength_score_blocks_delivery":False,
-                "legacy_7d_cohort":_crash_summary([r for r in records
+                "legacy_7d_cohort":_crash_summary([r for r in recent
                     if r.get("signal_filter_version") != CRASH_BOUNCE_FILTER_VERSION]),
-                "rolling_7d_by_model":{model:_crash_summary([r for r in records
+                "rolling_7d_by_model":{model:_crash_summary([r for r in recent
                     if r.get("tracking_model", "legacy_unknown")==model])
-                    for model in sorted({r.get("tracking_model", "legacy_unknown") for r in records})},
+                    for model in sorted({r.get("tracking_model", "legacy_unknown") for r in recent})},
                 "notes":notes}, ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
-            # Last 7 UTC days covers up to 72h entry wait + 72h outcome window.
-            for offset in range(8):
+            # Cover 150h entry wait plus 150h after entry (12.5 days).
+            for offset in range(15):
                 day = datetime.fromtimestamp(now-offset*86400, tz=timezone.utc).strftime("%Y-%m-%d")
                 source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
                 if os.path.exists(source):
@@ -7063,7 +7085,7 @@ def _crash_daily_report(state, now):
                    "V2 güç puanı 0-100: 7 faktör oransal, sinyali engellemez.\n"
                    f"Puanlı aday {rolling['scored_candidates']} | Ort. güç {mean_score_text}/100 "
                    f"| ≥75 puan {rolling['score_ge75']}\n"
-                   f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | 72h timeout {rolling['TIMEOUT']}\n"
+                   f"Son 7 gün: giriş {rolling['entered']} | TP {rolling['TP']} | zaman aşımı {rolling['TIMEOUT']}\n"
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
                    f"V2 Telegram kabul edilen: {rolling['sent_candidates']} | giriş/TP atlaması: {rolling['missed_entry_above_tp']}\n"
@@ -7089,6 +7111,8 @@ def _crash_daily_report(state, now):
 class CrashBounceWebSocketCache:
     """One routed futures socket; delta ticker cache + closed 15m candles."""
     URL = "wss://fstream.binance.com/market/stream?streams=!ticker@arr"
+    STALE_SECONDS = 120
+    WATCHDOG_SECONDS = 5
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -7103,6 +7127,10 @@ class CrashBounceWebSocketCache:
         self.thread = None
         self.dirty = False
         self.last_warning = 0.
+        self.last_ticker_at = 0.
+        self.watchdog_thread = None
+        self.reconnects = 0
+        self.reconnect_requested = False
 
     def load(self):
         if not os.path.exists(CRASH_BOUNCE_CANDLES_FILE):
@@ -7158,6 +7186,9 @@ class CrashBounceWebSocketCache:
             raise
 
     def on_message(self, ws, message):
+        from crash_policy import supported_symbol
+        if ws is not None and ws is not self.ws:
+            return
         try:
             payload = json.loads(message)
             data = payload.get("data", payload) if isinstance(payload, dict) else payload
@@ -7165,7 +7196,7 @@ class CrashBounceWebSocketCache:
                 for item in data:
                     try:
                         symbol = item["s"]
-                        if int(item.get("st",1)) != 1 or not symbol.endswith("USDT"):
+                        if int(item.get("st",1)) != 1 or not supported_symbol(symbol):
                             continue
                         price, change = float(item["c"]), float(item["P"])
                         event_time = int(item["E"])/1000
@@ -7183,6 +7214,7 @@ class CrashBounceWebSocketCache:
                             if old is None or event_time >= old["event_time"]:
                                 self.tickers[symbol] = {"ticker":ticker, "event_time":event_time,
                                                         "received_at":time.time()}
+                                self.last_ticker_at = time.time()
                     except (KeyError,ValueError,TypeError,AttributeError):
                         continue
             elif isinstance(data, dict) and data.get("e") == "aggTrade":
@@ -7197,7 +7229,7 @@ class CrashBounceWebSocketCache:
                 if k.get("i") != "15m" or k.get("x") is not True:
                     return
                 symbol = data["s"]
-                if int(data.get("st",1))!=1 or not symbol.endswith("USDT"):
+                if int(data.get("st",1))!=1 or not supported_symbol(symbol):
                     return
                 row = [k["t"],k["o"],k["h"],k["l"],k["c"],k["v"],k["T"],
                        k.get("q","0"),k.get("n",0),k.get("V","0"),k.get("Q","0"),"0"]
@@ -7232,7 +7264,8 @@ class CrashBounceWebSocketCache:
                 ws.close()
 
     def reconcile(self, symbols, trade_symbols=None):
-        wanted = set(symbols)
+        from crash_policy import supported_symbol
+        wanted = {s for s in symbols if supported_symbol(s)}
         trades = set(trade_symbols or ())
         if len(wanted)>100 or len(trades)>100:
             raise ValueError("Too many crash websocket subscriptions")
@@ -7249,6 +7282,8 @@ class CrashBounceWebSocketCache:
             self.connected=True
             self.ws=ws
             self.opened_at=time.time()
+            self.last_ticker_at=0.
+            self.reconnect_requested=False
             self.tickers={}  # Never carry pre-disconnect prices into a new session.
             wanted=set(self.wanted)
             trade_wanted=set(self.trade_wanted)
@@ -7258,6 +7293,8 @@ class CrashBounceWebSocketCache:
 
     def on_close(self, ws, code, message):
         with self.lock:
+            if ws is not self.ws:
+                return
             self.connected=False
             self.tickers={}
         log(f"[CRASH WS CLOSED] code={code} reason={str(message)[:160]}; reconnecting with backoff")
@@ -7265,28 +7302,67 @@ class CrashBounceWebSocketCache:
     def on_error(self, ws, error):
         log(f"[CRASH WS ERR] {type(error).__name__}: {str(error)[:200]}")
 
+    def health(self, now=None):
+        now = time.time() if now is None else now
+        with self.lock:
+            age = max(0., now-(self.last_ticker_at or self.opened_at)) if self.opened_at else None
+            return {"connected":self.connected, "ticker_age_seconds":age,
+                    "ticker_count":len(self.tickers), "reconnects":self.reconnects}
+
+    def watchdog_step(self):
+        now = time.time()
+        with self.lock:
+            age = now-(self.last_ticker_at or self.opened_at)
+            if not self.connected or self.reconnect_requested or age <= self.STALE_SECONDS:
+                return
+            ws = self.ws
+            self.reconnect_requested = True
+            self.connected = False
+            self.tickers = {}
+        log(f"[CRASH WS STALE] no fresh ticker for {age:.1f}s; closing socket to reconnect")
+        if ws is not None:
+            try:
+                ws.close(timeout=5)
+            except Exception as error:
+                log(f"[CRASH WS CLOSE ERR] {type(error).__name__}: {str(error)[:160]}")
+
+    def _watchdog(self):
+        while True:
+            try:
+                self.watchdog_step()
+            except Exception as error:
+                log(f"[CRASH WS WATCHDOG ERR] {type(error).__name__}: {str(error)[:160]}")
+            time.sleep(self.WATCHDOG_SECONDS)
+
     def _run(self):
         import random
         delay=5
         while True:
             started=time.time()
             try:
+                self.reconnects += 1
+                log(f"[CRASH WS CONNECT] attempt={self.reconnects}")
                 self.ws = _websocket_lib.WebSocketApp(self.URL, on_open=self.on_open,
                     on_message=self.on_message, on_close=self.on_close, on_error=self.on_error)
                 # websocket-client automatically replies to server PING frames.
                 self.ws.run_forever(ping_interval=60, ping_timeout=20)
             except Exception as error:
-                log(f"[CRASH WS CONNECT ERR] {type(error).__name__}")
+                log(f"[CRASH WS CONNECT ERR] {type(error).__name__}: {str(error)[:200]}")
             finally:
                 with self.lock:
                     self.connected=False
                     self.tickers={}
             if time.time()-started>300:
                 delay=5
-            time.sleep(min(60,delay)+random.uniform(0,3))
+            wait = min(60,delay)+random.uniform(0,3)
+            log(f"[CRASH WS RETRY] in {wait:.1f}s attempt={self.reconnects}")
+            time.sleep(wait)
             delay=min(60,delay*2)
 
     def start(self):
+        if not self.watchdog_thread or not self.watchdog_thread.is_alive():
+            self.watchdog_thread=threading.Thread(target=self._watchdog, name="crash-ws-watchdog", daemon=True)
+            self.watchdog_thread.start()
         if self.thread and self.thread.is_alive():
             return
         self.load()
@@ -7402,6 +7478,7 @@ def _crash_get_candles(symbol):
 
 
 def _crash_load_market_cache():
+    from crash_policy import supported_symbol
     if not os.path.exists(CRASH_BOUNCE_MARKET_FILE):
         return {},0
     try:
@@ -7410,6 +7487,7 @@ def _crash_load_market_cache():
         market=saved["market"]; at=float(saved["updated_at"])
         if not isinstance(market,dict) or time.time()-at>7*86400:
             return {},0
+        market = {s:t for s,t in market.items() if supported_symbol(s)}
         for symbol,tick in market.items():
             if not symbol.endswith("USDT") or not Decimal(str(tick)).is_finite() or Decimal(str(tick))<=0:
                 raise ValueError("Invalid market cache")
@@ -7421,6 +7499,7 @@ def _crash_load_market_cache():
 
 
 def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
+    from crash_policy import supported_symbol, TRACKING_SECONDS
     now = time.time() if now is None else now
     tickers = _CRASH_WS_CACHE.snapshot(now) if tickers is None else tickers
     candles_get = _crash_get_candles if candles_get is None else candles_get
@@ -7431,13 +7510,14 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     _crash_review_pending_v2(state, now)
     _crash_send_pending(state, now)
     if not tickers:
-        log("[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data")
+        log(f"[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data; {_CRASH_WS_CACHE.health(now)}")
         return
     # Rank the trading futures universe before applying threshold/cooldown.
     # Do not replace a cooldown coin with the 21st loser.
     ranked = []
     for ticker in tickers:
-        if not isinstance(ticker, dict) or ticker.get("symbol") not in market:
+        if (not isinstance(ticker, dict) or ticker.get("symbol") not in market
+                or not supported_symbol(ticker.get("symbol"))):
             continue
         try:
             change = float(ticker["priceChangePercent"])
@@ -7447,10 +7527,11 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             ranked.append((change, ticker["symbol"], ticker))
     ranked.sort(key=lambda item: (item[0], item[1]))
     top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
-    # Keep previously alerted coins under observation for 72h, including after TP
+    # Keep previously alerted coins under observation for 150h, including after TP
     # and after they leave the top 20 / recover above the -12% threshold.
     watching = {sym for sym, rec in state["symbols"].items()
-                if now - rec.get("created_at", 0) < 72*3600 and sym in market}
+                if now - rec.get("created_at", 0) < TRACKING_SECONDS and sym in market
+                and supported_symbol(sym)}
     selected = list(top)
     selected_symbols = {sym for _, sym, _ in top}
     selected.extend((change, sym, ticker) for change, sym, ticker in ranked
@@ -7462,7 +7543,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
                               trade_watching)
     _crash_append_data({"type":"scan", "observed_at":now,
-        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":72,"tracking_model":"ws_aggtrade_upcross_v3",
+        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":150,"tracking_model":"ws_aggtrade_upcross_v3",
                          "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480,
                          "strength_score_version":"continuous_7factor_v1",
                          "strength_score_blocks_signals":False},
@@ -7552,6 +7633,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
 
 def _crash_bounce_worker():
     global _CRASH_ACTIVE_STATE, _CRASH_RISK_RESEARCH
+    from crash_policy import supported_symbol
     try:
         from crash_risk_research import RiskResearch
         import websocket
@@ -7586,7 +7668,7 @@ def _crash_bounce_worker():
             for historical in state['history']:
                 if historical.get('v2_status') == 'STRONG_V2' and historical.get('tracking_status') == 'WAIT_ENTRY':
                     _crash_risk_observe('watch', historical)
-                if now - historical['created_at'] <= 7*86400:
+                if now - historical['created_at'] <= 14*86400:
                     _crash_queue_history(historical, 'signal', historical['created_at'])
                     if historical.get('entered_at'):
                         _crash_queue_history(historical, 'entry', historical['entered_at'])
@@ -7599,7 +7681,8 @@ def _crash_bounce_worker():
                             s["symbol"]: next(f["tickSize"] for f in s["filters"]
                                               if f["filterType"] == "PRICE_FILTER")
                             for s in info["symbols"]
-                            if s.get("quoteAsset") == "USDT"
+                            if supported_symbol(s.get("symbol"))
+                            and s.get("quoteAsset") == "USDT"
                             and s.get("contractType") == "PERPETUAL"
                             and s.get("status") == "TRADING"
                         }
@@ -14637,6 +14720,7 @@ if __name__=="__main__":
 
 
     
+
 
 
 

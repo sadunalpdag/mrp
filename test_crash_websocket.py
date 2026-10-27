@@ -127,3 +127,60 @@ class WebSocketTests(unittest.TestCase):
 
 
 if __name__=='__main__': unittest.main()
+
+
+class RecoveryTests(unittest.TestCase):
+    setUp = WebSocketTests.setUp
+    event = WebSocketTests.event
+
+    def test_silent_socket_closes_once_and_discards_prices(self):
+        ws=Mock(); self.cache.on_open(ws)
+        self.cache.on_message(ws,json.dumps([self.event()]))
+        self.now+=121
+        self.cache.watchdog_step()
+        ws.close.assert_called_once_with(timeout=5)
+        self.assertFalse(self.cache.connected)
+        self.assertEqual(self.cache.snapshot(self.now),[])
+        self.cache.watchdog_step()
+        ws.close.assert_called_once()
+
+    def test_fresh_ticker_prevents_reconnect_but_stale_payload_does_not(self):
+        ws=Mock(); self.cache.on_open(ws)
+        self.now+=119
+        self.cache.on_message(ws,json.dumps([self.event()]))
+        self.cache.watchdog_step(); ws.close.assert_not_called()
+        self.now+=121
+        self.cache.on_message(ws,json.dumps([self.event(offset=-200)]))
+        self.cache.watchdog_step(); ws.close.assert_called_once()
+
+    def test_new_session_restores_trades_and_ignores_old_callbacks(self):
+        old=Mock(); new=Mock()
+        self.cache.reconcile({'AUSDT'},{'AUSDT'})
+        self.cache.on_open(old);self.cache.on_close(old,1006,'lost')
+        self.cache.on_open(new)
+        self.cache.on_close(old,1006,'late close')
+        self.cache.on_message(old,json.dumps([self.event()]))
+        self.assertTrue(self.cache.connected)
+        self.assertEqual(self.cache.tickers,{})
+        self.assertEqual({p for c in new.send.call_args_list
+            for p in json.loads(c.args[0])['params']},{'ausdt@kline_15m','ausdt@aggTrade'})
+        self.cache.on_message(new,json.dumps([self.event()]))
+        self.now+=20
+        self.assertEqual(len(self.cache.snapshot(self.now)),1)
+
+    def test_run_retries_closed_socket_with_backoff(self):
+        app=Mock()
+        self.g['_websocket_lib']=SimpleNamespace(WebSocketApp=Mock(return_value=app))
+        self.g['time'].sleep=Mock(side_effect=[None,StopIteration])
+        with self.assertRaises(StopIteration):self.cache._run()
+        self.assertEqual(app.run_forever.call_count,2)
+        waits=[c.args[0] for c in self.g['time'].sleep.call_args_list]
+        self.assertTrue(5<=waits[0]<=8)
+        self.assertTrue(10<=waits[1]<=13)
+
+    def test_unicode_not_cached_or_subscribed_as_new_candidate(self):
+        self.cache.on_message(None,json.dumps([self.event('牛来USDT'),self.event()]))
+        self.assertEqual(set(self.cache.tickers),{'AUSDT'})
+        ws=Mock();self.cache.on_open(ws)
+        self.cache.reconcile({'牛来USDT','AUSDT'})
+        self.assertEqual(self.cache.wanted,{'AUSDT'})
