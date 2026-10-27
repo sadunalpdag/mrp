@@ -133,3 +133,61 @@ python -m unittest discover -p 'test_crash*.py' -v
 - This rule verifies a particular sampled reversal pattern; it does not guarantee price continuation, fills or profitability. In-progress lows and intraperiod breaks can be missed; 3-minute sampling can delay or miss confirmation. Fees, slippage, funding and leverage remain unmodeled.
 - 44 offline tests cover candle close timing, upward high crossing, low invalidation, supersession, duplicate suppression, restart/retry, disk failure and independent confirmation outcomes alongside the earlier transport tests. No live messages or orders are sent by tests.
 
+
+## Two-hour health messages and optional night execution
+
+Telegram health messages run independently of the scan thread, first after about
+three minutes on a new installation, then every two hours after an acknowledged
+send. The saved schedule survives restarts. Failed sends retry after five minutes;
+ambiguous Telegram timeouts wait two hours to avoid flooding. Reports distinguish
+fresh WebSocket data, completed scans, missing candles, scan failures and the last
+acknowledged signal delivery. A healthy scan without eligible candidates is normal.
+A frozen scan or stale stream is never reported as healthy. Render also receives
+`[CRASH SCAN COMPLETE]` counters and `[CRASH HEARTBEAT]` delivery results.
+A stopped Render process cannot send a heartbeat.
+
+The live executor is **disabled by default** (`CRASH_NIGHT_TRADING=off`). Deployment
+alone does not enable trading. The account owner must enable it themselves, using
+`CRASH_NIGHT_TRADING=live`, existing `BINANCE_API_KEY` / `BINANCE_SECRET_KEY`, and
+`CRASH_NIGHT_STATE_DIR` pointing to an **absolute directory on the persistent Render
+disk**. An ephemeral directory is unsuitable. Use one service instance; the file
+lock protects only processes sharing that disk. Never delete state to clear limits
+or errors. Startup failures leave trading off and appear in health reports.
+
+Execution behavior:
+
+- Paris local hours **20:00 inclusive to 08:00 exclusive**, including DST changes.
+- Existing Crash Bounce V2 rules remain unchanged. Only a new upward crossing, at
+  most five seconds old, from an acknowledged Telegram candidate can trigger entry.
+  No historical catch-up or candidate-message buys.
+- **10x**, at most **50 USDT notional** after rounding (approximately **5 USDT initial
+  margin**, excluding fees). Margin mode is unchanged. Exchange filters may prevent
+  small orders; quantities are never increased to satisfy minimums.
+- At most **10 reserved entry attempts per Paris calendar day**. No-fill, rejected
+  or uncertain attempts consume a slot conservatively. The quota resets at midnight,
+  not at the start of the overnight window.
+- At most **five occupied symbols**, including account positions and pending orders.
+  Existing positions/orders on the target symbol prevent entry. Concurrent manual
+  activity or another bot can change the account after the check; use a dedicated
+  account/subaccount for this executor.
+- One-way position mode is required; hedge mode is rejected without changing it.
+- TP and price/quantity/minimum-notional filters are checked **before** entry.
+  BUY LIMIT IOC at the candidate price avoids chasing higher. It may not fill;
+  unfilled remainder does not stay open.
+- After a fill, SELL LIMIT GTC `reduceOnly` is submitted for the **filled quantity**,
+  then queried to confirm its properties and status. Entry and TP are separate
+  requests: atomic TP protection and TP execution are not guaranteed. No SL is added.
+- TP failure/cancellation or uncertain entry results **halt additional entries**
+  and queue a Telegram warning. Existing positions are not force-closed. Protection
+  checks continue outside entry hours. Restarting does not clear the halt; account
+  and state require manual review.
+- Durable client IDs/phases are written before POST. Unknown responses and restart
+  recovery query the saved ID rather than blindly resubmitting. A crash between
+  persisting TP intent and submitting it can leave an unprotected position, followed
+  by a halt requiring manual intervention. An alert does not mean it was closed.
+- Unacknowledged execution notifications block additional entries and retry.
+  Timeout retries can duplicate notifications, but do not intentionally repeat an
+  exchange order. Signal-only and health messages continue.
+
+Tests use fake exchange/Telegram adapters without real orders. Live fills, persistent
+storage, account permissions and Telegram delivery require operator verification.

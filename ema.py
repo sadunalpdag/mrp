@@ -6555,7 +6555,16 @@ def _crash_send_pending(state, now):
         record["v2_telegram_attempts"] = record.get("v2_telegram_attempts", 0) + 1
         record["v2_delivery_status"] = "ATTEMPTING"
         _crash_save_state(state)
+        if globals().get('_CRASH_NIGHT') is not None:
+            message = message.replace('Gerçek emir yok.', 'Otomatik işlem dolumu ayrı mesajla bildirilir.')
         receipt = _crash_telegram_receipt(message)
+        monitor = globals().get('_CRASH_HEALTH')
+        if monitor:
+            if receipt.get('ok'):
+                monitor.update(last_signal_at=receipt['accepted_at'],
+                               last_signal_symbol=record['symbol'], delivery_error='yok')
+            else:
+                monitor.update(delivery_error=receipt.get('error', 'UNKNOWN'))
         record["v2_telegram_last_error"] = receipt.get("error")
         record["v2_telegram_response_at"] = time.time()
         if receipt["ok"]:
@@ -7427,6 +7436,9 @@ def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False)
             for record, transition in changed:
                 if transition == 'OPEN':
                     _crash_risk_observe('entry', record)
+                    executor = globals().get('_CRASH_NIGHT')
+                    if executor is not None:
+                        executor.submit(record, observed_at)
                 _crash_append_data({"type":"ws_trade_transition","observed_at":observed_at,
                                     "transition":transition,"record":record},observed_at)
 
@@ -7512,6 +7524,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     if not tickers:
         log(f"[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data; {_CRASH_WS_CACHE.health(now)}")
         return
+    scan_metrics = dict(candles_ok=0, candles_wait=0, candidates=0, scan_errors=0)
     # Rank the trading futures universe before applying threshold/cooldown.
     # Do not replace a cooldown coin with the 21st loser.
     ranked = []
@@ -7568,8 +7581,10 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             klines = candles_get(symbol)
             plan = crash_bounce_plan(klines, ticker["lastPrice"], market[symbol], int(now * 1000))
             if plan is None:
+                scan_metrics["candles_wait"] += 1
                 log(f"[CRASH BOUNCE WAIT] {symbol}: insufficient/fresh data")
                 continue
+            scan_metrics["candles_ok"] += 1
             if previous and Decimal(plan["entry"]) > Decimal(str(previous["entry"])) * Decimal("0.98"):
                 continue
             features = _crash_features(klines, ticker, now)
@@ -7605,6 +7620,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                                 if now - r["created_at"] <= 180 * 86400]
             _crash_save_state(state)
             _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
+            scan_metrics["candidates"] += 1
             log(f"[CRASH BOUNCE] {symbol} entry={plan['entry']} tp={plan['tp']}")
             _crash_queue_history(record, 'signal', now)
             stored = state["history"][-1]
@@ -7619,6 +7635,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             _crash_send_pending(state, time.time())
             _crash_save_state(state)
         except Exception as error:
+            scan_metrics["scan_errors"] += 1
             log(f"[CRASH BOUNCE ERR] {symbol}: {error}")
             if BinanceRateLimiter.is_banned():
                 break
@@ -7629,6 +7646,43 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                       and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
                               trade_watching)
+
+    monitor = globals().get('_CRASH_HEALTH')
+    if monitor:
+        monitor.update(scan_completed_at=time.time(), **scan_metrics)
+    log(f"[CRASH SCAN COMPLETE] {scan_metrics}")
+
+
+def _crash_start_services():
+    """Optional live executor is OFF by default; heartbeat is independent of scans."""
+    global _CRASH_HEALTH, _CRASH_NIGHT
+    from crash_heartbeat import Heartbeat
+    _CRASH_NIGHT = None
+    mode = os.getenv('CRASH_NIGHT_TRADING', 'off').strip().lower()
+    trading_status = 'KAPALI'
+    if mode == 'live':
+        try:
+            from crash_night import BinanceBroker, NightExecutor
+            # Require an explicit persistent directory; daily limits must survive redeploys.
+            directory = os.environ['CRASH_NIGHT_STATE_DIR']
+            if not os.path.isabs(directory):
+                raise ValueError('PERSISTENT_ABSOLUTE_DIRECTORY_REQUIRED')
+            executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
+                                     _crash_telegram_receipt, log)
+            executor.alert('ℹ️ GECE OTOMATİK İŞLEM BAŞLATILDI\n20:00–08:00 Europe/Paris | 10x | yaklaşık 5 USDT teminat / en fazla 50 USDT pozisyon\nGünde en fazla 10 giriş denemesi, en fazla 5 açık sembol. TP doğrulanamazsa yeni girişler durur. SL yok.')
+            _CRASH_NIGHT = executor
+            executor.start()
+        except Exception as error:
+            trading_status = f'BAŞLATILAMADI ({type(error).__name__})'
+            log(f'[CRASH NIGHT START ERR] {type(error).__name__}')
+    elif mode != 'off':
+        trading_status = 'KAPALI: geçersiz CRASH_NIGHT_TRADING değeri'
+    def health():
+        result = dict(_CRASH_WS_CACHE.health(time.time()))
+        result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
+        return result
+    _CRASH_HEALTH = Heartbeat(DATA_DIR, _crash_telegram_receipt, health, log)
+    _CRASH_HEALTH.start()
 
 
 def _crash_bounce_worker():
@@ -14707,7 +14761,8 @@ def main():
         if not math.isfinite(until):
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
-    log("[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; public data and virtual tracking, no orders")
+    _crash_start_services()
+    log(f"[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; night_executor={'enabled' if _CRASH_NIGHT else 'off'}")
     # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()
 
