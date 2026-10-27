@@ -7654,35 +7654,71 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
 
 
 def _crash_start_services():
-    """Optional live executor is OFF by default; heartbeat is independent of scans."""
-    global _CRASH_HEALTH, _CRASH_NIGHT
+    """New entries always start paused; an authenticated owner command can arm them."""
+    global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL
     from crash_heartbeat import Heartbeat
     _CRASH_NIGHT = None
+    _CRASH_CONTROL = None
+    trading_status = 'KAPALI; açmak için /otomatik_ac'
     mode = os.getenv('CRASH_NIGHT_TRADING', 'off').strip().lower()
-    trading_status = 'KAPALI'
-    if mode == 'live':
+
+    def executor_create():
+        global _CRASH_NIGHT
+        if _CRASH_NIGHT is not None:
+            return _CRASH_NIGHT
+        if mode not in ('off', 'live', 'telegram'):
+            raise ValueError('INVALID_CRASH_NIGHT_TRADING')
+        from crash_night import BinanceBroker, NightExecutor
+        directory = os.getenv('CRASH_NIGHT_STATE_DIR', '')
+        if not directory or not os.path.isabs(directory):
+            raise ValueError('CRASH_NIGHT_STATE_DIR_REQUIRED')
+        executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
+                                 _crash_telegram_receipt, log)
+        executor.start()
+        _CRASH_NIGHT = executor
+        return executor
+
+    # Resume existing TP monitoring after restart, but never resume entries automatically.
+    directory = os.getenv('CRASH_NIGHT_STATE_DIR', '')
+    if mode in ('live', 'telegram') or (directory and os.path.exists(
+            os.path.join(directory, 'crash_night_state.json'))):
         try:
-            from crash_night import BinanceBroker, NightExecutor
-            # Require an explicit persistent directory; daily limits must survive redeploys.
-            directory = os.environ['CRASH_NIGHT_STATE_DIR']
-            if not os.path.isabs(directory):
-                raise ValueError('PERSISTENT_ABSOLUTE_DIRECTORY_REQUIRED')
-            executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
-                                     _crash_telegram_receipt, log)
-            executor.alert('ℹ️ GECE OTOMATİK İŞLEM BAŞLATILDI\n20:00–08:00 Europe/Paris | 10x | yaklaşık 5 USDT teminat / en fazla 50 USDT pozisyon\nGünde en fazla 10 giriş denemesi, en fazla 5 açık sembol. TP doğrulanamazsa yeni girişler durur. SL yok.')
-            _CRASH_NIGHT = executor
-            executor.start()
+            executor_create()
         except Exception as error:
-            trading_status = f'BAŞLATILAMADI ({type(error).__name__})'
+            trading_status = f'BAŞLATILAMADI ({type(error).__name__}); Render ayarlarını kontrol edin'
             log(f'[CRASH NIGHT START ERR] {type(error).__name__}')
-    elif mode != 'off':
-        trading_status = 'KAPALI: geçersiz CRASH_NIGHT_TRADING değeri'
+
+    def control_action(action):
+        if action == 'status':
+            return _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
+        if action == 'off' and _CRASH_NIGHT is None:
+            return '⏸️ Otomatik girişler zaten kapalı. Pozisyon kapatma emri gönderilmedi.'
+        try:
+            executor = executor_create()
+        except Exception as error:
+            log(f'[CRASH NIGHT CONFIG ERR] {type(error).__name__}')
+            return ('⚠️ Otomatik işlem açılamadı. Render: BINANCE_API_KEY, BINANCE_SECRET_KEY ve '
+                    'kalıcı diske bağlı CRASH_NIGHT_STATE_DIR ayarlarını kontrol edin. '
+                    'Kayıt dosyası hatalıysa silmeyin; mevcut pozisyonları inceleyin.')
+        return executor.request_control(action)
+
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
+        result['trading'] += ' | Telegram kontrolü: '+(_CRASH_CONTROL.status() if _CRASH_CONTROL else 'kapalı/ayarsız')
         return result
     _CRASH_HEALTH = Heartbeat(DATA_DIR, _crash_telegram_receipt, health, log)
     _CRASH_HEALTH.start()
+    if globals().get('BOT_TOKEN') and globals().get('CHAT_ID'):
+        try:
+            from crash_telegram_control import TelegramControl
+            _CRASH_CONTROL = TelegramControl(DATA_DIR, BOT_TOKEN, CHAT_ID,
+                os.getenv('TELEGRAM_OWNER_ID'), control_action, _crash_telegram_receipt, log)
+            _CRASH_CONTROL.start()
+            log('[CRASH CONTROL READY] owner commands enabled; new entries start paused')
+        except Exception as error:
+            _CRASH_CONTROL = None
+            log(f'[CRASH CONTROL START ERR] {type(error).__name__}; check TELEGRAM_OWNER_ID for group chats')
 
 
 def _crash_bounce_worker():
@@ -14762,7 +14798,7 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     _crash_start_services()
-    log(f"[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; night_executor={'enabled' if _CRASH_NIGHT else 'off'}")
+    log(f"[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; night_executor={'paused; TP monitor active' if _CRASH_NIGHT else 'off'}")
     # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()
 

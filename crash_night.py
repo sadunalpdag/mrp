@@ -119,7 +119,7 @@ class BinanceBroker:
 
 
 class NightExecutor:
-    def __init__(self, directory, broker, deliver, log, clock=time.time):
+    def __init__(self, directory, broker, deliver, log, clock=time.time, enabled=False):
         self.broker, self.deliver, self.log, self.clock = broker, deliver, log, clock
         os.makedirs(directory, exist_ok=True)
         self.path = os.path.join(directory, 'crash_night_state.json')
@@ -135,6 +135,7 @@ class NightExecutor:
                     raise ValueError('INVALID_EXECUTOR_STATE')
             elif os.path.exists(marker):
                 raise ValueError('EXECUTOR_STATE_MISSING')
+            self.state['paused'] = not enabled
             self.save()
             with open(marker, 'a') as handle:
                 handle.flush()
@@ -146,6 +147,11 @@ class NightExecutor:
         self.queue = queue.Queue(maxsize=100)
         self.thread = None
         self.next_poll = 0
+        self.enabled = threading.Event()
+        self.armed_at = clock()
+        if enabled:
+            self.enabled.set()
+        self.controls = queue.Queue(maxsize=10)
 
     def save(self):
         with open(self.path+'.tmp', 'w', encoding='utf-8') as handle:
@@ -155,8 +161,48 @@ class NightExecutor:
         os.replace(self.path+'.tmp', self.path)
 
     def summary(self):
-        count = sum(o['day'] == day(self.clock()) for o in self.state['orders'].values())
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else 'AÇIK'} | bugün {count}/10 | 20:00–08:00 Paris"
+        count = sum(o['day'] == day(self.clock()) for o in list(self.state['orders'].values()))
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/10 | 20:00–08:00 Paris"
+
+    def apply_control(self, action):
+        if action == 'on':
+            if self.state['halt']:
+                return '⚠️ Açılamadı: '+self.state['halt']+'. Binance pozisyonları ve TP emirleri kontrol edilmeli. Komut hata kilidini kaldırmaz.'
+            self.enabled.clear()
+            while True:
+                try:
+                    self.queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.state['paused'] = False
+            self.save()
+            self.armed_at = self.clock()
+            self.enabled.set()
+            return ('✅ Otomatik girişler AÇIK. Yalnız yeni giriş geçişleri işlenecek.\n'
+                    '20:00–08:00 Paris | 10x | en fazla 50 USDT pozisyon / yaklaşık 5 USDT teminat\n'
+                    'Günde 10 giriş denemesi, aynı anda en fazla 5 sembol. TP +%1; SL yok.\n'+self.summary())
+        if action == 'off':
+            self.enabled.clear()
+            self.state['paused'] = True
+            self.save()
+            return '⏸️ Yeni girişler KAPALI. Mevcut pozisyonlar kapatılmadı; TP takibi sürüyor. Daha önce gönderilmiş giriş emri sonuçlanabilir.'
+        return self.summary()
+
+    def request_control(self, action):
+        if action == 'status':
+            return self.summary()
+        if action == 'off':
+            # Block further preflight/POST checks without waiting for REST reconciliation.
+            self.enabled.clear()
+        done = threading.Event()
+        result = {}
+        try:
+            self.controls.put_nowait((action, done, result))
+        except queue.Full:
+            return '⚠️ Komut kuyruğu dolu. /otomatik_durum ile kontrol edin.'
+        if not done.wait(20):
+            return '⏳ Komut işlenmeyi bekliyor. /otomatik_durum ile sonucu kontrol edin.'
+        return result['message']
 
     def alert(self, text):
         self.state['outbox'].append({'text': text, 'retry_at': 0})
@@ -181,6 +227,8 @@ class NightExecutor:
         # An unacknowledged alert blocks new entries until delivery succeeds.
 
     def submit(self, record, observed_at):
+        if not self.enabled.is_set() or observed_at < self.armed_at:
+            return
         try:
             self.queue.put_nowait((dict(record), observed_at))
         except queue.Full:
@@ -190,7 +238,8 @@ class NightExecutor:
         from crash_policy import supported_symbol
         now = self.clock()
         sid, symbol = record.get('signal_id'), record.get('symbol')
-        if (not sid or not supported_symbol(symbol) or self.state['halt'] or self.state['outbox']
+        if (not self.enabled.is_set() or observed_at < self.armed_at
+                or not sid or not supported_symbol(symbol) or self.state['halt'] or self.state['outbox']
                 or not night(now) or not 0 <= now-observed_at <= 5 or observed_at < self.started
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') != 'OPEN' or sid in self.state['orders']):
@@ -207,12 +256,16 @@ class NightExecutor:
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
-        if not night(now) or not 0 <= now-observed_at <= 5:
+        if not self.enabled.is_set() or not night(now) or not 0 <= now-observed_at <= 5:
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
         order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_id=cid+'e', tp_id=cid+'t', **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
+        if not self.enabled.is_set():
+            order['phase'] = 'NO_FILL'
+            self.save()
+            return
         try:
             self.broker.buy(symbol, p, order['entry_id'])
         except Exception:
@@ -266,6 +319,19 @@ class NightExecutor:
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]} {type(error).__name__}')
 
     def step(self):
+        while True:
+            try:
+                action, done, result = self.controls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                result['message'] = self.apply_control(action)
+            except Exception:
+                self.enabled.clear()
+                result['message'] = '⚠️ Komut kaydedilemedi; yeni girişler kapalı.'
+                raise
+            finally:
+                done.set()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll:
             self.next_poll = self.clock()+30

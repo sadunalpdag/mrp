@@ -120,7 +120,7 @@ class NightTests(unittest.TestCase):
                       v2_status='STRONG_V2', v2_sent=True, tracking_status='OPEN')
 
     def make(self):
-        e = NightExecutor(self.tmp.name, self.b, self.deliver, Mock(), lambda:self.now)
+        e = NightExecutor(self.tmp.name, self.b, self.deliver, Mock(), lambda:self.now, enabled=True)
         self.addCleanup(e.guard.close)
         return e
 

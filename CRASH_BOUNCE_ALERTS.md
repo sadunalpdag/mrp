@@ -146,13 +146,40 @@ A frozen scan or stale stream is never reported as healthy. Render also receives
 `[CRASH SCAN COMPLETE]` counters and `[CRASH HEARTBEAT]` delivery results.
 A stopped Render process cannot send a heartbeat.
 
-The live executor is **disabled by default** (`CRASH_NIGHT_TRADING=off`). Deployment
-alone does not enable trading. The account owner must enable it themselves, using
-`CRASH_NIGHT_TRADING=live`, existing `BINANCE_API_KEY` / `BINANCE_SECRET_KEY`, and
-`CRASH_NIGHT_STATE_DIR` pointing to an **absolute directory on the persistent Render
-disk**. An ephemeral directory is unsuitable. Use one service instance; the file
-lock protects only processes sharing that disk. Never delete state to clear limits
-or errors. Startup failures leave trading off and appear in health reports.
+New entries **always start paused**, including when `CRASH_NIGHT_TRADING=live`.
+Deployment/restart does not activate trading. The owner explicitly arms it by sending
+`/otomatik_ac` to the bot. `/otomatik_kapat` stops new entries while existing TP
+monitoring continues; it does not close positions. An entry request already in
+flight may still complete. `/otomatik_durum` reports the gate, persistent fault lock
+and daily attempt count. `/otomatik_ac` cannot clear a TP/unknown-entry fault lock.
+There is no catch-up of crossings buffered while disabled, and neither command
+resets daily limits. After a restart, send a fresh open command if desired.
+
+Render still requires `BINANCE_API_KEY`, `BINANCE_SECRET_KEY`, and
+`CRASH_NIGHT_STATE_DIR` pointing to an **absolute directory on its persistent disk**.
+Commands cannot create a persistent disk or supply missing API permissions. With
+these settings, `CRASH_NIGHT_TRADING=off` is sufficient: a fresh owner open command
+can initialize the executor. `live` or `telegram` initialize paused monitoring at
+startup; an existing executor state also resumes monitoring even in `off` mode.
+To pause while retaining TP supervision, prefer the Telegram close command.
+
+Use one service instance; file locking only covers processes sharing the same disk.
+Never delete state to clear limits/errors. Startup failures leave new entries off.
+Telegram uses the existing `BOT_TOKEN` and `CHAT_ID`. In a private chat, a positive
+numeric `CHAT_ID` also identifies the owner. For a group, explicitly set
+`TELEGRAM_OWNER_ID` to the owner's numeric user ID; group membership alone never
+authorizes commands. Both chat and sender IDs must match. Channels/anonymous admins,
+bots, forwarded/edited messages, pre-start messages and messages older than 90 seconds
+are rejected. Use the three exact commands without an `@botname` suffix.
+
+Commands use a dedicated getUpdates poller, not the legacy free-form trading handler.
+Do not run another poller or webhook for the same bot. HTTP 409 indicates a polling
+or webhook conflict; the code logs it without exposing the bot token and does not
+delete webhooks automatically. Update offsets persist before command execution to
+avoid replay. A failed acknowledgement can leave the result uncertain: use status.
+A stop gate is applied immediately when the authenticated command reaches the
+executor, then persisted by the worker. A command waiting over 20 seconds returns
+"işlenmeyi bekliyor" rather than claiming completion.
 
 Execution behavior:
 
