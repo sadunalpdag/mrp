@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import threading
 import time
 from datetime import datetime
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 ZONE = ZoneInfo('Europe/Paris')
 D = Decimal
+ENTRY_TTL_SECONDS = 8 * 3600
 
 
 def night(now):
@@ -199,6 +201,12 @@ class BinanceBroker:
     def order(self, symbol, client_id):
         return self.request('GET', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
 
+    def open_entry_orders(self):
+        result = self.request('GET', '/fapi/v1/openOrders')
+        if not isinstance(result, list):
+            raise ValueError('INVALID_ORDER_RESPONSE')
+        return result
+
     def cancel_entry(self, symbol, client_id):
         return self.request('DELETE', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
 
@@ -246,6 +254,7 @@ class NightExecutor:
         self.queue = queue.Queue(maxsize=100)
         self.thread = None
         self.next_poll = 0
+        self.next_expiry_scan = 0
         self.enabled = threading.Event()
         self.armed_at = clock()
         if enabled:
@@ -378,7 +387,7 @@ class NightExecutor:
         if not self.enabled.is_set() or not 0 <= now-observed_at <= 120:
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
-        order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_kind='GTC', entry_id=cid+'e', tp_id=cid+'t', **p)
+        order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_kind='GTC', submitted_at=now, entry_id=cid+'e', tp_id=cid+'t', **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
         if not self.enabled.is_set():
@@ -399,14 +408,17 @@ class NightExecutor:
                 status = entry.get('status')
                 qty = D(entry['executedQty'])
                 if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
-                    if qty == 0:
+                    created = D(str(entry.get('time', 0))) / 1000 or D(str(order.get('submitted_at', self.clock())))
+                    expired = D(str(self.clock())) - created >= ENTRY_TTL_SECONDS
+                    if qty == 0 and not expired:
                         if not order.get('pending_notified'):
                             order['pending_notified'] = True
                             self.alert(f'⏳ ALIŞ LİMİTİ BEKLİYOR | {symbol}\nGTC limit: {order["price"]} | Miktar: {order["quantity"]}\nFiyat limite veya altına gelince gerçekleşebilir. Henüz dolum yok.')
                         return
                     # Stop the unfilled remainder before protecting the final filled quantity.
                     # Query after cancellation even when the DELETE response is uncertain.
-                    order['partial_cancel_requested'] = True
+                    order['expiry_cancel_requested'] = bool(expired)
+                    order['partial_cancel_requested'] = qty > 0
                     self.save()
                     try:
                         self.broker.cancel_entry(symbol, order['entry_id'])
@@ -420,7 +432,8 @@ class NightExecutor:
                 if qty == 0:
                     order['phase'] = 'NO_FILL'
                     self.save()
-                    self.alert(f'ℹ️ OTOMATİK İŞLEM | {symbol}\nGiriş emri dolmadan kapandı; açık giriş emri bırakılmadı. Günlük hak kullanıldı.')
+                    reason = '8 saat doldu; bekleyen alış iptal edildi.' if order.get('expiry_cancel_requested') else 'Giriş emri dolmadan kapandı.'
+                    self.alert(f'ℹ️ OTOMATİK İŞLEM | {symbol}\n{reason} Açık giriş emri bırakılmadı. Günlük hak kullanıldı.')
                     return
                 if qty < 0 or qty > D(order['quantity']):
                     raise ValueError('INVALID_FILLED_QUANTITY')
@@ -459,6 +472,31 @@ class NightExecutor:
                 self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]} {type(error).__name__}')
 
+    def expire_untracked_entries(self):
+        # After ephemeral storage loss, identify only this bot's BUY entry IDs.
+        fetch = getattr(self.broker, 'open_entry_orders', None)
+        if not callable(fetch):
+            return
+        tracked = {o['entry_id'] for o in self.state['orders'].values() if 'entry_id' in o}
+        for entry in fetch():
+            cid = entry.get('clientOrderId', '')
+            if (cid in tracked or not re.fullmatch(r'cbn[0-9a-f]{24}e', cid)
+                    or entry.get('side') != 'BUY' or entry.get('type') != 'LIMIT'
+                    or entry.get('positionSide', 'BOTH') not in ('BOTH', 'LONG')):
+                continue
+            created = D(str(entry.get('time', 0))) / 1000
+            if created <= 0 or D(str(self.clock())) - created < ENTRY_TTL_SECONDS:
+                continue
+            symbol = entry['symbol']
+            try:
+                self.broker.cancel_entry(symbol, cid)
+            except Exception:
+                pass
+            result = self.broker.order(symbol, cid)
+            if result.get('status') not in ('FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'):
+                raise ValueError('ENTRY_EXPIRY_CANCEL_UNCONFIRMED')
+            self.alert(f'ℹ️ 8 SAATLİK ALIŞ TAKİBİ | {symbol}\nBot giriş emri artık açık değil. Durum: {result.get("status")} | Dolan miktar: {result.get("executedQty")}\nAçık pozisyon ve TP emirleri iptal edilmedi.')
+
     def step(self):
         while True:
             try:
@@ -484,6 +522,9 @@ class NightExecutor:
                     from crash_manual_tp import ManualTPGuard
                     self.manual_guard = ManualTPGuard(self)
                 self.manual_guard.scan()
+        if self.clock() >= self.next_expiry_scan:
+            self.next_expiry_scan = self.clock()+60
+            self.expire_untracked_entries()
         self.deliver_pending()
         try:
             record, observed_at = self.queue.get_nowait()

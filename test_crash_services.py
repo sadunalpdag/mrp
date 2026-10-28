@@ -240,6 +240,45 @@ class NightTests(unittest.TestCase):
         self.assertNotIn('unverified_day',self.e.state)
         self.enter();self.assertEqual(len(self.b.buys),1)
 
+    def test_pending_entry_expires_at_eight_hours_not_before(self):
+        order=self.pending_entry()
+        def cancel(symbol,cid):
+            self.b.orders[cid].update(status='CANCELED',executedQty='0')
+        self.b.cancel_entry=Mock(side_effect=cancel)
+        self.now+=8*3600-1;self.e.reconcile(order)
+        self.b.cancel_entry.assert_not_called()
+        self.now+=1;self.e.reconcile(order)
+        self.b.cancel_entry.assert_called_once()
+        self.assertEqual(order['phase'],'NO_FILL');self.assertFalse(self.b.tps)
+        self.assertIn('8 saat',self.e.state['outbox'][-1]['text'])
+
+    def test_expiry_racing_fill_gets_tp_instead_of_no_fill(self):
+        order=self.pending_entry();self.now+=8*3600
+        def cancel(symbol,cid):
+            self.b.orders[cid].update(status='FILLED',executedQty='5')
+        self.b.cancel_entry=Mock(side_effect=cancel)
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'],'PROTECTED');self.assertEqual(self.b.tps[0][1],'5')
+
+    def test_legacy_order_uses_exchange_creation_time(self):
+        order=self.pending_entry();order.pop('submitted_at')
+        self.b.orders[order['entry_id']]['time']=(self.now-8*3600)*1000
+        def cancel(symbol,cid):self.b.orders[cid].update(status='CANCELED')
+        self.b.cancel_entry=Mock(side_effect=cancel)
+        self.e.reconcile(order);self.b.cancel_entry.assert_called_once()
+
+    def test_orphan_sweep_only_expires_own_buy_not_tp_or_manual(self):
+        cid='cbn'+'a'*24+'e'
+        old=dict(symbol='AUSDT',clientOrderId=cid,side='BUY',type='LIMIT',positionSide='LONG',time=(self.now-8*3600)*1000)
+        tp=dict(old,side='SELL',clientOrderId='cbn'+'a'*24+'t')
+        manual=dict(old,clientOrderId='manual-order')
+        fresh=dict(old,clientOrderId='cbn'+'b'*24+'e',time=self.now*1000)
+        self.b.open_entry_orders=Mock(return_value=[old,tp,manual,fresh])
+        self.b.cancel_entry=Mock()
+        self.b.orders[cid]=dict(status='CANCELED',executedQty='0')
+        self.e.expire_untracked_entries()
+        self.b.cancel_entry.assert_called_once_with('AUSDT',cid)
+
     def test_partial_fill_tp_only_filled_quantity(self):
         self.b.fill='2.3'; self.enter()
         self.assertEqual(self.b.tps[0][1],'2.3')
