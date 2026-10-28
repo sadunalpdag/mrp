@@ -156,6 +156,21 @@ class BinanceBroker:
             return {'positionSide': 'BOTH', 'reduceOnly': 'true'}
         raise ValueError('INVALID_POSITION_SIDE')
 
+    @staticmethod
+    def is_closing_order(order):
+        # Hedge closes are identified by positionSide + direction, not reduceOnly.
+        if order.get('reduceOnly') in (True, 'true') or order.get('closePosition') in (True, 'true'):
+            return True
+        return ((order.get('positionSide') == 'LONG' and order.get('side') == 'SELL')
+                or (order.get('positionSide') == 'SHORT' and order.get('side') == 'BUY'))
+
+    def check_slots(self, active, orders):
+        closing = [o for o in orders if self.is_closing_order(o)]
+        pending = {o['symbol'] for o in orders if not self.is_closing_order(o)}
+        total = len(active | pending)
+        if total >= 5:
+            raise ValueError(f'MAX_5_WITH_PENDING_ORDERS | açık={len(active)} giriş={len(pending-active)} toplam={total} kapatma_hariç={len(closing)}')
+
     def preflight(self, symbol):
         dual = self.request('GET', '/fapi/v1/positionSide/dual').get('dualSidePosition')
         if type(dual) is not bool:
@@ -169,15 +184,13 @@ class BinanceBroker:
         if any(o['symbol'] == symbol for o in orders):
             raise ValueError('EXISTING_SYMBOL_ORDER')
         # Pending orders on other symbols can also occupy future position slots.
-        if len(active | {o['symbol'] for o in orders}) >= 5:
-            raise ValueError('MAX_5_WITH_PENDING_ORDERS')
+        self.check_slots(active, orders)
         algo_orders = self.request('GET', '/fapi/v1/openAlgoOrders')
         if not isinstance(algo_orders, list):
             raise ValueError('INVALID_ALGO_ORDER_RESPONSE')
         if any(o['symbol'] == symbol for o in algo_orders):
             raise ValueError('EXISTING_SYMBOL_ALGO_ORDER')
-        if len(active | {o['symbol'] for o in orders+algo_orders}) >= 5:
-            raise ValueError('MAX_5_WITH_PENDING_ORDERS')
+        self.check_slots(active, orders+algo_orders)
         result = self.request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': 10})
         if result.get('leverage') != 10:
             raise ValueError('LEVERAGE_NOT_CONFIRMED')
@@ -358,7 +371,7 @@ class NightExecutor:
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
-            self.alert(f'⚠️ OTOMATİK GİRİŞ YAPILMADI | {symbol}\nTP/giriş ön kontrolü başarısız: {type(error).__name__}: {str(error)[:80] if isinstance(error, (ValueError, BrokerError)) else "CHECK_FAILED"}')
+            self.alert(f'⚠️ OTOMATİK GİRİŞ YAPILMADI | {symbol}\nTP/giriş ön kontrolü başarısız: {type(error).__name__}: {str(error)[:240] if isinstance(error, (ValueError, BrokerError)) else "CHECK_FAILED"}')
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()

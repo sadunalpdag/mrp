@@ -343,6 +343,29 @@ class BrokerTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.b.preflight('AUSDT')
             self.assertFalse(any(c.args[0]=='POST' for c in self.b.request.call_args_list))
 
+    def test_three_pending_two_closing_orders_only_count_three_slots(self):
+        orders=[dict(symbol=f'P{i}',side='BUY',positionSide='LONG') for i in range(3)]
+        orders += [dict(symbol='C1',side='SELL',positionSide='LONG')]
+        algo=[dict(symbol='C2',side='SELL',positionSide='BOTH',closePosition='true')]
+        self.b.request=Mock(side_effect=[{'dualSidePosition':True},[],orders,algo,{'leverage':10}])
+        self.assertEqual(self.b.preflight('AUSDT'),'LONG')
+
+    def test_three_pending_plus_two_positions_still_five_not_seven(self):
+        positions=[dict(symbol='C1',positionAmt='1'),dict(symbol='C2',positionAmt='1')]
+        orders=[dict(symbol=f'P{i}',side='BUY',positionSide='LONG') for i in range(3)]
+        orders += [dict(symbol=s,side='SELL',positionSide='LONG') for s in ('C1','C2')]
+        self.b.request=Mock(side_effect=[{'dualSidePosition':True},positions,orders])
+        with self.assertRaisesRegex(ValueError,'açık=2 giriş=3 toplam=5 kapatma_hariç=2'):
+            self.b.preflight('AUSDT')
+
+    def test_closing_classifier_preserves_unknown_and_short_entry_slots(self):
+        for order in (dict(reduceOnly=True),dict(closePosition='true'),
+                      dict(positionSide='LONG',side='SELL'),dict(positionSide='SHORT',side='BUY')):
+            self.assertTrue(self.b.is_closing_order(order))
+        for order in ({},dict(positionSide='SHORT',side='SELL'),dict(positionSide='BOTH',side='SELL'),
+                      dict(type='TAKE_PROFIT',side='SELL',reduceOnly=False)):
+            self.assertFalse(self.b.is_closing_order(order))
+
     def test_leverage_ack_required(self):
         self.b.request=Mock(side_effect=[{'dualSidePosition':False},[],[],[],{'leverage':5}])
         with self.assertRaisesRegex(ValueError,'LEVERAGE_NOT_CONFIRMED'): self.b.preflight('AUSDT')
