@@ -167,7 +167,7 @@ locks remain effective even with the entry flag set to 1.
 The broker reads **exactly** `BINANCE_API_KEY` and `BINANCE_SECRET_KEY` from the
 process environment. The screenshot contains those names, not their values, and
 does not establish key validity, IP permissions or Futures trading permissions.
-`CRASH_NIGHT_STATE_DIR` must point to an absolute directory on a persistent disk.
+`CRASH_NIGHT_STATE_DIR` is optional; by default state is stored in `DATA_DIR/night_execution`. No Render persistent disk is required. Missing state blocks new entries for the current Paris calendar day because rejected/no-fill attempts cannot be recovered reliably from positions. Manual TP repair queries live positions and both normal/algo orders after startup; it remains available during this hold. Ephemeral storage may disappear on deploy, repeating the daily hold. Existing exchange orders are not canceled.
 Keep one service instance and never delete state to clear a limit/fault.
 
 Execution behavior:

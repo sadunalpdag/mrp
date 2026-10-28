@@ -230,6 +230,8 @@ class NightExecutor:
         os.replace(self.path+'.tmp', self.path)
 
     def summary(self):
+        if self.state.get('unverified_day') == day(self.clock()):
+            return 'YENİ GİRİŞ BEKLİYOR: bugün geçmiş giriş sayısı doğrulanamadı | TP kontrolleri çalışıyor'
         count = sum(o['day'] == day(self.clock()) for o in list(self.state['orders'].values()))
         return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 20:00–08:00 Paris"
 
@@ -312,6 +314,8 @@ class NightExecutor:
                 or not night(now) or not 0 <= now-observed_at <= 5 or observed_at < self.started
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') != 'OPEN' or sid in self.state['orders']):
+            return
+        if self.state.get('unverified_day') == day(now):
             return
         if sum(o['day'] == day(now) for o in self.state['orders'].values()) >= self.max_daily:
             return

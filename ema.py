@@ -7670,17 +7670,20 @@ def _crash_start_services():
     repair_flag = globals().get('MANUAL_TP_REPAIR_ENABLED', 0)
     if auto_flag not in (0, 1) or repair_flag not in (0, 1):
         raise ValueError('TRADE_FLAGS_MUST_BE_ZERO_OR_ONE')
-    directory = os.getenv('CRASH_NIGHT_STATE_DIR', '')
+    configured_directory = os.getenv('CRASH_NIGHT_STATE_DIR', '').strip()
+    directory = os.path.abspath(configured_directory or os.path.join(DATA_DIR, 'night_execution'))
     trading_status = 'KAPALI (ema.py AUTO_TRADING_ENABLED=0)'
     prior = directory and os.path.exists(os.path.join(directory, 'crash_night_state.json'))
     if auto_flag or repair_flag or prior:
         try:
-            from crash_night import BinanceBroker, NightExecutor
-            if not directory or not os.path.isabs(directory):
-                raise ValueError('CRASH_NIGHT_STATE_DIR_REQUIRED')
+            from crash_night import BinanceBroker, NightExecutor, day
             executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 5), manual_tp=bool(repair_flag))
+            if not prior:
+                executor.state['unverified_day'] = day(time.time())
+                executor.save()
+                executor.alert('ℹ️ Önceki işlem kaydı yok. Günlük giriş sayısı doğrulanamadığından bugün yeni otomatik giriş bekletiliyor. Manuel TP kontrolü açık ise Binance pozisyon ve emirleri sorgulanacak.')
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nGece girişleri: {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
                 '20:00–08:00 Paris | 50 USDT pozisyon | 10x | aynı anda en fazla 5 sembol\n'
@@ -7688,8 +7691,15 @@ def _crash_start_services():
             _CRASH_NIGHT = executor
             executor.start()
         except Exception as error:
-            trading_status = f'BAŞLATILAMADI ({type(error).__name__}); Binance anahtarlarını ve kalıcı disk yolunu kontrol edin'
-            log(f'[CRASH NIGHT START ERR] {type(error).__name__}')
+            reasons = {
+                'MISSING_BINANCE_CREDENTIALS': 'Binance API anahtarı veya secret boş',
+                'INVALID_EXECUTOR_STATE': 'İşlem kayıt dosyası geçersiz',
+                'EXECUTOR_STATE_MISSING': 'Önceki işlem kayıt dosyası eksik',
+            }
+            code = str(error) if str(error) in reasons else type(error).__name__
+            reason = reasons.get(code, 'Başlangıç başarısız; veri klasörü erişimini ve kayıt dosyasını kontrol edin')
+            trading_status = f'BAŞLATILAMADI | {code}: {reason}'
+            log(f'[CRASH NIGHT START ERR] {code}: {reason}')
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status

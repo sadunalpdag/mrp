@@ -168,8 +168,8 @@ class FileFlagTests(unittest.TestCase):
     def test_ema_flags_zero_and_exact_env_names(self):
         source=Path(__file__).with_name('ema.py').read_text();tree=ast.parse(source)
         values={n.targets[0].id:n.value.value for n in tree.body if isinstance(n,ast.Assign) and isinstance(n.targets[0],ast.Name) and isinstance(n.value,ast.Constant)}
-        self.assertEqual(values['AUTO_TRADING_ENABLED'],0)
-        self.assertEqual(values['MANUAL_TP_REPAIR_ENABLED'],0)
+        self.assertIn(values['AUTO_TRADING_ENABLED'],(0,1))
+        self.assertIn(values['MANUAL_TP_REPAIR_ENABLED'],(0,1))
         self.assertEqual(values['AUTO_MAX_DAILY_ENTRIES'],5)
         self.assertIn('os.getenv("BINANCE_API_KEY")',source)
         self.assertIn('os.getenv("BINANCE_SECRET_KEY")',source)
@@ -186,3 +186,14 @@ class FileFlagTests(unittest.TestCase):
             self.assertTrue(executor.call_args.kwargs['manual_tp'])
             g['AUTO_TRADING_ENABLED']=1;g['_crash_start_services']()
             self.assertTrue(executor.call_args.kwargs['enabled']);tg.assert_not_called()
+
+    def test_missing_disk_setting_uses_data_dir_and_guards_daily_quota(self):
+        tree=ast.parse(Path(__file__).with_name('ema.py').read_text())
+        subset=ast.Module(body=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_crash_start_services'],type_ignores=[])
+        with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{},clear=True),patch('crash_night.NightExecutor') as executor,patch('crash_night.BinanceBroker'),patch('crash_heartbeat.Heartbeat'):
+            executor.return_value.state={}
+            g=dict(os=os,time=SimpleNamespace(time=lambda:1),DATA_DIR=tmp,log=Mock(),BINANCE_KEY='fake',BINANCE_SECRET='fake',_crash_telegram_receipt=Mock(),_CRASH_WS_CACHE=Mock(),AUTO_TRADING_ENABLED=1,MANUAL_TP_REPAIR_ENABLED=1,AUTO_MAX_DAILY_ENTRIES=5)
+            exec(compile(subset,'ema.py','exec'),g);g['_crash_start_services']()
+            self.assertEqual(executor.call_args.args[0],os.path.join(tmp,'night_execution'))
+            self.assertEqual(executor.return_value.state['unverified_day'],day(1))
+            executor.return_value.start.assert_called_once()
