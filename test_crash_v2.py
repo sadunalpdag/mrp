@@ -70,6 +70,26 @@ class CrashV2Tests(unittest.TestCase):
         env["_crash_send_pending"](state, 105)
         receipt.assert_not_called()
 
+    def test_gtc_submission_once_after_successful_candidate_delivery(self):
+        env, receipt = self._delivery_context()
+        executor = Mock(); env['_CRASH_NIGHT'] = executor
+        state, record = self._candidate()
+        env['_crash_send_pending'](state,105)
+        env['_crash_send_pending'](state,110)
+        executor.submit.assert_called_once()
+        submitted, observed = executor.submit.call_args.args
+        self.assertTrue(submitted['v2_sent'])
+        self.assertEqual(submitted['tracking_status'],'WAIT_ENTRY')
+        self.assertEqual(observed,101)
+
+    def test_failed_signal_delivery_never_submits_gtc(self):
+        env, receipt = self._delivery_context()
+        executor=Mock();env['_CRASH_NIGHT']=executor
+        receipt.return_value={'ok':False,'error':'NETWORK','ambiguous':True}
+        state, record=self._candidate()
+        env['_crash_send_pending'](state,105)
+        executor.submit.assert_not_called()
+
     def test_qualified_candidate_alert_before_any_entry(self):
         env, receipt = self._delivery_context()
         state, record = self._candidate()
@@ -124,3 +144,4 @@ class CrashV2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

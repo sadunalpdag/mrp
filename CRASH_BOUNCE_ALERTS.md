@@ -173,9 +173,7 @@ Keep one service instance and never delete state to clear a limit/fault.
 Execution behavior:
 
 - Automatic entries run **24 hours**, without a night-only restriction. Daily counters still use the Paris calendar day.
-- Existing Crash Bounce V2 rules remain unchanged. Only a new upward crossing, at
-  most five seconds old, from an acknowledged Telegram candidate can trigger entry.
-  No historical catch-up or candidate-message buys.
+- Existing Crash Bounce V2 rules remain unchanged. A newly acknowledged Telegram candidate queues a GTC limit entry (maximum queue age 120 seconds). No upward crossing is required for real orders; virtual research tracking keeps its existing crossing model. No historical catch-up.
 - **10x**, at most **50 USDT notional** after rounding (approximately **5 USDT initial
   margin**, excluding fees). Margin mode is unchanged. Exchange filters may prevent
   small orders; quantities are never increased to satisfy minimums.
@@ -188,9 +186,9 @@ Execution behavior:
   account/subaccount for this executor.
 - One-way and Hedge long positions are supported; account mode is never changed.
 - TP and price/quantity/minimum-notional filters are checked **before** entry.
-  BUY LIMIT IOC at the candidate price avoids chasing higher. It may not fill;
-  unfilled remainder does not stay open.
-- After a fill, SELL LIMIT GTC `reduceOnly` is submitted for the **filled quantity**,
+  BUY LIMIT GTC at the candidate price waits when the market is higher and can fill at the limit or better when the market is lower;
+  an entirely unfilled order stays open. After a partial fill the remainder is canceled before TP submission.
+- After a fill, SELL LIMIT GTC (`reduceOnly` in one-way; `positionSide=LONG` in hedge) is submitted for the **filled quantity**,
   then queried to confirm its properties and status. Entry and TP are separate
   requests: atomic TP protection and TP execution are not guaranteed. No SL is added.
 - TP failure/cancellation or uncertain entry results **halt additional entries**
@@ -250,3 +248,8 @@ performed as part of this change.
 Manual long TP repair and automatic long entries support BOTH (one-way) and LONG (hedge). The account mode is never changed. Hedge closing orders use SELL + positionSide=LONG without reduceOnly; one-way orders retain reduceOnly. Existing normal and conditional TP orders are matched to the same symbol and position side. SHORT positions/orders are not managed. Coin-specific failures identify the symbol and LONG side. If fetching the account position list fails, a separate account-query warning explicitly says TP absence was not established.
 
 Position sizing remains 50 USDT notional at 10x (approximately 5 USDT margin); existing positions or pending orders on the candidate symbol block duplicate automatic entry.
+
+### GTC candidate entries
+A candidate acknowledged by Telegram immediately queues a BUY LIMIT GTC at its entry level. Quantity is calculated with a 50 USDT notional ceiling at that limit; a better fill may use less than 50 USDT. The predetermined candidate TP price is retained. New unfilled orders stay on Binance until filled or canceled, including across bot restarts; disabling new entries does not cancel them. Pending symbols count toward the five-symbol cap. Live orders do not follow virtual low-break invalidation.
+
+The worker polls tracked orders every five seconds (plus API latency). NEW with no fill is normal pending state, not an error. On partial fill the bot cancels the remainder, queries final executed quantity, then places TP for that quantity. An unconfirmed cancellation stops new entries and alerts; TP protection cannot be guaranteed during an API outage. Unknown submit responses are queried, not blindly resubmitted. Existing missing-history daily hold still applies.

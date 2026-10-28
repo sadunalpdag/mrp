@@ -6563,7 +6563,7 @@ def _crash_send_pending(state, now):
         record["v2_delivery_status"] = "ATTEMPTING"
         _crash_save_state(state)
         if globals().get('_CRASH_NIGHT') is not None:
-            message = message.replace('Gerçek emir yok.', 'Otomatik işlem dolumu ayrı mesajla bildirilir.')
+            message = message.replace('Gerçek emir yok.', 'Otomatik GTC limit sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
         receipt = _crash_telegram_receipt(message)
         monitor = globals().get('_CRASH_HEALTH')
         if monitor:
@@ -6579,6 +6579,9 @@ def _crash_send_pending(state, now):
             record["v2_delivery_status"] = "SENT"
             record["v2_telegram_sent_at"] = receipt["accepted_at"]
             record["v2_telegram_message_id"] = receipt["message_id"]
+            executor = globals().get('_CRASH_NIGHT')
+            if executor is not None:
+                executor.submit(record, receipt['accepted_at'])
         else:
             record["v2_delivery_status"] = ("UNKNOWN_DELIVERY" if receipt.get("ambiguous")
                                            else "SEND_FAILED_RETRY")
@@ -7443,9 +7446,6 @@ def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False)
             for record, transition in changed:
                 if transition == 'OPEN':
                     _crash_risk_observe('entry', record)
-                    executor = globals().get('_CRASH_NIGHT')
-                    if executor is not None:
-                        executor.submit(record, observed_at)
                 _crash_append_data({"type":"ws_trade_transition","observed_at":observed_at,
                                     "transition":transition,"record":record},observed_at)
 

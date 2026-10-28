@@ -1,7 +1,7 @@
 """Opt-in night executor. Importing this module never sends an order.
 
 The caller supplies an exchange adapter and explicitly enables live operation.
-Only fresh, Telegram-acknowledged OPEN transitions can be submitted.
+Only fresh, Telegram-acknowledged candidates can be submitted.
 """
 import fcntl
 import hashlib
@@ -186,9 +186,12 @@ class BinanceBroker:
     def order(self, symbol, client_id):
         return self.request('GET', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
 
+    def cancel_entry(self, symbol, client_id):
+        return self.request('DELETE', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
+
     def buy(self, symbol, p, client_id):
         return self.request('POST', '/fapi/v1/order', dict(symbol=symbol, side='BUY', type='LIMIT',
-            timeInForce='IOC', quantity=p['quantity'], price=p['price'], newClientOrderId=client_id,
+            timeInForce='GTC', quantity=p['quantity'], price=p['price'], newClientOrderId=client_id,
             newOrderRespType='RESULT', positionSide=p.get('position_side', 'BOTH')))
 
     def tp(self, symbol, qty, price, client_id, position_side="BOTH"):
@@ -324,11 +327,12 @@ class NightExecutor:
         sid, symbol = record.get('signal_id'), record.get('symbol')
         if (not self.enabled.is_set() or observed_at < self.armed_at
                 or not sid or not supported_symbol(symbol) or self.state['halt'] or self.state['outbox']
-                or not 0 <= now-observed_at <= 5 or observed_at < self.started
+                or not 0 <= now-observed_at <= 120 or observed_at < self.started
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
-                or record.get('tracking_status') != 'OPEN' or sid in self.state['orders']):
+                or record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') or sid in self.state['orders']):
             return
         if self.state.get('unverified_day') == day(now):
+            self.alert(f'ℹ️ OTOMATİK GİRİŞ BEKLETİLDİ | {symbol}\nKod: DAILY_HISTORY_UNKNOWN — Bugünkü geçmiş giriş sayısı doğrulanamadı.')
             return
         if sum(o['day'] == day(now) for o in self.state['orders'].values()) >= self.max_daily:
             return
@@ -343,10 +347,10 @@ class NightExecutor:
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
-        if not self.enabled.is_set() or not 0 <= now-observed_at <= 5:
+        if not self.enabled.is_set() or not 0 <= now-observed_at <= 120:
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
-        order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_id=cid+'e', tp_id=cid+'t', **p)
+        order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_kind='GTC', entry_id=cid+'e', tp_id=cid+'t', **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
         if not self.enabled.is_set():
@@ -364,13 +368,31 @@ class NightExecutor:
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
                 entry = self.broker.order(symbol, order['entry_id'])
-                if entry.get('status') not in ('FILLED', 'EXPIRED', 'CANCELED', 'EXPIRED_IN_MATCH', 'REJECTED'):
-                    raise ValueError('ENTRY_RESULT_NOT_FINAL')
+                status = entry.get('status')
                 qty = D(entry['executedQty'])
+                if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
+                    if qty == 0:
+                        if not order.get('pending_notified'):
+                            order['pending_notified'] = True
+                            self.alert(f'⏳ ALIŞ LİMİTİ BEKLİYOR | {symbol}\nGTC limit: {order["price"]} | Miktar: {order["quantity"]}\nFiyat limite veya altına gelince gerçekleşebilir. Henüz dolum yok.')
+                        return
+                    # Stop the unfilled remainder before protecting the final filled quantity.
+                    # Query after cancellation even when the DELETE response is uncertain.
+                    order['partial_cancel_requested'] = True
+                    self.save()
+                    try:
+                        self.broker.cancel_entry(symbol, order['entry_id'])
+                    except Exception:
+                        pass
+                    entry = self.broker.order(symbol, order['entry_id'])
+                    status = entry.get('status')
+                    qty = D(entry['executedQty'])
+                if status not in ('FILLED', 'EXPIRED', 'CANCELED', 'EXPIRED_IN_MATCH', 'REJECTED'):
+                    raise ValueError('ENTRY_RESULT_NOT_FINAL')
                 if qty == 0:
                     order['phase'] = 'NO_FILL'
                     self.save()
-                    self.alert(f'ℹ️ OTOMATİK İŞLEM | {symbol}\nIOC giriş dolmadı; açık giriş emri bırakılmadı. Günlük hak kullanıldı.')
+                    self.alert(f'ℹ️ OTOMATİK İŞLEM | {symbol}\nGiriş emri dolmadan kapandı; açık giriş emri bırakılmadı. Günlük hak kullanıldı.')
                     return
                 if qty < 0 or qty > D(order['quantity']):
                     raise ValueError('INVALID_FILLED_QUANTITY')
@@ -425,7 +447,7 @@ class NightExecutor:
                 done.set()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll:
-            self.next_poll = self.clock()+30
+            self.next_poll = self.clock()+5
             for order in list(self.state['orders'].values()):
                 if order['phase'] in ('ENTRY_UNKNOWN', 'TP_UNKNOWN', 'PROTECTED'):
                     self.reconcile(order)

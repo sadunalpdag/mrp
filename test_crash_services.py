@@ -163,6 +163,56 @@ class NightTests(unittest.TestCase):
         self.assertEqual(len(self.b.tps),1)
         self.assertEqual(order['phase'],'PROTECTED')
 
+    def pending_entry(self):
+        original=self.b.buy
+        def pending(symbol,p,cid):
+            result=original(symbol,p,cid)
+            result.update(status='NEW',executedQty='0')
+            return result
+        self.b.buy=pending
+        self.enter(tracking_status='WAIT_ENTRY')
+        return self.e.state['orders']['signal-1']
+
+    def test_gtc_pending_survives_restart_then_fill_protects_once(self):
+        order=self.pending_entry()
+        self.assertFalse(self.b.tps);self.assertIsNone(self.e.state['halt'])
+        self.assertIn('ALIŞ LİMİTİ BEKLİYOR',self.e.state['outbox'][-1]['text'])
+        self.e.save();self.e.guard.close();self.e=self.make()
+        order=self.e.state['orders']['signal-1']
+        self.e.reconcile(order);self.assertEqual(len(self.b.buys),1)
+        self.b.orders[order['entry_id']].update(status='FILLED',executedQty='5')
+        self.e.reconcile(order);self.e.reconcile(order)
+        self.assertEqual(len(self.b.tps),1);self.assertEqual(order['phase'],'PROTECTED')
+
+    def test_gtc_partial_cancels_remainder_and_protects_final_race_fill(self):
+        order=self.pending_entry()
+        self.b.orders[order['entry_id']].update(status='PARTIALLY_FILLED',executedQty='2')
+        def cancel(symbol,cid):
+            self.b.orders[cid].update(status='CANCELED',executedQty='3')
+        self.b.cancel_entry=Mock(side_effect=cancel)
+        self.e.reconcile(order)
+        self.b.cancel_entry.assert_called_once()
+        self.assertEqual(self.b.tps[0][1],'3')
+
+    def test_gtc_cancel_uncertain_does_not_assume_final_quantity(self):
+        order=self.pending_entry()
+        self.b.orders[order['entry_id']].update(status='PARTIALLY_FILLED',executedQty='2')
+        self.b.cancel_entry=Mock(side_effect=BrokerError('UNKNOWN'))
+        self.e.reconcile(order)
+        self.assertFalse(self.b.tps);self.assertTrue(self.e.state['halt'])
+        self.assertEqual(order['phase'],'ENTRY_UNKNOWN')
+
+    def test_candidate_immediate_fill_without_upward_cross(self):
+        self.enter(tracking_status='WAIT_ENTRY')
+        self.assertEqual(len(self.b.buys),1)
+        self.assertEqual(self.e.state['orders']['signal-1']['phase'],'PROTECTED')
+
+    def test_gtc_user_cancels_unfilled_order_no_tp(self):
+        order=self.pending_entry()
+        self.b.orders[order['entry_id']].update(status='CANCELED',executedQty='0')
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'],'NO_FILL');self.assertFalse(self.b.tps)
+
     def test_partial_fill_tp_only_filled_quantity(self):
         self.b.fill='2.3'; self.enter()
         self.assertEqual(self.b.tps[0][1],'2.3')
@@ -203,7 +253,7 @@ class NightTests(unittest.TestCase):
         self.enter(); self.assertEqual(len(self.b.buys),1)
 
     def test_stale_unsent_nonascii_do_not_enter(self):
-        self.e.enter(self.r,self.now-6)
+        self.e.enter(self.r,self.now-121)
         self.enter(v2_sent=False); self.enter(symbol='龙虾USDT')
         self.assertFalse(self.b.buys)
 
@@ -244,6 +294,13 @@ class NightTests(unittest.TestCase):
 class BrokerTests(unittest.TestCase):
     def setUp(self):
         self.b=BinanceBroker('fake','fake')
+
+    def test_buy_uses_waiting_gtc_with_limit_cap(self):
+        self.b.request=Mock()
+        self.b.buy('AUSDT',dict(quantity='2',price='22.5',position_side='LONG'),'cid')
+        p=self.b.request.call_args.args[2]
+        self.assertEqual(p['timeInForce'],'GTC');self.assertEqual(p['price'],'22.5')
+        self.assertEqual(p['type'],'LIMIT');self.assertEqual(p['side'],'BUY')
 
     def test_hedge_mode_supported_without_changing_account_mode(self):
         self.b.request=Mock(side_effect=[{'dualSidePosition':True},[],[],[],{'leverage':10}])
