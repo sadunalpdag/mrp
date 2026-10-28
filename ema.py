@@ -233,8 +233,8 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 
 # GERÇEK İŞLEM AYARLARI: 0=kapalı, 1=açık. Değişiklik sonrası yeniden başlatın.
 # Açma/kapama yalnız bu dosyadan yapılır; Telegram kontrol komutları kullanılmaz.
-AUTO_TRADING_ENABLED = 0
-MANUAL_TP_REPAIR_ENABLED = 0
+AUTO_TRADING_ENABLED = 1
+MANUAL_TP_REPAIR_ENABLED = 1
 AUTO_MAX_DAILY_ENTRIES = 5
 
 BINANCE_FAPI   = "https://fapi.binance.com"
