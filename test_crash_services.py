@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from decimal import Decimal as D
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -139,6 +140,29 @@ class NightTests(unittest.TestCase):
         self.assertEqual(len(self.b.tps),1)
         self.assertEqual(self.e.state['orders']['signal-1']['phase'],'PROTECTED')
 
+    def test_daytime_entry_allowed_with_same_notional(self):
+        self.now=timestamp('2026-10-28T12:00:00')
+        self.enter()
+        self.assertEqual(len(self.b.buys),1)
+        p=self.b.buys[0][1]
+        self.assertLessEqual(D(p['quantity'])*D(p['price']),D('50'))
+
+    def test_hedge_entry_and_tp_survive_reconcile(self):
+        self.b.preflight=lambda symbol:'LONG'
+        original=self.b.tp
+        def hedge_tp(symbol,qty,price,cid,position_side='BOTH'):
+            result=original(symbol,qty,price,cid)
+            result.update(positionSide=position_side,reduceOnly=False)
+            return result
+        self.b.tp=hedge_tp
+        self.enter()
+        order=self.e.state['orders']['signal-1']
+        self.assertEqual(order['position_side'],'LONG')
+        self.assertEqual(order['phase'],'PROTECTED')
+        self.e.reconcile(order)
+        self.assertEqual(len(self.b.tps),1)
+        self.assertEqual(order['phase'],'PROTECTED')
+
     def test_partial_fill_tp_only_filled_quantity(self):
         self.b.fill='2.3'; self.enter()
         self.assertEqual(self.b.tps[0][1],'2.3')
@@ -178,10 +202,9 @@ class NightTests(unittest.TestCase):
         self.now=timestamp('2026-10-28T00:00:01')
         self.enter(); self.assertEqual(len(self.b.buys),1)
 
-    def test_stale_unsent_nonascii_and_daytime_do_not_enter(self):
+    def test_stale_unsent_nonascii_do_not_enter(self):
         self.e.enter(self.r,self.now-6)
         self.enter(v2_sent=False); self.enter(symbol='龙虾USDT')
-        self.now=timestamp('2026-10-28T12:00:00'); self.enter()
         self.assertFalse(self.b.buys)
 
     def test_failed_alert_blocks_new_entry_then_retries(self):
@@ -222,10 +245,10 @@ class BrokerTests(unittest.TestCase):
     def setUp(self):
         self.b=BinanceBroker('fake','fake')
 
-    def test_hedge_mode_rejected_without_mutation(self):
-        self.b.request=Mock(return_value={'dualSidePosition':True})
-        with self.assertRaises(ValueError): self.b.preflight('AUSDT')
-        self.assertEqual(self.b.request.call_count,1)
+    def test_hedge_mode_supported_without_changing_account_mode(self):
+        self.b.request=Mock(side_effect=[{'dualSidePosition':True},[],[],[],{'leverage':10}])
+        self.assertEqual(self.b.preflight('AUSDT'),'LONG')
+        self.assertFalse(any(c.args[0]=='POST' and c.args[1]=='/fapi/v1/positionSide/dual' for c in self.b.request.call_args_list))
 
     def test_existing_positions_max_five_and_pending_orders(self):
         for positions, orders in [([{'symbol':'AUSDT','positionAmt':'1'}],[]),

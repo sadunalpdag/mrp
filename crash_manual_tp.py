@@ -1,4 +1,4 @@
-"""Missing-TP repair for one-way USDT perpetual longs; serialized by NightExecutor.
+"""Missing-TP repair for one-way and hedge USDT perpetual longs; serialized by NightExecutor.
 
 No API calls at import. Disabled unless explicitly configured by the operator.
 """
@@ -12,23 +12,22 @@ def truth(value):
     return value is True or value == 'true'
 
 
-def tp_coverage(orders, symbol, entry, qty):
+def tp_coverage(orders, symbol, entry, qty, position_side="BOTH"):
     """Return full/partial/none/conflict; never replace an existing closing order."""
     covered = D('0')
     conflict = False
     for o in orders:
         if o.get('symbol') != symbol or o.get('side') != 'SELL':
             continue
+        if o.get('positionSide', 'BOTH') != position_side:
+            continue
         status = o.get('status', o.get('algoStatus'))
         if status not in ('NEW', 'PARTIALLY_FILLED'):
             conflict = True  # transitional/unknown order states are not proof of absence
             continue
-        if o.get('positionSide', 'BOTH') != 'BOTH':
-            conflict = True
-            continue
         typ = o.get('type', o.get('orderType'))
         close_all = truth(o.get('closePosition'))
-        reducing = truth(o.get('reduceOnly')) or close_all
+        reducing = position_side == 'LONG' or truth(o.get('reduceOnly')) or close_all
         if not reducing:
             conflict = True
             continue
@@ -70,7 +69,7 @@ def repair_plan(position, info):
 
 
 LOCAL_REASONS = {
-    'ONE_WAY_MODE_REQUIRED': 'Hedge modu desteklenmiyor; hesap modu değiştirilmedi.',
+    'INVALID_POSITION_SIDE': 'Pozisyon yönü doğrulanamadı; TP eksik olduğu söylenemez.',
     'PRICE_FILTER': 'TP fiyatı borsanın fiyat sınırlarına uymuyor.',
     'LOT_SIZE': 'Pozisyon miktarı emir adımına veya miktar sınırına uymuyor.',
     'SYMBOL_NOT_TRADING': 'Sembol aktif USDT perpetual işlem koşullarını sağlamıyor.',
@@ -98,7 +97,8 @@ class ManualTPGuard:
         self.notices[key] = now+1800
         details = '' if not record else f"\nGiriş: {record.get('entry')} | Miktar: {record.get('qty')} | Hedef TP: {record.get('tp', 'hesaplanamadı')}"
         title = 'TP OLUŞTURULAMADI' if record and record.get('phase') == 'REJECTED' else 'TP KONTROLÜ'
-        self.e.alert(f'⚠️ {title} | {symbol}{details}\nKod: {code}\nNeden: {explanation}\nPiyasa kapatma emri gönderilmedi; pozisyon ve TP durumunu Binance üzerinden kontrol edin.')
+        side_label = '' if symbol.startswith('HESAP') else ' | LONG'
+        self.e.alert(f'⚠️ {title} | {symbol}{side_label}{details}\nKod: {code}\nNeden: {explanation}\nPiyasa kapatma emri gönderilmedi; pozisyon ve TP durumunu Binance üzerinden kontrol edin.')
 
     def fail(self, symbol, error, record=None):
         if isinstance(error, ValueError) and str(error) in LOCAL_REASONS:
@@ -112,7 +112,8 @@ class ManualTPGuard:
         try:
             order = self.b.order(symbol, record['client_id'])
             if (order.get('symbol') != symbol or order.get('type') != 'LIMIT'
-                    or order.get('positionSide', 'BOTH') != 'BOTH' or order.get('side') != 'SELL' or not truth(order.get('reduceOnly'))
+                    or order.get('positionSide', 'BOTH') != record.get('position_side', 'BOTH') or order.get('side') != 'SELL'
+                    or (record.get('position_side', 'BOTH') == 'BOTH' and not truth(order.get('reduceOnly')))
                     or D(order.get('origQty', '0')) != D(record['qty'])
                     or D(order.get('price', '0')) != D(record['tp'])):
                 raise ValueError('TP_PROPERTIES')
@@ -133,13 +134,12 @@ class ManualTPGuard:
 
     def scan(self):
         try:
-            if self.b.request('GET', '/fapi/v1/positionSide/dual').get('dualSidePosition') is not False:
-                raise ValueError('ONE_WAY_MODE_REQUIRED')
             positions = self.b.positions()
         except Exception as error:
-            self.fail('HESAP', error)
+            self.warn('HESAP — coin listesi alınamadı', 'POSITION_QUERY_FAILED',
+                      'Açık pozisyonlar sorgulanamadı; TP eksikliği tespit edilmiş değildir. '+error_details(error))
             return  # failed query is not an empty account / absent TP
-        active = {p['symbol'] for p in positions if D(p['positionAmt']) != 0}
+        active = {p['symbol'] for p in positions if D(p['positionAmt']) > 0 and p.get('positionSide', 'BOTH') in ('BOTH', 'LONG')}
         for symbol, record in self.state.items():
             if symbol not in active and record['phase'] != 'UNKNOWN':
                 record['absent'] = True
@@ -149,6 +149,8 @@ class ManualTPGuard:
             symbol = p.get('symbol')
             if not supported_symbol(symbol) or D(p['positionAmt']) <= 0 or symbol in excluded:
                 continue
+            if p.get('positionSide') == 'SHORT':
+                continue
             try:
                 self.inspect(p)
             except Exception as error:
@@ -156,6 +158,9 @@ class ManualTPGuard:
 
     def inspect(self, p):
         symbol = p['symbol']
+        position_side = p.get('positionSide', 'BOTH')
+        if position_side not in ('BOTH', 'LONG'):
+            raise ValueError('INVALID_POSITION_SIDE')
         entry, qty = D(p['entryPrice']), D(p['positionAmt'])
         r = self.state.get(symbol)
         fingerprint = str(entry.normalize())+':'+str(qty.normalize())
@@ -163,18 +168,18 @@ class ManualTPGuard:
             self.verify(symbol, r)
             return
         orders = self.b.closing_orders(symbol)  # BOTH normal and conditional required
-        coverage = tp_coverage(orders, symbol, entry, qty)
+        coverage = tp_coverage(orders, symbol, entry, qty, position_side)
         if coverage == 'full':
             return
         if coverage == 'partial':
             raise ValueError('PARTIAL_TP')
         if coverage == 'conflict':
             raise ValueError('ORDER_CONFLICT')
-        if r and not r.get('absent') and r['fingerprint'] != fingerprint:
+        if r and not r.get('absent') and (r['fingerprint'] != fingerprint or r.get('position_side', 'BOTH') != position_side):
             raise ValueError('POSITION_CHANGED')
         if not r or r.get('absent'):
             version = (r or {}).get('version', 0)+1
-            r = dict(fingerprint=fingerprint, version=version, entry=str(entry), qty=str(qty), phase='READY', attempts=0, retry_at=0)
+            r = dict(position_side=position_side, fingerprint=fingerprint, version=version, entry=str(entry), qty=str(qty), phase='READY', attempts=0, retry_at=0)
             self.state[symbol] = r
             self.e.save()
         if r['phase'] == 'PROTECTED':
@@ -186,21 +191,22 @@ class ManualTPGuard:
         qty_text, target = repair_plan(p, self.b.info(symbol))
         r['tp'] = target
         # Refresh position AND both order sets immediately before submission.
-        latest = next((x for x in self.b.positions() if x['symbol']==symbol and D(x['positionAmt'])>0), None)
+        latest = next((x for x in self.b.positions() if x['symbol']==symbol and x.get('positionSide', 'BOTH') == position_side and D(x['positionAmt'])>0), None)
         if latest is None:
             return
         if D(latest['entryPrice']) != entry or D(latest['positionAmt']) != qty:
             raise ValueError('POSITION_CHANGED')
-        if tp_coverage(self.b.closing_orders(symbol), symbol, entry, qty) != 'none':
+        if tp_coverage(self.b.closing_orders(symbol), symbol, entry, qty, position_side) != 'none':
             return
         if self.b.best_bid(symbol) >= D(target):
             raise ValueError('TARGET_PASSED')
         r['attempts'] += 1
-        digest = hashlib.sha256(f'{symbol}:{fingerprint}:{r["version"]}:{r["attempts"]}'.encode()).hexdigest()[:26]
+        digest = hashlib.sha256(f'{symbol}:{position_side}:{fingerprint}:{r["version"]}:{r["attempts"]}'.encode()).hexdigest()[:26]
         r.update(client_id='cbm'+digest, phase='UNKNOWN', retry_at=self.e.clock()+60)
         self.e.save()  # No POST unless durable intent was written.
         try:
-            self.b.repair_tp(symbol, qty_text, target, r['client_id'])
+            kwargs = {'position_side': 'LONG'} if position_side == 'LONG' else {}
+            self.b.repair_tp(symbol, qty_text, target, r['client_id'], **kwargs)
         except Exception as error:
             r['submit_error'] = error_details(error)
             if (isinstance(error, BrokerError) and not error.uncertain

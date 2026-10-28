@@ -24,10 +24,10 @@ class ManualBroker:
     def closing_orders(self,symbol):return copy.deepcopy(self.open)
     def info(self,symbol):return copy.deepcopy(INFO)
     def best_bid(self,symbol):return self.bid
-    def repair_tp(self,symbol,qty,price,cid):
+    def repair_tp(self,symbol,qty,price,cid,position_side="BOTH"):
         self.posts.append((symbol,qty,price,cid))
         if self.failure:raise self.failure
-        self.queries[cid]=dict(symbol=symbol,side='SELL',type='LIMIT',status='NEW',positionSide='BOTH',reduceOnly=True,origQty=qty,executedQty='0',price=price)
+        self.queries[cid]=dict(symbol=symbol,side='SELL',type='LIMIT',status='NEW',positionSide=position_side,reduceOnly=position_side=='BOTH',origQty=qty,executedQty='0',price=price)
         self.open.append(self.queries[cid])
     def order(self,symbol,cid):
         if cid not in self.queries:raise BrokerError('-2013')
@@ -119,9 +119,39 @@ class ManualTests(unittest.TestCase):
         self.e.state['orders'].clear();self.b.ps[0]['positionAmt']='-5'
         self.g.scan();self.assertFalse(self.b.posts)
 
-    def test_hedge_mode_warns_without_changing_mode(self):
-        self.b.dual=True;self.g.scan();self.assertFalse(self.b.posts)
-        self.assertIn('ONE_WAY_MODE_REQUIRED',self.e.state['outbox'][-1]['text'])
+    def test_hedge_mode_repairs_long_and_verifies(self):
+        self.b.dual=True;self.b.ps[0]['positionSide']='LONG'
+        self.g.scan();self.assertEqual(len(self.b.posts),1)
+        self.assertEqual(self.g.state['AUSDT']['phase'],'PROTECTED')
+        self.assertEqual(self.g.state['AUSDT']['position_side'],'LONG')
+
+    def test_hedge_existing_tp_no_false_alarm_or_duplicate(self):
+        self.b.ps[0]['positionSide']='LONG'
+        for kind in ('LIMIT','TAKE_PROFIT_MARKET'):
+            self.b.open=[dict(symbol='AUSDT',side='SELL',positionSide='LONG',algoStatus='NEW',orderType=kind,price='10.2',triggerPrice='10.2',quantity='5',reduceOnly=False)]
+            self.g.scan()
+        self.assertFalse(self.b.posts);self.assertFalse(self.e.state['outbox'])
+
+    def test_hedge_short_order_does_not_cover_long(self):
+        self.b.ps[0]['positionSide']='LONG'
+        self.b.open=[dict(symbol='AUSDT',side='SELL',positionSide='SHORT',status='NEW',type='LIMIT',price='10.2',origQty='5')]
+        self.g.scan();self.assertEqual(len(self.b.posts),1)
+
+    def test_symbol_in_query_failure_alert(self):
+        self.b.closing_orders=Mock(side_effect=BrokerError('-2015'))
+        self.g.scan()
+        self.assertIn('AUSDT | LONG',self.e.state['outbox'][-1]['text'])
+        self.assertFalse(self.b.posts)
+
+    def test_hedge_broker_sends_long_without_reduce_only(self):
+        b=BinanceBroker('fake','fake');b.request=Mock()
+        b.repair_tp('AUSDT','5','10.1','cid',position_side='LONG')
+        args=b.request.call_args.args[2]
+        self.assertEqual(args['positionSide'],'LONG');self.assertNotIn('reduceOnly',args)
+        b.tp('AUSDT','5','10.1','cid',position_side='LONG')
+        self.assertNotIn('reduceOnly',b.request.call_args.args[2])
+        b.buy('AUSDT',dict(quantity='5',price='10',position_side='LONG'),'entry')
+        self.assertEqual(b.request.call_args.args[2]['positionSide'],'LONG')
 
     def test_position_closed_before_submit_no_order(self):
         self.b.positions=Mock(side_effect=[copy.deepcopy(self.b.ps),[]])

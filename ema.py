@@ -7684,9 +7684,9 @@ def _crash_start_services():
                 executor.state['unverified_day'] = day(time.time())
                 executor.save()
                 executor.alert('ℹ️ Önceki işlem kaydı yok. Günlük giriş sayısı doğrulanamadığından bugün yeni otomatik giriş bekletiliyor. Manuel TP kontrolü açık ise Binance pozisyon ve emirleri sorgulanacak.')
-            executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nGece girişleri: {"AÇIK" if auto_flag else "KAPALI"}\n'
+            executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler: {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
-                '20:00–08:00 Paris | 50 USDT pozisyon | 10x | aynı anda en fazla 5 sembol\n'
+                '24 saat | 50 USDT pozisyon | 10x | aynı anda en fazla 5 sembol\n'
                 f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram aç/kapat devre dışı.')
             _CRASH_NIGHT = executor
             executor.start()

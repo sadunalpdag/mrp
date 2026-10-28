@@ -138,18 +138,29 @@ class BinanceBroker:
         result = self.request('GET', '/fapi/v1/ticker/bookTicker', {'symbol': symbol}, signed=False)
         return D(result['bidPrice'])
 
-    def repair_tp(self, symbol, qty, price, client_id):
+    def repair_tp(self, symbol, qty, price, client_id, position_side="BOTH"):
         # Maker-only: never deliberately sell immediately after a missed target.
         return self.request('POST', '/fapi/v1/order', dict(symbol=symbol, side='SELL', type='LIMIT',
-            timeInForce='GTX', quantity=qty, price=price, reduceOnly='true', newClientOrderId=client_id))
+            timeInForce='GTX', quantity=qty, price=price, newClientOrderId=client_id,
+            **self.close_params(position_side)))
 
     def info(self, symbol):
         data = self.request('GET', '/fapi/v1/exchangeInfo', signed=False)
         return next(s for s in data['symbols'] if s['symbol'] == symbol)
 
+    @staticmethod
+    def close_params(position_side):
+        if position_side == 'LONG':
+            return {'positionSide': 'LONG'}
+        if position_side == 'BOTH':
+            return {'positionSide': 'BOTH', 'reduceOnly': 'true'}
+        raise ValueError('INVALID_POSITION_SIDE')
+
     def preflight(self, symbol):
-        if self.request('GET', '/fapi/v1/positionSide/dual').get('dualSidePosition') is not False:
-            raise ValueError('ONE_WAY_MODE_REQUIRED')
+        dual = self.request('GET', '/fapi/v1/positionSide/dual').get('dualSidePosition')
+        if type(dual) is not bool:
+            raise ValueError('INVALID_POSITION_MODE')
+        position_side = 'LONG' if dual else 'BOTH'
         positions = self.request('GET', '/fapi/v3/positionRisk')
         active = {p['symbol'] for p in positions if D(p['positionAmt']) != 0}
         if symbol in active or len(active) >= 5:
@@ -170,6 +181,7 @@ class BinanceBroker:
         result = self.request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': 10})
         if result.get('leverage') != 10:
             raise ValueError('LEVERAGE_NOT_CONFIRMED')
+        return position_side
 
     def order(self, symbol, client_id):
         return self.request('GET', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
@@ -177,11 +189,12 @@ class BinanceBroker:
     def buy(self, symbol, p, client_id):
         return self.request('POST', '/fapi/v1/order', dict(symbol=symbol, side='BUY', type='LIMIT',
             timeInForce='IOC', quantity=p['quantity'], price=p['price'], newClientOrderId=client_id,
-            newOrderRespType='RESULT'))
+            newOrderRespType='RESULT', positionSide=p.get('position_side', 'BOTH')))
 
-    def tp(self, symbol, qty, price, client_id):
+    def tp(self, symbol, qty, price, client_id, position_side="BOTH"):
         return self.request('POST', '/fapi/v1/order', dict(symbol=symbol, side='SELL', type='LIMIT',
-            timeInForce='GTC', quantity=qty, price=price, reduceOnly='true', newClientOrderId=client_id))
+            timeInForce='GTC', quantity=qty, price=price, newClientOrderId=client_id,
+            **self.close_params(position_side)))
 
 
 class NightExecutor:
@@ -233,7 +246,7 @@ class NightExecutor:
         if self.state.get('unverified_day') == day(self.clock()):
             return 'YENİ GİRİŞ BEKLİYOR: bugün geçmiş giriş sayısı doğrulanamadı | TP kontrolleri çalışıyor'
         count = sum(o['day'] == day(self.clock()) for o in list(self.state['orders'].values()))
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 20:00–08:00 Paris"
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 24 saat"
 
     def apply_control(self, action):
         if action == 'on':
@@ -250,7 +263,7 @@ class NightExecutor:
             self.armed_at = self.clock()
             self.enabled.set()
             return ('✅ Otomatik girişler AÇIK. Yalnız yeni giriş geçişleri işlenecek.\n'
-                    '20:00–08:00 Paris | 10x | en fazla 50 USDT pozisyon / yaklaşık 5 USDT teminat\n'
+                    '24 saat | 10x | en fazla 50 USDT pozisyon / yaklaşık 5 USDT teminat\n'
                     f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla 5 sembol. TP +%1; SL yok.\n'+self.summary())
         if action == 'off':
             self.enabled.clear()
@@ -311,7 +324,7 @@ class NightExecutor:
         sid, symbol = record.get('signal_id'), record.get('symbol')
         if (not self.enabled.is_set() or observed_at < self.armed_at
                 or not sid or not supported_symbol(symbol) or self.state['halt'] or self.state['outbox']
-                or not night(now) or not 0 <= now-observed_at <= 5 or observed_at < self.started
+                or not 0 <= now-observed_at <= 5 or observed_at < self.started
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') != 'OPEN' or sid in self.state['orders']):
             return
@@ -323,13 +336,14 @@ class NightExecutor:
             return
         try:
             p = plan(record, self.broker.info(symbol))
-            self.broker.preflight(symbol)
+            position_side = self.broker.preflight(symbol)
+            p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
             self.alert(f'⚠️ OTOMATİK GİRİŞ YAPILMADI | {symbol}\nTP/giriş ön kontrolü başarısız: {type(error).__name__}: {str(error)[:80] if isinstance(error, (ValueError, BrokerError)) else "CHECK_FAILED"}')
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
-        if not self.enabled.is_set() or not night(now) or not 0 <= now-observed_at <= 5:
+        if not self.enabled.is_set() or not 0 <= now-observed_at <= 5:
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
         order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_id=cid+'e', tp_id=cid+'t', **p)
@@ -364,13 +378,16 @@ class NightExecutor:
                 order['phase'] = 'TP_UNKNOWN'
                 self.save()  # On restart query this client ID; never duplicate TP.
                 try:
-                    self.broker.tp(symbol, order['filled_qty'], order['tp'], order['tp_id'])
+                    kwargs = {'position_side': 'LONG'} if order.get('position_side') == 'LONG' else {}
+                    self.broker.tp(symbol, order['filled_qty'], order['tp'], order['tp_id'], **kwargs)
                 except Exception as error:
                     order['tp_submit_error'] = error_details(error)
                     self.save()
             if order['phase'] in ('TP_UNKNOWN', 'PROTECTED'):
                 tp = self.broker.order(symbol, order['tp_id'])
-                if (tp.get('side') != 'SELL' or tp.get('reduceOnly') is not True
+                expected_side = order.get('position_side', 'BOTH')
+                if (tp.get('side') != 'SELL' or tp.get('positionSide', 'BOTH') != expected_side
+                        or (expected_side == 'BOTH' and tp.get('reduceOnly') not in (True, 'true'))
                         or D(tp['origQty']) != D(order['filled_qty']) or D(tp['price']) != D(order['tp'])):
                     raise ValueError('TP_PROPERTIES_NOT_CONFIRMED')
                 if tp.get('status') == 'FILLED':

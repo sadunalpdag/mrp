@@ -153,7 +153,7 @@ controls. Both are shipped **0/off**. Changes take effect after restart/redeploy
 
 ```python
 AUTO_TRADING_ENABLED = 0       # 1: allow new night entries
-MANUAL_TP_REPAIR_ENABLED = 0   # 1: inspect/repair missing TP on manual one-way longs
+MANUAL_TP_REPAIR_ENABLED = 0   # 1: inspect/repair missing TP on manual longs
 AUTO_MAX_DAILY_ENTRIES = 5
 ```
 
@@ -172,7 +172,7 @@ Keep one service instance and never delete state to clear a limit/fault.
 
 Execution behavior:
 
-- Paris local hours **20:00 inclusive to 08:00 exclusive**, including DST changes.
+- Automatic entries run **24 hours**, without a night-only restriction. Daily counters still use the Paris calendar day.
 - Existing Crash Bounce V2 rules remain unchanged. Only a new upward crossing, at
   most five seconds old, from an acknowledged Telegram candidate can trigger entry.
   No historical catch-up or candidate-message buys.
@@ -186,7 +186,7 @@ Execution behavior:
   Existing positions/orders on the target symbol prevent entry. Concurrent manual
   activity or another bot can change the account after the check; use a dedicated
   account/subaccount for this executor.
-- One-way position mode is required; hedge mode is rejected without changing it.
+- One-way and Hedge long positions are supported; account mode is never changed.
 - TP and price/quantity/minimum-notional filters are checked **before** entry.
   BUY LIMIT IOC at the candidate price avoids chasing higher. It may not fill;
   unfilled remainder does not stay open.
@@ -213,7 +213,7 @@ storage, account permissions and Telegram delivery require operator verification
 
 With `MANUAL_TP_REPAIR_ENABLED=1`, the executor inspects positive USDT perpetual
 positions approximately every 30 seconds, including outside the night entry window.
-The supported account mode is one-way; shorts/hedge positions are not modified.
+One-way and Hedge long positions are supported; short positions are not modified.
 This covers account longs not already owned by the automatic-entry tracker, rather
 than inferring manual provenance from Binance (the exchange does not label a
 position "manual"). It may include longs opened by other software on the account.
@@ -245,3 +245,8 @@ require review. Same-price/same-size close-and-reopen between polls cannot relia
 be distinguished; the guard can conservatively hold instead of placing a new TP.
 Offline tests cover these paths; no live orders or API credential verification were
 performed as part of this change.
+
+### Hedge-mode compatibility
+Manual long TP repair and automatic long entries support BOTH (one-way) and LONG (hedge). The account mode is never changed. Hedge closing orders use SELL + positionSide=LONG without reduceOnly; one-way orders retain reduceOnly. Existing normal and conditional TP orders are matched to the same symbol and position side. SHORT positions/orders are not managed. Coin-specific failures identify the symbol and LONG side. If fetching the account position list fails, a separate account-query warning explicitly says TP absence was not established.
+
+Position sizing remains 50 USDT notional at 10x (approximately 5 USDT margin); existing positions or pending orders on the candidate symbol block duplicate automatic entry.
