@@ -8,12 +8,14 @@ COMMANDS = {'/otomatik_ac': 'on', '/otomatik_kapat': 'off', '/otomatik_durum': '
 
 
 class TelegramControl:
-    def __init__(self, directory, token, chat_id, owner_id, action, deliver, log, clock=time.time, fetch=None):
+    def __init__(self, directory, token, chat_id, owner_id, action, deliver, log, clock=time.time, fetch=None, counter_only=False, require_owner=True):
+        self.counter_only = counter_only
+        self.require_owner = require_owner
         self.token, self.chat_id = token, str(chat_id)
         # Private chat ID equals the user ID. Group/channel IDs cannot infer an owner.
         fallback = self.chat_id if self.chat_id.isdigit() and int(self.chat_id) > 0 else ''
         self.owner_id = str(owner_id or fallback)
-        if not self.owner_id.isdigit() or int(self.owner_id) <= 0:
+        if require_owner and (not self.owner_id.isdigit() or int(self.owner_id) <= 0):
             raise ValueError('TELEGRAM_OWNER_ID_REQUIRED_FOR_GROUP')
         self.action, self.deliver, self.log, self.clock = action, deliver, log, clock
         self.fetch = fetch or self.get_updates
@@ -55,7 +57,7 @@ class TelegramControl:
             return None
         sender = msg.get('from', {})
         if (str(msg.get('chat', {}).get('id')) != self.chat_id
-                or str(sender.get('id')) != self.owner_id or sender.get('is_bot') is not False
+                or (self.require_owner and str(sender.get('id')) != self.owner_id) or sender.get('is_bot') is not False
                 or msg.get('sender_chat') or msg.get('forward_origin') or msg.get('forward_date')
                 or msg.get('forward_from') or msg.get('forward_sender_name')
                 or msg.get('via_bot') or msg.get('edit_date')):
@@ -65,7 +67,15 @@ class TelegramControl:
         if not isinstance(date, (float, int)) or date < self.started or not 0 <= now-date <= 90:
             return None
         # Exact commands only. Quoted, edited, forwarded and free-form signals cannot arm trading.
-        return COMMANDS.get(msg.get('text', '').strip())
+        text = msg.get('text', '').strip()
+        if self.counter_only:
+            if text in ('/sayac', '/otomatik_durum'):
+                return 'status'
+            parts = text.split()
+            if len(parts) == 2 and parts[0] == '/sayac' and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) <= 3:
+                return 'counter:'+parts[1]
+            return None
+        return COMMANDS.get(text)
 
     def status(self):
         if self.last_error:

@@ -24,6 +24,25 @@ class ControlTests(unittest.TestCase):
     def update(self, uid=1, text='/otomatik_ac'):
         return dict(update_id=uid,message={'chat':{'id':123},'from':{'id':123,'is_bot':False},'date':self.now,'text':text})
 
+    def test_counter_only_commands_authorized_and_cannot_toggle_trading(self):
+        self.c.counter_only=True
+        self.assertEqual(self.c.command(self.update(text='/sayac 0')),'counter:0')
+        self.assertEqual(self.c.command(self.update(text='/sayac 3')),'counter:3')
+        self.assertEqual(self.c.command(self.update(text='/sayac')),'status')
+        for text in ('/otomatik_ac','/otomatik_kapat','/sayac -1','/sayac 1 extra'):
+            self.assertIsNone(self.c.command(self.update(text=text)))
+        u=self.update(text='/sayac 0');u['message']['from']['id']=456
+        self.assertIsNone(self.c.command(u))
+
+    def test_chat_scoped_counter_allows_other_users_not_other_chats(self):
+        c=TelegramControl(self.tmp.name,'fake','-100999',None,self.action,self.deliver,Mock(),lambda:self.now,self.fetch,counter_only=True,require_owner=False)
+        u=self.update(text='/sayac 0');u['message']['chat']['id']=-100999;u['message']['from']['id']=456
+        self.assertEqual(c.command(u),'counter:0')
+        u['message']['chat']['id']=-100888
+        self.assertIsNone(c.command(u))
+        u['message']['chat']['id']=-100999;u['message']['text']='/otomatik_ac'
+        self.assertIsNone(c.command(u))
+
     def test_owner_only_exact_commands(self):
         for text, action in [('/otomatik_ac','on'),('/otomatik_kapat','off'),('/otomatik_durum','status')]:
             self.assertEqual(self.c.command(self.update(text=text)),action)

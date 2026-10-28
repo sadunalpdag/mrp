@@ -158,7 +158,7 @@ AUTO_MAX_DAILY_ENTRIES = 5
 ```
 
 `CRASH_NIGHT_TRADING` and Telegram open/close commands no longer activate anything.
-The Telegram command poller is not started. Telegram remains an output channel for
+The Telegram poller accepts only counter/status commands in the configured chat. Telegram also sends
 signals, health reports and execution/TP errors; `TELEGRAM_OWNER_ID` is not needed
 for sending those messages. Setting the entry flag to 0 stops new entries but
 preserves supervision of previously tracked automatic TP orders. Persisted fault
@@ -167,7 +167,7 @@ locks remain effective even with the entry flag set to 1.
 The broker reads **exactly** `BINANCE_API_KEY` and `BINANCE_SECRET_KEY` from the
 process environment. The screenshot contains those names, not their values, and
 does not establish key validity, IP permissions or Futures trading permissions.
-`CRASH_NIGHT_STATE_DIR` is optional; by default state is stored in `DATA_DIR/night_execution`. No Render persistent disk is required. Missing state blocks new entries for the current Paris calendar day because rejected/no-fill attempts cannot be recovered reliably from positions. Manual TP repair queries live positions and both normal/algo orders after startup; it remains available during this hold. Ephemeral storage may disappear on deploy, repeating the daily hold. Existing exchange orders are not canceled.
+`CRASH_NIGHT_STATE_DIR` is optional; by default state is stored in `DATA_DIR/night_execution`. No Render persistent disk is required. Missing state starts the current-day counter at zero by user request. Manual TP repair queries live positions and both normal/algo orders after startup. Ephemeral storage may disappear on deploy, resetting the local counter. Existing exchange orders are not canceled.
 Keep one service instance and never delete state to clear a limit/fault.
 
 Execution behavior:
@@ -252,4 +252,9 @@ Position sizing remains 50 USDT notional at 10x (approximately 5 USDT margin); e
 ### GTC candidate entries
 A candidate acknowledged by Telegram immediately queues a BUY LIMIT GTC at its entry level. Quantity is calculated with a 50 USDT notional ceiling at that limit; a better fill may use less than 50 USDT. The predetermined candidate TP price is retained. New unfilled orders stay on Binance until filled or canceled, including across bot restarts; disabling new entries does not cancel them. Pending symbols count toward the five-symbol cap. Live orders do not follow virtual low-break invalidation.
 
-The worker polls tracked orders every five seconds (plus API latency). NEW with no fill is normal pending state, not an error. On partial fill the bot cancels the remainder, queries final executed quantity, then places TP for that quantity. An unconfirmed cancellation stops new entries and alerts; TP protection cannot be guaranteed during an API outage. Unknown submit responses are queried, not blindly resubmitted. Existing missing-history daily hold still applies.
+The worker polls tracked orders every five seconds (plus API latency). NEW with no fill is normal pending state, not an error. On partial fill the bot cancels the remainder, queries final executed quantity, then places TP for that quantity. An unconfirmed cancellation stops new entries and alerts; TP protection cannot be guaranteed during an API outage. Unknown submit responses are queried, not blindly resubmitted. Missing-history daily hold has been removed; a fresh state starts at zero.
+
+### Daily counter and Telegram correction
+Missing local execution history now starts at 0, as explicitly requested. The old unverified-day hold is removed. A missing/ephemeral state store can therefore reset the used-entry counter on deploy; existing Binance positions and orders are still checked separately for the five-symbol cap. The Paris calendar day determines the counter: after midnight, previous-day counts/adjustments do not apply. No positions or pending orders are canceled by resetting the counter.
+
+The configured-chat Telegram poller is enabled solely for `/sayac` (show status), `/sayac N` (set today's used-entry count, 0 through AUTO_MAX_DAILY_ENTRIES), and `/otomatik_durum`. It does not accept trading enable/disable commands; those remain controlled by ema.py. New attempts after a correction increment the corrected value. TELEGRAM_OWNER_ID is not required. Any human user in configured CHAT_ID can correct the counter, including all members of a configured group. Other chats and forwarded/edited/stale messages are rejected. This changes the used count, not the daily maximum.

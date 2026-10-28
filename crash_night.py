@@ -217,6 +217,7 @@ class NightExecutor:
                     raise ValueError('INVALID_EXECUTOR_STATE')
             elif os.path.exists(marker):
                 raise ValueError('EXECUTOR_STATE_MISSING')
+            self.state.pop('unverified_day', None)
             self.state['paused'] = not enabled
             self.save()
             with open(marker, 'a') as handle:
@@ -245,13 +246,30 @@ class NightExecutor:
             os.fsync(handle.fileno())
         os.replace(self.path+'.tmp', self.path)
 
+    def daily_count(self):
+        today = day(self.clock())
+        raw = sum(o['day'] == today for o in list(self.state['orders'].values()))
+        adjustment = self.state.get('daily_counter_override', {})
+        if adjustment.get('day') == today:
+            return max(0, adjustment['count'] + raw - adjustment['raw_at_set'])
+        return raw
+
     def summary(self):
-        if self.state.get('unverified_day') == day(self.clock()):
-            return 'YENİ GİRİŞ BEKLİYOR: bugün geçmiş giriş sayısı doğrulanamadı | TP kontrolleri çalışıyor'
-        count = sum(o['day'] == day(self.clock()) for o in list(self.state['orders'].values()))
+        count = self.daily_count()
         return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 24 saat"
 
     def apply_control(self, action):
+        if action.startswith('counter:'):
+            value = action.split(':', 1)[1]
+            if not value.isascii() or not value.isdigit() or not 0 <= int(value) <= self.max_daily:
+                return f'⚠️ Kullanım: /sayac 0–{self.max_daily}. Bu değer bugünkü kullanılan giriş sayısıdır.'
+            today = day(self.clock())
+            before = self.daily_count()
+            self.state['daily_counter_override'] = dict(day=today, count=int(value),
+                raw_at_set=sum(o['day'] == today for o in self.state['orders'].values()))
+            self.save()
+            return (f'✅ Günlük kullanılan giriş sayısı: {before} → {int(value)} / {self.max_daily}\n'
+                    'Paris 00:00 itibarıyla yeni gün sayacı 0 olur. Açık/bekleyen emirler değişmedi; aynı anda 5 sembol sınırı korunuyor.')
         if action == 'on':
             if self.state['halt']:
                 return '⚠️ Açılamadı: '+self.state['halt']+'. Binance pozisyonları ve TP emirleri kontrol edilmeli. Komut hata kilidini kaldırmaz.'
@@ -331,10 +349,7 @@ class NightExecutor:
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') or sid in self.state['orders']):
             return
-        if self.state.get('unverified_day') == day(now):
-            self.alert(f'ℹ️ OTOMATİK GİRİŞ BEKLETİLDİ | {symbol}\nKod: DAILY_HISTORY_UNKNOWN — Bugünkü geçmiş giriş sayısı doğrulanamadı.')
-            return
-        if sum(o['day'] == day(now) for o in self.state['orders'].values()) >= self.max_daily:
+        if self.daily_count() >= self.max_daily:
             return
         if any(o['phase'] not in ('DONE', 'NO_FILL') and o['symbol'] == symbol for o in self.state['orders'].values()):
             return

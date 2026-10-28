@@ -7680,10 +7680,6 @@ def _crash_start_services():
             executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 5), manual_tp=bool(repair_flag))
-            if not prior:
-                executor.state['unverified_day'] = day(time.time())
-                executor.save()
-                executor.alert('ℹ️ Önceki işlem kaydı yok. Günlük giriş sayısı doğrulanamadığından bugün yeni otomatik giriş bekletiliyor. Manuel TP kontrolü açık ise Binance pozisyon ve emirleri sorgulanacak.')
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler: {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
                 '24 saat | 50 USDT pozisyon | 10x | aynı anda en fazla 5 sembol\n'
@@ -7700,10 +7696,22 @@ def _crash_start_services():
             reason = reasons.get(code, 'Başlangıç başarısız; veri klasörü erişimini ve kayıt dosyasını kontrol edin')
             trading_status = f'BAŞLATILAMADI | {code}: {reason}'
             log(f'[CRASH NIGHT START ERR] {code}: {reason}')
+    if _CRASH_NIGHT is not None:
+        try:
+            from crash_telegram_control import TelegramControl
+            token, chat = globals().get('BOT_TOKEN'), globals().get('CHAT_ID')
+            if not token or not chat:
+                raise ValueError('TELEGRAM_COUNTER_CREDENTIALS_MISSING')
+            _CRASH_CONTROL = TelegramControl(directory, token, chat, os.getenv('TELEGRAM_OWNER_ID'),
+                _CRASH_NIGHT.request_control, _crash_telegram_receipt, log, counter_only=True, require_owner=False)
+            _CRASH_CONTROL.start()
+        except Exception as error:
+            code = str(error) if str(error) in ('TELEGRAM_OWNER_ID_REQUIRED_FOR_GROUP', 'TELEGRAM_COUNTER_CREDENTIALS_MISSING') else type(error).__name__
+            log(f'[CRASH COUNTER CONTROL ERR] {code}')
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
-        result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: ema.py'
+        result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: ema.py | Telegram sayaç: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
         return result
     _CRASH_HEALTH = Heartbeat(DATA_DIR, _crash_telegram_receipt, health, log)
     _CRASH_HEALTH.start()

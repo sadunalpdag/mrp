@@ -213,6 +213,33 @@ class NightTests(unittest.TestCase):
         self.e.reconcile(order)
         self.assertEqual(order['phase'],'NO_FILL');self.assertFalse(self.b.tps)
 
+    def test_counter_override_persists_increments_and_resets_next_day(self):
+        self.assertEqual(self.e.daily_count(),0)
+        self.enter();self.assertEqual(self.e.daily_count(),1)
+        self.e.apply_control('counter:0')
+        self.assertEqual(self.e.daily_count(),0)
+        self.assertEqual(len(self.e.state['orders']),1)
+        self.e.save();self.e.guard.close();self.e=self.make()
+        self.assertEqual(self.e.daily_count(),0)
+        self.e.state['orders']['second']=dict(day=day(self.now),phase='DONE',symbol='BUSDT')
+        self.assertEqual(self.e.daily_count(),1)
+        self.e.apply_control('counter:10')
+        self.assertEqual(self.e.daily_count(),10)
+        self.now=timestamp('2026-10-28T00:00:00')
+        self.assertEqual(self.e.daily_count(),0)
+        self.assertEqual(len(self.e.state['orders']),2)
+
+    def test_counter_invalid_values_do_not_change_quota(self):
+        for value in ('-1','11','x','1.5'):
+            self.e.apply_control('counter:'+value)
+            self.assertEqual(self.e.daily_count(),0)
+
+    def test_old_unknown_history_marker_no_longer_blocks_first_entry(self):
+        self.e.state['unverified_day']=day(self.now)
+        self.e.save();self.e.guard.close();self.e=self.make()
+        self.assertNotIn('unverified_day',self.e.state)
+        self.enter();self.assertEqual(len(self.b.buys),1)
+
     def test_partial_fill_tp_only_filled_quantity(self):
         self.b.fill='2.3'; self.enter()
         self.assertEqual(self.b.tps[0][1],'2.3')
