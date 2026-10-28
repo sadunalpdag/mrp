@@ -120,7 +120,7 @@ class NightTests(unittest.TestCase):
                       v2_status='STRONG_V2', v2_sent=True, tracking_status='OPEN')
 
     def make(self):
-        e = NightExecutor(self.tmp.name, self.b, self.deliver, Mock(), lambda:self.now, enabled=True)
+        e = NightExecutor(self.tmp.name, self.b, self.deliver, Mock(), lambda:self.now, enabled=True, max_daily=10)
         self.addCleanup(e.guard.close)
         return e
 
@@ -151,7 +151,7 @@ class NightTests(unittest.TestCase):
 
     def test_tp_failure_halts_and_alerts_without_closing_or_duplicate(self):
         self.b.fail_tp=True; self.enter()
-        self.assertEqual(self.e.state['halt'],'TP DOĞRULANAMADI')
+        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
         self.e.deliver_pending(); self.enter(signal_id='signal-2',symbol='BUSDT')
         self.e.step()
         self.assertEqual(len(self.b.buys),1); self.assertEqual(len(self.b.tps),1)
@@ -168,7 +168,7 @@ class NightTests(unittest.TestCase):
         self.e.save(); self.e.guard.close()
         self.e=self.make(); self.e.step()
         self.assertFalse(self.b.buys)
-        self.assertEqual(self.e.state['halt'],'GİRİŞ SONUCU BELİRSİZ')
+        self.assertTrue(self.e.state['halt'].startswith('GİRİŞ SONUCU BELİRSİZ'))
 
     def test_daily_limit_persisted_and_resets_at_midnight(self):
         for i in range(10):
@@ -194,7 +194,7 @@ class NightTests(unittest.TestCase):
         self.enter(); self.e.deliver_pending()
         o=self.e.state['orders']['signal-1']; self.b.orders[o['tp_id']]['status']='CANCELED'
         self.now=timestamp('2026-10-28T12:00:00'); self.e.step()
-        self.assertEqual(self.e.state['halt'],'TP DOĞRULANAMADI')
+        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
 
     def test_bad_state_and_multiple_processes_fail_closed(self):
         with self.assertRaises(BlockingIOError): self.make()
@@ -237,7 +237,7 @@ class BrokerTests(unittest.TestCase):
             self.assertFalse(any(c.args[0]=='POST' for c in self.b.request.call_args_list))
 
     def test_leverage_ack_required(self):
-        self.b.request=Mock(side_effect=[{'dualSidePosition':False},[],[],{'leverage':5}])
+        self.b.request=Mock(side_effect=[{'dualSidePosition':False},[],[],[],{'leverage':5}])
         with self.assertRaisesRegex(ValueError,'LEVERAGE_NOT_CONFIRMED'): self.b.preflight('AUSDT')
 
     def test_tp_is_reduce_only_limit_not_market(self):

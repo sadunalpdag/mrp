@@ -146,40 +146,29 @@ A frozen scan or stale stream is never reported as healthy. Render also receives
 `[CRASH SCAN COMPLETE]` counters and `[CRASH HEARTBEAT]` delivery results.
 A stopped Render process cannot send a heartbeat.
 
-New entries **always start paused**, including when `CRASH_NIGHT_TRADING=live`.
-Deployment/restart does not activate trading. The owner explicitly arms it by sending
-`/otomatik_ac` to the bot. `/otomatik_kapat` stops new entries while existing TP
-monitoring continues; it does not close positions. An entry request already in
-flight may still complete. `/otomatik_durum` reports the gate, persistent fault lock
-and daily attempt count. `/otomatik_ac` cannot clear a TP/unknown-entry fault lock.
-There is no catch-up of crossings buffered while disabled, and neither command
-resets daily limits. After a restart, send a fresh open command if desired.
+### Python file switches (current)
 
-Render still requires `BINANCE_API_KEY`, `BINANCE_SECRET_KEY`, and
-`CRASH_NIGHT_STATE_DIR` pointing to an **absolute directory on its persistent disk**.
-Commands cannot create a persistent disk or supply missing API permissions. With
-these settings, `CRASH_NIGHT_TRADING=off` is sufficient: a fresh owner open command
-can initialize the executor. `live` or `telegram` initialize paused monitoring at
-startup; an existing executor state also resumes monitoring even in `off` mode.
-To pause while retaining TP supervision, prefer the Telegram close command.
+The following settings near the top of `ema.py` are the only production activation
+controls. Both are shipped **0/off**. Changes take effect after restart/redeploy:
 
-Use one service instance; file locking only covers processes sharing the same disk.
-Never delete state to clear limits/errors. Startup failures leave new entries off.
-Telegram uses the existing `BOT_TOKEN` and `CHAT_ID`. In a private chat, a positive
-numeric `CHAT_ID` also identifies the owner. For a group, explicitly set
-`TELEGRAM_OWNER_ID` to the owner's numeric user ID; group membership alone never
-authorizes commands. Both chat and sender IDs must match. Channels/anonymous admins,
-bots, forwarded/edited messages, pre-start messages and messages older than 90 seconds
-are rejected. Use the three exact commands without an `@botname` suffix.
+```python
+AUTO_TRADING_ENABLED = 0       # 1: allow new night entries
+MANUAL_TP_REPAIR_ENABLED = 0   # 1: inspect/repair missing TP on manual one-way longs
+AUTO_MAX_DAILY_ENTRIES = 5
+```
 
-Commands use a dedicated getUpdates poller, not the legacy free-form trading handler.
-Do not run another poller or webhook for the same bot. HTTP 409 indicates a polling
-or webhook conflict; the code logs it without exposing the bot token and does not
-delete webhooks automatically. Update offsets persist before command execution to
-avoid replay. A failed acknowledgement can leave the result uncertain: use status.
-A stop gate is applied immediately when the authenticated command reaches the
-executor, then persisted by the worker. A command waiting over 20 seconds returns
-"işlenmeyi bekliyor" rather than claiming completion.
+`CRASH_NIGHT_TRADING` and Telegram open/close commands no longer activate anything.
+The Telegram command poller is not started. Telegram remains an output channel for
+signals, health reports and execution/TP errors; `TELEGRAM_OWNER_ID` is not needed
+for sending those messages. Setting the entry flag to 0 stops new entries but
+preserves supervision of previously tracked automatic TP orders. Persisted fault
+locks remain effective even with the entry flag set to 1.
+
+The broker reads **exactly** `BINANCE_API_KEY` and `BINANCE_SECRET_KEY` from the
+process environment. The screenshot contains those names, not their values, and
+does not establish key validity, IP permissions or Futures trading permissions.
+`CRASH_NIGHT_STATE_DIR` must point to an absolute directory on a persistent disk.
+Keep one service instance and never delete state to clear a limit/fault.
 
 Execution behavior:
 
@@ -190,7 +179,7 @@ Execution behavior:
 - **10x**, at most **50 USDT notional** after rounding (approximately **5 USDT initial
   margin**, excluding fees). Margin mode is unchanged. Exchange filters may prevent
   small orders; quantities are never increased to satisfy minimums.
-- At most **10 reserved entry attempts per Paris calendar day**. No-fill, rejected
+- At most **5 reserved entry attempts per Paris calendar day**. No-fill, rejected
   or uncertain attempts consume a slot conservatively. The quota resets at midnight,
   not at the start of the overnight window.
 - At most **five occupied symbols**, including account positions and pending orders.
@@ -218,3 +207,41 @@ Execution behavior:
 
 Tests use fake exchange/Telegram adapters without real orders. Live fills, persistent
 storage, account permissions and Telegram delivery require operator verification.
+
+
+### Manual-position missing-TP repair
+
+With `MANUAL_TP_REPAIR_ENABLED=1`, the executor inspects positive USDT perpetual
+positions approximately every 30 seconds, including outside the night entry window.
+The supported account mode is one-way; shorts/hedge positions are not modified.
+This covers account longs not already owned by the automatic-entry tracker, rather
+than inferring manual provenance from Binance (the exchange does not label a
+position "manual"). It may include longs opened by other software on the account.
+
+Both normal open orders and `/fapi/v1/openAlgoOrders` must be queried successfully.
+An existing full reduce-only profitable LIMIT or conditional TAKE_PROFIT order is
+preserved, including `closePosition` TP. Partial TP coverage, other closing orders,
+SL/trailing-order conflicts and unknown order states produce warnings rather than
+adding a conflicting order. No existing order is canceled or resized.
+
+If there is no closing order, use actual average entry ×1.01, tick-size rounded up,
+for the full actual long quantity. Recheck position and both order lists before
+POST. If best bid already reached the target, warn without submitting a sale.
+Repair orders use reduce-only LIMIT **GTX (maker-only)** to avoid deliberately
+selling immediately if price jumps during the check. A maker rejection is reported
+with code `-5022`. TP placement still cannot be atomic with the original manual entry.
+
+Persist client order ID before sending. An uncertain response is query-only across
+restarts, never a blind resubmission. For a known whitelist of definite rejection
+codes, allow one later retry after at least 60 seconds and fresh checks (two attempts
+maximum per observed position version). Authentication/filter/reduce-only failures
+report sanitized Binance codes and Turkish explanations. Unknown errors do not
+include raw signed URLs, keys or response messages. Identical warnings are throttled
+to 30 minutes, and execution notifications remain in the persistent delivery queue.
+
+A filled/canceled/expired prior TP with a remaining position is warned about rather
+than automatically recreated. Changes to a previously attempted position also
+require review. Same-price/same-size close-and-reopen between polls cannot reliably
+be distinguished; the guard can conservatively hold instead of placing a new TP.
+Offline tests cover these paths; no live orders or API credential verification were
+performed as part of this change.
