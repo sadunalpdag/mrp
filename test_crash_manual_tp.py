@@ -41,6 +41,20 @@ class ManualTests(unittest.TestCase):
         self.e=NightExecutor(self.tmp.name,self.b,Mock(return_value={'ok':True}),Mock(),lambda:self.now,manual_tp=True)
         self.addCleanup(self.e.guard.close);self.g=ManualTPGuard(self.e)
 
+    def test_rate_limit_stops_coin_loop_and_reports_once(self):
+        self.b.ps.append(dict(self.b.ps[0],symbol='BUSDT'))
+        def limited(symbol):
+            self.b.cooldown_until=self.now+300
+            raise BrokerError('-1003')
+        self.b.closing_orders=Mock(side_effect=limited)
+        self.g.scan()
+        self.b.closing_orders.assert_called_once_with('AUSDT')
+        self.g.fail('BUSDT',BrokerError('-1003'))
+        self.assertEqual(len(self.e.state['outbox']),1)
+        message=self.e.state['outbox'][0]['text']
+        self.assertIn('AUSDT',message);self.assertIn('300 sn',message)
+        self.assertIn('TP eksikliği doğrulanmadı',message)
+
     def test_manual_daytime_long_missing_tp_repaired_verified(self):
         self.g.scan();self.assertEqual(len(self.b.posts),1)
         self.assertEqual(tuple(D(v) for v in self.b.posts[0][1:3]),(D('5'),D('10.1')))

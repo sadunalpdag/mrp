@@ -279,6 +279,21 @@ class NightTests(unittest.TestCase):
         self.e.expire_untracked_entries()
         self.b.cancel_entry.assert_called_once_with('AUSDT',cid)
 
+    def test_manual_scan_runs_once_per_minute_not_every_five_seconds(self):
+        self.e.manual_tp_enabled=True;self.e.manual_guard=Mock()
+        self.e.step()
+        self.now+=5;self.e.step()
+        self.assertEqual(self.e.manual_guard.scan.call_count,1)
+        self.now+=55;self.e.step()
+        self.assertEqual(self.e.manual_guard.scan.call_count,2)
+
+    def test_rate_pause_keeps_control_and_telegram_without_exchange_poll(self):
+        self.b.cooldown_until=self.now+300
+        self.e.manual_tp_enabled=True;self.e.manual_guard=Mock()
+        self.e.alert('test');self.e.step()
+        self.e.manual_guard.scan.assert_not_called()
+        self.assertFalse(self.e.state['outbox'])
+
     def test_partial_fill_tp_only_filled_quantity(self):
         self.b.fill='2.3'; self.enter()
         self.assertEqual(self.b.tps[0][1],'2.3')
@@ -404,6 +419,23 @@ class BrokerTests(unittest.TestCase):
         for order in ({},dict(positionSide='SHORT',side='SELL'),dict(positionSide='BOTH',side='SELL'),
                       dict(type='TAKE_PROFIT',side='SELL',reduceOnly=False)):
             self.assertFalse(self.b.is_closing_order(order))
+
+    def test_rate_limit_respects_retry_after_and_blocks_followup_http(self):
+        response=Mock(status_code=429,headers={'Retry-After':'300'})
+        response.json.return_value={'code':-1003,'msg':'Too many requests'}
+        http=Mock(return_value=response)
+        with patch.dict('sys.modules', {'requests':SimpleNamespace(request=http)}),patch('crash_night.time.time',return_value=1000):
+            with self.assertRaises(BrokerError):self.b.positions()
+            self.assertEqual(self.b.cooldown_until,1300)
+            with self.assertRaises(BrokerError):self.b.positions()
+            self.assertEqual(http.call_count,1)
+
+    def test_ip_ban_until_timestamp_is_honored(self):
+        response=Mock(status_code=418,headers={})
+        response.json.return_value={'code':-1003,'msg':'IP banned until 1793220000000'}
+        with patch.dict('sys.modules', {'requests':SimpleNamespace(request=Mock(return_value=response))}),patch('crash_night.time.time',return_value=1793210000):
+            with self.assertRaises(BrokerError):self.b.positions()
+            self.assertGreaterEqual(self.b.cooldown_until,1793220005)
 
     def test_leverage_ack_required(self):
         self.b.request=Mock(side_effect=[{'dualSidePosition':False},[],[],[],{'leverage':5}])

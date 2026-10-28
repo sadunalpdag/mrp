@@ -101,11 +101,15 @@ class BinanceBroker:
         if not key or not secret:
             raise ValueError('MISSING_BINANCE_CREDENTIALS')
         self.key, self.secret = key, secret
+        self.cooldown_until = 0
+        self.rate_failures = 0
 
     def request(self, method, path, params=None, signed=True):
         import requests
         import hmac
         from urllib.parse import urlencode
+        if time.time() < self.cooldown_until:
+            raise BrokerError('-1003')
         params = dict(params or {})
         if signed:
             params.update(timestamp=int(time.time()*1000), recvWindow=5000)
@@ -115,9 +119,27 @@ class BinanceBroker:
         try:
             response = requests.request(method, 'https://fapi.binance.com'+path+'?'+query,
                 headers={'X-MBX-APIKEY': self.key}, timeout=(5, 10))
-            body = response.json()
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
         except Exception:
             raise BrokerError('UNKNOWN', uncertain=True) from None
+        api_code = str(body.get('code', '')) if isinstance(body, dict) else ''
+        if response.status_code in (429, 418) or api_code == '-1003':
+            self.rate_failures += 1
+            delay = min(3600, 120 * 2**min(self.rate_failures-1, 5))
+            if response.status_code == 418:
+                delay = max(delay, 900)
+            try:
+                delay = max(delay, float(response.headers.get('Retry-After', 0)))
+            except (ValueError, TypeError):
+                pass
+            ban = re.search(r'ban(?:ned)? until (\d{13})', str(body.get('msg', '')), re.I) if isinstance(body, dict) else None
+            if ban:
+                delay = max(delay, int(ban.group(1))/1000-time.time()+5)
+            self.cooldown_until = time.time()+delay
+            raise BrokerError('-1003')
         if response.status_code >= 400:
             code = body.get('code', 'UNKNOWN') if isinstance(body, dict) else 'UNKNOWN'
             raise BrokerError(code, uncertain=response.status_code >= 500 or str(code) in ('-1006', '-1007'))
@@ -255,6 +277,8 @@ class NightExecutor:
         self.thread = None
         self.next_poll = 0
         self.next_expiry_scan = 0
+        self.next_manual_scan = 0
+        self.protected_poll = {}
         self.enabled = threading.Event()
         self.armed_at = clock()
         if enabled:
@@ -466,6 +490,9 @@ class NightExecutor:
                 else:
                     raise ValueError('TP_NOT_ACTIVE')
         except Exception as error:
+            if isinstance(error, BrokerError) and error.code == '-1003':
+                self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
+                return
             reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
             if not order.get('warned'):
                 order['warned'] = True
@@ -511,20 +538,35 @@ class NightExecutor:
                 raise
             finally:
                 done.set()
+        # A rate-limit pause suppresses exchange calls, not Telegram delivery/controls.
+        if self.clock() < getattr(self.broker, 'cooldown_until', 0):
+            self.deliver_pending()
+            return
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll:
             self.next_poll = self.clock()+5
             for order in list(self.state['orders'].values()):
+                if order['phase'] == 'PROTECTED':
+                    key = order['entry_id']
+                    if self.clock() < self.protected_poll.get(key, 0):
+                        continue
+                    self.protected_poll[key] = self.clock()+60
                 if order['phase'] in ('ENTRY_UNKNOWN', 'TP_UNKNOWN', 'PROTECTED'):
                     self.reconcile(order)
-            if self.manual_tp_enabled:
+            if self.manual_tp_enabled and self.clock() >= self.next_manual_scan:
+                self.next_manual_scan = self.clock()+60
                 if self.manual_guard is None:
                     from crash_manual_tp import ManualTPGuard
                     self.manual_guard = ManualTPGuard(self)
                 self.manual_guard.scan()
         if self.clock() >= self.next_expiry_scan:
             self.next_expiry_scan = self.clock()+60
-            self.expire_untracked_entries()
+            try:
+                self.expire_untracked_entries()
+            except BrokerError as error:
+                if error.code != '-1003':
+                    raise
+                self.log('[CRASH API COOLDOWN] eski giriş taraması ertelendi')
         self.deliver_pending()
         try:
             record, observed_at = self.queue.get_nowait()

@@ -101,6 +101,13 @@ class ManualTPGuard:
         self.e.alert(f'⚠️ {title} | {symbol}{side_label}{details}\nKod: {code}\nNeden: {explanation}\nPiyasa kapatma emri gönderilmedi; pozisyon ve TP durumunu Binance üzerinden kontrol edin.')
 
     def fail(self, symbol, error, record=None):
+        if isinstance(error, BrokerError) and error.code == '-1003':
+            now = self.e.clock()
+            if now >= self.notices.get('API_RATE_LIMIT', 0):
+                self.notices['API_RATE_LIMIT'] = now+300
+                wait = max(0, int(getattr(self.b, 'cooldown_until', now)-now))
+                self.e.alert(f'⚠️ API SORGULAMASI BEKLETİLDİ | {symbol}\nKod: -1003\nAPI istek sınırı aşıldı; işlem modülü {wait} sn bekleyecek. TP eksikliği doğrulanmadı; mevcut emirler iptal edilmedi.')
+            return
         if isinstance(error, ValueError) and str(error) in LOCAL_REASONS:
             self.warn(symbol, str(error), LOCAL_REASONS[str(error)], record)
         else:
@@ -129,6 +136,9 @@ class ManualTPGuard:
             self.e.save()
             raise ValueError('TP_NO_LONGER_ACTIVE')
         except Exception as error:
+            if isinstance(error, BrokerError) and error.code == '-1003':
+                self.fail(symbol, error)
+                return
             reason = record.get('submit_error', error_details(error))
             self.warn(symbol, 'TP_UNCONFIRMED', 'Emir sonucu/koruması doğrulanamadı. '+reason+' Yeni TP tekrar gönderilmedi.', record)
 
@@ -136,6 +146,9 @@ class ManualTPGuard:
         try:
             positions = self.b.positions()
         except Exception as error:
+            if isinstance(error, BrokerError) and error.code == '-1003':
+                self.fail('HESAP — coin listesi alınamadı', error)
+                return
             self.warn('HESAP — coin listesi alınamadı', 'POSITION_QUERY_FAILED',
                       'Açık pozisyonlar sorgulanamadı; TP eksikliği tespit edilmiş değildir. '+error_details(error))
             return  # failed query is not an empty account / absent TP
@@ -155,6 +168,8 @@ class ManualTPGuard:
                 self.inspect(p)
             except Exception as error:
                 self.fail(symbol, error, self.state.get(symbol))
+            if self.e.clock() < getattr(self.b, 'cooldown_until', 0):
+                break
 
     def inspect(self, p):
         symbol = p['symbol']
