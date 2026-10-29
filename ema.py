@@ -6836,8 +6836,20 @@ def _crash_queue_history(record, phase, now):
             from crash_data_sources import DataSources
             blocked = lambda: (time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
                 or time.time() < getattr(getattr(globals().get('_CRASH_NIGHT'), 'broker', None), 'cooldown_until', 0))
+            # Only annotate the existing REST-wait log; do not change API pacing.
+            def _crash_history_log(message):
+                if message.startswith('[CRASH DATA REST WAIT]') and 'REST_BEKLEMESI' in message:
+                    until = max(
+                        _crash_cooldown_until,
+                        globals().get('_rl_ban_until_ts', 0),
+                        getattr(getattr(globals().get('_CRASH_NIGHT'), 'broker', None),
+                                'cooldown_until', 0),
+                    )
+                    message += f'; REST_bekleme_sn={max(0, int(until - time.time()))}'
+                log(message)
+
             resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
-                _crash_public_get, blocked, log)
+                _crash_public_get, blocked, _crash_history_log)
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
@@ -7482,7 +7494,9 @@ def _crash_data_wait_detail(symbol, rows, now, last_price, tick_size):
     from crash_data_diagnostics import candle_diagnostic
     detail = candle_diagnostic(rows, now, last_price, tick_size)
     until = max(globals().get('_crash_cooldown_until', 0),
-                globals().get('_rl_ban_until_ts', 0))
+                globals().get('_rl_ban_until_ts', 0),
+                getattr(getattr(globals().get('_CRASH_NIGHT'), 'broker', None),
+                        'cooldown_until', 0))
     if globals().get('CRASH_DATA_FALLBACK_ENABLED', 0):
         collector = globals().get('_CRASH_HISTORY_COLLECTOR')
         return (detail + f'; REST_bekleme_sn={max(0,int(until-now))}; '
