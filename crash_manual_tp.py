@@ -142,7 +142,7 @@ class ManualTPGuard:
             reason = record.get('submit_error', error_details(error))
             self.warn(symbol, 'TP_UNCONFIRMED', 'Emir sonucu/koruması doğrulanamadı. '+reason+' Yeni TP tekrar gönderilmedi.', record)
 
-    def scan(self):
+    def scan(self, symbols=None):
         try:
             positions = self.b.positions()
         except Exception as error:
@@ -154,12 +154,14 @@ class ManualTPGuard:
             return  # failed query is not an empty account / absent TP
         active = {p['symbol'] for p in positions if D(p['positionAmt']) > 0 and p.get('positionSide', 'BOTH') in ('BOTH', 'LONG')}
         for symbol, record in self.state.items():
-            if symbol not in active and record['phase'] != 'UNKNOWN':
+            if (symbols is None or symbol in symbols) and symbol not in active and record['phase'] != 'UNKNOWN':
                 record['absent'] = True
         self.e.save()
         excluded = {o['symbol'] for o in self.e.state['orders'].values() if o['phase'] not in ('DONE', 'NO_FILL')}
         for p in positions:
             symbol = p.get('symbol')
+            if symbols is not None and symbol not in symbols:
+                continue
             if not supported_symbol(symbol) or D(p['positionAmt']) <= 0 or symbol in excluded:
                 continue
             if p.get('positionSide') == 'SHORT':

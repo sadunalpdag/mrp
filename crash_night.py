@@ -288,6 +288,13 @@ class NightExecutor:
         if enabled:
             self.enabled.set()
         self.controls = queue.Queue(maxsize=10)
+        self.account_stream = None
+        self.account_events = queue.Queue(maxsize=2000)
+        self.account_resync = threading.Event()
+        self.account_versions = {}
+        self.account_resync_after = 0
+        self.ws_manual_symbols = set()
+        self.ws_manual_after = 0
 
     def save(self):
         with open(self.path+'.tmp', 'w', encoding='utf-8') as handle:
@@ -306,7 +313,8 @@ class NightExecutor:
 
     def summary(self):
         count = self.daily_count()
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 24 saat"
+        stream = self.account_stream.summary() if self.account_stream else 'Hesap WS: baslatilmadi / REST yedek'
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 24 saat | {stream}"
 
     def apply_control(self, action):
         if action.startswith('counter:'):
@@ -428,11 +436,11 @@ class NightExecutor:
             pass
         self.reconcile(order)
 
-    def reconcile(self, order, check_expiry=True):
+    def reconcile(self, order, check_expiry=True, ws_order=None):
         symbol = order['symbol']
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
-                entry = self.broker.order(symbol, order['entry_id'])
+                entry = ws_order if ws_order and ws_order['clientOrderId'] == order['entry_id'] else self.broker.order(symbol, order['entry_id'])
                 status = entry.get('status')
                 qty = D(entry['executedQty'])
                 if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
@@ -475,7 +483,7 @@ class NightExecutor:
                     order['tp_submit_error'] = error_details(error)
                     self.save()
             if order['phase'] in ('TP_UNKNOWN', 'PROTECTED'):
-                tp = self.broker.order(symbol, order['tp_id'])
+                tp = ws_order if ws_order and ws_order['clientOrderId'] == order['tp_id'] else self.broker.order(symbol, order['tp_id'])
                 expected_side = order.get('position_side', 'BOTH')
                 if (tp.get('side') != 'SELL' or tp.get('positionSide', 'BOTH') != expected_side
                         or (expected_side == 'BOTH' and tp.get('reduceOnly') not in (True, 'true'))
@@ -528,6 +536,99 @@ class NightExecutor:
                 raise ValueError('ENTRY_EXPIRY_CANCEL_UNCONFIRMED')
             self.alert(f'ℹ️ 8 SAATLİK ALIŞ TAKİBİ | {symbol}\nBot giriş emri artık açık değil. Durum: {result.get("status")} | Dolan miktar: {result.get("executedQty")}\nAçık pozisyon ve TP emirleri iptal edilmedi.')
 
+    def on_account_event(self, event):
+        # Socket callbacks never mutate trading state or place orders.
+        if event.get('e') == 'ACCOUNT_STREAM_RESYNC':
+            self.account_resync.set()
+            return
+        try:
+            self.account_events.put_nowait(event)
+        except queue.Full:
+            if not self.account_resync.is_set():
+                self.log('[CRASH ACCOUNT WS OVERFLOW] REST mutabakati gerekli')
+            self.account_resync.set()
+
+    def process_account_events(self):
+        from crash_user_stream import order_update
+        now = self.clock()
+        if self.account_resync.is_set() and now >= self.account_resync_after:
+            self.account_resync.clear()
+            self.account_resync_after = now+60
+            self.next_poll = self.next_manual_scan = 0
+            self.protected_poll.clear()
+        for _ in range(200):
+            if self.clock() < getattr(self.broker, 'cooldown_until', 0):
+                break
+            try:
+                event = self.account_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                stamp = int(event['E'])
+                # Stale/replayed events cause authoritative reconciliation, not a late TP.
+                if not -5 <= now-stamp/1000 <= 30:
+                    self.account_resync.set()
+                    continue
+                if event.get('e') == 'ORDER_TRADE_UPDATE':
+                    update = order_update(event)
+                    key = ('order', update['symbol'], update['clientOrderId'])
+                    version = (stamp, Decimal(update['executedQty']),
+                               update['status'] in ('FILLED','CANCELED','EXPIRED','EXPIRED_IN_MATCH','REJECTED'))
+                    if version <= self.account_versions.get(key, (-1, Decimal(0), False)):
+                        continue
+                    self.account_versions[key] = version
+                    matched = False
+                    for order in list(self.state['orders'].values()):
+                        if order['symbol'] != update['symbol']:
+                            continue
+                        is_entry = update['clientOrderId'] == order['entry_id']
+                        is_tp = update['clientOrderId'] == order['tp_id']
+                        if not (is_entry or is_tp):
+                            continue
+                        matched = True
+                        if (is_entry and order['phase'] != 'ENTRY_UNKNOWN') or (is_tp and order['phase'] not in ('TP_UNKNOWN','PROTECTED')):
+                            break
+                        expected = 'BUY' if is_entry else 'SELL'
+                        if (update['side'] != expected or update['type'] != 'LIMIT'
+                                or update['positionSide'] != order.get('position_side','BOTH')
+                                or (is_entry and (Decimal(update['origQty']) != Decimal(order['quantity'])
+                                    or Decimal(update['price']) != Decimal(order['price'])))):
+                            self.account_resync.set()
+                            break
+                        self.log(f"[CRASH ACCOUNT ORDER] {update['symbol']}; status={update['status']}; filled={update['executedQty']}")
+                        self.reconcile(order, check_expiry=False, ws_order=update)
+                        self.protected_poll[order['entry_id']] = now+TP_POLL_SECONDS
+                        break
+                    if not matched:
+                        self.ws_manual_symbols.add(update['symbol'])
+                elif event.get('e') == 'ACCOUNT_UPDATE':
+                    # This is a delta: omitted symbols are NOT closed positions.
+                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in ('DONE','NO_FILL')}
+                    for p in event.get('a', {}).get('P', []):
+                        key = ('position', p['s'], p.get('ps','BOTH'))
+                        if stamp <= self.account_versions.get(key, -1):
+                            continue
+                        self.account_versions[key] = stamp
+                        if p.get('ps','BOTH') in ('BOTH','LONG') and p['s'] not in tracked:
+                            self.ws_manual_symbols.add(p['s'])
+                        self.log(f"[CRASH ACCOUNT POSITION] {p['s']}; side={p.get('ps','BOTH')}; degisiklik alindi")
+                if len(self.account_versions) > 10000:
+                    self.account_versions.clear()
+                    self.account_resync.set()
+            except Exception as error:
+                self.account_resync.set()
+                self.log(f'[CRASH ACCOUNT EVENT ERR] {type(error).__name__}')
+        if (self.manual_tp_enabled and self.ws_manual_symbols and now >= self.ws_manual_after
+                and self.clock() >= getattr(self.broker, 'cooldown_until', 0)):
+            if self.manual_guard is None:
+                from crash_manual_tp import ManualTPGuard
+                self.manual_guard = ManualTPGuard(self)
+            symbols = set(self.ws_manual_symbols)
+            self.ws_manual_symbols.clear()
+            self.ws_manual_after = now+30
+            # REST safety check is scoped to changed symbols; never treat a delta as a snapshot.
+            self.manual_guard.scan(symbols=symbols)
+
     def step(self):
         while True:
             try:
@@ -546,6 +647,7 @@ class NightExecutor:
         if self.clock() < getattr(self.broker, 'cooldown_until', 0):
             self.deliver_pending()
             return
+        self.process_account_events()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
@@ -581,6 +683,15 @@ class NightExecutor:
     def start(self):
         if self.thread and self.thread.is_alive():
             return
+        if isinstance(self.broker, BinanceBroker):
+            try:
+                import websocket
+                from crash_user_stream import AccountStream
+                self.account_stream = AccountStream(self.broker, self.on_account_event, self.log, websocket,
+                    blocked=getattr(self, 'public_rest_blocked', lambda:False))
+                self.account_stream.start()
+            except Exception as error:
+                self.log(f'[CRASH ACCOUNT WS START ERR] {type(error).__name__}; REST yedek aktif')
         def run():
             while True:
                 try:

@@ -7699,6 +7699,7 @@ def _crash_start_services():
                 '24 saat | 50 USDT pozisyon | 10x | aynı anda en fazla 5 sembol\n'
                 f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram aç/kapat devre dışı.')
             _CRASH_NIGHT = executor
+            executor.public_rest_blocked = lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
             executor.start()
         except Exception as error:
             reasons = {
