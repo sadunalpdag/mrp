@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
-from crash_data_sources import DataSources, STEP, DAY, valid_rows
+from crash_data_sources import DataSources, STEP, DAY, valid_rows, REST_MAX_CANDLES, source_counts, tagged
 from crash_history import HistoryCollector
 
 
@@ -29,15 +29,63 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(out),1)
         self.rest.assert_not_called();self.s.archive.assert_not_called()
 
-    def test_rest_success_prevents_archive_and_preserves_ws_overlap(self):
+    def test_archive_precedes_rest_and_preserves_ws_overlap(self):
         start=self.today-DAY
-        self.rest.return_value=rows(start,2)
-        self.s.archive=Mock()
+        order=[]
+        def archive(symbol,day):
+            order.append('ARCHIVE')
+            return []
+        def rest(*args,**kwargs):
+            order.append('REST')
+            return rows(start,1)
+        self.s.archive=Mock(side_effect=archive)
+        self.rest.side_effect=rest
         cache=rows(start+STEP,1);cache[0][4]='1.15'
         out=self.s.resolve('BTCUSDT',start,start+2*STEP,cache)
+        self.assertEqual(order,['ARCHIVE','REST'])
         self.assertEqual(out[1][4],'1.15')
         self.assertEqual(out[0][12],'BINANCE_REST')
-        self.s.archive.assert_not_called()
+        self.assertEqual(self.rest.call_args.args[1]['limit'],1)
+
+    def test_archive_and_ws_fill_most_of_480_rest_gets_only_remaining(self):
+        end=self.today+40*STEP
+        start=end-480*STEP
+        archived=[tagged(r,'BINANCE_ARCHIVE') for r in rows(start,309)]
+        ws=rows(end-STEP,1)
+        self.s.archive=Mock(side_effect=lambda symbol,day:archived)
+        self.rest.return_value=rows(start+309*STEP,170)
+        out=self.s.resolve('BTCUSDT',start,end,ws)
+        self.assertEqual(len(out),480)
+        self.assertEqual(source_counts(out),{
+            'BINANCE_ARCHIVE':309,'BINANCE_REST':170,'BINANCE_CACHE_WS':1})
+        params=self.rest.call_args.args[1]
+        self.assertEqual(params['startTime'],start+309*STEP)
+        self.assertEqual(params['endTime'],end-STEP-1)
+        self.assertEqual(params['limit'],170)
+
+    def test_full_archive_never_uses_rest(self):
+        end=self.today
+        start=end-480*STEP
+        self.s.archive=Mock(side_effect=lambda symbol,day:
+            [tagged(r,'BINANCE_ARCHIVE') for r in rows(day,96)])
+        out=self.s.resolve('BTCUSDT',start,end,[])
+        self.assertEqual(len(out),480)
+        self.assertEqual(source_counts(out),{'BINANCE_ARCHIVE':480})
+        self.rest.assert_not_called()
+
+    def test_archive_missing_never_requests_480_from_rest(self):
+        end=self.today
+        start=end-480*STEP
+        self.s.archive=Mock(return_value=[])
+        self.rest.side_effect=lambda path,params:rows(params['startTime'],params['limit'])
+        cache=[]
+        calls=[]
+        for _ in range(3):
+            cache=self.s.resolve('BTCUSDT',start,end,cache)
+            calls.append(self.rest.call_args.args[1]['limit'])
+        self.assertEqual(calls,[REST_MAX_CANDLES,REST_MAX_CANDLES,96])
+        self.assertEqual(len(cache),480)
+        self.assertLess(max(calls),480)
 
     def test_ban_still_uses_archive_but_not_today(self):
         self.s.blocked=lambda:True
