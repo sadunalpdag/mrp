@@ -17,10 +17,11 @@ class HistoryPacingWait(Exception):
 from crash_policy import supported_symbol
 
 class HistoryCollector:
-    def __init__(self, directory, fetch, emit, blocked, log, resolver=None, ws_rows=None, on_rows=None):
+    def __init__(self, directory, fetch, emit, blocked, log, resolver=None, ws_rows=None, on_rows=None, bybit=None):
         self.directory, self.fetch, self.emit = directory, fetch, emit
         self.blocked, self.log = blocked, log
         self.resolver, self.ws_rows, self.on_rows = resolver, ws_rows, on_rows
+        self.bybit = bybit  # Independent reference: never included in Binance cache
         self.lock = threading.RLock()
         self.thread = None
         self.attempts = []
@@ -137,11 +138,21 @@ class HistoryCollector:
         if self.on_rows:
             self.on_rows(job['symbol'], retained)
         from crash_data_sources import source_counts
-        return dict(data_sources=source_counts(snapshot), type='history_5d', signal_id=job['signal_id'], symbol=job['symbol'],
+        event = dict(data_sources=source_counts(snapshot), type='history_5d', signal_id=job['signal_id'], symbol=job['symbol'],
                     phase=job['phase'], as_of=job['as_of'], fetched_at=time.time(),
                     interval='15m', expected_candles=COUNT, candle_count=len(snapshot),
                     complete=len(snapshot)==COUNT, missing_candles=COUNT-len(snapshot),
                     closed_15m_ohlcv=snapshot)
+        # Bybit analysis is provenance-separated. It never changes live signal
+        # decisions, Binance OHLCV, positions, TP orders, or order submission.
+        if not event['complete'] and self.bybit is not None:
+            try:
+                reference = self.bybit.inspect(job['symbol'], end)
+                if reference is not None:
+                    event['bybit_reference'] = reference
+            except Exception as error:
+                self.log(f'[CRASH BYBIT RESEARCH ERR] {job["symbol"]}; {type(error).__name__}')
+        return event
 
     def step(self, now=None):
         now = time.time() if now is None else now
