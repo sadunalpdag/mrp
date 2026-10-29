@@ -70,6 +70,7 @@ class BybitGapTests(unittest.TestCase):
 
     def test_wrong_bybit_market_price_fails_closed(self):
         rows=candles(self.start+308*STEP,172)
+        rows[0][2]='1.6'
         rows[0][4]='1.5'  # Same-time Binance anchor close = 1.1
         self.get.return_value=payload(rows)
         self.assertEqual(self.b.fill_missing('BTCUSDT',self.start,self.end,
