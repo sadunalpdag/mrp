@@ -30,6 +30,7 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
     start = end - HISTORY_CANDLES * STEP_MS
     candles = {}
     quote_volumes = {}
+    provenance = {}
     for batch in (history_rows, ws_rows):
         if not isinstance(batch, list):
             continue
@@ -44,6 +45,11 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
                         min(o,h,l,c) <= 0 or v < 0 or
                         l > min(o,c) or h < max(o,c) or l > h):
                     continue
+                new_source = row[12] if len(row)>12 else 'BINANCE_CACHE_WS'
+                if (opened in candles and provenance[opened] != 'BYBIT_LINEAR'
+                        and new_source == 'BYBIT_LINEAR'):
+                    continue  # Binance data always outranks a cached Bybit gap.
+                provenance[opened] = new_source
                 candles[opened] = (o,h,l,c,v)
                 try:
                     quote = float(row[7])
