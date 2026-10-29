@@ -88,7 +88,6 @@ class Heartbeat:
                 f"Son başarılı sinyal gönderimi: {stamp(signal_at)} {m.get('last_signal_symbol', '')}\n"
                 f"Son sinyal gönderim hatası: {m.get('delivery_error', 'yok')}\n"
                 f"Otomatik işlem: {health.get('trading', 'KAPALI')}\n"
-                f"{health.get('reentry_paper', 'RE-ENTRY SANAL: kapalı')}\n"
                 f"Saat dilimi: Europe/Paris. Bu mesaj işlem sinyali değildir.")
 
     def step(self):
