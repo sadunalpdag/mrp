@@ -7551,7 +7551,11 @@ def _crash_get_candles(symbol):
             saved = []
         end = int(now*1000)//900000*900000
         merged = valid_rows(saved, end-480*900000, end)
-        merged.update(valid_rows(rows, end-480*900000, end))
+        for t, candle in valid_rows(rows, end-480*900000, end).items():
+            previous = merged.get(t)
+            if (previous is None or len(candle)<=12 or candle[12]!='BYBIT_LINEAR'
+                    or (len(previous)>12 and previous[12]=='BYBIT_LINEAR')):
+                merged[t] = candle
         rows = [merged[t] for t in sorted(merged)][-64:]
         if _crash_cached_candles_valid(rows, now):
             _CRASH_WS_CACHE.merge_candles(symbol, rows)
