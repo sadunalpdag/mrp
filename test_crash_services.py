@@ -279,13 +279,32 @@ class NightTests(unittest.TestCase):
         self.e.expire_untracked_entries()
         self.b.cancel_entry.assert_called_once_with('AUSDT',cid)
 
-    def test_manual_scan_runs_once_per_minute_not_every_five_seconds(self):
+    def test_manual_scan_runs_every_five_minutes(self):
         self.e.manual_tp_enabled=True;self.e.manual_guard=Mock()
         self.e.step()
         self.now+=5;self.e.step()
         self.assertEqual(self.e.manual_guard.scan.call_count,1)
-        self.now+=55;self.e.step()
+        self.now+=295;self.e.step()
         self.assertEqual(self.e.manual_guard.scan.call_count,2)
+
+    def test_order_and_expiry_poll_intervals(self):
+        self.e.state['orders'] = {
+            'a': dict(phase='ENTRY_UNKNOWN',entry_id='a'),
+            'b': dict(phase='TP_UNKNOWN',entry_id='b'),
+            'c': dict(phase='PROTECTED',entry_id='c')}
+        self.e.reconcile = Mock()
+        self.e.expire_untracked_entries = Mock()
+        self.e.step()
+        self.assertEqual(self.e.reconcile.call_count,3)
+        self.now += 299; self.e.step()
+        self.assertEqual(self.e.reconcile.call_count,3)
+        self.now += 1; self.e.step()
+        self.assertEqual(self.e.reconcile.call_count,6)
+        self.assertFalse(self.e.reconcile.call_args.kwargs['check_expiry'])
+        self.assertEqual(self.e.expire_untracked_entries.call_count,1)
+        self.now += 600; self.e.step()
+        self.assertTrue(self.e.reconcile.call_args.kwargs['check_expiry'])
+        self.assertEqual(self.e.expire_untracked_entries.call_count,2)
 
     def test_rate_pause_keeps_control_and_telegram_without_exchange_poll(self):
         self.b.cooldown_until=self.now+300

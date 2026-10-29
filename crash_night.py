@@ -18,6 +18,10 @@ from zoneinfo import ZoneInfo
 ZONE = ZoneInfo('Europe/Paris')
 D = Decimal
 ENTRY_TTL_SECONDS = 8 * 3600
+ORDER_POLL_SECONDS = 5 * 60
+TP_POLL_SECONDS = 5 * 60
+MANUAL_TP_POLL_SECONDS = 5 * 60
+ENTRY_EXPIRY_SCAN_SECONDS = 15 * 60
 
 
 def night(now):
@@ -424,7 +428,7 @@ class NightExecutor:
             pass
         self.reconcile(order)
 
-    def reconcile(self, order):
+    def reconcile(self, order, check_expiry=True):
         symbol = order['symbol']
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
@@ -433,7 +437,7 @@ class NightExecutor:
                 qty = D(entry['executedQty'])
                 if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
                     created = D(str(entry.get('time', 0))) / 1000 or D(str(order.get('submitted_at', self.clock())))
-                    expired = D(str(self.clock())) - created >= ENTRY_TTL_SECONDS
+                    expired = check_expiry and D(str(self.clock())) - created >= ENTRY_TTL_SECONDS
                     if qty == 0 and not expired:
                         if not order.get('pending_notified'):
                             order['pending_notified'] = True
@@ -543,24 +547,24 @@ class NightExecutor:
             self.deliver_pending()
             return
         # Manage protective orders even outside the entry window or when halted.
-        if self.clock() >= self.next_poll:
-            self.next_poll = self.clock()+5
+        if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
+            self.next_poll = self.clock()+ORDER_POLL_SECONDS
             for order in list(self.state['orders'].values()):
                 if order['phase'] == 'PROTECTED':
                     key = order['entry_id']
                     if self.clock() < self.protected_poll.get(key, 0):
                         continue
-                    self.protected_poll[key] = self.clock()+60
+                    self.protected_poll[key] = self.clock()+TP_POLL_SECONDS
                 if order['phase'] in ('ENTRY_UNKNOWN', 'TP_UNKNOWN', 'PROTECTED'):
-                    self.reconcile(order)
+                    self.reconcile(order, check_expiry=self.clock() >= self.next_expiry_scan)
             if self.manual_tp_enabled and self.clock() >= self.next_manual_scan:
-                self.next_manual_scan = self.clock()+60
+                self.next_manual_scan = self.clock()+MANUAL_TP_POLL_SECONDS
                 if self.manual_guard is None:
                     from crash_manual_tp import ManualTPGuard
                     self.manual_guard = ManualTPGuard(self)
                 self.manual_guard.scan()
         if self.clock() >= self.next_expiry_scan:
-            self.next_expiry_scan = self.clock()+60
+            self.next_expiry_scan = self.clock()+ENTRY_EXPIRY_SCAN_SECONDS
             try:
                 self.expire_untracked_entries()
             except BrokerError as error:
