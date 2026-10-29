@@ -6552,7 +6552,11 @@ def _crash_send_pending(state, now):
         from crash_context import format_context
         context_message = format_context(d.get("five_day_context"))
         archive_count = d.get('data_sources', {}).get('BINANCE_ARCHIVE', 0)
-        source_message = f'Veri: Binance günlük arşivinden {archive_count} mum tamamlandı.\n' if archive_count else '' 
+        bybit_count = d.get('data_sources', {}).get('BYBIT_LINEAR', 0)
+        source_message = f'Veri: Binance günlük arşivinden {archive_count} mum tamamlandı.\n' if archive_count else ''
+        if bybit_count:
+            source_message += (f'⚠️ Eksik {bybit_count} mum Bybit USDT Futures ile tamamlandı; '
+                               'fiyat/hacim borsaya göre farklı olabilir.\n')
         message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
@@ -6620,7 +6624,11 @@ def _crash_v2_validate_entry(record, now):
         from crash_data_sources import valid_rows, source_counts
         end = int(now*1000)//900000*900000
         selected = valid_rows(rows, end-480*900000, end)
-        selected.update(valid_rows(ws_rows, end-480*900000, end))
+        for t, candle in valid_rows(ws_rows, end-480*900000, end).items():
+            prev = selected.get(t)
+            if (prev is None or len(candle)<=12 or candle[12]!='BYBIT_LINEAR'
+                    or (len(prev)>12 and prev[12]=='BYBIT_LINEAR')):
+                selected[t] = candle
         result['data_sources'] = source_counts(list(selected.values()))
         return result
     except (ValueError, TypeError, OverflowError, AttributeError) as error:
@@ -6848,16 +6856,16 @@ def _crash_queue_history(record, phase, now):
                     message += f'; REST_bekleme_sn={max(0, int(until - time.time()))}'
                 log(message)
 
-            resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
-                _crash_public_get, blocked, _crash_history_log)
             from crash_bybit import BybitReference
             bybit = BybitReference(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'bybit_reference'), log)
+            resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
+                _crash_public_get, blocked, _crash_history_log, bybit=bybit)
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
                 resolver=resolver, ws_rows=_CRASH_WS_CACHE.candles,
-                on_rows=_CRASH_WS_CACHE.merge_candles, bybit=bybit)
+                on_rows=_CRASH_WS_CACHE.merge_candles)
         key = phase + "_history_queued"
         if not record.get(key):
             _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
@@ -7201,6 +7209,10 @@ class CrashBounceWebSocketCache:
                         continue
                     if int(row[6])-int(row[0]) != 900000-1:
                         continue
+                    old = merged.get(int(row[0]))
+                    if (len(row)>12 and row[12]=='BYBIT_LINEAR' and old is not None
+                            and (len(old)<=12 or old[12]!='BYBIT_LINEAR')):
+                        continue  # Never overwrite a Binance candle with a Bybit one.
                     merged[int(row[0])] = list(row)
                 except (ValueError, TypeError, IndexError):
                     continue
