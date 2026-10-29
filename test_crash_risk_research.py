@@ -13,7 +13,7 @@ class ResearchTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.r=RiskResearch(self.tmp.name)
-        self.at=self.r.state['started_at']+1
+        self.at=int(self.r.state['started_at'])+1  # Exact millisecond round trip; avoid floating future-quote flakiness.
         self.id=0
 
     def enter(self,key='one',score=60,symbol='AUSDT',at=None):
@@ -130,3 +130,4 @@ class ResearchTests(unittest.TestCase):
         for part in ('AUSDT','s1','signal','invalid timestamp','retry=300s'):self.assertIn(part,message)
 
 if __name__=='__main__':unittest.main()
+

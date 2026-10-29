@@ -26,12 +26,12 @@ except Exception:
 
 # ==============================================================================
 # 📘 EMA ULTRA — CRASH BOUNCE V2 ONLY (signal / research mode)
-#  - Only Crash Bounce V2 starts in main(); Fibonacci is not started.
+#  - Crash Bounce V2 plus isolated 4H/5m Re-entry paper worker; Fibonacci is not started.
 #  - Scan every 180 seconds, top 20 USDT-M losers with 24h drop >= 12%.
 #  - As-of candidate: strict 480 closed 15m candles, RSI14 >= 20, 4h recovery >= 1%.
 #  - Telegram is sent on qualified candidate, before the simulated entry.
 #  - Binance Futures aggTrade WS events track ordered hypothetical entry and TP.
-#  - No live order placement, leverage, SL, or legacy strategy worker is started.
+#  - Real Crash orders/TP use explicit Python flags; Re-entry is strictly paper-only.
 # ==============================================================================
 
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -236,6 +236,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 AUTO_TRADING_ENABLED = 1
 MANUAL_TP_REPAIR_ENABLED = 1
 AUTO_MAX_DAILY_ENTRIES = 5
+REENTRY_PAPER_ENABLED = 1  # Sanal 4h/5m izleme; gerçek emir göndermez.
 
 BINANCE_FAPI   = "https://fapi.binance.com"
 
@@ -7660,12 +7661,34 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     log(f"[CRASH SCAN COMPLETE] {scan_metrics}")
 
 
+def _reentry_public_cooldown():
+    executor = globals().get('_CRASH_NIGHT')
+    private_until = getattr(executor.broker, 'cooldown_until', 0) if executor else 0
+    until = max(globals().get('_crash_cooldown_until', 0), private_until)
+    if BinanceRateLimiter.is_banned():
+        until = max(until, time.time()+60)
+    return until
+
+
+def _reentry_public_fetch(path, params):
+    if time.time() < _reentry_public_cooldown():
+        raise RuntimeError('REENTRY_SHARED_COOLDOWN')
+    return _crash_public_get(path, params)
+
+
+def _reentry_public_universe(now):
+    market, _ = _crash_load_market_cache()
+    return [t for t in _CRASH_WS_CACHE.snapshot(now) if t.get('symbol') in market]
+
+
 def _crash_start_services():
     """File-controlled entry and manual TP repair; both shipped disabled."""
-    global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL
+    global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL, _REENTRY_PAPER, _REENTRY_PAPER_ERROR
     from crash_heartbeat import Heartbeat
     _CRASH_NIGHT = None
     _CRASH_CONTROL = None
+    _REENTRY_PAPER = None
+    _REENTRY_PAPER_ERROR = 'kapalı'
     auto_flag = globals().get('AUTO_TRADING_ENABLED', 0)
     repair_flag = globals().get('MANUAL_TP_REPAIR_ENABLED', 0)
     if auto_flag not in (0, 1) or repair_flag not in (0, 1):
@@ -7708,8 +7731,18 @@ def _crash_start_services():
         except Exception as error:
             code = str(error) if str(error) in ('TELEGRAM_OWNER_ID_REQUIRED_FOR_GROUP', 'TELEGRAM_COUNTER_CREDENTIALS_MISSING') else type(error).__name__
             log(f'[CRASH COUNTER CONTROL ERR] {code}')
+    if globals().get('REENTRY_PAPER_ENABLED', 0):
+        try:
+            from reentry_paper import ReentryPaper
+            _REENTRY_PAPER = ReentryPaper(DATA_DIR, _reentry_public_fetch, _reentry_public_universe,
+                _crash_telegram_receipt, log, cooldown=_reentry_public_cooldown)
+            _REENTRY_PAPER.start()
+        except Exception as error:
+            _REENTRY_PAPER_ERROR = type(error).__name__
+            log(f'[REENTRY PAPER START ERR] {_REENTRY_PAPER_ERROR}')
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
+        result['reentry_paper'] = _REENTRY_PAPER.summary() if _REENTRY_PAPER else 'RE-ENTRY SANAL: '+_REENTRY_PAPER_ERROR
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
         result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: ema.py | Telegram sayaç: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
         return result
@@ -14794,7 +14827,7 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     _crash_start_services()
-    log(f"[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; night_executor={_CRASH_NIGHT.summary() if _CRASH_NIGHT else 'off'}")
+    log(f"[START] CRASH BOUNCE V2 + REENTRY PAPER; Fibonacci disabled; executor={_CRASH_NIGHT.summary() if _CRASH_NIGHT else 'off'}")
     # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()
 

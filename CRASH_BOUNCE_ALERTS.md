@@ -267,3 +267,14 @@ Bot-created BUY LIMIT entries expire after eight hours from exchange creation ti
 
 ### Execution API polling and rate limits
 Pending entry/unconfirmed TP reconciliation runs on a five-second worker interval; verified TP checks and manual position scans run at most once per minute. Old-entry expiry sweep remains once per minute. Each scan can contain several weighted REST requests. The execution broker pauses all its exchange requests after -1003/429/418, honors numeric Retry-After and a ban-until timestamp, and uses exponential fallback backoff. Telegram controls/delivery continue during this pause. Other public-data collectors and other services on the same IP also consume rate limits; this broker-local change alone cannot guarantee no rate-limit errors.
+
+### Separate 4H/5m Re-entry paper worker
+`REENTRY_PAPER_ENABLED=1` starts isolated `reentry_paper.py`. It has no trading broker or order API. Crash Bounce signal and real-order rules remain unchanged.
+
+Universe: top five quote-volume symbols from the current validated Futures ticker cache, plus up to five existing paper positions. Scan every five minutes. Fetch 100 five-minute candles per watched symbol through the existing shared public-data limiter; cache 60 four-hour candles per symbol for each four-hour bucket. Defer while either public or execution REST cooldown is active. Failed/incomplete scans are not reported as healthy completed scans.
+
+Only closed, contiguous candles are used. Freeze the most recent completed 4h candle zone before the break candle. Four of the last five 4h closes above/below EMA20 establish LONG/SHORT direction. A strong 5m candle closes outside the zone, followed within three candles by the first strong close back inside in the trend direction. Strong means body >=60% of range. Future 4h data cannot revise the frozen zone.
+
+Hypothetical entry is the confirmation close, not a real fill. TP is +1% for LONG / -1% price for SHORT. NO SL. Up to five paper positions are tracked for 150 hours; then TIMEOUT. Missing bars censor results as DATA_GAP. Max adverse move uses 5m highs/lows including the entire TP bar, so intrabar ordering is not implied. Fees, slippage, funding, margin and liquidation are not simulated.
+
+State, signal inputs, results and Telegram queue: DATA_DIR/reentry_paper_state.json. Ephemeral storage loss can erase this research history. Two-hour health reports include separate paper status, last completed scan, data errors, OPEN/TP/TIMEOUT/DATA_GAP counts and Telegram delivery status. Separate candidate/result messages explicitly say SANAL, no real order. This experiment does not consume real-order limits or /sayac.
