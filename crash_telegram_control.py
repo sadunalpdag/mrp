@@ -68,6 +68,11 @@ class TelegramControl:
             return None
         # Exact commands only. Quoted, edited, forwarded and free-form signals cannot arm trading.
         text = msg.get('text', '').strip()
+        parts = text.split()
+        if text in ('/limit', '/tutar'):
+            return 'status'
+        if len(parts) == 2 and parts[0] in ('/limit', '/tutar') and len(parts[1]) <= 12:
+            return ('limit:' if parts[0] == '/limit' else 'amount:') + parts[1]
         if self.counter_only:
             if text in ('/sayac', '/otomatik_durum'):
                 return 'status'

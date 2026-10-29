@@ -38,7 +38,7 @@ def rounded(value, step, up=False):
         rounding=ROUND_UP if up else ROUND_DOWN)*D(str(step))
 
 
-def plan(record, info):
+def plan(record, info, position_usdt='50'):
     if info.get('status') != 'TRADING' or info.get('contractType') != 'PERPETUAL':
         raise ValueError('SYMBOL_NOT_TRADING_PERPETUAL')
     filters = {f['filterType']: f for f in info['filters']}
@@ -50,7 +50,10 @@ def plan(record, info):
     for price in (entry, tp):
         if price < D(pf['minPrice']) or price > D(pf['maxPrice']):
             raise ValueError('PRICE_FILTER')
-    qty = rounded(D('50')/entry, lot['stepSize'])
+    budget = D(str(position_usdt))
+    if not budget.is_finite() or not 0 < budget <= 100:
+        raise ValueError('INVALID_POSITION_USDT')
+    qty = rounded(budget/entry, lot['stepSize'])
     if qty < D(lot['minQty']) or qty > D(lot['maxQty']) or qty <= 0:
         raise ValueError('LOT_SIZE')
     minimum = D(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
@@ -273,7 +276,12 @@ class NightExecutor:
         except Exception:
             self.guard.close()
             raise
-        self.max_daily = max_daily
+        settings = self.state.get('trade_settings', {})
+        self.max_daily = int(settings.get('max_daily', max_daily))
+        self.position_usdt = D(str(settings.get('position_usdt', '50')))
+        if not 1 <= self.max_daily <= 15 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 100:
+            self.guard.close()
+            raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
         self.manual_guard = None
         self.started = clock()
@@ -314,9 +322,27 @@ class NightExecutor:
     def summary(self):
         count = self.daily_count()
         stream = self.account_stream.summary() if self.account_stream else 'Hesap WS: baslatilmadi / REST yedek'
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | 24 saat | {stream}"
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | {stream}"
 
     def apply_control(self, action):
+        if action.startswith(('limit:', 'amount:')):
+            kind, raw = action.split(':', 1)
+            try:
+                value = D(raw)
+                ceiling = 15 if kind == 'limit' else 100
+                if not value.is_finite() or not 1 <= value <= ceiling or (kind == 'limit' and value != value.to_integral_value()):
+                    raise ValueError('range')
+            except (ValueError, ArithmeticError):
+                return '⚠️ Kullanım: /limit 1–15 veya /tutar 1–100 (USDT toplam pozisyon, teminat değil).'
+            settings = dict(self.state.get('trade_settings', {}))
+            settings['max_daily' if kind == 'limit' else 'position_usdt'] = int(value) if kind == 'limit' else str(value)
+            self.state['trade_settings'] = settings
+            self.save()
+            if kind == 'limit':
+                self.max_daily = int(value)
+            else:
+                self.position_usdt = value
+            return ('✅ Yeni giriş ayarı kaydedildi. Kullanılan sayaç, mevcut pozisyonlar ve bekleyen emirler değişmedi. Aynı anda 5 sembol sınırı korunuyor.\n'+self.summary())
         if action.startswith('counter:'):
             value = action.split(':', 1)[1]
             if not value.isascii() or not value.isdigit() or not 0 <= int(value) <= self.max_daily:
@@ -342,7 +368,7 @@ class NightExecutor:
             self.armed_at = self.clock()
             self.enabled.set()
             return ('✅ Otomatik girişler AÇIK. Yalnız yeni giriş geçişleri işlenecek.\n'
-                    '24 saat | 10x | en fazla 50 USDT pozisyon / yaklaşık 5 USDT teminat\n'
+                    f'24 saat | 10x | en fazla {self.position_usdt} USDT pozisyon / yaklaşık {self.position_usdt/10} USDT teminat\n'
                     f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla 5 sembol. TP +%1; SL yok.\n'+self.summary())
         if action == 'off':
             self.enabled.clear()
@@ -412,7 +438,7 @@ class NightExecutor:
         if any(o['phase'] not in ('DONE', 'NO_FILL') and o['symbol'] == symbol for o in self.state['orders'].values()):
             return
         try:
-            p = plan(record, self.broker.info(symbol))
+            p = plan(record, self.broker.info(symbol), self.position_usdt)
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
