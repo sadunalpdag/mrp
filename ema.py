@@ -6430,7 +6430,11 @@ def _crash_public_get_locked(path, params=None):
                 until = max(until, (stamp / 1000 if stamp > 1e11 else stamp) + 5)
         except (ValueError, AttributeError, TypeError):
             pass
-        log(f"[CRASH REST HTTP LIMIT] status={response.status_code}; pausing bootstrap only")
+        log(f"[CRASH REST HTTP LIMIT] status={response.status_code}; endpoint={path}; "
+            f"symbol={(params or {}).get('symbol', 'ALL')}; "
+            f"used_weight_1m={response.headers.get('X-MBX-USED-WEIGHT-1M', 'bilinmiyor')}; "
+            f"retry_after_sn={retry}; REST_bekleme_sn={max(0, int(until-time.time()))}; "
+            f"bekleme_bitis_epoch={until:.0f}; gecmis_mum_sorgulari_bekletiliyor")
         _crash_set_cooldown(until)
         response.raise_for_status()
     response.raise_for_status()
@@ -6619,26 +6623,11 @@ def _crash_v2_assess_candidate(record, now, allow_rest=False):
     """Compute STRICT V2 from 480 candles as of initial candidate, not entry."""
     as_of = record["created_at"]
     result = _crash_v2_validate_entry(record, as_of)
-    if (result.get("status") == "MISSING_5D_HISTORY" and allow_rest
-            and time.time() >= _crash_cooldown_until and not BinanceRateLimiter.is_banned()):
-        # Only NEW candidates trigger one prioritized 5d bootstrap. The existing
-        # global REST weight limiter and 1s pacing are respected.
-        end = int(as_of * 1000) // 900000 * 900000
-        start = end - 480 * 900000
-        try:
-            rows = _crash_public_get("/fapi/v1/klines",
-                   {"symbol":record["symbol"],"interval":"15m","startTime":start,
-                    "endTime":end-1,"limit":499})
-            from crash_v2 import assess_entry
-            from crash_history import HistoryCollector
-            valid = HistoryCollector.validated(rows)
-            fresh = [valid[t] for t in sorted(valid) if start <= t < end]
-            result = assess_entry(fresh, _CRASH_WS_CACHE.candles(record["symbol"]), as_of,
-                                  btc_change_24h=record.get("btc_change_24h"))
-            # The asynchronous HistoryCollector owns persistent history_cache writes.
-            # Avoid racing its shared .tmp file while this fast-path scores the candidate.
-        except Exception as error:
-            log(f"[CRASH V2 BOOTSTRAP DEFERRED] {record['symbol']}: {type(error).__name__}")
+    if result.get("status") == "MISSING_5D_HISTORY" and allow_rest:
+        # One asynchronous owner writes the cache; never duplicate its REST work.
+        _crash_queue_history(record, 'signal', as_of)
+        log(f"[CRASH V2 HISTORY WAIT] {record['symbol']}: 5 gunluk veri kuyrukta; "
+            "tek isci, indirmeler arasi en az 60 sn; aday sure siniri korunuyor")
     return result
 
 
@@ -7453,6 +7442,7 @@ def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False)
 _CRASH_WS_CACHE = CrashBounceWebSocketCache()
 _crash_seed_retry = {}
 _crash_seed_attempts = []
+_crash_seed_errors = {}
 
 
 def _crash_write_json(path, data):
@@ -7473,6 +7463,27 @@ def _crash_cached_candles_valid(rows, now):
             all(int(b[0])-int(a[0])==900000 for a,b in zip(recent,recent[1:])))
 
 
+def _crash_data_wait_detail(symbol, rows, now, last_price, tick_size):
+    from crash_data_diagnostics import candle_diagnostic
+    detail = candle_diagnostic(rows, now, last_price, tick_size)
+    until = max(globals().get('_crash_cooldown_until', 0),
+                globals().get('_rl_ban_until_ts', 0))
+    attempts = [t for t in globals().get('_crash_seed_attempts', []) if now-t < 3600]
+    retry = globals().get('_crash_seed_retry', {}).get(symbol, 0)
+    if now < until or BinanceRateLimiter.is_banned():
+        wait = 'REST_BEKLEMESI'
+        seconds = max(0, int(until-now))
+    elif now < retry:
+        wait, seconds = 'COIN_TEKRAR_BEKLEMESI', int(retry-now)
+    elif len(attempts) >= 24:
+        wait, seconds = 'SAATLIK_24_DENEME_SINIRI', max(0, int(min(attempts)+3600-now))
+    else:
+        wait, seconds = 'AKTIF_BEKLEME_YOK', 0
+    return (detail + f'; veri_yenileme={wait}; kalan_sn={seconds}; '
+            f'son_saat_deneme={len(attempts)}/24; '
+            f'son_indirme_hatasi={globals().get("_crash_seed_errors", {}).get(symbol, "yok")}')
+
+
 def _crash_get_candles(symbol):
     now=time.time()
     rows=_CRASH_WS_CACHE.candles(symbol)
@@ -7490,9 +7501,12 @@ def _crash_get_candles(symbol):
     try:
         seed=_crash_public_get("/fapi/v1/klines",{"symbol":symbol,"interval":"15m","limit":64})
         _CRASH_WS_CACHE.merge_candles(symbol,seed)
+        _crash_seed_errors.pop(symbol, None)
         log(f"[CRASH WS SEED] {symbol}: historical candles cached")
     except Exception as error:
-        log(f"[CRASH WS SEED DEFERRED] {symbol}: {type(error).__name__}")
+        status = getattr(getattr(error, 'response', None), 'status_code', None)
+        _crash_seed_errors[symbol] = f'{type(error).__name__},HTTP={status}'
+        log(f"[CRASH WS SEED DEFERRED] {symbol}: {_crash_data_wait_detail(symbol, rows, time.time(), '1', '1')}")
     return _CRASH_WS_CACHE.candles(symbol)
 
 
@@ -7589,7 +7603,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             plan = crash_bounce_plan(klines, ticker["lastPrice"], market[symbol], int(now * 1000))
             if plan is None:
                 scan_metrics["candles_wait"] += 1
-                log(f"[CRASH BOUNCE WAIT] {symbol}: insufficient/fresh data")
+                log(f"[CRASH BOUNCE WAIT] {symbol}: {_crash_data_wait_detail(symbol, klines, now, ticker['lastPrice'], market[symbol])}")
                 continue
             scan_metrics["candles_ok"] += 1
             if previous and Decimal(plan["entry"]) > Decimal(str(previous["entry"])) * Decimal("0.98"):

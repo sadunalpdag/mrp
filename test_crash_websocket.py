@@ -15,7 +15,7 @@ class WebSocketTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         tree=ast.parse(Path(__file__).with_name('ema.py').read_text())
-        functions={'_crash_write_json','_crash_get_candles','_crash_cached_candles_valid','_crash_bounce_worker'}
+        functions={'_crash_data_wait_detail','_crash_write_json','_crash_get_candles','_crash_cached_candles_valid','_crash_bounce_worker'}
         subset=ast.Module(body=[n for n in tree.body if
             (isinstance(n,ast.ClassDef) and n.name=='CrashBounceWebSocketCache') or
             (isinstance(n,ast.FunctionDef) and n.name in functions)],type_ignores=[])
@@ -24,7 +24,7 @@ class WebSocketTests(unittest.TestCase):
             json=json,math=math,os=os,threading=threading,SAVE_LOCK=threading.Lock(),log=Mock(),
             CRASH_BOUNCE_CANDLES_FILE=self.tmp.name+'/candles.json',
             CRASH_BOUNCE_MARKET_FILE=self.tmp.name+'/market.json',
-            _crash_cooldown_until=0.,_crash_seed_retry={},_crash_seed_attempts=[],
+            _crash_cooldown_until=0.,_crash_seed_retry={},_crash_seed_attempts=[],_crash_seed_errors={},
             _crash_public_get=Mock(),BinanceRateLimiter=SimpleNamespace(is_banned=lambda:False),
             _CRASH_STATE_LOCK=threading.RLock(),_CRASH_ACTIVE_STATE=None,
             _crash_trade_consumer=lambda:None)
@@ -184,3 +184,16 @@ class RecoveryTests(unittest.TestCase):
         ws=Mock();self.cache.on_open(ws)
         self.cache.reconcile({'牛来USDT','AUSDT'})
         self.assertEqual(self.cache.wanted,{'AUSDT'})
+
+    def test_data_wait_reasons_preserve_cooldown_priority(self):
+        detail = self.g['_crash_data_wait_detail']
+        self.g['_crash_cooldown_until'] = self.now + 600
+        self.g['_crash_seed_retry']['AUSDT'] = self.now + 1800
+        text = detail('AUSDT', [], self.now, '1', '.001')
+        self.assertIn('REST_BEKLEMESI', text)
+        self.assertIn('kalan_sn=600', text)
+        self.g['_crash_cooldown_until'] = 0
+        self.assertIn('COIN_TEKRAR_BEKLEMESI', detail('AUSDT', [], self.now, '1', '.001'))
+        self.g['_crash_seed_retry'].clear()
+        self.g['_crash_seed_attempts'] = [self.now-100]*24
+        self.assertIn('SAATLIK_24_DENEME_SINIRI', detail('AUSDT', [], self.now, '1', '.001'))

@@ -7,6 +7,12 @@ import time
 
 STEP = 900000
 COUNT = 480
+DOWNLOAD_INTERVAL = 60
+
+
+class HistoryPacingWait(Exception):
+    pass
+
 
 from crash_policy import supported_symbol
 
@@ -19,6 +25,8 @@ class HistoryCollector:
         self.attempts = []
         os.makedirs(directory, exist_ok=True)
         self.path = os.path.join(directory, 'pending.json')
+        self.pacing_path = os.path.join(directory, 'download_schedule.json')
+        self.next_download = self._read(self.pacing_path, {}).get('next_download', 0)
         self.jobs = self._read(self.path, {})
         discarded = [key for key,job in self.jobs.items()
                      if not isinstance(job, dict) or not supported_symbol(job.get('symbol'))]
@@ -82,7 +90,7 @@ class HistoryCollector:
             result[t] = row
         return result
 
-    def collect(self, job):
+    def collect(self, job, scheduled_at=None):
         if not supported_symbol(job.get('symbol')):
             raise ValueError('Unsupported history symbol')
         # End at the last fully closed candle at the ORIGINAL event time.
@@ -93,9 +101,21 @@ class HistoryCollector:
         expected = list(range(start, end, STEP))
         missing = [t for t in expected if t not in cached]
         if missing:
-            # An incremental tail in normal operation; also repairs internal gaps.
+            if scheduled_at is not None:
+                if scheduled_at < self.next_download:
+                    raise HistoryPacingWait()
+                self.next_download = scheduled_at + DOWNLOAD_INTERVAL
+                self._write(self.pacing_path, {'next_download': self.next_download})
+                self.attempts.append(scheduled_at)
+            # Download only the first contiguous missing range; retain partial progress.
+            missing_end = missing[0] + STEP
+            while missing_end < end and missing_end not in cached:
+                missing_end += STEP
+            self.log(f"[CRASH HISTORY DOWNLOAD] {job['symbol']}; "
+                     f"cached={COUNT-len(missing)}/480; missing={len(missing)}; "
+                     f"request_candles={(missing_end-missing[0])//STEP}; next_request_after=60s")
             rows = self.fetch('/fapi/v1/klines', dict(symbol=job['symbol'], interval='15m',
-                              startTime=missing[0], endTime=end-1, limit=499))
+                              startTime=missing[0], endTime=missing_end-1, limit=499))
             fresh = self.validated(rows)
             cached.update({t:r for t,r in fresh.items() if start <= t < end})
         snapshot = [cached[t] for t in expected if t in cached]
@@ -117,19 +137,31 @@ class HistoryCollector:
         if len(self.attempts) >= 24:
             return
         with self.lock:
-            item = next(((k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now), None)
+            ready = [(k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now]
+            # Current signal checks precede entry research and expired snapshots.
+            ready.sort(key=lambda item: (not (item[1]['phase']=='signal' and
+                0 <= now-item[1]['as_of'] <= 90), -item[1]['as_of']))
+            item = ready[0] if ready else None
         if item is None:
             return
         key, job = item
-        self.attempts.append(now)
         try:
-            event = self.collect(job)
+            event = self.collect(job, scheduled_at=now)
             # Use fetch day so the upcoming ZIP includes late/retried downloads.
             self.emit(event, time.time())
             with self.lock:
-                self.jobs.pop(key, None)
+                if event['complete']:
+                    self.jobs.pop(key, None)
+                else:
+                    self.jobs[key]['retry_after'] = now + 1800
                 self._write(self.path, self.jobs)
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
+        except HistoryPacingWait:
+            with self.lock:
+                self.jobs[key]['retry_after'] = self.next_download
+                self._write(self.path, self.jobs)
+            self.log(f"[CRASH HISTORY SCHEDULE] {job['symbol']}; "
+                     f"queue={len(self.jobs)}; wait_seconds={max(0,int(self.next_download-now))}")
         except Exception as error:
             with self.lock:
                 self.jobs[key]['retry_after'] = now + 1800

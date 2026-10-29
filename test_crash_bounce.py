@@ -12,7 +12,7 @@ from unittest.mock import Mock
 
 class CrashBounceTests(unittest.TestCase):
     def setUp(self):
-        names={"_crash_signal_score","crash_bounce_plan","run_crash_bounce_alerts",
+        names={"_crash_data_wait_detail","_crash_signal_score","crash_bounce_plan","run_crash_bounce_alerts",
                "_crash_send_pending","_crash_initialize_tracking","tg_send"}
         tree=ast.parse(Path(__file__).with_name("ema.py").read_text())
         subset=ast.Module(body=[n for n in tree.body if isinstance(n,ast.FunctionDef)
@@ -109,3 +109,4 @@ class CrashBounceTests(unittest.TestCase):
 
 if __name__=="__main__":
     unittest.main()
+

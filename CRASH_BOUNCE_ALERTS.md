@@ -270,3 +270,9 @@ Pending entry/unconfirmed TP reconciliation runs on a five-second worker interva
 
 ### Re-entry paper worker removed
 The separate 4H/5m paper worker, its REST candle requests, Telegram messages and heartbeat section have been removed. Existing research state files are left untouched, but are no longer processed. Crash Bounce scanning remains every three minutes with the existing real-entry and TP rules.
+
+### Candle availability diagnostics
+`CRASH BOUNCE WAIT` reports the closed-candle count (16 needed for the initial 4h plan), last close in UTC, age, timestamp gaps and invalid values. This is separate from the later 480-candle V2 history requirement. The same message identifies REST cooldown, per-symbol retry delay, or the hourly 24-bootstrap-attempt budget, remaining seconds and the last seed error type/HTTP status. HTTP-limit logs identify the public endpoint, symbol, returned weight and selected pause duration. Diagnostics do not add API requests or change signal rules or retry timing.
+
+### Scheduled five-day history
+V2 candidate assessment no longer performs a separate synchronous 480-candle download. It queues missing history for the single collector, which persists its results for reuse. Downloads are spaced by at least 60 seconds, with the next-download time persisted when storage survives a restart; the existing 24-attempt/hour budget and API cooldown remain. Cache hits need no download. Only a contiguous missing interval is requested; incomplete jobs remain queued for retry. Recent signal jobs have priority over entry research and older snapshots. The existing 90-second signal freshness limit is unchanged, so a candidate can expire while waiting for first-time history; stale candidates are not traded late. This schedule covers five-day history, not execution/TP polling or the separate 4h bootstrap.
