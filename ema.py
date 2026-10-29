@@ -6850,10 +6850,14 @@ def _crash_queue_history(record, phase, now):
 
             resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
                 _crash_public_get, blocked, _crash_history_log)
+            from crash_bybit import BybitReference
+            bybit = BybitReference(
+                os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'bybit_reference'), log)
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
-                resolver=resolver, ws_rows=_CRASH_WS_CACHE.candles, on_rows=_CRASH_WS_CACHE.merge_candles)
+                resolver=resolver, ws_rows=_CRASH_WS_CACHE.candles,
+                on_rows=_CRASH_WS_CACHE.merge_candles, bybit=bybit)
         key = phase + "_history_queued"
         if not record.get(key):
             _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
