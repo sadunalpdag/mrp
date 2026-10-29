@@ -1,5 +1,5 @@
-"""Closed Binance USD-M 15m: cache/WS -> REST -> archive -> Bybit missing-only.
-Bybit candles are source-tagged and replaceable by authoritative Binance data.
+"""Closed Binance USD-M 15m: local cache/WS -> daily archive -> REST gaps -> Bybit.
+All fallbacks are source-tagged; Binance is preferred whenever available.
 """
 import csv
 import hashlib
@@ -15,6 +15,7 @@ from crash_policy import supported_symbol
 
 STEP = 900000
 DAY = 86400000
+REST_MAX_CANDLES = 192  # Never request all 480 candles through Binance REST.
 
 
 def valid_rows(rows, start, end):
@@ -123,44 +124,72 @@ class DataSources:
         end=min(end,int(self.clock()*1000)//STEP*STEP)
         found=valid_rows(cached,start,end)
         expected=range(start,end,STEP)
+
         def source(row):
             return row[12] if len(row)>12 else 'BINANCE_CACHE_WS'
-        def missing():return [t for t in expected if t not in found]
-        def bybit_times():return [t for t in expected if t in found and source(found[t])=='BYBIT_LINEAR']
+
+        def missing():
+            return [t for t in expected if t not in found]
+
+        def bybit_times():
+            return [t for t in expected if t in found and source(found[t])=='BYBIT_LINEAR']
+
         def add(rows,src=None):
+            added=0
             for t,row in valid_rows(rows,start,end).items():
-                # Binance always outranks previous Bybit data at the same UTC time.
                 if (t not in found or
-                        (source(found[t])=='BYBIT_LINEAR'
-                         and (src is not None or source(row)!='BYBIT_LINEAR'))):
+                        (source(found[t])=='BYBIT_LINEAR' and
+                         (src is not None or source(row)!='BYBIT_LINEAR'))):
                     found[t]=tagged(row,src) if src else row
+                    added+=1
+            return added
+
+        # First use cached closed Binance/WebSocket candles, then published
+        # Binance daily archives. The archive host has a separate request
+        # budget and cached ZIPs are not downloaded again.
+        today=int(self.clock()*1000)//DAY*DAY
+        needed_days=missing()+bybit_times()
+        for day in sorted({t//DAY*DAY for t in needed_days if t//DAY*DAY<today}):
+            add(self.archive(symbol,day))
+
+        # Only query the gaps left AFTER cache, WS and archive. A single REST
+        # call is bounded to at most 192 consecutive 15m candles (not 480).
+        # Keep a 30m backoff for later Binance replacement of Bybit candles.
         gaps=missing()
         old_bybit=bybit_times()
         blocked=self.blocked()
-        recheck=(old_bybit and self.clock()>=self.binance_recheck.get(symbol,0))
+        recheck=bool(old_bybit and self.clock()>=self.binance_recheck.get(symbol,0))
         work=gaps if gaps else (old_bybit if recheck else [])
+        rest_added=0
         if work and not blocked:
             first=work[0]
             finish=first+STEP
-            while finish<end and (finish not in found or source(found[finish])=='BYBIT_LINEAR'):
+            while (finish<end and (finish not in found or source(found[finish])=='BYBIT_LINEAR')
+                   and (finish-first)//STEP<REST_MAX_CANDLES):
                 finish+=STEP
+            request_candles=(finish-first)//STEP
             try:
                 if not gaps:
                     self.binance_recheck[symbol]=self.clock()+1800
-                add(self.rest('/fapi/v1/klines',{'symbol':symbol,'interval':'15m',
-                    'startTime':first,'endTime':finish-1,'limit':499}),'BINANCE_REST')
+                rest_added=add(self.rest('/fapi/v1/klines', {
+                    'symbol':symbol, 'interval':'15m',
+                    'startTime':first, 'endTime':finish-1,
+                    'limit':request_candles}), 'BINANCE_REST')
+                self.log(f'[CRASH DATA REST GAPS] {symbol}; '
+                         f'istenen={request_candles}; alinan={rest_added}; '
+                         f'arsiv_oncelikli=1')
             except Exception as error:
-                self.log(f'[CRASH DATA REST WAIT] {symbol}; type={type(error).__name__}; yedek kaynaklara geciliyor')
+                self.log(f'[CRASH DATA REST WAIT] {symbol}; '
+                         f'type={type(error).__name__}; yedek kaynaklara geciliyor')
         elif gaps and blocked:
             self.log(f'[CRASH DATA REST WAIT] {symbol}; REST_BEKLEMESI; yedek kaynaklar aktif')
-        today=int(self.clock()*1000)//DAY*DAY
-        # Published daily Binance data can also replace prior Bybit candles.
-        replace_days=missing()+bybit_times()
-        for day in sorted({t//DAY*DAY for t in replace_days if t//DAY*DAY<today}):
-            add(self.archive(symbol,day))
-        if missing() and self.bybit is not None:
-            # Request ONLY the still-missing intervals, never 480-mum reference.
+
+        # If REST is working, allow later queue passes to fetch any additional
+        # gaps without immediately loading Bybit. If REST is blocked or could
+        # not supply missing rows, Bybit may fill ONLY those missing timestamps.
+        if missing() and self.bybit is not None and (blocked or rest_added==0):
             add(self.bybit.fill_missing(symbol,start,end,missing(),list(found.values())))
+
         rows=[found[t] for t in sorted(found)]
         self.log(f'[CRASH DATA SOURCES] {symbol}; candles={len(rows)}/{len(expected)}; '
                  f'missing={len(missing())}; sources={source_counts(rows)}')
