@@ -199,8 +199,9 @@ class BinanceBroker:
         closing = [o for o in orders if self.is_closing_order(o)]
         pending = {o['symbol'] for o in orders if not self.is_closing_order(o)}
         total = len(active | pending)
-        if total >= 5:
-            raise ValueError(f'MAX_5_WITH_PENDING_ORDERS | açık={len(active)} giriş={len(pending-active)} toplam={total} kapatma_hariç={len(closing)}')
+        limit = getattr(self, 'max_symbols', 5)
+        if total >= limit:
+            raise ValueError(f'MAX_{limit}_WITH_PENDING_ORDERS | açık={len(active)} giriş={len(pending-active)} toplam={total} kapatma_hariç={len(closing)}')
 
     def preflight(self, symbol):
         dual = self.request('GET', '/fapi/v1/positionSide/dual').get('dualSidePosition')
@@ -209,8 +210,8 @@ class BinanceBroker:
         position_side = 'LONG' if dual else 'BOTH'
         positions = self.request('GET', '/fapi/v3/positionRisk')
         active = {p['symbol'] for p in positions if D(p['positionAmt']) != 0}
-        if symbol in active or len(active) >= 5:
-            raise ValueError('POSITION_EXISTS_OR_MAX_5')
+        if symbol in active or len(active) >= getattr(self, 'max_symbols', 5):
+            raise ValueError(f"POSITION_EXISTS_OR_MAX_{getattr(self, 'max_symbols', 5)}")
         orders = self.request('GET', '/fapi/v1/openOrders')
         if any(o['symbol'] == symbol for o in orders):
             raise ValueError('EXISTING_SYMBOL_ORDER')
@@ -278,8 +279,10 @@ class NightExecutor:
             raise
         settings = self.state.get('trade_settings', {})
         self.max_daily = int(settings.get('max_daily', max_daily))
+        self.max_symbols = int(settings.get('max_symbols', 5))
+        self.broker.max_symbols = self.max_symbols
         self.position_usdt = D(str(settings.get('position_usdt', '50')))
-        if not 1 <= self.max_daily <= 15 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 100:
+        if not 1 <= self.max_symbols <= 15 or not 1 <= self.max_daily <= 15 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 100:
             self.guard.close()
             raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
@@ -322,27 +325,31 @@ class NightExecutor:
     def summary(self):
         count = self.daily_count()
         stream = self.account_stream.summary() if self.account_stream else 'Hesap WS: baslatilmadi / REST yedek'
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | {stream}"
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | {stream}"
 
     def apply_control(self, action):
-        if action.startswith(('limit:', 'amount:')):
+        if action.startswith(('limit:', 'amount:', 'symbols:')):
             kind, raw = action.split(':', 1)
             try:
                 value = D(raw)
-                ceiling = 15 if kind == 'limit' else 100
-                if not value.is_finite() or not 1 <= value <= ceiling or (kind == 'limit' and value != value.to_integral_value()):
+                ceiling = 100 if kind == 'amount' else 15
+                if not value.is_finite() or not 1 <= value <= ceiling or (kind != 'amount' and value != value.to_integral_value()):
                     raise ValueError('range')
             except (ValueError, ArithmeticError):
-                return '⚠️ Kullanım: /limit 1–15 veya /tutar 1–100 (USDT toplam pozisyon, teminat değil).'
+                return '⚠️ Kullanım: /sembol 1–15, /limit 1–15 veya /tutar 1–100 (USDT toplam pozisyon, teminat değil).'
             settings = dict(self.state.get('trade_settings', {}))
-            settings['max_daily' if kind == 'limit' else 'position_usdt'] = int(value) if kind == 'limit' else str(value)
+            key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols'}[kind]
+            settings[key] = str(value) if kind == 'amount' else int(value)
             self.state['trade_settings'] = settings
             self.save()
             if kind == 'limit':
                 self.max_daily = int(value)
+            elif kind == 'symbols':
+                self.max_symbols = int(value)
+                self.broker.max_symbols = self.max_symbols
             else:
                 self.position_usdt = value
-            return ('✅ Yeni giriş ayarı kaydedildi. Kullanılan sayaç, mevcut pozisyonlar ve bekleyen emirler değişmedi. Aynı anda 5 sembol sınırı korunuyor.\n'+self.summary())
+            return (f'✅ Yeni giriş ayarı kaydedildi. Kullanılan sayaç, mevcut pozisyonlar ve bekleyen emirler değişmedi. Aynı anda sembol sınırı: {self.max_symbols}.\n'+self.summary())
         if action.startswith('counter:'):
             value = action.split(':', 1)[1]
             if not value.isascii() or not value.isdigit() or not 0 <= int(value) <= self.max_daily:
@@ -353,7 +360,7 @@ class NightExecutor:
                 raw_at_set=sum(o['day'] == today for o in self.state['orders'].values()))
             self.save()
             return (f'✅ Günlük kullanılan giriş sayısı: {before} → {int(value)} / {self.max_daily}\n'
-                    'Paris 00:00 itibarıyla yeni gün sayacı 0 olur. Açık/bekleyen emirler değişmedi; aynı anda 5 sembol sınırı korunuyor.')
+                    f'Paris 00:00 itibarıyla yeni gün sayacı 0 olur. Açık/bekleyen emirler değişmedi; aynı anda sembol sınırı: {self.max_symbols}.')
         if action == 'on':
             if self.state['halt']:
                 return '⚠️ Açılamadı: '+self.state['halt']+'. Binance pozisyonları ve TP emirleri kontrol edilmeli. Komut hata kilidini kaldırmaz.'
@@ -369,7 +376,7 @@ class NightExecutor:
             self.enabled.set()
             return ('✅ Otomatik girişler AÇIK. Yalnız yeni giriş geçişleri işlenecek.\n'
                     f'24 saat | 10x | en fazla {self.position_usdt} USDT pozisyon / yaklaşık {self.position_usdt/10} USDT teminat\n'
-                    f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla 5 sembol. TP +%1; SL yok.\n'+self.summary())
+                    f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla {self.max_symbols} sembol. TP +%1; SL yok.\n'+self.summary())
         if action == 'off':
             self.enabled.clear()
             self.state['paused'] = True
