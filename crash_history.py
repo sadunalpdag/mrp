@@ -21,7 +21,7 @@ class HistoryCollector:
         self.directory, self.fetch, self.emit = directory, fetch, emit
         self.blocked, self.log = blocked, log
         self.resolver, self.ws_rows, self.on_rows = resolver, ws_rows, on_rows
-        self.bybit = bybit  # Independent reference: never included in Binance cache
+        self.bybit = bybit  # Compatibility for existing caller tests; resolver owns fallback
         self.lock = threading.RLock()
         self.thread = None
         self.attempts = []
@@ -105,10 +105,16 @@ class HistoryCollector:
         cached = self.validated(self._read(path, []))
         if self.ws_rows:
             from crash_data_sources import valid_rows
-            cached.update(valid_rows(self.ws_rows(job['symbol']), start, end))
+            for t, row in valid_rows(self.ws_rows(job['symbol']), start, end).items():
+                old = cached.get(t)
+                if (old is None or len(row) <= 12 or row[12] != 'BYBIT_LINEAR'
+                        or (len(old) > 12 and old[12] == 'BYBIT_LINEAR')):
+                    cached[t] = row
         expected = list(range(start, end, STEP))
         missing = [t for t in expected if t not in cached]
-        if missing:
+        bybit_cached = any(len(r)>12 and r[12]=='BYBIT_LINEAR'
+                           for t,r in cached.items() if start <= t < end)
+        if missing or (bybit_cached and self.resolver is not None):
             if scheduled_at is not None:
                 if scheduled_at < self.next_download:
                     raise HistoryPacingWait()
@@ -143,15 +149,10 @@ class HistoryCollector:
                     interval='15m', expected_candles=COUNT, candle_count=len(snapshot),
                     complete=len(snapshot)==COUNT, missing_candles=COUNT-len(snapshot),
                     closed_15m_ohlcv=snapshot)
-        # Bybit analysis is provenance-separated. It never changes live signal
-        # decisions, Binance OHLCV, positions, TP orders, or order submission.
-        if not event['complete'] and self.bybit is not None:
-            try:
-                reference = self.bybit.inspect(job['symbol'], end)
-                if reference is not None:
-                    event['bybit_reference'] = reference
-            except Exception as error:
-                self.log(f'[CRASH BYBIT RESEARCH ERR] {job["symbol"]}; {type(error).__name__}')
+        if event['data_sources'].get('BYBIT_LINEAR'):
+            self.log(f'[CRASH HISTORY MIXED] {job["symbol"]}; '
+                     f'bybit={event["data_sources"]["BYBIT_LINEAR"]}; '
+                     'Binance=oncelikli; karma_veri_ile_sinyal_hesaplanabilir')
         return event
 
     def step(self, now=None):
@@ -176,10 +177,11 @@ class HistoryCollector:
             if job['phase'] != 'warmup':
                 self.emit(event, time.time())
             with self.lock:
-                if event['complete']:
+                if event['complete'] and not event['data_sources'].get('BYBIT_LINEAR', 0):
                     self.jobs.pop(key, None)
                 else:
-                    self.jobs[key]['retry_after'] = now + (300 if self.resolver else 1800)
+                    self.jobs[key]['retry_after'] = now + (
+                        1800 if event['complete'] else (300 if self.resolver else 1800))
                 self._write(self.path, self.jobs)
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
         except HistoryPacingWait:
