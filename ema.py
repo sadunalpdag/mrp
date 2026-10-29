@@ -6312,6 +6312,7 @@ def update_max_profit_tracking():
 # ===================== CRASH-BOUNCE ALERTS (SIGNAL ONLY) =====================
 CRASH_BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_state.json")
 CRASH_BOUNCE_SCAN_SECONDS = 180
+CRASH_DATA_FALLBACK_ENABLED = 1  # WS/cache -> REST -> Binance daily archive
 CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
 CRASH_BOUNCE_FILTER_VERSION = "five_day_entry_v2_only"
@@ -6550,11 +6551,14 @@ def _crash_send_pending(state, now):
             )
         from crash_context import format_context
         context_message = format_context(d.get("five_day_context"))
+        archive_count = d.get('data_sources', {}).get('BINANCE_ARCHIVE', 0)
+        source_message = f'Veri: Binance günlük arşivinden {archive_count} mum tamamlandı.\n' if archive_count else '' 
         message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
                    f"RSI14 (15m): {d['rsi14']:.2f}\n"
                    f"5 günlük veri: {d['candles']}/480 kapalı mum\n"
+                   f"{source_message}"
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
                    f"{score_message}"
                    f"{context_message}"
@@ -6611,8 +6615,14 @@ def _crash_v2_validate_entry(record, now):
     except (OSError, ValueError, TypeError):
         pass
     try:
-        return assess_entry(rows, _CRASH_WS_CACHE.candles(record["symbol"]), now,
-                            btc_change_24h=record.get("btc_change_24h"))
+        ws_rows = _CRASH_WS_CACHE.candles(record["symbol"])
+        result = assess_entry(rows, ws_rows, now, btc_change_24h=record.get("btc_change_24h"))
+        from crash_data_sources import valid_rows, source_counts
+        end = int(now*1000)//900000*900000
+        selected = valid_rows(rows, end-480*900000, end)
+        selected.update(valid_rows(ws_rows, end-480*900000, end))
+        result['data_sources'] = source_counts(list(selected.values()))
+        return result
     except (ValueError, TypeError, OverflowError, AttributeError) as error:
         log(f"[CRASH V2 HISTORY ERR] {record['symbol']}: {type(error).__name__}")
         return {"status":"MISSING_5D_HISTORY", "qualified":False, "candles":0}
@@ -6823,10 +6833,15 @@ def _crash_queue_history(record, phase, now):
     try:
         if _CRASH_HISTORY_COLLECTOR is None:
             from crash_history import HistoryCollector
+            from crash_data_sources import DataSources
+            blocked = lambda: (time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
+                or time.time() < getattr(getattr(globals().get('_CRASH_NIGHT'), 'broker', None), 'cooldown_until', 0))
+            resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
+                _crash_public_get, blocked, log)
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
-                _crash_public_get, _crash_append_data,
-                lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned(), log)
+                _crash_public_get, _crash_append_data, blocked, log,
+                resolver=resolver, ws_rows=_CRASH_WS_CACHE.candles, on_rows=_CRASH_WS_CACHE.merge_candles)
         key = phase + "_history_queued"
         if not record.get(key):
             _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
@@ -7468,6 +7483,13 @@ def _crash_data_wait_detail(symbol, rows, now, last_price, tick_size):
     detail = candle_diagnostic(rows, now, last_price, tick_size)
     until = max(globals().get('_crash_cooldown_until', 0),
                 globals().get('_rl_ban_until_ts', 0))
+    if globals().get('CRASH_DATA_FALLBACK_ENABLED', 0):
+        collector = globals().get('_CRASH_HISTORY_COLLECTOR')
+        return (detail + f'; REST_bekleme_sn={max(0,int(until-now))}; '
+                f'veri_yenileme=WS_KAYIT_REST_ARSIV_KUYRUGU; '
+                f'kuyruk={len(collector.jobs) if collector else 0}; '
+                f'indirme_aralik_bekleme_sn={max(0,int(collector.next_download-now)) if collector else 0}; '
+                'bugunun_arsivi_ertesi_gun_yayinlanir')
     attempts = [t for t in globals().get('_crash_seed_attempts', []) if now-t < 3600]
     retry = globals().get('_crash_seed_retry', {}).get(symbol, 0)
     if now < until or BinanceRateLimiter.is_banned():
@@ -7488,6 +7510,24 @@ def _crash_get_candles(symbol):
     now=time.time()
     rows=_CRASH_WS_CACHE.candles(symbol)
     if _crash_cached_candles_valid(rows,now):
+        return rows
+    if globals().get('CRASH_DATA_FALLBACK_ENABLED', 0):
+        from crash_data_sources import valid_rows
+        path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'history_cache', symbol+'.json')
+        try:
+            with open(path, encoding='utf-8') as handle:
+                saved = json.load(handle)
+        except (OSError, ValueError):
+            saved = []
+        end = int(now*1000)//900000*900000
+        merged = valid_rows(saved, end-480*900000, end)
+        merged.update(valid_rows(rows, end-480*900000, end))
+        rows = [merged[t] for t in sorted(merged)][-64:]
+        if _crash_cached_candles_valid(rows, now):
+            _CRASH_WS_CACHE.merge_candles(symbol, rows)
+            return rows
+        _crash_queue_history({'symbol':symbol, 'signal_id':'warmup:'+symbol}, 'warmup', now)
+        log(f'[CRASH DATA QUEUED] {symbol}; WS/cache eksik; REST -> GUNLUK_ARSIV sirasi')
         return rows
     if now<_crash_cooldown_until or BinanceRateLimiter.is_banned():
         return rows

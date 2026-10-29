@@ -288,3 +288,10 @@ Official references checked 2026-10-29:
 - https://www.binance.com/en-NG/support/announcement/detail/ebf9b0aa9eca4ff3804eef6fb09ba32a
 - https://developers.binance.com/en/docs/products/derivatives-trading-usds-futures/user-data-streams
 - https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/user-data-streams
+
+### Three-source candle recovery (no CoinAPI)
+`CRASH_DATA_FALLBACK_ENABLED=1` routes missing candle history through a single asynchronous worker: existing saved history plus closed WebSocket candles first, Binance REST second when permitted, then Binance's official daily USD-M 15m archive. No CoinAPI code, key or third-party provider is used. The first 4h plan also queues a warmup when its cache is missing, including during a REST pause; a REST ban no longer prevents archive recovery jobs from running. Warmups populate the same five-day cache and WS tail without emitting a synthetic signal.
+
+Only missing timestamps are filled. WS rows take priority over saved history, which in turn is not overwritten by lower-priority sources. Archive ZIPs and their SHA256 CHECKSUM files are fetched from data.binance.vision, checked before CSV parsing, size-limited and cached. Redirects are rejected. UTC-aligned closed 15m OHLCV rows are validated; current-day archives are not requested, absent days are retried after an hour, and gaps are never fabricated. Recovery batches retain the 60-second spacing and 24/hour budget. An incomplete recovery job remains queued; Binance REST cooldown does not apply to the independent archive host.
+
+Source counts are stored in research snapshots/V2 features. Signals using daily archive candles identify their count; logs show source counts, unresolved gaps and queue status. Archive data is historical only: current-day missing candles still require an existing local/WS record or restored Binance REST access. A live ticker, valid market metadata, all 480 required closed candles and the original strategy gates are still required. The existing candidate freshness limit remains in force; source recovery does not guarantee an uninterrupted signal supply.
