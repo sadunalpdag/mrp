@@ -1,5 +1,5 @@
-"""Closed Binance USD-M 15m candles: cache/WS -> REST -> daily archive.
-No signed requests or third-party data providers.
+"""Closed Binance USD-M 15m: cache/WS -> REST -> archive -> Bybit missing-only.
+Bybit candles are source-tagged and replaceable by authoritative Binance data.
 """
 import csv
 import hashlib
@@ -43,10 +43,12 @@ def source_counts(rows):
 
 
 class DataSources:
-    def __init__(self, directory, rest, blocked, log, get=None, clock=time.time):
+    def __init__(self, directory, rest, blocked, log, get=None, clock=time.time, bybit=None):
         self.directory,self.rest,self.blocked,self.log=directory,rest,blocked,log
         self.get,self.clock=get,clock
         self.retry={}
+        self.binance_recheck={}
+        self.bybit=bybit
         self.next_http=0
         os.makedirs(directory,exist_ok=True)
 
@@ -121,24 +123,44 @@ class DataSources:
         end=min(end,int(self.clock()*1000)//STEP*STEP)
         found=valid_rows(cached,start,end)
         expected=range(start,end,STEP)
+        def source(row):
+            return row[12] if len(row)>12 else 'BINANCE_CACHE_WS'
         def missing():return [t for t in expected if t not in found]
-        def add(rows,source=None):
+        def bybit_times():return [t for t in expected if t in found and source(found[t])=='BYBIT_LINEAR']
+        def add(rows,src=None):
             for t,row in valid_rows(rows,start,end).items():
-                if t not in found:found[t]=tagged(row,source) if source else row
+                # Binance always outranks previous Bybit data at the same UTC time.
+                if (t not in found or
+                        (source(found[t])=='BYBIT_LINEAR'
+                         and (src is not None or source(row)!='BYBIT_LINEAR'))):
+                    found[t]=tagged(row,src) if src else row
         gaps=missing()
-        if gaps and not self.blocked():
-            finish=gaps[0]+STEP
-            while finish<end and finish not in found:finish+=STEP
+        old_bybit=bybit_times()
+        blocked=self.blocked()
+        recheck=(old_bybit and self.clock()>=self.binance_recheck.get(symbol,0))
+        work=gaps if gaps else (old_bybit if recheck else [])
+        if work and not blocked:
+            first=work[0]
+            finish=first+STEP
+            while finish<end and (finish not in found or source(found[finish])=='BYBIT_LINEAR'):
+                finish+=STEP
             try:
+                if not gaps:
+                    self.binance_recheck[symbol]=self.clock()+1800
                 add(self.rest('/fapi/v1/klines',{'symbol':symbol,'interval':'15m',
-                    'startTime':gaps[0],'endTime':finish-1,'limit':499}),'BINANCE_REST')
+                    'startTime':first,'endTime':finish-1,'limit':499}),'BINANCE_REST')
             except Exception as error:
                 self.log(f'[CRASH DATA REST WAIT] {symbol}; type={type(error).__name__}; yedek kaynaklara geciliyor')
-        elif gaps:
+        elif gaps and blocked:
             self.log(f'[CRASH DATA REST WAIT] {symbol}; REST_BEKLEMESI; yedek kaynaklar aktif')
         today=int(self.clock()*1000)//DAY*DAY
-        for day in sorted({t//DAY*DAY for t in missing() if t//DAY*DAY<today}):
+        # Published daily Binance data can also replace prior Bybit candles.
+        replace_days=missing()+bybit_times()
+        for day in sorted({t//DAY*DAY for t in replace_days if t//DAY*DAY<today}):
             add(self.archive(symbol,day))
+        if missing() and self.bybit is not None:
+            # Request ONLY the still-missing intervals, never 480-mum reference.
+            add(self.bybit.fill_missing(symbol,start,end,missing(),list(found.values())))
         rows=[found[t] for t in sorted(found)]
         self.log(f'[CRASH DATA SOURCES] {symbol}; candles={len(rows)}/{len(expected)}; '
                  f'missing={len(missing())}; sources={source_counts(rows)}')
