@@ -6603,6 +6603,11 @@ def _crash_send_pending(state, now):
                     _CRASH_SHADOW.submit(record)
             except Exception as error:
                 log(f'[CRASH DERIVATIVES QUEUE ERR] {type(error).__name__}')
+            try:
+                if globals().get('_CRASH_AI') is not None:
+                    _CRASH_AI.submit(record)
+            except Exception as error:
+                log(f'[CRASH AI QUEUE ERR] {type(error).__name__}; V2 continues')
             executor = globals().get('_CRASH_NIGHT')
             if executor is not None:
                 executor.submit(record, receipt['accepted_at'])
@@ -7130,6 +7135,8 @@ def _crash_daily_report(state, now):
                 "notes":notes}, ensure_ascii=False, indent=2))
             from crash_derivatives import export_csv, summarize
             archive.writestr("derivatives_shadow.csv", export_csv(records))
+            from crash_ai import export_csv as export_ai_csv
+            archive.writestr("openai_reviews.csv", export_ai_csv(records))
             archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
             # Cover 150h entry wait plus 150h after entry (12.5 days).
@@ -7784,6 +7791,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
 
 
 _CRASH_SHADOW = None
+_CRASH_AI = None
 _CRASH_REPORT_REQUEST = threading.Event()
 
 
@@ -7830,10 +7838,45 @@ def _crash_drain_shadow(state):
         if record is None:
             continue
         record['derivatives_shadow'] = result
+        try:
+            if globals().get('_CRASH_AI') is not None:
+                _CRASH_AI.update_derivatives(result)
+        except Exception as error:
+            log(f'[CRASH AI DATA ERR] {type(error).__name__}')
         _crash_append_data({'type':'derivatives_shadow', **result}, time.time())
         _crash_save_state(state)
         receipt = _crash_telegram_receipt(f"🔬 GÖLGE ANALİZ | {result['symbol']}\nSinyal: {result['signal_id']}\n"+format_shadow(result))
         result['telegram_delivery'] = {k:receipt.get(k) for k in ('ok','error','ambiguous','message_id')}
+        _crash_save_state(state)
+
+
+def _crash_start_ai():
+    global _CRASH_AI
+    from crash_ai import Analyst
+    _CRASH_AI = Analyst(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'openai'), log)
+    _CRASH_AI.start()
+
+
+def _crash_drain_ai(state):
+    import queue
+    from crash_ai import format_review
+    analyst = globals().get('_CRASH_AI')
+    if analyst is None:
+        return
+    while True:
+        try:
+            result = analyst.results.get_nowait()
+        except queue.Empty:
+            break
+        record = next((r for r in state['history'] if r.get('signal_id') == result['signal_id']), None)
+        if record is None or record.get('ai_review'):
+            continue
+        # Save before Telegram. Restart cannot trigger duplicate paid evaluation/message.
+        record['ai_review'] = result
+        _crash_append_data({'type': 'openai_review', **result}, time.time())
+        _crash_save_state(state)
+        receipt = _crash_telegram_receipt(format_review(result))
+        result['telegram_delivery'] = {k: receipt.get(k) for k in ('ok','error','ambiguous','message_id')}
         _crash_save_state(state)
 
 
@@ -7889,6 +7932,8 @@ def _crash_start_services():
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
+        ai = globals().get('_CRASH_AI')
+        result['trading'] += ' | OpenAI: ' + ('AÇIK (yalnız analiz)' if ai and ai.enabled else 'KAPALI/anahtar yok')
         result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: Telegram aç/kapat; ema.py başlangıç ayarı | Telegram: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
         return result
     _CRASH_HEALTH = Heartbeat(DATA_DIR, _crash_telegram_receipt, health, log)
@@ -7918,6 +7963,10 @@ def _crash_bounce_worker():
         _crash_start_shadow()
     except Exception as error:
         log(f'[CRASH DERIVATIVES START ERR] {type(error).__name__}; V2 continues')
+    try:
+        _crash_start_ai()
+    except Exception as error:
+        log(f'[CRASH AI START ERR] {type(error).__name__}; V2 continues')
     while True:
         try:
             if state is None:
@@ -7929,6 +7978,10 @@ def _crash_bounce_worker():
                 _crash_save_state(state)
             try:
                 _crash_drain_shadow(state)
+                try:
+                    _crash_drain_ai(state)
+                except Exception as error:
+                    log(f'[CRASH AI DELIVERY ERR] {type(error).__name__}; V2 continues')
                 _crash_daily_report(state, time.time())
             except Exception as error:
                 log(f"[CRASH REPORT ERR] {type(error).__name__}: {error}")
