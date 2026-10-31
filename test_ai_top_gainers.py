@@ -47,6 +47,19 @@ class Tests(unittest.TestCase):
             bot.follow_step()
             self.assertEqual(bot.state["trades"][0]["status"],"TP_1PCT")
 
+    def test_btc_missing_ws_does_not_consume_hour(self):
+        now=[time.time()]
+        with tempfile.TemporaryDirectory() as d:
+            class Unready:
+                def snapshot(self, moment):
+                    return []
+            bot=TopGainers(d,Unready(),lambda *args:rows(),
+                           lambda message:{"ok":True},
+                           env={"TOP_GAINERS_ENABLED":"1"},clock=lambda:now[0])
+            bot.btc_step()
+            self.assertEqual(bot.state["btc_slots"],[])
+            self.assertEqual(bot.state["btc"],[])
+
     def test_daily_does_not_claim_unresolved_success(self):
         now=datetime(2026,10,31,21,10,tzinfo=ZoneInfo("Europe/Paris")).timestamp()
         posts=[]
