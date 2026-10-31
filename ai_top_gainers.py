@@ -312,9 +312,8 @@ class TopGainers:
                             correct=actual==pred["direction"])
             if slot in self.state["btc_slots"]:
                 return
-            self.state["btc_slots"].append(slot)
-            self.state["btc_slots"]=self.state["btc_slots"][-240:]
-            self.save()
+            # Do not consume an hourly forecast slot before its inputs are ready.
+            # Reserve immediately before the paid model call, not at worker startup.
         record={"slot":slot,"as_of":now,"status":"NO_AI_KEY","direction":None,
                 "confidence":None,"reason":"","actual_direction":None,"correct":None}
         try:
@@ -322,8 +321,16 @@ class TopGainers:
             details=features("BTCUSDT",rows,0,None)
             live=self.collect(self.clock()).get("BTCUSDT")
             if "rsi14_1h" not in details or not live:
-                record["status"]="MISSING_MARKET_DATA"
-            elif self.key:
+                # Startup race: retry next minute instead of losing the entire hour.
+                self.log("[BTC HOURLY] MISSING_MARKET_DATA; retry later")
+                return
+            with self.lock:
+                if slot in self.state["btc_slots"]:
+                    return
+                self.state["btc_slots"].append(slot)
+                self.state["btc_slots"]=self.state["btc_slots"][-240:]
+                self.save()
+            if self.key:
                 schema={"type":"object","additionalProperties":False,"properties":{
                     "direction":{"type":"string","enum":["UP","DOWN","SIDEWAYS"]},
                     "confidence":{"type":"integer","minimum":0,"maximum":100},
@@ -345,6 +352,10 @@ class TopGainers:
                 record.update(status="NO_AI_KEY",reference_price=live)
         except Exception as error:
             record["status"]="ERROR_"+type(error).__name__
+            # Transient REST failures should not burn the hour's only forecast.
+            if slot not in self.state["btc_slots"]:
+                self.log("[BTC HOURLY] INPUT_ERROR_"+type(error).__name__+"; retry later")
+                return
         with self.lock:
             self.state["btc"].append(record)
             self.state["btc"]=self.state["btc"][-720:]
