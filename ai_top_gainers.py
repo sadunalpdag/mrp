@@ -371,32 +371,42 @@ class TopGainers:
             self.save()
             since=now-86400
             trades=[t.copy() for t in self.state["trades"] if t["created_at"]>=since]
+            finished=[t.copy() for t in self.state["trades"]
+                      if t.get("finished_at",0)>=since]
+            trailing=[t.copy() for t in self.state["trades"]
+                      if t["created_at"]>=now-7*86400]
             btc=[b.copy() for b in self.state["btc"] if b["as_of"]>=since]
+            btc7=[b.copy() for b in self.state["btc"] if b["as_of"]>=now-7*86400]
         entered=[t for t in trades if t["entry_at"] is not None]
-        resolved=[t for t in entered if t["status"] in ("TP_1PCT","TIMEOUT_AFTER_ENTRY_24H")]
+        resolved=[t for t in finished if t["status"] in ("TP_1PCT","TIMEOUT_AFTER_ENTRY_24H")]
         tp=[t for t in resolved if t["status"]=="TP_1PCT"]
+        trailing_entered=[t for t in trailing if t.get("entry_at") is not None]
+        noentry=sum(t["status"]=="NO_ENTRY_24H" for t in finished)
         evaluated=[b for b in btc if b.get("correct") is not None]
         correct=sum(1 for b in evaluated if b["correct"])
+        evaluated7=[b for b in btc7 if b.get("correct") is not None]
+        correct7=sum(1 for b in evaluated7 if b["correct"])
+        resolved_pct=f"{100*len(tp)/len(resolved):.1f}%" if resolved else "henüz yok"
+        avg_time=(sum((t["tp_at"]-t["entry_at"])/3600 for t in tp)/len(tp)) if tp else None
+        avg_text=f"{avg_time:.2f} saat" if avg_time is not None else "henüz yok"
         msg=(f"📊 AI PİYASA GÜNLÜK RAPOR | {day} (Paris)\n"
-             f"Top Gainers araştırması: {len(trades)} LONG aday\n"
-             f"Sanal giriş gözlenen: {len(entered)} | bekleyen: "
-             f"{sum(t['status']=='WAIT_ENTRY' for t in trades)}\n"
-             f"TP +%1: {len(tp)} | sonuçlanmış giriş: {len(resolved)}\n"
-             f"Sonuçlananlarda TP: "
-             f"{(100*len(tp)/len(resolved)):.1f}%" if resolved else
-             f"📊 AI PİYASA GÜNLÜK RAPOR | {day} (Paris)\n"
-             f"Top Gainers araştırması: {len(trades)} LONG aday\n"
-             f"Sanal giriş gözlenen: {len(entered)} | sonuçlanan: 0\n"
-             "TP başarı oranı: henüz hesaplanamaz")
-        msg+=(f"\nBTC 1H: {len(evaluated)} doğrulanabilir tahmin | "
-              f"{correct} doğru | "
-              f"{(100*correct/len(evaluated)):.1f}%" if evaluated
-              else "\nBTC 1H: henüz doğrulanabilir tahmin yok")
-        msg+="\nYalnız WS örnekleri: kaçırılan giriş/TP olabilir; otomatik işlem yok."
+             f"Yeni LONG aday: {len(trades)} | giriş gözlenen: {len(entered)}\n"
+             f"Son 24h sonuçlanan giriş: {len(resolved)} | TP +%1: {len(tp)}\n"
+             f"Sonuçlananlarda TP: {resolved_pct} | ort. TP: {avg_text}\n"
+             f"Giriş olmadan 24h dolan: {noentry}\n"
+             f"Son 7 gün: {len(trailing)} aday | {len(trailing_entered)} gözlenen giriş\n")
+        if evaluated:
+            msg+=f"BTC 1H (24h): {correct}/{len(evaluated)} doğru ({100*correct/len(evaluated):.1f}%)\n"
+        else:
+            msg+="BTC 1H (24h): doğrulanabilir tahmin yok\n"
+        if evaluated7:
+            msg+=f"BTC 1H (7g): {correct7}/{len(evaluated7)} doğru ({100*correct7/len(evaluated7):.1f}%)\n"
+        msg+="Yalnız WS örnekleri: kaçırılan giriş/TP olabilir; otomatik işlem yok."
         receipt=self.telegram(msg)
         with self.lock:
             self.state["daily"].append({"day":day,"at":now,"trades":len(trades),
                "entered":len(entered),"tp":len(tp),"resolved":len(resolved),
+               "no_entry":noentry,"avg_tp_hours":avg_time,
                "btc_evaluated":len(evaluated),"btc_correct":correct,
                "telegram":{k:receipt.get(k) for k in ("ok","error","ambiguous","message_id")}})
             self.state["daily"]=self.state["daily"][-90:]
