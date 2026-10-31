@@ -11,10 +11,10 @@ class TradeSettingsTests(unittest.TestCase):
     def test_commands_scoped_and_not_forwarded(self):
         with tempfile.TemporaryDirectory() as d:
             c = TelegramControl(d, 'fake', '123', None, Mock(), Mock(), Mock(), lambda:1000, Mock(), counter_only=True, require_owner=False)
-            msg = {'chat':{'id':123}, 'from':{'id':456,'is_bot':False}, 'date':1000, 'text':'/limit 15'}
-            self.assertEqual(c.command({'message':msg}), 'limit:15')
-            msg['text'] = '/tutar 100'
-            self.assertEqual(c.command({'message':msg}), 'amount:100')
+            msg = {'chat':{'id':123}, 'from':{'id':456,'is_bot':False}, 'date':1000, 'text':'/limit 50'}
+            self.assertEqual(c.command({'message':msg}), 'limit:50')
+            msg['text'] = '/tutar 500'
+            self.assertEqual(c.command({'message':msg}), 'amount:500')
             msg['text'] = '/sembol 15'
             self.assertEqual(c.command({'message':msg}), 'symbols:15')
             msg['chat']['id'] = 999
@@ -27,32 +27,32 @@ class TradeSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             e = NightExecutor(d, Mock(), Mock(), Mock())
             e.apply_control('counter:3')
-            e.apply_control('limit:15')
+            e.apply_control('limit:50')
             e.apply_control('symbols:50')
-            e.apply_control('amount:100')
+            e.apply_control('amount:500')
             self.assertEqual(e.daily_count(), 3)
             self.assertEqual(e.state['orders'], {})
-            self.assertIn('100 USDT', e.summary())
-            for bad in ('symbols:0','symbols:51','symbols:1.5','limit:0','limit:16','limit:1.5','amount:NaN','amount:Infinity','amount:-1','amount:101','amount:no'):
+            self.assertIn('500 USDT', e.summary())
+            for bad in ('symbols:0','symbols:51','symbols:1.5','limit:0','limit:51','limit:1.5','amount:NaN','amount:Infinity','amount:-1','amount:501','amount:no'):
                 self.assertIn('⚠️', e.apply_control(bad))
-            self.assertEqual(e.max_daily, 15)
+            self.assertEqual(e.max_daily, 50)
             self.assertEqual(e.max_symbols, 50)
             self.assertEqual(e.broker.max_symbols, 50)
-            self.assertEqual(e.position_usdt, Decimal('100'))
+            self.assertEqual(e.position_usdt, Decimal('500'))
             e.guard.close()
             e = NightExecutor(d, Mock(), Mock(), Mock())
-            self.assertEqual(e.max_daily, 15)
+            self.assertEqual(e.max_daily, 50)
             self.assertEqual(e.max_symbols, 50)
             self.assertEqual(e.broker.max_symbols, 50)
-            self.assertEqual(e.position_usdt, Decimal('100'))
+            self.assertEqual(e.position_usdt, Decimal('500'))
             self.assertEqual(e.daily_count(), 3)
             e.guard.close()
 
     def test_budget_rounds_down_and_keeps_exchange_minimum(self):
         record = {'entry':'3', 'tp':'3.03'}
-        p = plan(record, INFO, '100')
-        self.assertEqual(Decimal(p['quantity']), Decimal('33.3'))
-        self.assertLessEqual(Decimal(p['price'])*Decimal(p['quantity']), 100)
+        p = plan(record, INFO, '500')
+        self.assertEqual(Decimal(p['quantity']), Decimal('166.6'))
+        self.assertLessEqual(Decimal(p['price'])*Decimal(p['quantity']), 500)
         with self.assertRaisesRegex(ValueError, 'MIN_NOTIONAL'):
             plan(record, INFO, '1')
 

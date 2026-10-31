@@ -51,7 +51,7 @@ def plan(record, info, position_usdt='50'):
         if price < D(pf['minPrice']) or price > D(pf['maxPrice']):
             raise ValueError('PRICE_FILTER')
     budget = D(str(position_usdt))
-    if not budget.is_finite() or not 0 < budget <= 100:
+    if not budget.is_finite() or not 0 < budget <= 500:
         raise ValueError('INVALID_POSITION_USDT')
     qty = rounded(budget/entry, lot['stepSize'])
     if qty < D(lot['minQty']) or qty > D(lot['maxQty']) or qty <= 0:
@@ -282,7 +282,7 @@ class NightExecutor:
         self.max_symbols = int(settings.get('max_symbols', 5))
         self.broker.max_symbols = self.max_symbols
         self.position_usdt = D(str(settings.get('position_usdt', '50')))
-        if not 1 <= self.max_symbols <= 50 or not 1 <= self.max_daily <= 15 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 100:
+        if not 1 <= self.max_symbols <= 50 or not 1 <= self.max_daily <= 50 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 500:
             self.guard.close()
             raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
@@ -332,11 +332,11 @@ class NightExecutor:
             kind, raw = action.split(':', 1)
             try:
                 value = D(raw)
-                ceiling = {'amount':100, 'symbols':50, 'limit':15}[kind]
+                ceiling = {'amount':500, 'symbols':50, 'limit':50}[kind]
                 if not value.is_finite() or not 1 <= value <= ceiling or (kind != 'amount' and value != value.to_integral_value()):
                     raise ValueError('range')
             except (ValueError, ArithmeticError):
-                return '⚠️ Kullanım: /sembol 1–50, /limit 1–15 veya /tutar 1–100 (USDT toplam pozisyon, teminat değil).'
+                return '⚠️ Kullanım: /sembol 1–50, /limit 1–50 veya /tutar 1–500 (USDT toplam pozisyon, teminat değil).'
             settings = dict(self.state.get('trade_settings', {}))
             key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols'}[kind]
             settings[key] = str(value) if kind == 'amount' else int(value)

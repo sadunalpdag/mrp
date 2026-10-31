@@ -24,7 +24,7 @@ Review at least 30–50 prospective signals (summary marks 50). Groups report TP
 
 Daily reports run at 21:00 Europe/Paris using a DST-aware calendar slot, rather than waiting 24h of process lifetime. `/rapor` requests an immediate report through the configured Telegram chat even with automatic entry off. Text summary and ZIP are sent separately; failed ZIP sends retry after 30m. Missing pending ZIP files regenerate; oversized ZIPs log a text-only delivery. Telegram document captions are bounded. No direct Render/Telegram delivery was tested during implementation.
 
-`/sembol 50` sets concurrent unique open/pending-entry symbols (range 1–50). TP closers remain excluded. `/limit` still controls daily entry attempts (1–15); `/tutar` remains total notional (1–100 USDT). These commands do not enable automatic entries. Saved values persist only while the state file survives.
+`/sembol 50` sets concurrent unique open/pending-entry symbols (range 1–50). TP closers remain excluded. `/limit` still controls daily entry attempts (1–50); `/tutar` remains total notional (1–500 USDT). These commands do not enable automatic entries. Saved values persist only while the state file survives.
 
 References:
 - https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data
