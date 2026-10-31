@@ -7967,6 +7967,15 @@ def _crash_bounce_worker():
         _crash_start_ai()
     except Exception as error:
         log(f'[CRASH AI START ERR] {type(error).__name__}; V2 continues')
+    try:
+        from ai_top_gainers import TopGainers
+        gainers = TopGainers(
+            os.path.join(DATA_DIR, 'ai_top_gainers'), _CRASH_WS_CACHE,
+            _crash_public_get, _crash_telegram_receipt, log,
+            market_symbols=lambda: _crash_load_market_cache()[0])
+        gainers.start()
+    except Exception as error:
+        log(f'[TOP GAINERS START ERR] {type(error).__name__}; V2 continues')
     while True:
         try:
             if state is None:
