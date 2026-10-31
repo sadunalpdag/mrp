@@ -282,7 +282,7 @@ class NightExecutor:
         self.max_symbols = int(settings.get('max_symbols', 5))
         self.broker.max_symbols = self.max_symbols
         self.position_usdt = D(str(settings.get('position_usdt', '50')))
-        if not 1 <= self.max_symbols <= 15 or not 1 <= self.max_daily <= 15 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 100:
+        if not 1 <= self.max_symbols <= 50 or not 1 <= self.max_daily <= 15 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 100:
             self.guard.close()
             raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
@@ -332,11 +332,11 @@ class NightExecutor:
             kind, raw = action.split(':', 1)
             try:
                 value = D(raw)
-                ceiling = 100 if kind == 'amount' else 15
+                ceiling = {'amount':100, 'symbols':50, 'limit':15}[kind]
                 if not value.is_finite() or not 1 <= value <= ceiling or (kind != 'amount' and value != value.to_integral_value()):
                     raise ValueError('range')
             except (ValueError, ArithmeticError):
-                return '⚠️ Kullanım: /sembol 1–15, /limit 1–15 veya /tutar 1–100 (USDT toplam pozisyon, teminat değil).'
+                return '⚠️ Kullanım: /sembol 1–50, /limit 1–15 veya /tutar 1–100 (USDT toplam pozisyon, teminat değil).'
             settings = dict(self.state.get('trade_settings', {}))
             key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols'}[kind]
             settings[key] = str(value) if kind == 'amount' else int(value)

@@ -233,7 +233,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 
 # GERÇEK İŞLEM AYARLARI: 0=kapalı, 1=açık. Değişiklik sonrası yeniden başlatın.
 # Açma/kapama yalnız bu dosyadan yapılır; Telegram kontrol komutları kullanılmaz.
-AUTO_TRADING_ENABLED = 1
+AUTO_TRADING_ENABLED = 0
 MANUAL_TP_REPAIR_ENABLED = 1
 AUTO_MAX_DAILY_ENTRIES = 5
 
@@ -6398,7 +6398,8 @@ def _crash_public_get(path, params=None):
 
 def _crash_public_get_locked(path, params=None):
     global _crash_next_request, _crash_weight_window, _crash_weight_used, _crash_backoff
-    if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/klines"):
+    if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/klines", "/api/v3/klines",
+                    "/futures/data/openInterestHist", "/fapi/v1/fundingRate"):
         raise ValueError("Crash-only endpoint not allowed")
     if time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned():
         raise RuntimeError("Binance REST cooldown active")
@@ -6412,7 +6413,8 @@ def _crash_public_get_locked(path, params=None):
     _crash_wait_until(_crash_next_request)
     _crash_next_request = time.time() + 1.0
     _crash_weight_used += weight
-    response = requests.get(BINANCE_FAPI + path, params=params, timeout=10)
+    base = "https://api.binance.com" if path.startswith("/api/v3/") else BINANCE_FAPI
+    response = requests.get(base + path, params=params, timeout=10)
     if response.status_code in (403, 418, 429):
         floor = 900 if response.status_code in (403, 418) else 120
         _crash_backoff = min(86400, max(floor, _crash_backoff * 2))
@@ -6480,7 +6482,7 @@ def _crash_load_state():
     for record in state["history"]:
         if "tracking_status" not in record:
             record["tracking_status"] = "LEGACY_UNKNOWN"
-    state.setdefault("report", {"last_success_at":time.time(), "next_due_at":time.time()+86400})
+    state.setdefault("report", {"last_success_at":time.time()-86400})
     return state
 
 
@@ -6528,6 +6530,10 @@ def _crash_send_pending(state, now):
             continue
         if now - record.get("v2_last_attempt_at", -1e9) < 20:
             continue
+        from crash_derivatives import empty_snapshot, format_shadow
+        if 'derivatives_shadow' not in record:
+            record['derivatives_shadow'] = empty_snapshot(record)
+        shadow_message = format_shadow(record['derivatives_shadow'])
         d = record["v2_features"]
         strength = d.get("strength_score") or {}
         score_message = "📊 Kademeli güç puanı: veri yok\n"
@@ -6566,6 +6572,7 @@ def _crash_send_pending(state, now):
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
                    f"{score_message}"
                    f"{context_message}"
+                   f"{shadow_message}"
                    "Puan bilgi amaçlı; TP olasılığı değildir.\n"
                    f"Giriş seviyesi: {record['entry']} | anlık: {record.get('last_price')}\n"
                    f"TP +%1 (brüt): {record['tp']}\n"
@@ -6574,7 +6581,7 @@ def _crash_send_pending(state, now):
         record["v2_telegram_attempts"] = record.get("v2_telegram_attempts", 0) + 1
         record["v2_delivery_status"] = "ATTEMPTING"
         _crash_save_state(state)
-        if globals().get('_CRASH_NIGHT') is not None:
+        if globals().get('_CRASH_NIGHT') is not None and _CRASH_NIGHT.enabled.is_set():
             message = message.replace('Gerçek emir yok.', 'Otomatik GTC limit sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
         receipt = _crash_telegram_receipt(message)
         monitor = globals().get('_CRASH_HEALTH')
@@ -6591,6 +6598,11 @@ def _crash_send_pending(state, now):
             record["v2_delivery_status"] = "SENT"
             record["v2_telegram_sent_at"] = receipt["accepted_at"]
             record["v2_telegram_message_id"] = receipt["message_id"]
+            try:
+                if globals().get('_CRASH_SHADOW') is not None:
+                    _CRASH_SHADOW.submit(record)
+            except Exception as error:
+                log(f'[CRASH DERIVATIVES QUEUE ERR] {type(error).__name__}')
             executor = globals().get('_CRASH_NIGHT')
             if executor is not None:
                 executor.submit(record, receipt['accepted_at'])
@@ -7031,19 +7043,30 @@ def _crash_send_report_file(path, caption):
     try:
         with open(path, "rb") as handle:
             response = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
-                data={"chat_id":CHAT_ID, "caption":caption},
+                data={"chat_id":CHAT_ID, "caption":caption[:900]},
                 files={"document":(os.path.basename(path),handle)}, timeout=60)
         response.raise_for_status()
-        return bool(response.json().get("ok"))
+        result = response.json()
+        if not result.get("ok"):
+            log(f"[CRASH REPORT SEND ERR] Telegram code={result.get('error_code')} reason={str(result.get('description', ''))[:180]}")
+        return bool(result.get("ok"))
     except Exception as error:
-        log(f"[CRASH REPORT SEND ERR] {type(error).__name__}")
+        log(f"[CRASH REPORT SEND ERR] {type(error).__name__}; HTTP={getattr(getattr(error, 'response', None), 'status_code', None)}")
         return False
 
 
 def _crash_daily_report(state, now):
     import zipfile
     from crash_context import summarize_context
-    report = state.setdefault("report", {"last_success_at":now, "next_due_at":now+86400})
+    from crash_report_schedule import prepare, success
+    report = prepare(state.setdefault("report", {}), now)
+    if _CRASH_REPORT_REQUEST.is_set():
+        _CRASH_REPORT_REQUEST.clear()
+        report.update(next_due_at=now, retry_after=0)
+    pending = report.get("pending")
+    if pending and not os.path.isfile(pending.get("path", "")):
+        report.pop("pending", None)
+        log("[CRASH REPORT] missing ZIP will be regenerated")
     if now < report["next_due_at"]:
         return
     if now < report.get("retry_after", 0):
@@ -7105,6 +7128,9 @@ def _crash_daily_report(state, now):
                     if r.get("tracking_model", "legacy_unknown")==model])
                     for model in sorted({r.get("tracking_model", "legacy_unknown") for r in recent})},
                 "notes":notes}, ensure_ascii=False, indent=2))
+            from crash_derivatives import export_csv, summarize
+            archive.writestr("derivatives_shadow.csv", export_csv(records))
+            archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
             # Cover 150h entry wait plus 150h after entry (12.5 days).
             for offset in range(15):
@@ -7143,11 +7169,20 @@ def _crash_daily_report(state, now):
         _crash_save_state(state)
     report["retry_after"] = now + 1800
     _crash_save_state(state)
+    if not pending.get('summary_sent'):
+        receipt = _crash_telegram_receipt(pending['caption'])
+        pending['summary_sent'] = bool(receipt.get('ok') or receipt.get('ambiguous'))
+        log(f"[CRASH REPORT SUMMARY] accepted={receipt.get('ok')} error={receipt.get('error')}")
+        _crash_save_state(state)
     if os.path.getsize(pending["path"]) > 49*1024*1024:
-        log("[CRASH REPORT ERR] export exceeds Telegram document limit")
+        log("[CRASH REPORT ERR] export exceeds Telegram document limit; text summary only")
+        if pending.get('summary_sent'):
+            success(report, now)
+            report['last_zip_error'] = 'DOCUMENT_TOO_LARGE_TEXT_ONLY'
+            _crash_save_state(state)
         return
     if _crash_send_report_file(pending["path"], pending["caption"]):
-        report.update(last_success_at=pending["period_end"], next_due_at=now+86400)
+        success(report, now)
         report.pop("pending",None)
         report.pop("retry_after",None)
         _crash_save_state(state)
@@ -7283,7 +7318,7 @@ class CrashBounceWebSocketCache:
                 if int(data.get("st",1))!=1 or not supported_symbol(symbol):
                     return
                 row = [k["t"],k["o"],k["h"],k["l"],k["c"],k["v"],k["T"],
-                       k.get("q","0"),k.get("n",0),k.get("V","0"),k.get("Q","0"),"0"]
+                       k.get("q"),k.get("n",0),k.get("V"),k.get("Q"),"0"]
                 self.merge_candles(symbol, [row])
             elif isinstance(data, dict) and "code" in data:
                 log(f"[CRASH WS SERVER ERR] code={data['code']}")
@@ -7748,6 +7783,60 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     log(f"[CRASH SCAN COMPLETE] {scan_metrics}")
 
 
+_CRASH_SHADOW = None
+_CRASH_REPORT_REQUEST = threading.Event()
+
+
+def _crash_control_action(action):
+    if action == 'report':
+        _CRASH_REPORT_REQUEST.set()
+        return '✅ Günlük rapor sıraya alındı; özet ve ZIP ayrı gönderilecek.'
+    if _CRASH_NIGHT is None:
+        return 'Otomatik giriş KAPALI; işlem modülü hazır değil. /rapor kullanılabilir.'
+    return _CRASH_NIGHT.request_control(action)
+
+
+def _crash_start_shadow():
+    global _CRASH_SHADOW
+    from crash_derivatives import ShadowCollector
+    def blocked():
+        broker = getattr(globals().get('_CRASH_NIGHT'), 'broker', None)
+        return (time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
+                or time.time() < getattr(broker, 'cooldown_until', 0))
+    def cached(symbol):
+        path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'history_cache', symbol+'.json')
+        try:
+            with open(path, encoding='utf-8') as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            rows = []
+        return rows + _CRASH_WS_CACHE.candles(symbol)
+    _CRASH_SHADOW = ShadowCollector(os.path.join(CRASH_BOUNCE_RESEARCH_DIR,'derivatives'),
+        _crash_public_get, blocked, cached, log)
+    _CRASH_SHADOW.start()
+
+
+def _crash_drain_shadow(state):
+    import queue
+    from crash_derivatives import format_shadow
+    if _CRASH_SHADOW is None:
+        return
+    while True:
+        try:
+            result = _CRASH_SHADOW.results.get_nowait()
+        except queue.Empty:
+            break
+        record = next((r for r in state['history'] if r.get('signal_id') == result['signal_id']), None)
+        if record is None:
+            continue
+        record['derivatives_shadow'] = result
+        _crash_append_data({'type':'derivatives_shadow', **result}, time.time())
+        _crash_save_state(state)
+        receipt = _crash_telegram_receipt(f"🔬 GÖLGE ANALİZ | {result['symbol']}\nSinyal: {result['signal_id']}\n"+format_shadow(result))
+        result['telegram_delivery'] = {k:receipt.get(k) for k in ('ok','error','ambiguous','message_id')}
+        _crash_save_state(state)
+
+
 def _crash_start_services():
     """File-controlled entry and manual TP repair; both shipped disabled."""
     global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL
@@ -7770,7 +7859,7 @@ def _crash_start_services():
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 5), manual_tp=bool(repair_flag))
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler: {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
-                '24 saat | 50 USDT pozisyon | 10x | aynı anda en fazla 5 sembol\n'
+                f'24 saat | {executor.position_usdt} USDT pozisyon | 10x | aynı anda en fazla {executor.max_symbols} sembol\n'
                 f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram aç/kapat devre dışı.')
             _CRASH_NIGHT = executor
             executor.public_rest_blocked = lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
@@ -7785,14 +7874,14 @@ def _crash_start_services():
             reason = reasons.get(code, 'Başlangıç başarısız; veri klasörü erişimini ve kayıt dosyasını kontrol edin')
             trading_status = f'BAŞLATILAMADI | {code}: {reason}'
             log(f'[CRASH NIGHT START ERR] {code}: {reason}')
-    if _CRASH_NIGHT is not None:
+    if globals().get('BOT_TOKEN') and globals().get('CHAT_ID'):
         try:
             from crash_telegram_control import TelegramControl
             token, chat = globals().get('BOT_TOKEN'), globals().get('CHAT_ID')
             if not token or not chat:
                 raise ValueError('TELEGRAM_COUNTER_CREDENTIALS_MISSING')
             _CRASH_CONTROL = TelegramControl(directory, token, chat, os.getenv('TELEGRAM_OWNER_ID'),
-                _CRASH_NIGHT.request_control, _crash_telegram_receipt, log, counter_only=True, require_owner=False)
+                _crash_control_action, _crash_telegram_receipt, log, counter_only=True, require_owner=False)
             _CRASH_CONTROL.start()
         except Exception as error:
             code = str(error) if str(error) in ('TELEGRAM_OWNER_ID_REQUIRED_FOR_GROUP', 'TELEGRAM_COUNTER_CREDENTIALS_MISSING') else type(error).__name__
@@ -7825,6 +7914,10 @@ def _crash_bounce_worker():
     threading.Thread(target=_crash_trade_consumer,
                      name="crash-trade-consumer",daemon=True).start()
     _CRASH_WS_CACHE.start()
+    try:
+        _crash_start_shadow()
+    except Exception as error:
+        log(f'[CRASH DERIVATIVES START ERR] {type(error).__name__}; V2 continues')
     while True:
         try:
             if state is None:
@@ -7832,15 +7925,23 @@ def _crash_bounce_worker():
                 with _CRASH_STATE_LOCK:
                     _CRASH_ACTIVE_STATE = state
                 _crash_apply_filter_migration(state, time.time())
-                state.setdefault("report", {"last_success_at":time.time(), "next_due_at":time.time()+86400})
+                state.setdefault("report", {"last_success_at":time.time()-86400})
                 _crash_save_state(state)
             try:
+                _crash_drain_shadow(state)
                 _crash_daily_report(state, time.time())
             except Exception as error:
                 log(f"[CRASH REPORT ERR] {type(error).__name__}: {error}")
             now = time.time()
             # Recover queued downloads after restart; retain original event cutoffs.
             for historical in state['history']:
+                if (globals().get('_CRASH_SHADOW') is not None and historical.get('v2_sent')
+                        and (historical.get('derivatives_shadow') or {}).get('status') == 'PENDING'
+                        and now-historical['created_at'] < 86400):
+                    try:
+                        _CRASH_SHADOW.submit(historical)
+                    except Exception as error:
+                        log(f'[CRASH DERIVATIVES QUEUE ERR] {type(error).__name__}')
                 if historical.get('v2_status') == 'STRONG_V2' and historical.get('tracking_status') == 'WAIT_ENTRY':
                     _crash_risk_observe('watch', historical)
                 if now - historical['created_at'] <= 14*86400:

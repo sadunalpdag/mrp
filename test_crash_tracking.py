@@ -1,4 +1,6 @@
 """Offline tracking, research exports and delivery retry regression tests."""
+import threading
+from crash_report_schedule import slot
 import ast
 import json
 import math
@@ -20,7 +22,7 @@ class TrackingTests(unittest.TestCase):
         names={'_crash_initialize_tracking','_crash_track_results','_crash_summary',
                '_crash_features','_crash_daily_report','_crash_send_report_file'}
         subset=ast.Module(body=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names],type_ignores=[])
-        self.g=dict(math=math,os=os,json=json,datetime=datetime,timezone=timezone,
+        self.g=dict(_CRASH_REPORT_REQUEST=threading.Event(), _crash_telegram_receipt=Mock(return_value={"ok":True}), math=math,os=os,json=json,datetime=datetime,timezone=timezone,
                     CRASH_BOUNCE_FILTER_VERSION='five_day_entry_v2_only',
                     CRASH_BOUNCE_RESEARCH_DIR=self.tmp.name,_crash_save_state=Mock(),
                     _crash_append_data=Mock(),_crash_entry_features=Mock(),
@@ -114,7 +116,7 @@ class TrackingTests(unittest.TestCase):
         old=dict(symbol='BUSDT',created_at=self.now-12*86400,entry='1',tp='1.01',
                  tracking_status='OPEN',entered_at=self.now-6*86400)
         self.state['history'].append(old)
-        self.state['report']={'last_success_at':self.now-86400,'next_due_at':self.now}
+        self.state['report']={'last_success_at':self.now-86400,'schedule_version':2,'next_due_at':self.now}
         self.g['_crash_send_report_file'].return_value=False
         self.g['_crash_daily_report'](self.state,self.now)
         with zipfile.ZipFile(self.state['report']['pending']['path']) as z:
@@ -142,11 +144,11 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(f['volume_ratio_last_vs_previous20'],1)
         self.assertEqual(f['rsi14_wilder'],50)
 
-    def test_report_first_due_in_24h_and_failed_send_reuses_export(self):
+    def test_report_calendar_due_and_failed_send_reuses_export(self):
         self.g['_crash_daily_report'](self.state,self.now)
         self.g['_crash_send_report_file'].assert_not_called()
         self.g['_crash_send_report_file'].return_value=False
-        due=self.now+86400
+        due=self.state["report"]["next_due_at"]
         self.g['_crash_daily_report'](self.state,due)
         pending=dict(self.state['report']['pending'])
         with zipfile.ZipFile(pending['path']) as z:
@@ -158,8 +160,18 @@ class TrackingTests(unittest.TestCase):
         self.g['_crash_send_report_file'].return_value=True
         self.g['_crash_daily_report'](self.state,due+1800)
         self.assertNotIn('pending',self.state['report'])
-        self.assertEqual(self.state['report']['next_due_at'],due+1800+86400)
+        self.assertEqual(self.state['report']['next_due_at'],slot(due+1800, tomorrow=True))
         self.assertEqual(self.g['_crash_send_report_file'].call_args.args[0],pending['path'])
+
+    def test_manual_report_and_missing_pending_zip_rebuild(self):
+        self.state['report']={'last_success_at':self.now-86400,'schedule_version':2,
+                             'next_due_at':self.now+86400,
+                             'pending':{'path':'/does/not/exist','caption':'old','period_end':self.now}}
+        self.g['_CRASH_REPORT_REQUEST'].set()
+        self.g['_crash_daily_report'](self.state,self.now)
+        self.g['_crash_send_report_file'].assert_called_once()
+        self.g['_crash_telegram_receipt'].assert_called_once()
+        self.assertNotIn('pending',self.state['report'])
 
     def test_new_ws_model_does_not_count_three_minute_snapshot_as_tp(self):
         r=self.upward_fixture()

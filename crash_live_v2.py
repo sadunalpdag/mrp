@@ -47,6 +47,10 @@ def advance_trade(record, price, observed_at, trade_id):
     if gap > 30:
         record['coverage_gaps'] = record.get('coverage_gaps', 0) + 1
     status = record.get('tracking_status', 'WAIT_ENTRY')
+    if record.get('derivatives_shadow') is not None:
+        record['shadow_new_low_observed'] = record.get('shadow_new_low_observed', False) or price < bottom
+        if status == 'OPEN':
+            record['shadow_mae_pct'] = min(record.get('shadow_mae_pct', 0.0), 100*(price/entry-1))
     # Gaps cannot prove which threshold crossed first.
     reliable = gap <= 30 and (previous_id is not None or gap <= 10)
     if status == 'WAIT_ENTRY':
