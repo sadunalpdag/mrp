@@ -1,9 +1,11 @@
 name: Crash Bounce V2 checks
 on:
   push:
-    branches: [master]
+    branches: [master, feature/ai-top-gainers-4h]
     paths:
       - 'ema.py'
+      - 'ai_top_gainers.py'
+      - 'test_ai_top_gainers.py'
       - 'crash_v2.py'
       - 'crash_history.py'
       - 'crash_live_v2.py'
@@ -25,6 +27,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Check Python syntax
-        run: python -m py_compile ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py crash_context.py
+        run: python -m py_compile ai_top_gainers.py ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py crash_context.py
       - name: Run offline Crash Bounce tests
         run: python -m unittest discover -p 'test_crash*.py' -v
+
+      - name: Run offline AI market research tests
+        run: python -m unittest test_ai_top_gainers -v

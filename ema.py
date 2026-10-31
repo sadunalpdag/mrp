@@ -7137,6 +7137,9 @@ def _crash_daily_report(state, now):
             archive.writestr("derivatives_shadow.csv", export_csv(records))
             from crash_ai import export_csv as export_ai_csv
             archive.writestr("openai_reviews.csv", export_ai_csv(records))
+            ai_market_path = os.path.join(globals().get('DATA_DIR', os.path.dirname(CRASH_BOUNCE_RESEARCH_DIR)), 'ai_top_gainers', 'top_gainers_state.json')
+            if os.path.isfile(ai_market_path):
+                archive.write(ai_market_path, 'ai_market/top_gainers_state.json')
             archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
             # Cover 150h entry wait plus 150h after entry (12.5 days).
@@ -7967,6 +7970,15 @@ def _crash_bounce_worker():
         _crash_start_ai()
     except Exception as error:
         log(f'[CRASH AI START ERR] {type(error).__name__}; V2 continues')
+    try:
+        from ai_top_gainers import TopGainers
+        gainers = TopGainers(
+            os.path.join(DATA_DIR, 'ai_top_gainers'), _CRASH_WS_CACHE,
+            _crash_public_get, _crash_telegram_receipt, log,
+            market_symbols=lambda: _crash_load_market_cache()[0])
+        gainers.start()
+    except Exception as error:
+        log(f'[TOP GAINERS START ERR] {type(error).__name__}; V2 continues')
     while True:
         try:
             if state is None:
