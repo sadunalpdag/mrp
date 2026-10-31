@@ -7137,6 +7137,9 @@ def _crash_daily_report(state, now):
             archive.writestr("derivatives_shadow.csv", export_csv(records))
             from crash_ai import export_csv as export_ai_csv
             archive.writestr("openai_reviews.csv", export_ai_csv(records))
+            ai_market_path = os.path.join(DATA_DIR, 'ai_top_gainers', 'top_gainers_state.json')
+            if os.path.isfile(ai_market_path):
+                archive.write(ai_market_path, 'ai_market/top_gainers_state.json')
             archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
             # Cover 150h entry wait plus 150h after entry (12.5 days).
