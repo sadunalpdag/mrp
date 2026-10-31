@@ -144,9 +144,11 @@ class TopGainers:
             self.log("[TOP GAINERS] fewer than ten comparable instruments")
             return True
         inputs=[]
+        klines={}
         for symbol,ret in ranked:
             try:
                 rows=self.fetch("/fapi/v1/klines",{"symbol":symbol,"interval":"1h","limit":60})
+                klines[symbol]=rows
                 inputs.append(features(symbol,rows,ret,None))
             except Exception as error:
                 self.log("[TOP GAINERS KLINES] "+symbol+" "+type(error).__name__)
@@ -156,47 +158,47 @@ class TopGainers:
                 "analyses":[],"usage":{}}
         if self.key:
             try:
-                import requests
-                post=self.post or requests.post
-                response=post("https://api.openai.com/v1/responses",
-                  headers={"Authorization":"Bearer "+self.key},
-                  json={"model":self.env.get("TOP_GAINERS_MODEL",MODEL),
-                        "store":False,"instructions":INSTRUCTIONS,
-                        "input":json.dumps({"as_of_utc":datetime.fromtimestamp(now,timezone.utc).isoformat(),
-                                            "gainers":inputs},allow_nan=False),
-                        "reasoning":{"effort":"none"},"max_output_tokens":2200,
-                        "text":{"format":{"type":"json_schema","name":"gainers_review",
-                                          "strict":True,"schema":SCHEMA}}},
-                  timeout=(5,60))
-                if response.status_code==200:
-                    body=response.json()
-                    if body.get("status")!="completed":
-                        raise ValueError("INCOMPLETE")
-                    content="".join(c.get("text","") for o in body.get("output",[])
-                        if o.get("type")=="message" for c in o.get("content",[])
-                        if c.get("type")=="output_text")
-                    parsed=json.loads(content)["analyses"]
-                    bysymbol={a["symbol"]:a for a in parsed}
-                    expected={s for s,_ in ranked}
-                    if len(parsed)!=10 or set(bysymbol)!=expected:
-                        raise ValueError("INVALID_SYMBOL_COVERAGE")
-                    for a in parsed:
-                        market_price=prices[a["symbol"]]
-                        entry=number(a.get("entry_price"))
+                from ai_market_agents import AgentsResearch
+                recent_btc = next((p.get("direction") for p in reversed(self.state.get("btc", []))
+                                   if p.get("status") == "COMPLETE"
+                                   and p.get("direction") in ("UP", "DOWN", "SIDEWAYS")
+                                   and 0 <= now-p.get("as_of", 0) <= 5400), None)
+                engine = AgentsResearch(
+                    self.key, model=self.env.get("TOP_GAINERS_MODEL", MODEL),
+                    post=self.post, log=self.log,
+                    web_enabled=self.env.get("TOP_GAINERS_NEWS_ENABLED", "1") == "1",
+                    max_calls_per_scan=5, max_web_calls_per_scan=1)
+                outcome = engine.evaluate(
+                    inputs, klines=klines, fetch=self.fetch, final_schema=SCHEMA,
+                    btc=recent_btc,
+                    spot_enabled=self.env.get("TOP_GAINERS_SPOT_DELTA_ENABLED", "0") == "1",
+                    market_prices={s: prices[s] for s, _ in ranked})
+                report["status"] = outcome["status"]
+                report["agents"] = outcome["agents"]
+                report["derivative_metrics"] = outcome["derivative_metrics"]
+                report["agent_usage"] = outcome["usage"]
+                report["estimated_model_usd"] = outcome["estimated_model_usd"]
+                report["web_tool_calls"] = outcome["web_tool_calls"]
+                report["estimated_search_usd"] = outcome["estimated_search_usd"]
+                report["estimated_total_usd"] = outcome["estimated_total_usd"]
+                if report["status"] == "COMPLETE":
+                    for a in outcome["analyses"]:
+                        market_price = prices[a["symbol"]]
+                        entry = number(a.get("entry_price"))
                         if entry is None or not market_price*0.90 <= entry <= market_price:
-                            a["entry_price"]=None
+                            a["entry_price"] = None
                         else:
-                            a["entry_price"]=entry
-                    report["analyses"]=parsed
-                    report["usage"]=body.get("usage",{})
-                    report["status"]="COMPLETE"
-                else:
-                    report["status"]="HTTP_"+str(response.status_code)
+                            a["entry_price"] = entry
+                    report["analyses"] = outcome["analyses"]
             except Exception as error:
-                report["status"]="AI_"+type(error).__name__
+                self.log("[TOP GAINERS MULTIAGENT ERROR] " + type(error).__name__)
+                report["status"] = "AI_" + type(error).__name__
         lines=["🤖 AI TOP GAINERS | 4H | USDT-M FUTURES",
                "Bağımsız araştırma • emir açılmaz",
                "AI durumu: "+report["status"]]
+        news_state=(report.get("agents") or {}).get("news",{}).get("status","UNKNOWN")
+        lines.append("Analistler: Teknik | Haber ("+news_state+") | Türev | Risk")
+        lines.append("Haber zamanı doğrulanmadıysa güçlü kanıt sayılmaz.")
         indexed={a["symbol"]:a for a in report["analyses"]}
         for i,(symbol,ret) in enumerate(ranked,1):
             a=indexed.get(symbol)
@@ -413,6 +415,11 @@ class TopGainers:
         if evaluated7:
             msg+=f"BTC 1H (7g): {correct7}/{len(evaluated7)} doğru ({100*correct7/len(evaluated7):.1f}%)\n"
         msg+="Yalnız WS örnekleri: kaçırılan giriş/TP olabilir; otomatik işlem yok."
+        research_today=[r for r in self.state.get("reports",[])
+                        if r.get("at",0)>=since]
+        costs=[r.get("estimated_total_usd") for r in research_today]
+        spent=sum(c for c in costs if isinstance(c,(int,float)))
+        msg+=f"\nTop Gainers AI maliyeti (tahmini): ${spent:.3f} / 24s"
         receipt=self.telegram(msg)
         with self.lock:
             self.state["daily"].append({"day":day,"at":now,"trades":len(trades),
@@ -430,7 +437,12 @@ class TopGainers:
             return
         def run():
             while True:
-                for method in (self.follow_step,self.btc_step,self.step,self.daily_step):
+                research = getattr(self, "_research_thread", None)
+                if research is None or not research.is_alive():
+                    self._research_thread = threading.Thread(
+                        target=self.step, daemon=True, name="top-gainers-4h-research")
+                    self._research_thread.start()
+                for method in (self.follow_step,self.btc_step,self.daily_step):
                     try:method()
                     except Exception as error:
                         self.log("[TOP GAINERS ERROR] "+method.__name__+" "+type(error).__name__)
