@@ -29,3 +29,8 @@ Daily reports run at 21:00 Europe/Paris using a DST-aware calendar slot, rather 
 References:
 - https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data
 - https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market
+
+
+## Telegram automatic-entry switch
+
+`/otomatik_ac` enables new entries, `/otomatik_kapat` disables new entries, and `/otomatik_durum` reports the current mode. The configured chat and existing fresh/non-forwarded-message checks apply. Parameters and daily used count are not reset. Switching off does not cancel existing pending orders or close positions; TP maintenance continues. Turning on discards queued pre-activation candidates and does not clear error holds. Missing Binance credentials prevent activation. The executor is prepared paused when credentials exist even if both Python startup switches are zero. `AUTO_TRADING_ENABLED=0` remains the deployment/startup default: after restart, explicitly enable again via Telegram. No live orders were placed during tests.

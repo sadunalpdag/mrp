@@ -7838,7 +7838,7 @@ def _crash_drain_shadow(state):
 
 
 def _crash_start_services():
-    """File-controlled entry and manual TP repair; both shipped disabled."""
+    """Python controls startup defaults; configured-chat commands can toggle new entries."""
     global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL
     from crash_heartbeat import Heartbeat
     _CRASH_NIGHT = None
@@ -7851,7 +7851,7 @@ def _crash_start_services():
     directory = os.path.abspath(configured_directory or os.path.join(DATA_DIR, 'night_execution'))
     trading_status = 'KAPALI (ema.py AUTO_TRADING_ENABLED=0)'
     prior = directory and os.path.exists(os.path.join(directory, 'crash_night_state.json'))
-    if auto_flag or repair_flag or prior:
+    if auto_flag or repair_flag or prior or (globals().get('BINANCE_KEY') and globals().get('BINANCE_SECRET')):
         try:
             from crash_night import BinanceBroker, NightExecutor, day
             executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
@@ -7860,7 +7860,7 @@ def _crash_start_services():
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler: {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
                 f'24 saat | {executor.position_usdt} USDT pozisyon | 10x | aynı anda en fazla {executor.max_symbols} sembol\n'
-                f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram aç/kapat devre dışı.')
+                f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram: /otomatik_ac ve /otomatik_kapat.')
             _CRASH_NIGHT = executor
             executor.public_rest_blocked = lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
             executor.start()
@@ -7881,7 +7881,7 @@ def _crash_start_services():
             if not token or not chat:
                 raise ValueError('TELEGRAM_COUNTER_CREDENTIALS_MISSING')
             _CRASH_CONTROL = TelegramControl(directory, token, chat, os.getenv('TELEGRAM_OWNER_ID'),
-                _crash_control_action, _crash_telegram_receipt, log, counter_only=True, require_owner=False)
+                _crash_control_action, _crash_telegram_receipt, log, counter_only=True, require_owner=False, allow_toggle=True)
             _CRASH_CONTROL.start()
         except Exception as error:
             code = str(error) if str(error) in ('TELEGRAM_OWNER_ID_REQUIRED_FOR_GROUP', 'TELEGRAM_COUNTER_CREDENTIALS_MISSING') else type(error).__name__
@@ -7889,7 +7889,7 @@ def _crash_start_services():
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
-        result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: ema.py | Telegram sayaç: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
+        result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: Telegram aç/kapat; ema.py başlangıç ayarı | Telegram: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
         return result
     _CRASH_HEALTH = Heartbeat(DATA_DIR, _crash_telegram_receipt, health, log)
     _CRASH_HEALTH.start()

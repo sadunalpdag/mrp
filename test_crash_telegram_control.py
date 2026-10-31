@@ -24,6 +24,23 @@ class ControlTests(unittest.TestCase):
     def update(self, uid=1, text='/otomatik_ac'):
         return dict(update_id=uid,message={'chat':{'id':123},'from':{'id':123,'is_bot':False},'date':self.now,'text':text})
 
+    def test_explicit_toggle_in_parameter_mode_still_checks_chat_and_freshness(self):
+        c=TelegramControl(self.tmp.name,'fake','123',None,self.action,self.deliver,Mock(),
+                          lambda:self.now,self.fetch,counter_only=True,require_owner=False,allow_toggle=True)
+        u=self.update(text='/otomatik_ac');u['message']['from']['id']=456
+        self.assertEqual(c.command(u),'on')
+        u['message']['text']='/otomatik_kapat'
+        self.assertEqual(c.command(u),'off')
+        u['message']['chat']['id']=999
+        self.assertIsNone(c.command(u))
+        u['message']['chat']['id']=123;u['message']['date']-=100
+        self.assertIsNone(c.command(u))
+        u=self.update(text='/otomatik_ac');u['message']['forward_origin']={'type':'user'}
+        self.assertIsNone(c.command(u))
+        u=self.update(text='/otomatik_ac extra')
+        self.assertIsNone(c.command(u))
+        self.assertEqual(c.command(self.update(text='/sayac 3')),'counter:3')
+
     def test_counter_only_commands_authorized_and_cannot_toggle_trading(self):
         self.c.counter_only=True
         self.assertEqual(self.c.command(self.update(text='/sayac 0')),'counter:0')
@@ -132,6 +149,15 @@ class GateTests(unittest.TestCase):
         message=self.e.apply_control('on')
         self.assertIn('Açılamadı',message); self.assertFalse(self.e.enabled.is_set())
         self.assertEqual(self.e.state['halt'],'TP DOĞRULANAMADI')
+
+    def test_toggle_preserves_limits_budget_and_used_count(self):
+        self.e.apply_control('limit:50');self.e.apply_control('symbols:50')
+        self.e.apply_control('amount:500');self.e.apply_control('counter:7')
+        self.e.apply_control('on');self.e.apply_control('off');self.e.apply_control('on')
+        self.assertEqual(self.e.daily_count(),7)
+        self.assertEqual(self.e.max_daily,50)
+        self.assertEqual(self.e.max_symbols,50)
+        self.assertEqual(float(self.e.position_usdt),500)
 
     def test_on_discards_buffered_crossings_and_pre_activation_event(self):
         self.e.queue.put((self.r,self.now))

@@ -8,3 +8,8 @@ Settings are saved in crash_night_state.json and restored on restart if that fil
 
 
 `/rapor` requests the daily research summary and ZIP immediately. Scheduled reports run at 21:00 Europe/Paris. Automatic new entries ship disabled for the derivatives shadow study; parameter commands do not enable them. See DERIVATIVES_SHADOW.md.
+
+
+## Telegram automatic-entry switch
+
+`/otomatik_ac` enables new entries, `/otomatik_kapat` disables new entries, and `/otomatik_durum` reports the current mode. The configured chat and existing fresh/non-forwarded-message checks apply. Parameters and daily used count are not reset. Switching off does not cancel existing pending orders or close positions; TP maintenance continues. Turning on discards queued pre-activation candidates and does not clear error holds. Missing Binance credentials prevent activation. The executor is prepared paused when credentials exist even if both Python startup switches are zero. `AUTO_TRADING_ENABLED=0` remains the deployment/startup default: after restart, explicitly enable again via Telegram. No live orders were placed during tests.

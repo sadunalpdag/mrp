@@ -8,8 +8,10 @@ COMMANDS = {'/otomatik_ac': 'on', '/otomatik_kapat': 'off', '/otomatik_durum': '
 
 
 class TelegramControl:
-    def __init__(self, directory, token, chat_id, owner_id, action, deliver, log, clock=time.time, fetch=None, counter_only=False, require_owner=True):
+    def __init__(self, directory, token, chat_id, owner_id, action, deliver, log, clock=time.time, fetch=None, counter_only=False, require_owner=True, allow_toggle=False):
         self.counter_only = counter_only
+        self.allow_toggle = allow_toggle
+        os.makedirs(directory, exist_ok=True)
         self.require_owner = require_owner
         self.token, self.chat_id = token, str(chat_id)
         # Private chat ID equals the user ID. Group/channel IDs cannot infer an owner.
@@ -68,6 +70,8 @@ class TelegramControl:
             return None
         # Exact commands only. Quoted, edited, forwarded and free-form signals cannot arm trading.
         text = msg.get('text', '').strip()
+        if self.allow_toggle and text in COMMANDS:
+            return COMMANDS[text]
         if text == '/rapor':
             return 'report'
         parts = text.split()

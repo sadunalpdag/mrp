@@ -218,13 +218,13 @@ class FileFlagTests(unittest.TestCase):
         self.assertIn('os.getenv("BINANCE_API_KEY")',source)
         self.assertIn('os.getenv("BINANCE_SECRET_KEY")',source)
 
-    def test_file_flags_control_executor_telegram_cannot_override(self):
+    def test_file_flags_set_startup_mode_credentials_prepare_paused_executor(self):
         tree=ast.parse(Path(__file__).with_name('ema.py').read_text())
         subset=ast.Module(body=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='_crash_start_services'],type_ignores=[])
         with tempfile.TemporaryDirectory() as tmp,patch.dict(os.environ,{'CRASH_NIGHT_STATE_DIR':tmp,'CRASH_NIGHT_TRADING':'live'},clear=True),patch('crash_night.NightExecutor') as executor,patch('crash_night.BinanceBroker'),patch('crash_heartbeat.Heartbeat'),patch('crash_telegram_control.TelegramControl') as tg:
             g=dict(os=os,time=SimpleNamespace(time=lambda:1),DATA_DIR=tmp,log=Mock(),BINANCE_KEY='fake',BINANCE_SECRET='fake',_crash_telegram_receipt=Mock(),_CRASH_WS_CACHE=Mock(),AUTO_TRADING_ENABLED=0,MANUAL_TP_REPAIR_ENABLED=0,AUTO_MAX_DAILY_ENTRIES=5)
             exec(compile(subset,'ema.py','exec'),g);g['_crash_start_services']()
-            executor.assert_not_called();tg.assert_not_called()
+            self.assertFalse(executor.call_args.kwargs['enabled']);tg.assert_not_called()
             g['MANUAL_TP_REPAIR_ENABLED']=1;g['_crash_start_services']()
             self.assertFalse(executor.call_args.kwargs['enabled'])
             self.assertTrue(executor.call_args.kwargs['manual_tp'])
