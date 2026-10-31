@@ -64,6 +64,9 @@ def features(symbol, rows, ret, volume_24h):
     prevvol=sum(volumes[-28:-4])/24
     return {"symbol":symbol,"return_4h_pct":round(ret,3),
             "price":closes[-1],"rsi14_1h":round(rsi,2),
+            "return_1h_pct":round(100*(closes[-1]/closes[-2]-1),3),
+            "closed_4h_return_pct":round(100*(closes[-1]/closes[-5]-1),3),
+            "ema25_slope_pct":round(100*(ema(closes,25)/ema(closes[:-3],25)-1),3),
             "ema25_1h":round(ema(closes,25),8),
             "ema50_1h":round(ema(closes,50),8) if len(closes)>=50 else None,
             "atr14_pct":round(100*sum(tr[-14:])/14/closes[-1],3),
@@ -240,6 +243,12 @@ class TopGainers:
                 sym=t["symbol"]
                 price=prices.get(sym)
                 if price is None or now <= t["created_at"]:
+                    if t["status"]=="WAIT_ENTRY" and now-t["created_at"]>86400:
+                        t.update(status="NO_ENTRY_24H",finished_at=now)
+                        modified=True
+                    elif t["status"]=="OPEN" and now-t["entry_at"]>86400:
+                        t.update(status="TIMEOUT_AFTER_ENTRY_24H",finished_at=now)
+                        modified=True
                     continue
                 t["observations"]+=1
                 t["first_observed_at"]=t["first_observed_at"] or now
