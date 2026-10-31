@@ -55,7 +55,7 @@ class Tests(unittest.TestCase):
                            env={"TOP_GAINERS_ENABLED":"1"},clock=lambda:now)
             bot.daily_step();bot.daily_step()
             self.assertEqual(len(posts),1)
-            self.assertIn("henüz hesaplanamaz",posts[0])
+            self.assertIn("Sonuçlananlarda TP: henüz yok",posts[0])
             self.assertEqual(len(bot.state["daily"]),1)
 
 if __name__=="__main__":
