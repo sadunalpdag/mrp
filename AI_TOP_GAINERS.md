@@ -33,3 +33,11 @@ The existing `ema.py` starts `ai_top_gainers.TopGainers` as a daemon research wo
 ## Verification
 
 Run `python -m unittest test_ai_top_gainers -v` offline. CI on this branch also compiles both Python entry files and runs the existing Crash Bounce tests. Production API calls, Telegram delivery and deployment must still be verified in Render after merge.
+
+## Four analyst research (new)
+
+The four-hour Top Gainers scan evaluates up to ten symbols in batched OpenAI requests: technical indicators including MACD/ADX and support/resistance; OI/funding and perp taker-volume imbalance proxy (not real trade-level CVD); a single optional OpenAI web search for timestamped cited news; and risk including a recent BTC hourly forecast where available. A separate final evaluator proposes scored paper LONG entries. This is not the TradingAgents third-party graph/framework.
+
+The extra research uses a maximum of five OpenAI Responses API calls per four-hour report (three analyst calls, one optional web search, one final decision), shared paced public Binance REST requests, and **never** creates real orders. News is not counted as verified unless a URL and a plausibly recent model-reported date exist; publication dates are not independently verified. Model scores are opinions, not probabilities.
+
+Render options: `TOP_GAINERS_NEWS_ENABLED=1` to search once per four-hour cycle (set 0 to disable), `TOP_GAINERS_SPOT_DELTA_ENABLED=0` to disable extra spot kline calls (set 1 to enable). See `ai_market_agents.py`. New results and estimated AI costs are included in the existing Top Gainers JSON and daily 21:00 Europe/Paris report. API search costs, model tokens and REST consumption are additional to the old version; the daily cost calculation is approximate, not an enforced budget cap.
