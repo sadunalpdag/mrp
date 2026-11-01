@@ -151,12 +151,12 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.e.state['halt'],'TP DOĞRULANAMADI')
 
     def test_toggle_preserves_limits_budget_and_used_count(self):
-        self.e.apply_control('limit:50');self.e.apply_control('symbols:50')
+        self.e.apply_control('limit:20');self.e.apply_control('symbols:20')
         self.e.apply_control('amount:500');self.e.apply_control('counter:7')
         self.e.apply_control('on');self.e.apply_control('off');self.e.apply_control('on')
         self.assertEqual(self.e.daily_count(),7)
-        self.assertEqual(self.e.max_daily,50)
-        self.assertEqual(self.e.max_symbols,50)
+        self.assertEqual(self.e.max_daily,20)
+        self.assertEqual(self.e.max_symbols,20)
         self.assertEqual(float(self.e.position_usdt),500)
 
     def test_on_discards_buffered_crossings_and_pre_activation_event(self):
