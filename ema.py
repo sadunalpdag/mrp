@@ -231,11 +231,11 @@ CHAT_ID        = os.getenv("CHAT_ID")
 BINANCE_KEY    = os.getenv("BINANCE_API_KEY")
 BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 
-# GERÇEK İŞLEM AYARLARI: 0=kapalı, 1=açık. Değişiklik sonrası yeniden başlatın.
-# Açma/kapama yalnız bu dosyadan yapılır; Telegram kontrol komutları kullanılmaz.
-AUTO_TRADING_ENABLED = 0
+# GERÇEK İŞLEM AYARLARI: 0=kapalı, 1=açık. Telegram /otomatik_ac ve /otomatik_kapat da çalışır.
+# İlk çalıştırmada otomatik giriş AÇIK; kullanıcı Telegram'dan kapatırsa kapalı durumu korunur.
+AUTO_TRADING_ENABLED = 1
 MANUAL_TP_REPAIR_ENABLED = 1
-AUTO_MAX_DAILY_ENTRIES = 5
+AUTO_MAX_DAILY_ENTRIES = 20
 
 BINANCE_FAPI   = "https://fapi.binance.com"
 
@@ -7902,8 +7902,8 @@ def _crash_start_services():
             from crash_night import BinanceBroker, NightExecutor, day
             executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
-                max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 5), manual_tp=bool(repair_flag))
-            executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler: {"AÇIK" if auto_flag else "KAPALI"}\n'
+                max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 20), manual_tp=bool(repair_flag))
+            executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler (Python varsayılanı): {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
                 f'24 saat | {executor.position_usdt} USDT pozisyon | 10x | aynı anda en fazla {executor.max_symbols} sembol\n'
                 f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram: /otomatik_ac ve /otomatik_kapat.')
