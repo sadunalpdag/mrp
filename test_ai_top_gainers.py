@@ -11,7 +11,10 @@ class Cache:
     def __init__(self, price=101):
         self.price=price
     def snapshot(self, now):
-        return [{"s":f"COIN{i}USDT","c":str(self.price+i),"e":"24hrTicker"} for i in range(60)] + [{"s":"BTCUSDT","c":str(self.price)}]
+        # Exact normalized field names returned by ema.py CrashBounceWebSocketCache.
+        return [{"symbol":f"COIN{i}USDT","lastPrice":str(self.price+i),
+                 "priceChangePercent":"1","closeTime":int(now*1000)}
+                for i in range(60)] + [{"symbol":"BTCUSDT","lastPrice":str(self.price)}]
 
 def rows():
     end=int(time.time()//3600)*3600
@@ -23,6 +26,48 @@ class Tests(unittest.TestCase):
         item=SCHEMA["properties"]["analyses"]["items"]
         self.assertIn("entry_price",item["required"])
         self.assertEqual(item["properties"]["entry_price"]["type"],["number","null"])
+
+    def test_collect_real_ws_snapshot_and_legacy_fallback(self):
+        now=time.time()
+        with tempfile.TemporaryDirectory() as d:
+            bot=TopGainers(d,Cache(),lambda *a:rows(),lambda *a:{"ok":True},
+                           env={"TOP_GAINERS_ENABLED":"1"},clock=lambda:now)
+            prices=bot.collect(now)
+            self.assertEqual(len(prices),61)
+            self.assertEqual(prices["BTCUSDT"],101)
+            class Legacy:
+                def snapshot(self, moment):
+                    return [{"s":"ETHUSDT","c":"2500.5"},
+                            {"s":"BTCUSDT","c":"0"},
+                            {"symbol":"NOTUSDT","lastPrice":"nan"}]
+            bot.cache=Legacy()
+            self.assertEqual(bot.collect(now),{"ETHUSDT":2500.5})
+
+    def test_real_ws_snapshot_allows_top_gainers_report(self):
+        now=time.time()
+        delivered=[]
+        with tempfile.TemporaryDirectory() as d:
+            bot=TopGainers(d,Cache(),lambda *a:rows(),
+                           lambda message:delivered.append(message) or {"ok":True},
+                           env={"TOP_GAINERS_ENABLED":"1"},clock=lambda:now)
+            slot=int(now//(4*3600))
+            old={s:p*0.99 for s,p in bot.collect(now).items()}
+            bot.state["snapshots"].append({"at":now-4*3600,
+                                            "slot":slot-1,"prices":old})
+            self.assertTrue(bot.step())
+            self.assertEqual(bot.state["reports"][0]["status"],"NO_AI_KEY")
+            self.assertEqual(len(bot.state["reports"][0]["ranking"]),10)
+            self.assertIn("AI TOP GAINERS",delivered[0])
+
+    def test_btc_real_ws_snapshot_is_available(self):
+        now=time.time()
+        with tempfile.TemporaryDirectory() as d:
+            bot=TopGainers(d,Cache(),lambda *a:rows(),lambda *a:{"ok":True},
+                           env={"TOP_GAINERS_ENABLED":"1"},clock=lambda:now)
+            bot.btc_step()
+            self.assertEqual(len(bot.state["btc_slots"]),1)
+            self.assertEqual(bot.state["btc"][0]["status"],"NO_AI_KEY")
+            self.assertEqual(bot.state["btc"][0]["reference_price"],101)
 
     def test_btc_input_has_real_changes(self):
         f=features("BTCUSDT",rows(),0,None)
