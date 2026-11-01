@@ -126,6 +126,19 @@ class Tests(unittest.TestCase):
             bot.cache=Legacy()
             self.assertEqual(bot.collect(now),{"ETHUSDT":2500.5})
 
+    def test_scans_only_ranks_11_through_20(self):
+        now=time.time()
+        with tempfile.TemporaryDirectory() as d:
+            bot=TopGainers(d,Cache(),lambda *a:rows(),lambda _:{"ok":True},
+                           env={"TOP_GAINERS_ENABLED":"1"},clock=lambda:now)
+            prices=bot.collect(now)
+            old={s:p/(1+(100-i)/1000) for i,(s,p) in enumerate(prices.items())}
+            slot=int(now//(4*3600))
+            bot.state["snapshots"].append({"at":now-4*3600,"slot":slot-1,"prices":old})
+            self.assertTrue(bot.step())
+            self.assertEqual([s for s,_ in bot.state["reports"][0]["ranking"]],
+                             [f"COIN{i}USDT" for i in range(10,20)])
+
     def test_real_ws_snapshot_allows_top_gainers_report(self):
         now=time.time()
         delivered=[]
