@@ -90,7 +90,7 @@ class Analyst:
     def __init__(self, directory, log=print, clock=time.time, post=None, env=None):
         env = os.environ if env is None else env
         self.key = env.get('OPENAI_API_KEY', '').strip()
-        self.enabled = env.get('CRASH_AI_ENABLED', '1') == '1' and bool(self.key)
+        self.enabled = env.get('CRASH_AI_ENABLED', '0') == '1' and bool(self.key)
         self.model = env.get('CRASH_AI_MODEL', MODEL)
         self.limit = max(1, min(100, int(env.get('CRASH_AI_MAX_DAILY', '50'))))
         self.prompt = Path(__file__).with_name('crash_ai_prompt.txt').read_text(encoding='utf-8')

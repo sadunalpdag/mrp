@@ -188,10 +188,10 @@ class ManualTests(unittest.TestCase):
         self.b.ps=[dict(symbol='AUSDT',positionAmt='5',entryPrice='10')]
         self.g.scan();self.assertEqual(len(self.b.posts),2);self.assertNotEqual(first,self.b.posts[1][3])
 
-    def test_default_daily_limit_is_five(self):
-        self.assertEqual(self.e.max_daily,5)
+    def test_default_daily_limit_is_twenty(self):
+        self.assertEqual(self.e.max_daily,20)
         self.e.enabled.set();self.now=timestamp('2026-10-28T21:00:00')
-        for i in range(5):self.e.state['orders'][str(i)]=dict(symbol=str(i),day=day(self.now),phase='DONE')
+        for i in range(20):self.e.state['orders'][str(i)]=dict(symbol=str(i),day=day(self.now),phase='DONE')
         self.b.info=Mock()
         self.e.enter(dict(symbol='AUSDT',signal_id='six',v2_sent=True,v2_status='STRONG_V2',tracking_status='OPEN'),self.now)
         self.b.info.assert_not_called()
@@ -214,7 +214,7 @@ class FileFlagTests(unittest.TestCase):
         values={n.targets[0].id:n.value.value for n in tree.body if isinstance(n,ast.Assign) and isinstance(n.targets[0],ast.Name) and isinstance(n.value,ast.Constant)}
         self.assertIn(values['AUTO_TRADING_ENABLED'],(0,1))
         self.assertIn(values['MANUAL_TP_REPAIR_ENABLED'],(0,1))
-        self.assertEqual(values['AUTO_MAX_DAILY_ENTRIES'],5)
+        self.assertEqual(values['AUTO_MAX_DAILY_ENTRIES'],20)
         self.assertIn('os.getenv("BINANCE_API_KEY")',source)
         self.assertIn('os.getenv("BINANCE_SECRET_KEY")',source)
 

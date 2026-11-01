@@ -51,7 +51,7 @@ def plan(record, info, position_usdt='50'):
         if price < D(pf['minPrice']) or price > D(pf['maxPrice']):
             raise ValueError('PRICE_FILTER')
     budget = D(str(position_usdt))
-    if not budget.is_finite() or not 0 < budget <= 500:
+    if not budget.is_finite() or not 0 < budget <= 1000:
         raise ValueError('INVALID_POSITION_USDT')
     qty = rounded(budget/entry, lot['stepSize'])
     if qty < D(lot['minQty']) or qty > D(lot['maxQty']) or qty <= 0:
@@ -252,7 +252,7 @@ class BinanceBroker:
 
 
 class NightExecutor:
-    def __init__(self, directory, broker, deliver, log, clock=time.time, enabled=False, max_daily=5, manual_tp=False):
+    def __init__(self, directory, broker, deliver, log, clock=time.time, enabled=False, max_daily=20, manual_tp=False):
         self.broker, self.deliver, self.log, self.clock = broker, deliver, log, clock
         os.makedirs(directory, exist_ok=True)
         self.path = os.path.join(directory, 'crash_night_state.json')
@@ -269,7 +269,15 @@ class NightExecutor:
             elif os.path.exists(marker):
                 raise ValueError('EXECUTOR_STATE_MISSING')
             self.state.pop('unverified_day', None)
-            self.state['paused'] = not enabled
+            # Apply new defaults exactly once; later Telegram changes must survive redeploys.
+            if not self.state.get('trade_settings_defaults_20261101'):
+                self.state['trade_settings'] = {'max_daily': max_daily, 'max_symbols': 20,
+                                                'position_usdt': '500'}
+                self.state['trade_settings_defaults_20261101'] = True
+                self.state['paused'] = not enabled
+            else:
+                # Python's off switch always wins; preserve explicit Telegram /otomatik_kapat.
+                self.state['paused'] = not enabled or bool(self.state.get('paused', False))
             self.save()
             with open(marker, 'a') as handle:
                 handle.flush()
@@ -279,10 +287,10 @@ class NightExecutor:
             raise
         settings = self.state.get('trade_settings', {})
         self.max_daily = int(settings.get('max_daily', max_daily))
-        self.max_symbols = int(settings.get('max_symbols', 5))
+        self.max_symbols = int(settings.get('max_symbols', 20))
         self.broker.max_symbols = self.max_symbols
-        self.position_usdt = D(str(settings.get('position_usdt', '50')))
-        if not 1 <= self.max_symbols <= 50 or not 1 <= self.max_daily <= 50 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 500:
+        self.position_usdt = D(str(settings.get('position_usdt', '500')))
+        if not 1 <= self.max_symbols <= 20 or not 1 <= self.max_daily <= 20 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 1000:
             self.guard.close()
             raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
@@ -296,7 +304,7 @@ class NightExecutor:
         self.protected_poll = {}
         self.enabled = threading.Event()
         self.armed_at = clock()
-        if enabled:
+        if enabled and not self.state['paused']:
             self.enabled.set()
         self.controls = queue.Queue(maxsize=10)
         self.account_stream = None
@@ -332,11 +340,11 @@ class NightExecutor:
             kind, raw = action.split(':', 1)
             try:
                 value = D(raw)
-                ceiling = {'amount':500, 'symbols':50, 'limit':50}[kind]
+                ceiling = {'amount':1000, 'symbols':20, 'limit':20}[kind]
                 if not value.is_finite() or not 1 <= value <= ceiling or (kind != 'amount' and value != value.to_integral_value()):
                     raise ValueError('range')
             except (ValueError, ArithmeticError):
-                return '⚠️ Kullanım: /sembol 1–50, /limit 1–50 veya /tutar 1–500 (USDT toplam pozisyon, teminat değil).'
+                return '⚠️ Kullanım: /sembol 1–20, /limit 1–20 veya /tutar 1–1000 (USDT toplam pozisyon, teminat değil).'
             settings = dict(self.state.get('trade_settings', {}))
             key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols'}[kind]
             settings[key] = str(value) if kind == 'amount' else int(value)

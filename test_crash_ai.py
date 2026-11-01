@@ -41,7 +41,7 @@ class AITests(unittest.TestCase):
 
     def analyst(self, **env):
         return Analyst(self.tmp.name, log=lambda x: None, clock=lambda: self.now,
-                       post=self.post, env={'OPENAI_API_KEY': 'test-secret', **env})
+                       post=self.post, env={'OPENAI_API_KEY': 'test-secret', 'CRASH_AI_ENABLED': '1', **env})
 
     def test_allowlist_excludes_scores_secrets_and_future_outcomes(self):
         r = record()
@@ -53,6 +53,13 @@ class AITests(unittest.TestCase):
             self.assertNotIn(bad, text)
         self.assertIsNone(data['derivatives']['oi_change_4h'])
         self.assertEqual(data['metrics']['rsi_delta_1h'], 2)
+
+    def test_signal_ai_disabled_by_default(self):
+        a = Analyst(self.tmp.name, log=lambda x: None, clock=lambda: self.now,
+                    post=self.post, env={'OPENAI_API_KEY': 'test-secret'})
+        self.assertFalse(a.enabled)
+        self.assertFalse(a.submit(record()))
+        self.post.assert_not_called()
 
     def test_no_key_no_request(self):
         a = self.analyst(OPENAI_API_KEY='')
@@ -111,7 +118,7 @@ class AITests(unittest.TestCase):
         for result in (response(status='incomplete'), response(good() | {'ai_score': 101})):
             with tempfile.TemporaryDirectory() as directory:
                 a = Analyst(directory, log=lambda x: None, clock=lambda: 200,
-                            post=Mock(return_value=result), env={'OPENAI_API_KEY':'x'})
+                            post=Mock(return_value=result), env={'OPENAI_API_KEY':'x', 'CRASH_AI_ENABLED':'1'})
                 a.submit(record()); a.step(); d=a.results.get_nowait()
                 self.assertIsNone(d['assessment'])
                 self.assertIn('alınamadı', format_review(d))
@@ -139,7 +146,7 @@ class AITests(unittest.TestCase):
         self.assertEqual(a.results.get_nowait()['status'], 'HTTP_401')
         with tempfile.TemporaryDirectory() as d:
             a=Analyst(d, log=lambda x:None, clock=lambda:200,
-                      post=lambda *args, **kwargs: SimpleNamespace(status_code=429), env={'OPENAI_API_KEY':'x'})
+                      post=lambda *args, **kwargs: SimpleNamespace(status_code=429), env={'OPENAI_API_KEY':'x', 'CRASH_AI_ENABLED':'1'})
             a.submit(record()); a.step(); self.assertEqual(a.next_call,500)
 
     def test_corrupt_journal_disables(self):

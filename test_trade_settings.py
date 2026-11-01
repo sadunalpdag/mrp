@@ -27,25 +27,40 @@ class TradeSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             e = NightExecutor(d, Mock(), Mock(), Mock())
             e.apply_control('counter:3')
-            e.apply_control('limit:50')
-            e.apply_control('symbols:50')
-            e.apply_control('amount:500')
+            self.assertEqual((e.max_daily, e.max_symbols, e.position_usdt), (20, 20, Decimal('500')))
+            e.apply_control('limit:18')
+            e.apply_control('symbols:19')
+            e.apply_control('amount:1000')
             self.assertEqual(e.daily_count(), 3)
             self.assertEqual(e.state['orders'], {})
-            self.assertIn('500 USDT', e.summary())
-            for bad in ('symbols:0','symbols:51','symbols:1.5','limit:0','limit:51','limit:1.5','amount:NaN','amount:Infinity','amount:-1','amount:501','amount:no'):
+            self.assertIn('1000 USDT', e.summary())
+            for bad in ('symbols:0','symbols:21','symbols:1.5','limit:0','limit:21','limit:1.5','amount:NaN','amount:Infinity','amount:-1','amount:1001','amount:no'):
                 self.assertIn('⚠️', e.apply_control(bad))
-            self.assertEqual(e.max_daily, 50)
-            self.assertEqual(e.max_symbols, 50)
-            self.assertEqual(e.broker.max_symbols, 50)
-            self.assertEqual(e.position_usdt, Decimal('500'))
+            self.assertEqual(e.max_daily, 18)
+            self.assertEqual(e.max_symbols, 19)
+            self.assertEqual(e.broker.max_symbols, 19)
+            self.assertEqual(e.position_usdt, Decimal('1000'))
             e.guard.close()
             e = NightExecutor(d, Mock(), Mock(), Mock())
-            self.assertEqual(e.max_daily, 50)
-            self.assertEqual(e.max_symbols, 50)
-            self.assertEqual(e.broker.max_symbols, 50)
-            self.assertEqual(e.position_usdt, Decimal('500'))
+            self.assertEqual(e.max_daily, 18)
+            self.assertEqual(e.max_symbols, 19)
+            self.assertEqual(e.broker.max_symbols, 19)
+            self.assertEqual(e.position_usdt, Decimal('1000'))
             self.assertEqual(e.daily_count(), 3)
+            e.guard.close()
+
+    def test_new_defaults_migrate_and_telegram_off_survives_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            e = NightExecutor(d, Mock(), Mock(), Mock(), enabled=True)
+            self.assertEqual((e.max_daily,e.max_symbols,e.position_usdt),
+                             (20,20,Decimal('500')))
+            self.assertTrue(e.enabled.is_set())
+            e.apply_control('off')
+            e.guard.close()
+            e = NightExecutor(d, Mock(), Mock(), Mock(), enabled=True)
+            self.assertFalse(e.enabled.is_set())
+            e.apply_control('on')
+            self.assertTrue(e.enabled.is_set())
             e.guard.close()
 
     def test_budget_rounds_down_and_keeps_exchange_minimum(self):

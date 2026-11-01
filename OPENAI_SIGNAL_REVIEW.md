@@ -8,11 +8,11 @@ In the existing service's Environment settings add:
 
 ```
 OPENAI_API_KEY=<your OpenAI project API key>
-CRASH_AI_ENABLED=1
+CRASH_AI_ENABLED=0
 CRASH_AI_MAX_DAILY=50
 ```
 
-Do not commit or send the key in Telegram/chat. Redeploy/restart after changing environment variables. API billing/access must be enabled in the OpenAI project. With no key, the module logs OFF and the existing strategy continues. Set `CRASH_AI_ENABLED=0` to disable analysis independently of automatic orders.
+Do not commit or send the key in Telegram/chat. Redeploy/restart after changing environment variables. API billing/access must be enabled in the OpenAI project. With no key, the module logs OFF and the existing strategy continues. Signal-time AI reviews are disabled by default (`CRASH_AI_ENABLED=0`); set `CRASH_AI_ENABLED=1` to enable them again independently of automatic orders or the separate AI Top Gainers module.
 
 Default model: `gpt-5.4-mini-2026-03-17`. Optional `CRASH_AI_MODEL` override; it must support Responses, JSON Schema and `reasoning.effort=none`. Cost is reported as unknown for unrecognized model IDs. No SDK installation is needed; the existing `requests` dependency is used.
 
