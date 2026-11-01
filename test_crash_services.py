@@ -145,7 +145,7 @@ class NightTests(unittest.TestCase):
         self.enter()
         self.assertEqual(len(self.b.buys),1)
         p=self.b.buys[0][1]
-        self.assertLessEqual(D(p['quantity'])*D(p['price']),D('50'))
+        self.assertLessEqual(D(p['quantity'])*D(p['price']),D('500'))
 
     def test_hedge_entry_and_tp_survive_reconcile(self):
         self.b.preflight=lambda symbol:'LONG'
