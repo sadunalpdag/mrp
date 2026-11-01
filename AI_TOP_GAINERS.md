@@ -15,7 +15,7 @@ The existing `ema.py` starts `ai_top_gainers.TopGainers` as a daemon research wo
 ## Schedule and inputs
 
 - Every 4 hours at UTC 00/04/08/12/16/20 boundaries, rank USDT-M **active perpetual** instruments by changes between the current WS ticker snapshot and the snapshot taken one four-hour slot earlier. First slot after launch is a warmup with no ranking. Missing or stale symbols are not imputed. Therefore this is the *fresh, comparable WS subset*, not a guaranteed exchange-wide complete ranking.
-- On the selected ten instruments, request up to 60 1h Futures klines per symbol via the shared rate limiter; analyze only closed bars.
+- Select exactly **ranks 11–20** among comparable 4h gainers, ignoring ranks 1–10. On these ten instruments, request up to 60 1h Futures klines per symbol via the shared rate limiter; analyze only closed bars. Fewer than 20 eligible symbols means no 11–20 report.
 - A single OpenAI Structured Output request evaluates the ten coins and may propose **LONG paper entry levels**. Prices must be between 90% and 100% of the market snapshot price. Missing/invalid entries are omitted. TP is calculated in Python as entry x 1.01.
 - Every hour, an independent BTCUSDT AI forecast uses 1h closed candles and a current WS price, predicts UP/DOWN/SIDEWAYS over the next hour, and is compared against a later observed WS quote. A +/-0.2% band defines the neutral category.
 - Every day from 21:00 Europe/Paris, send a one-off research summary. In a long-running process it will usually run in the first worker cycle after 21:00. Schedules are DST-safe for local daily summaries.
@@ -36,7 +36,7 @@ Run `python -m unittest test_ai_top_gainers -v` offline. CI on this branch also 
 
 ## Four analyst research (new)
 
-The four-hour Top Gainers scan evaluates up to ten symbols in batched OpenAI requests: technical indicators including MACD/ADX and support/resistance; OI/funding and perp taker-volume imbalance proxy (not real trade-level CVD); a single optional OpenAI web search for timestamped cited news; and risk including a recent BTC hourly forecast where available. A separate final evaluator proposes scored paper LONG entries. This is not the TradingAgents third-party graph/framework.
+The four-hour Top Gainers scan evaluates only ranks 11–20 (up to ten symbols) in batched OpenAI requests: technical indicators including MACD/ADX and support/resistance; OI/funding and perp taker-volume imbalance proxy (not real trade-level CVD); a single optional OpenAI web search for timestamped cited news; and risk including a recent BTC hourly forecast where available. A separate final evaluator proposes scored paper LONG entries. This is not the TradingAgents third-party graph/framework.
 
 The extra research uses a maximum of five OpenAI Responses API calls per four-hour report (three analyst calls, one optional web search, one final decision), shared paced public Binance REST requests, and **never** creates real orders. News is not counted as verified unless a URL and a plausibly recent model-reported date exist; publication dates are not independently verified. Model scores are opinions, not probabilities.
 
