@@ -118,7 +118,7 @@ class AITests(unittest.TestCase):
         for result in (response(status='incomplete'), response(good() | {'ai_score': 101})):
             with tempfile.TemporaryDirectory() as directory:
                 a = Analyst(directory, log=lambda x: None, clock=lambda: 200,
-                            post=Mock(return_value=result), env={'OPENAI_API_KEY':'x'})
+                            post=Mock(return_value=result), env={'OPENAI_API_KEY':'x', 'CRASH_AI_ENABLED':'1'})
                 a.submit(record()); a.step(); d=a.results.get_nowait()
                 self.assertIsNone(d['assessment'])
                 self.assertIn('alınamadı', format_review(d))
@@ -146,7 +146,7 @@ class AITests(unittest.TestCase):
         self.assertEqual(a.results.get_nowait()['status'], 'HTTP_401')
         with tempfile.TemporaryDirectory() as d:
             a=Analyst(d, log=lambda x:None, clock=lambda:200,
-                      post=lambda *args, **kwargs: SimpleNamespace(status_code=429), env={'OPENAI_API_KEY':'x'})
+                      post=lambda *args, **kwargs: SimpleNamespace(status_code=429), env={'OPENAI_API_KEY':'x', 'CRASH_AI_ENABLED':'1'})
             a.submit(record()); a.step(); self.assertEqual(a.next_call,500)
 
     def test_corrupt_journal_disables(self):
