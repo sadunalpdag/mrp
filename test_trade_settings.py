@@ -49,6 +49,20 @@ class TradeSettingsTests(unittest.TestCase):
             self.assertEqual(e.daily_count(), 3)
             e.guard.close()
 
+    def test_new_defaults_migrate_and_telegram_off_survives_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            e = NightExecutor(d, Mock(), Mock(), Mock(), enabled=True)
+            self.assertEqual((e.max_daily,e.max_symbols,e.position_usdt),
+                             (20,20,Decimal('500')))
+            self.assertTrue(e.enabled.is_set())
+            e.apply_control('off')
+            e.guard.close()
+            e = NightExecutor(d, Mock(), Mock(), Mock(), enabled=True)
+            self.assertFalse(e.enabled.is_set())
+            e.apply_control('on')
+            self.assertTrue(e.enabled.is_set())
+            e.guard.close()
+
     def test_budget_rounds_down_and_keeps_exchange_minimum(self):
         record = {'entry':'3', 'tp':'3.03'}
         p = plan(record, INFO, '500')
