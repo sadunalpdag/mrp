@@ -100,14 +100,14 @@ def format_top_gainers_report(report, ranked):
                "UNCERTAIN":"Belirsiz"}.get(a.get("bias"),"Belirsiz")
         lines.append(f"{index}. {symbol} {ret:+.2f}% | {labels[decision]} | "
                      f"AI {a['score']}/100 | {trend}")
-        lines.append("Yorum: "+str(a.get("reason",""))[:65]+
-                     " | Risk: "+str(a.get("risk",""))[:55])
+        lines.append("Yorum: "+str(a.get("reason",""))[:50]+
+                     " | Risk: "+str(a.get("risk",""))[:40])
         if decision=="BUY":
             lines.append(f"LONG sanal giriş: {entry:.8g} | TP +%1: {entry*1.01:.8g}")
-            lines.append("Giriş gerekçesi: "+str(a.get("entry_reason",""))[:65])
+            lines.append("Giriş gerekçesi: "+str(a.get("entry_reason",""))[:50])
         else:
             lines.append("Giriş yok: "+str(a.get("entry_reason") or
-                         "AI uygun LONG giriş seviyesi önermedi.")[:78])
+                         "AI uygun LONG giriş seviyesi önermedi.")[:62])
     lines.append(f"📊 Kararlar: AL {totals['BUY']} | NÖTR {totals['NEUTRAL']} | "
                  f"SAT/KAÇIN {totals['AVOID']} | Analiz yok {missing}")
     lines.append("SAT/KAÇIN otomatik satış/SHORT değildir. AI puanı başarı olasılığı değildir.")
