@@ -191,7 +191,7 @@ class ManualTests(unittest.TestCase):
     def test_default_daily_limit_is_twenty(self):
         self.assertEqual(self.e.max_daily,20)
         self.e.enabled.set();self.now=timestamp('2026-10-28T21:00:00')
-        for i in range(5):self.e.state['orders'][str(i)]=dict(symbol=str(i),day=day(self.now),phase='DONE')
+        for i in range(20):self.e.state['orders'][str(i)]=dict(symbol=str(i),day=day(self.now),phase='DONE')
         self.b.info=Mock()
         self.e.enter(dict(symbol='AUSDT',signal_id='six',v2_sent=True,v2_status='STRONG_V2',tracking_status='OPEN'),self.now)
         self.b.info.assert_not_called()
