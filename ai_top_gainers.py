@@ -102,12 +102,22 @@ class TopGainers:
         os.replace(tmp,self.path)
 
     def collect(self, now):
+        """Normalize actual CrashBounceWebSocketCache snapshot fields.
+
+        The shared cache exposes symbol/lastPrice, not Binance raw s/c keys.
+        Keep raw keys supported for compatibility with other cache stubs.
+        """
         data=self.cache.snapshot(now)
         prices={}
         for t in data:
-            sym=t.get("s","")
-            price=number(t.get("c"))
-            if sym.endswith("USDT") and price and price>0:
+            if not isinstance(t,dict):
+                continue
+            sym=t.get("symbol") or t.get("s") or ""
+            raw_price=t.get("lastPrice")
+            if raw_price is None:
+                raw_price=t.get("c")
+            price=number(raw_price)
+            if isinstance(sym,str) and sym.endswith("USDT") and price is not None and price>0:
                 prices[sym]=price
         return prices
 
@@ -121,7 +131,7 @@ class TopGainers:
                 return False
             prices=self.collect(now)
             if len(prices)<50:
-                self.log("[TOP GAINERS] WS snapshot unavailable; retry later")
+                self.log(f"[TOP GAINERS] WS snapshot unavailable; valid_prices={len(prices)}; retry later")
                 return False
             older=self.state["snapshots"][-1] if self.state["snapshots"] else None
             # Mark slot before expensive calls, at-most-once AI / Telegram attempt.
