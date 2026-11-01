@@ -1,4 +1,4 @@
-"""Independent four-hour futures gainers report. Never places trades."""
+"""Independent four-hour futures rank 11-20 report. Never places trades."""
 import json
 import math
 import os
@@ -8,6 +8,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 INTERVAL = 4 * 3600
+RANK_START = 10   # 0-based, first selected symbol is rank 11
+RANK_STOP = 20    # exclusive, last selected symbol is rank 20
 MODEL = "gpt-5.4-mini-2026-03-17"
 SCHEMA = {"type":"object","additionalProperties":False,
  "properties":{"analyses":{"type":"array","maxItems":10,"items":{"type":"object",
@@ -21,7 +23,7 @@ SCHEMA = {"type":"object","additionalProperties":False,
  "required":["symbol","score","bias","reason","risk","decision","entry_reason","entry_price"]}}},
  "required":["analyses"]}
 INSTRUCTIONS = """You are an independent Binance USDT-M futures market research analyst.
-Evaluate ONLY the ten supplied top four-hour gainers. Base each claim solely on
+Evaluate ONLY the ten supplied four-hour gainers ranked 11 through 20. Base each claim solely on
 provided timestamped data; do not invent news, CVD, funding, OI or real-time data.
 Use bull, bear and risk perspectives, then give one concise conclusion per coin.
 The score measures subjective continuation strength, NOT win probability.
@@ -72,7 +74,7 @@ def normalize_recommendation(assessment, market_price):
 
 def format_top_gainers_report(report, ranked):
     """Compact Telegram report with an explicit decision for every assessed coin."""
-    lines=["🤖 AI TOP GAINERS | 4H | USDT-M FUTURES",
+    lines=["🤖 AI TOP GAINERS | 4H | RANK 11–20 | USDT-M FUTURES",
            "Sanal araştırma • gerçek emir açılmaz",
            "AI durumu: "+str(report.get("status","UNKNOWN"))]
     news=(report.get("agents") or {}).get("news",{}).get("status","UNKNOWN")
@@ -83,7 +85,7 @@ def format_top_gainers_report(report, ranked):
     labels={"BUY":"🟢 AL ADAYI","NEUTRAL":"⚪ NÖTR / BEKLE",
             "AVOID":"🔴 SAT / KAÇIN (LONG açma)"}
     missing=0
-    for index,(symbol,ret) in enumerate(ranked,1):
+    for index,(symbol,ret) in enumerate(ranked,RANK_START+1):
         a=indexed.get(symbol)
         if not a:
             missing+=1
@@ -228,10 +230,11 @@ class TopGainers:
                        if s in old and old[s]>0),key=lambda x:x[1],reverse=True)
         # Never rank dated contracts or symbols missing from validated active perpetual metadata.
         allowed=set(self.market_symbols() or ()) if self.market_symbols else set(prices)
-        ranked=[x for x in ranked if x[0] in allowed and x[0].isascii()
-                and x[0].endswith("USDT")][:10]
-        if len(ranked)<10:
-            self.log("[TOP GAINERS] fewer than ten comparable instruments")
+        eligible=[x for x in ranked if x[0] in allowed and x[0].isascii()
+                  and x[0].endswith("USDT")]
+        ranked=eligible[RANK_START:RANK_STOP]
+        if len(ranked)<RANK_STOP-RANK_START:
+            self.log("[TOP GAINERS] fewer than twenty comparable instruments; cannot rank 11-20")
             return True
         inputs=[]
         klines={}
