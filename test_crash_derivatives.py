@@ -109,11 +109,11 @@ class ShadowTests(unittest.TestCase):
         self.assertIsNone(summary['tp_rate_resolved_pct'])
         self.assertIn('oi_change_4h',export_csv([r]))
 
-    def test_auto_off_and_v2_unchanged(self):
+    def test_auto_on_default_and_v2_unchanged(self):
         tree=ast.parse(Path('ema.py').read_text())
         values={n.targets[0].id:n.value.value for n in tree.body if isinstance(n,ast.Assign)
                 and isinstance(n.targets[0],ast.Name) and isinstance(n.value,ast.Constant)}
-        self.assertEqual(values['AUTO_TRADING_ENABLED'],0)
+        self.assertEqual(values['AUTO_TRADING_ENABLED'],1)
 
     def test_signal_send_never_calls_rest_and_queues_only_after_acceptance(self):
         from test_crash_v2 import CrashV2Tests
