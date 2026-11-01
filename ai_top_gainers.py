@@ -15,8 +15,10 @@ SCHEMA = {"type":"object","additionalProperties":False,
  "symbol":{"type":"string"},"score":{"type":"integer","minimum":0,"maximum":100},
  "bias":{"type":"string","enum":["CONTINUE","PULLBACK","UNCERTAIN"]},
  "reason":{"type":"string"},"risk":{"type":"string"},
+ "decision":{"type":"string","enum":["BUY","NEUTRAL","AVOID"]},
+ "entry_reason":{"type":"string"},
  "entry_price":{"type":["number","null"]}},
- "required":["symbol","score","bias","reason","risk","entry_price"]}}},
+ "required":["symbol","score","bias","reason","risk","decision","entry_reason","entry_price"]}}},
  "required":["analyses"]}
 INSTRUCTIONS = """You are an independent Binance USDT-M futures market research analyst.
 Evaluate ONLY the ten supplied top four-hour gainers. Base each claim solely on
@@ -26,9 +28,12 @@ The score measures subjective continuation strength, NOT win probability.
 Consider momentum, RSI, EMA25, EMA50, realized volume, ATR and overextension.
 Do not suggest leverage or execute trades. Turkish output, max 110 characters
 for each reason and risk. All ten listed symbols must appear exactly once.
-For LONG paper research propose an entry_price no higher than supplied market price,
+Give every coin a BUY (paper LONG candidate), NEUTRAL (wait), or AVOID (avoid LONG,
+not an instruction to sell or short) decision and a concise entry_reason.
+BUY requires a supported entry_price no higher than supplied market price,
 prefer a retracement using EMA25/ATR/support; never invent an entry if data are
-insufficient: entry_price=null. Price may be at most 10 percent below market.
+insufficient: choose NEUTRAL or AVOID and entry_price=null.
+NEUTRAL/AVOID must have entry_price=null. Entry may be at most 10 percent below market.
 Do not forecast certainty. If evidence is sparse, use UNCERTAIN and conservative scores."""
 
 def number(value):
@@ -37,6 +42,81 @@ def number(value):
         return n if math.isfinite(n) else None
     except (TypeError, ValueError, OverflowError):
         return None
+
+def normalize_recommendation(assessment, market_price):
+    """Fail closed: only a valid BUY candidate can create a paper LONG."""
+    a=dict(assessment)
+    decision=a.get("decision")
+    why=str(a.get("entry_reason") or "").strip()
+    entry=number(a.get("entry_price"))
+    market=number(market_price)
+    if decision not in ("BUY","NEUTRAL","AVOID"):
+        a["decision"]="NEUTRAL"
+        a["entry_price"]=None
+        a["entry_reason"]="AI kararı doğrulanamadı; LONG giriş önerilmedi."
+    elif decision=="BUY" and (market is None or market<=0 or entry is None
+                               or not market*0.90 <= entry <= market):
+        a["decision"]="NEUTRAL"
+        a["entry_price"]=None
+        a["entry_reason"]=("Geçerli LONG giriş fiyatı yok. "+why).strip()[:160]
+    elif decision=="BUY":
+        a["entry_price"]=entry
+        a["entry_reason"]=why or "AI, teknik destek ve riske göre LONG giriş önerdi."
+    else:
+        a["entry_price"]=None
+        a["entry_reason"]=why or (
+            "Yükselişin zayıflama riski: LONG giriş önerilmiyor." if decision=="AVOID"
+            else "Risk veya veri yetersiz: uygun LONG giriş seviyesi yok.")
+    return a
+
+
+def format_top_gainers_report(report, ranked):
+    """Compact Telegram report with an explicit decision for every assessed coin."""
+    lines=["🤖 AI TOP GAINERS | 4H | USDT-M FUTURES",
+           "Sanal araştırma • gerçek emir açılmaz",
+           "AI durumu: "+str(report.get("status","UNKNOWN"))]
+    news=(report.get("agents") or {}).get("news",{}).get("status","UNKNOWN")
+    lines.append("Analistler: Teknik | Haber ("+news+") | Türev | Risk")
+    lines.append("Kaynağı/tarihi doğrulanmayan haber karar kanıtı sayılmaz.")
+    indexed={a["symbol"]:a for a in report.get("analyses",[])}
+    totals={"BUY":0,"NEUTRAL":0,"AVOID":0}
+    labels={"BUY":"🟢 AL ADAYI","NEUTRAL":"⚪ NÖTR / BEKLE",
+            "AVOID":"🔴 SAT / KAÇIN (LONG açma)"}
+    missing=0
+    for index,(symbol,ret) in enumerate(ranked,1):
+        a=indexed.get(symbol)
+        if not a:
+            missing+=1
+            lines.append(f"{index}. {symbol} {ret:+.2f}% | AI değerlendirmesi yok")
+            continue
+        decision=a.get("decision","NEUTRAL")
+        if decision not in totals:
+            decision="NEUTRAL"
+        entry=number(a.get("entry_price"))
+        if decision=="BUY" and (entry is None or entry<=0):
+            decision="NEUTRAL"
+        totals[decision]+=1
+        trend={"CONTINUE":"Yükseliş","PULLBACK":"Düzeltme",
+               "UNCERTAIN":"Belirsiz"}.get(a.get("bias"),"Belirsiz")
+        lines.append(f"{index}. {symbol} {ret:+.2f}% | {labels[decision]} | "
+                     f"AI {a['score']}/100 | {trend}")
+        lines.append("Yorum: "+str(a.get("reason",""))[:50]+
+                     " | Risk: "+str(a.get("risk",""))[:40])
+        if decision=="BUY":
+            lines.append(f"LONG sanal giriş: {entry:.8g} | TP +%1: {entry*1.01:.8g}")
+            lines.append("Giriş gerekçesi: "+str(a.get("entry_reason",""))[:50])
+        else:
+            lines.append("Giriş yok: "+str(a.get("entry_reason") or
+                         "AI uygun LONG giriş seviyesi önermedi.")[:62])
+    lines.append(f"📊 Kararlar: AL {totals['BUY']} | NÖTR {totals['NEUTRAL']} | "
+                 f"SAT/KAÇIN {totals['AVOID']} | Analiz yok {missing}")
+    lines.append("SAT/KAÇIN otomatik satış/SHORT değildir. AI puanı başarı olasılığı değildir.")
+    lines.append("Crash Bounce V2 ve gerçek emirler değişmedi.")
+    message="\n".join(lines)
+    if len(message.encode("utf-16-le"))//2>4096:
+        raise ValueError("TOP_GAINERS_TELEGRAM_MESSAGE_TOO_LONG")
+    return message
+
 
 def ema(values, period):
     a=2/(period+1); v=values[0]
@@ -192,40 +272,19 @@ class TopGainers:
                 report["estimated_search_usd"] = outcome["estimated_search_usd"]
                 report["estimated_total_usd"] = outcome["estimated_total_usd"]
                 if report["status"] == "COMPLETE":
-                    for a in outcome["analyses"]:
-                        market_price = prices[a["symbol"]]
-                        entry = number(a.get("entry_price"))
-                        if entry is None or not market_price*0.90 <= entry <= market_price:
-                            a["entry_price"] = None
-                        else:
-                            a["entry_price"] = entry
-                    report["analyses"] = outcome["analyses"]
+                    report["analyses"] = [
+                        normalize_recommendation(a, prices[a["symbol"]])
+                        for a in outcome["analyses"]
+                    ]
             except Exception as error:
                 self.log("[TOP GAINERS MULTIAGENT ERROR] " + type(error).__name__)
                 report["status"] = "AI_" + type(error).__name__
-        lines=["🤖 AI TOP GAINERS | 4H | USDT-M FUTURES",
-               "Bağımsız araştırma • emir açılmaz",
-               "AI durumu: "+report["status"]]
-        news_state=(report.get("agents") or {}).get("news",{}).get("status","UNKNOWN")
-        lines.append("Analistler: Teknik | Haber ("+news_state+") | Türev | Risk")
-        lines.append("Haber zamanı doğrulanmadıysa güçlü kanıt sayılmaz.")
-        indexed={a["symbol"]:a for a in report["analyses"]}
-        for i,(symbol,ret) in enumerate(ranked,1):
-            a=indexed.get(symbol)
-            direction={"CONTINUE":"Yükseliş","PULLBACK":"Düzeltme","UNCERTAIN":"Belirsiz"}.get((a or {}).get("bias"),"Veri")
-            lines.append(f"{i}. {symbol} {ret:+.2f}% | AI {a['score']}/100 | {direction}" if a else f"{i}. {symbol} {ret:+.2f}% | AI yok")
-            if a:
-                lines.append(str(a["reason"])[:110]+" | Risk: "+str(a["risk"])[:110])
-                entry=a.get("entry_price")
-                if entry is not None:
-                    lines.append(f"LONG sanal giriş: {entry:.8g} | TP +%1: {entry*1.01:.8g}")
-        lines.append("AI puanı başarı olasılığı değildir. Crash Bounce V2 değişmedi.")
-        receipt=self.telegram("\n".join(lines))
+        receipt=self.telegram(format_top_gainers_report(report,ranked))
         report["telegram"]={k:receipt.get(k) for k in ("ok","error","ambiguous","message_id")}
         with self.lock:
             if receipt.get("ok"):
                 for a in report["analyses"]:
-                    if a.get("entry_price") is None:
+                    if a.get("decision") != "BUY" or a.get("entry_price") is None:
                         continue
                     entry=float(a["entry_price"])
                     self.state["trades"].append({"id":f"{slot}:{a['symbol']}",

@@ -41,3 +41,16 @@ The four-hour Top Gainers scan evaluates up to ten symbols in batched OpenAI req
 The extra research uses a maximum of five OpenAI Responses API calls per four-hour report (three analyst calls, one optional web search, one final decision), shared paced public Binance REST requests, and **never** creates real orders. News is not counted as verified unless a URL and a plausibly recent model-reported date exist; publication dates are not independently verified. Model scores are opinions, not probabilities.
 
 Render options: `TOP_GAINERS_NEWS_ENABLED=1` to search once per four-hour cycle (set 0 to disable), `TOP_GAINERS_SPOT_DELTA_ENABLED=0` to disable extra spot kline calls (set 1 to enable). See `ai_market_agents.py`. New results and estimated AI costs are included in the existing Top Gainers JSON and daily 21:00 Europe/Paris report. API search costs, model tokens and REST consumption are additional to the old version; the daily cost calculation is approximate, not an enforced budget cap.
+
+
+## Explicit decisions in Telegram (2026-11-01)
+
+Every assessed coin now has a visible **AL ADAYI / NÖTR / BEKLE / SAT / KAÇIN**
+decision. "SAT / KAÇIN" means avoid a paper LONG due to downside risk; the
+system does not place short/sell orders. Only AL candidates with validated
+paper LONG entry prices (90%-100% of observed market price) are tracked,
+with a Python-calculated TP of +1%. Missing, invalid, or unsupported prices
+become NÖTR, never invented entries. The report states why the agent did
+not select an entry and totals BUY / NEUTRAL / AVOID / unavailable evaluations.
+These classifications are research opinions, not order instructions and not
+win probabilities. Telegram formatting is bounded to its message-length limit.

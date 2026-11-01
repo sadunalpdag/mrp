@@ -65,7 +65,8 @@ class Checks(unittest.TestCase):
                    'url':'https://example.com/market','title':'Market news'}]}]}]})
             is_final = json['text']['format']['name'] == 'top_final'
             out = ({'analyses':[{'symbol':s,'score':80,'bias':'CONTINUE',
-                   'reason':'test','risk':'test','entry_price':100} for s in syms]}
+                   'reason':'test','risk':'test','decision':'BUY',
+                   'entry_reason':'Support retest','entry_price':100} for s in syms]}
                    if is_final else
                    {'reviews':[{'symbol':s,'score':80,'stance':'BULL',
                    'evidence':'test','risk':'test'} for s in syms]})

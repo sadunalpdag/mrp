@@ -3,9 +3,9 @@ import tempfile
 import time
 import unittest
 from datetime import datetime
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
-from ai_top_gainers import TopGainers, features, SCHEMA
+from ai_top_gainers import TopGainers, features, SCHEMA, normalize_recommendation, format_top_gainers_report
 
 class Cache:
     def __init__(self, price=101):
@@ -26,6 +26,89 @@ class Tests(unittest.TestCase):
         item=SCHEMA["properties"]["analyses"]["items"]
         self.assertIn("entry_price",item["required"])
         self.assertEqual(item["properties"]["entry_price"]["type"],["number","null"])
+        self.assertIn("decision",item["required"])
+        self.assertIn("entry_reason",item["required"])
+        self.assertEqual(item["properties"]["decision"]["enum"],["BUY","NEUTRAL","AVOID"])
+
+
+    def test_normalization_does_not_force_unsafe_entry(self):
+        base={"symbol":"COINUSDT","decision":"BUY","entry_price":99,
+              "entry_reason":"Support test","score":78,"bias":"CONTINUE",
+              "reason":"momentum","risk":"volatility"}
+        self.assertEqual(normalize_recommendation(base,100)["entry_price"],99)
+        missing=normalize_recommendation({**base,"entry_price":None},100)
+        self.assertEqual(missing["decision"],"NEUTRAL")
+        self.assertIn("Geçerli LONG",missing["entry_reason"])
+        invalid=normalize_recommendation({**base,"entry_price":80},100)
+        self.assertEqual(invalid["decision"],"NEUTRAL")
+        avoid=normalize_recommendation({**base,"decision":"AVOID"},100)
+        self.assertIsNone(avoid["entry_price"])
+        self.assertEqual(avoid["decision"],"AVOID")
+        neutral=normalize_recommendation({**base,"decision":"NEUTRAL"},100)
+        self.assertIsNone(neutral["entry_price"])
+
+    def test_ten_buy_decisions_fit_telegram_character_limit(self):
+        ranked=[(f"COIN{i}USDT",12.34) for i in range(10)]
+        assessments=[{"symbol":symbol,"score":80,"bias":"CONTINUE",
+                      "reason":"momentum" * 45,"risk":"volatility" * 45,
+                      "decision":"BUY","entry_price":100,
+                      "entry_reason":"test support " * 60}
+                     for symbol,ret in ranked]
+        report={"status":"COMPLETE","analyses":assessments,
+                "agents":{"news":{"status":"SOURCED_DATE_REPORTED"}}}
+        message=format_top_gainers_report(report,ranked)
+        self.assertLessEqual(len(message.encode("utf-16-le"))//2,4096)
+        self.assertIn("Kararlar: AL 10 | NÖTR 0 | SAT/KAÇIN 0",message)
+        self.assertEqual(message.count("LONG sanal giriş:"),10)
+
+    def test_ai_report_shows_buy_neutral_avoid_without_false_paper_trades(self):
+        now=time.time()
+        sent=[]
+        class FakeAgents:
+            def __init__(self,*args,**kwargs):
+                pass
+            def evaluate(self,entries,*,market_prices,**kwargs):
+                analyses=[]
+                for i,e in enumerate(entries):
+                    symbol=e["symbol"]
+                    price=market_prices[symbol]
+                    decision="BUY" if i in (0,1) else ("AVOID" if i==2 else "NEUTRAL")
+                    entry=(price*.98 if i==0 else
+                           None if i==1 else
+                           price*.96 if i==2 else None)
+                    analyses.append({"symbol":symbol,"score":80,
+                                     "bias":"CONTINUE" if i<2 else "UNCERTAIN",
+                                     "reason":"RSI EMA destek sinyali",
+                                     "risk":"ATR oynaklık riski",
+                                     "decision":decision,"entry_price":entry,
+                                     "entry_reason":"Teknik seviyeye geri çekilme bekleniyor"})
+                return {"status":"COMPLETE","analyses":analyses,
+                        "agents":{"news":{"status":"NOT_SEARCHED"}},
+                        "derivative_metrics":[],"usage":[],
+                        "estimated_model_usd":0.0,"web_tool_calls":0,
+                        "estimated_search_usd":0.0,"estimated_total_usd":0.0}
+        with tempfile.TemporaryDirectory() as d:
+            bot=TopGainers(d,Cache(),lambda *a:rows(),
+                           lambda msg:sent.append(msg) or {"ok":True},
+                           env={"TOP_GAINERS_ENABLED":"1","OPENAI_API_KEY":"offline"},
+                           clock=lambda:now)
+            slot=int(now//(4*3600))
+            old={sym:p*.99 for sym,p in bot.collect(now).items()}
+            bot.state["snapshots"].append({"slot":slot-1,"at":now-4*3600,
+                                           "prices":old})
+            with patch("ai_market_agents.AgentsResearch",FakeAgents):
+                self.assertTrue(bot.step())
+            report=bot.state["reports"][0]
+            self.assertEqual(report["status"],"COMPLETE")
+            self.assertEqual([a["decision"] for a in report["analyses"][:3]],
+                             ["BUY","NEUTRAL","AVOID"])
+            self.assertEqual(len(bot.state["trades"]),1)
+            self.assertEqual(bot.state["trades"][0]["symbol"],
+                             report["analyses"][0]["symbol"])
+            self.assertIn("Kararlar: AL 1 | NÖTR 8 | SAT/KAÇIN 1",sent[0])
+            self.assertIn("Geçerli LONG giriş fiyatı yok",sent[0])
+            self.assertIn("SAT / KAÇIN",sent[0])
+            self.assertLessEqual(len(sent[0].encode("utf-16-le"))//2,4096)
 
     def test_collect_real_ws_snapshot_and_legacy_fallback(self):
         now=time.time()

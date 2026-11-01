@@ -15,6 +15,21 @@ on:
       - 'crash_context.py'
       - 'test_crash*.py'
       - '.github/workflows/crash-bounce-checks.yml'
+  pull_request:
+    branches: [master]
+    paths:
+      - 'ema.py'
+      - 'ai_top_gainers.py'
+      - 'ai_market_agents.py'
+      - 'test_ai_market_agents.py'
+      - 'test_ai_top_gainers.py'
+      - 'crash_v2.py'
+      - 'crash_history.py'
+      - 'crash_live_v2.py'
+      - 'crash_score_v3.py'
+      - 'crash_context.py'
+      - 'test_crash*.py'
+      - '.github/workflows/crash-bounce-checks.yml'
   workflow_dispatch:
 
 permissions:

@@ -54,12 +54,18 @@ FINAL_INSTRUCTIONS = ("Act as an independent final crypto RESEARCH DECISION anal
   "Use the provided technical, derivatives, risk, and cited news evidence for the same ten symbols. "
   "Each upstream analyst is independent; disagree when evidence conflicts. News must have "
   "a verifiable citation URL and an unambiguous date or it is UNKNOWN, not a positive. "
-  "Only suggest paper LONG entry_price for credible setups, at or below snapshot market price, "
-  "no more than 10% below; prefer a reasonable retracement to support/EMA/ATR. "
-  "Null entry is required when information or risk is insufficient. "
+  "For EVERY symbol set decision BUY, NEUTRAL, or AVOID explicitly. "
+  "BUY = sufficiently supported paper LONG candidate; NEUTRAL = wait/no entry; "
+  "AVOID = SAT/KAÇIN (avoid opening LONG), never a real sell or SHORT suggestion. "
+  "Only choose BUY if evidence supports a concrete entry_price at or below snapshot "
+  "market price and no more than 10% lower; use EMA25/ATR/support retracement. "
+  "For NEUTRAL and AVOID set entry_price=null. Never invent prices to force BUY. "
+  "For each coin include entry_reason: concise Turkish justification of the chosen "
+  "entry level or why no LONG entry is appropriate. When risk or data are insufficient "
+  "prefer NEUTRAL or AVOID. "
   "TP is calculated separately as +1% by Python. Give subjective continuation score (0-100), "
   "NEVER a success probability. No orders; concise Turkish reason and risk. "
-  "For each symbol choose CONTINUE, PULLBACK or UNCERTAIN. "
+  "For each symbol choose CONTINUE, PULLBACK or UNCERTAIN independently of decision. "
   "Never invent price, news, OI/CVD, funding or BTC forecasts. "
   "Return exactly one assessment for each of the ten symbols.")
 
@@ -359,7 +365,7 @@ class AgentsResearch:
         final_status = "UNAVAILABLE"
         try:
             data = self._call(FINAL_INSTRUCTIONS, final_payload,
-                              schema=final_schema, name="top_final", out=2100)
+                              schema=final_schema, name="top_final", out=2700)
             analyses = data.get("analyses", [])
             expected = {e["symbol"] for e in entries}
             if len(analyses) != 10 or {a.get("symbol") for a in analyses} != expected:
