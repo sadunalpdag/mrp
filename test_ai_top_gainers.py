@@ -140,6 +140,9 @@ class Tests(unittest.TestCase):
             self.assertTrue(bot.step())
             self.assertEqual(bot.state["reports"][0]["status"],"NO_AI_KEY")
             self.assertEqual(len(bot.state["reports"][0]["ranking"]),10)
+            self.assertIn("RANK 11–20",delivered[0])
+            self.assertIn("11.",delivered[0])
+            self.assertIn("20.",delivered[0])
             self.assertIn("AI TOP GAINERS",delivered[0])
 
     def test_btc_real_ws_snapshot_is_available(self):
