@@ -365,7 +365,7 @@ class AgentsResearch:
         final_status = "UNAVAILABLE"
         try:
             data = self._call(FINAL_INSTRUCTIONS, final_payload,
-                              schema=final_schema, name="top_final", out=2100)
+                              schema=final_schema, name="top_final", out=2700)
             analyses = data.get("analyses", [])
             expected = {e["symbol"] for e in entries}
             if len(analyses) != 10 or {a.get("symbol") for a in analyses} != expected:
