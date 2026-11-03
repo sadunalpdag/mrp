@@ -60,7 +60,10 @@ class CrashV2Tests(unittest.TestCase):
                       v2_sent=False, tracking_status="WAIT_ENTRY", symbol="TESTUSDT",
                       change_24h=-15, entry="1.000", tp="1.010", last_price="0.995",
                       v2_features=dict(recovery_4h_pct=1.2, rsi14=24, candles=480,
-                                       return_5d_pct=-13))
+                                       return_5d_pct=-13),
+                      failure_shadow=dict(version='tp_nonclosure_entry_gate_v1',
+                          flags=dict(weak_volume=False, falling_rsi_ema=False,
+                                     repeat_lower_entry=False)))
         return {"history":[record], "symbols":{"TESTUSDT":dict(record)}}, record
 
     def test_legacy_candidate_not_resent(self):
