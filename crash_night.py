@@ -827,7 +827,7 @@ class NightExecutor:
                         isolated.add(symbol)
                         continue
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonu kapalı fakat bekleyen emir var.'
-                if not self.broker.is_closing_order(o):
+                if not BinanceBroker.is_closing_order(o):
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonunda açıcı emir var.'
             if allow_reducing_orphans:
                 self.state['quarantined_symbols'] = sorted(isolated)
