@@ -104,7 +104,7 @@ class ManualCloseTests(unittest.TestCase):
         self.assertFalse(self.e.reconcile(order))
         self.assertTrue(self.e.state["halt"])
         self.assertEqual(order["phase"], "PROTECTED")
-        self.assertIn("Açılmadı", self.e.apply_control("on"))
+        self.assertIn("Açılamadı", self.e.apply_control("on"))
         self.assertTrue(self.e.state["halt"])
 
     def test_pending_buy_same_symbol_prevents_false_flat(self):
@@ -127,7 +127,7 @@ class ManualCloseTests(unittest.TestCase):
         self.assertFalse(self.e.reconcile(order))
         self.assertEqual(order["phase"], "PROTECTED")
         self.e.state["halt"] = "TP DOĞRULANAMADI\nKod: TP_NOT_ACTIVE"
-        self.assertIn("Açılmadı", self.e.apply_control("on"))
+        self.assertIn("Açılamadı", self.e.apply_control("on"))
 
     def test_no_tp_query_record_then_confirmed_flat(self):
         order = self.setup_order("OTHERSYMBOL")
@@ -139,14 +139,14 @@ class ManualCloseTests(unittest.TestCase):
         self.setup_order("AUSDT")
         self.e.state["halt"] = "TP DOĞRULANAMADI\nKod: TP_NOT_ACTIVE"
         self.b.open_rows = [dict(symbol="BUSDT", side="BUY", status="NEW")]
-        self.assertIn("Açılmadı", self.e.apply_control("on"))
+        self.assertIn("Açılamadı", self.e.apply_control("on"))
         self.assertTrue(self.e.state["halt"])
 
     def test_other_coin_unprotected_keeps_global_lock(self):
         self.setup_order("AUSDT")
         self.e.state["halt"] = "TP DOĞRULANAMADI\nKod: TP_NOT_ACTIVE"
         self.b.position_rows = [open_position("BUSDT")]
-        self.assertIn("Açılmadı", self.e.apply_control("on"))
+        self.assertIn("Açılamadı", self.e.apply_control("on"))
         self.assertTrue(self.e.state["halt"])
 
     def test_protected_other_coin_with_valid_tp_can_resume(self):
@@ -165,12 +165,12 @@ class ManualCloseTests(unittest.TestCase):
         self.e.state["halt"] = "TP DOĞRULANAMADI\nKod: TP_NOT_ACTIVE"
         self.b.position_rows = [dict(symbol="SHORTUSDT", positionSide="SHORT",
                                      positionAmt="-2", entryPrice="10")]
-        self.assertIn("Açılmadı", self.e.apply_control("on"))
+        self.assertIn("Açılamadı", self.e.apply_control("on"))
         self.assertTrue(self.e.state["halt"])
 
     def test_error_halt_other_than_tp_cannot_be_unlocked(self):
         self.e.state["halt"] = "EXECUTOR_ERROR"
-        self.assertIn("Açılmadı", self.e.apply_control("on"))
+        self.assertIn("Açılamadı", self.e.apply_control("on"))
         self.assertEqual(self.e.state["halt"], "EXECUTOR_ERROR")
 
     def test_ledger_appends_without_overwriting_past_runs(self):
