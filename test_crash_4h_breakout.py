@@ -54,6 +54,28 @@ class Tests(unittest.TestCase):
     def test_no_15m_rest_when_ws_missing(self):
         self.assertEqual(confirm_15m(Cache(),"COIN0USDT",100000),"NO_WS_CANDLES")
 
+    def test_final_24h_observation_and_zero_peak(self):
+        now=[200*PERIOD+3600]
+        with tempfile.TemporaryDirectory() as tmp:
+            b=BreakoutResearch(tmp,Cache(),Mock(),Mock(),
+                market_symbols=lambda:{f"COIN{i}USDT" for i in range(40)},
+                env={"CRASH_4H_BREAKOUT_ENABLED":"1"},clock=lambda:now[0])
+            cutoff=now[0]-24*3600-60
+            b.state["events"]=[{
+                "event_id":"old","symbol":"COIN0USDT","status":"BREAKOUT",
+                "close_at":cutoff,"close_ms":1,"close":200.0,
+                "partial_max":{"1":0,"4":0.1,"12":0.2,"24":0.25},
+                "max_observed_gain_pct":0.0,"last_observed_at":now[0]-120,
+                "observations":1
+            }]
+            latest=int(now[0]//PERIOD)*PERIOD*1000-1
+            b.state["cache"]={f"COIN{i}USDT":{"close_ms":latest}
+                              for i in range(30)}
+            b.step()
+            item=b.state["events"][0]
+            self.assertEqual(item["completed_horizons"]["24"],0.25)
+            self.assertEqual(item["max_observed_gain_pct"],0.0)
+
     def test_export_missing_horizons_not_falsely_zero(self):
         s=export_csv([{"event_id":"s","symbol":"AAAUSDT","status":"BREAKOUT",
             "close_at":1,"close":2,"observations":3,"max_observed_gain_pct":1.2,
