@@ -596,8 +596,10 @@ class NightExecutor:
                 and self.state.get('halt_symbol') == symbol):
             self.pending_flat_close_recovery = True
         self.alert(f'ℹ️ HARİCİ KAPANIŞ DOĞRULANDI | {symbol} | {side}\n'
-                   f'Binance pozisyon miktarı 0 ve açık emir bulunmadı; TP durumu: {tp_status}.\n'
-                   'Bu kapanış TP başarısı sayılmaz. Yeni giriş güvenlik kilidi otomatik kaldırılmadı.')
+                   f'Binance pozisyon miktarı 0; TP durumu: {tp_status}.\n'
+                   + (f'{len(leftovers)} eski yalnız kapatma emri var; bu sembol karantinada.\n'
+                      if leftovers else 'Açık emir yok.\n')
+                   + 'Bu kapanış TP başarısı sayılmaz. Başka coinlerde girişleri engellemez.')
         self.log(f'[CRASH NIGHT EXTERNAL CLOSE] {symbol}; side={side}; tp={tp_status}')
         return True
 
