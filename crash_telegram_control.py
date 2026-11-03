@@ -70,6 +70,11 @@ class TelegramControl:
             return None
         # Exact commands only. Quoted, edited, forwarded and free-form signals cannot arm trading.
         text = msg.get('text', '').strip()
+        # Reset of a trading safety latch is owner-only, even when ordinary
+        # counter/toggle commands are allowed for the configured chat.
+        if text == '/otomatik_kilit_kaldir':
+            return ('unlock' if self.allow_toggle and self.owner_id
+                    and str(sender.get('id')) == self.owner_id else None)
         if self.allow_toggle and text in COMMANDS:
             return COMMANDS[text]
         if text == '/rapor':
