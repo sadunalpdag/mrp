@@ -16,7 +16,7 @@ def append_trade_event(directory, event, at=None):
     path = os.path.join(directory, instant.strftime("%Y-%m-%d") + ".jsonl")
     data = dict(schema_version=1, timestamp=instant.isoformat(), **event)
     raw = (json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-                      allow_nan=False) + "\n").encode("utf-8")
+                      allow_nan=False, default=str) + "\n").encode("utf-8")
     if len(raw) > 16384:
         raise ValueError("AUDIT_EVENT_TOO_LARGE")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
