@@ -437,7 +437,7 @@ class NightExecutor:
                     self.log('[CRASH NIGHT RECOVERY DENIED] ' + type(error).__name__)
                     recovered = False
                 if not recovered:
-                    return ('⚠️ Açılmadı: ' + str(self.state['halt']) +
+                    return ('⚠️ Açılamadı: ' + str(self.state['halt']) +
                             '\nTüm pozisyonlar, TP emirleri, bekleyen girişler ve algo emirleri doğrulanmadan güvenlik kilidi kalkmaz.')
             self.enabled.clear()
             while True:
