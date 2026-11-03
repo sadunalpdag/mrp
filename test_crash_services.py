@@ -118,7 +118,10 @@ class NightTests(unittest.TestCase):
         self.b = FakeBroker(); self.deliver=Mock(return_value={'ok':True})
         self.e = self.make()
         self.r = dict(symbol='AUSDT', signal_id='signal-1', entry='10', tp='10.10',
-                      v2_status='STRONG_V2', v2_sent=True, tracking_status='OPEN')
+                      v2_status='STRONG_V2', v2_sent=True, tracking_status='OPEN',
+                      failure_shadow=dict(version='tp_nonclosure_entry_gate_v1',
+                          flags=dict(weak_volume=False, falling_rsi_ema=False,
+                                     repeat_lower_entry=False)))
 
     def make(self):
         e = NightExecutor(self.tmp.name, self.b, self.deliver, Mock(), lambda:self.now, enabled=True, max_daily=10)
