@@ -344,6 +344,16 @@ class NightExecutor:
         self.account_resync_after = 0
         self.ws_manual_symbols = set()
         self.ws_manual_after = 0
+        # Only this user-approved, explicitly configured recovery may auto-arm.
+        self.auto_bootstrap_requested = (
+            enabled and os.getenv('CRASH_BOOTSTRAP_LIVE_ONCE') == '1'
+            and self.state.get('halt') == 'STATE_HISTORY_UNVERIFIED'
+            and not self.state.get('orders')
+            and not self.state.get('bootstrap_completed_20261103')
+            and not self.state.get('bootstrap_cancelled_20261103'))
+        self.next_bootstrap_check = 0
+        self.pending_flat_close_recovery = False
+        self.next_flat_close_check = 0
 
     def save(self):
         with open(self.path+'.tmp', 'w', encoding='utf-8') as handle:
@@ -419,6 +429,8 @@ class NightExecutor:
                     f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla {self.max_symbols} sembol. TP +%1; SL yok.\n'+self.summary())
         if action == 'off':
             self.enabled.clear()
+            self.auto_bootstrap_requested = False
+            self.state['bootstrap_cancelled_20261103'] = True
             self.state['paused'] = True
             self.save()
             return '⏸️ Yeni girişler KAPALI. Mevcut pozisyonlar kapatılmadı; TP takibi sürüyor. Daha önce gönderilmiş giriş emri sonuçlanabilir.'
@@ -446,6 +458,7 @@ class NightExecutor:
 
     def halt(self, reason, symbol):
         self.state['halt'] = reason
+        self.state['halt_symbol'] = symbol
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
 
     def deliver_pending(self):
@@ -552,11 +565,122 @@ class NightExecutor:
         order.update(phase='CLOSED_EXTERNALLY', externally_closed_at=self.clock(),
                      external_close_tp_status=tp_status)
         self.save()
+        if (str(self.state.get('halt', '')).startswith('TP DOĞRULANAMADI')
+                and self.state.get('halt_symbol') == symbol):
+            self.pending_flat_close_recovery = True
         self.alert(f'ℹ️ HARİCİ KAPANIŞ DOĞRULANDI | {symbol} | {side}\n'
                    f'Binance pozisyon miktarı 0 ve açık emir bulunmadı; TP durumu: {tp_status}.\n'
                    'Bu kapanış TP başarısı sayılmaz. Yeni giriş güvenlik kilidi otomatik kaldırılmadı.')
         self.log(f'[CRASH NIGHT EXTERNAL CLOSE] {symbol}; side={side}; tp={tp_status}')
         return True
+
+    def audited_bootstrap_snapshot(self):
+        """Read-only Binance full-account fingerprint; never infer flat on error."""
+        from crash_manual_tp import tp_coverage
+        positions = self.broker.positions()
+        standard = self.broker.open_entry_orders()
+        algo = self.broker.open_algo_orders()
+        if any(not isinstance(v, list) or any(not isinstance(o, dict) for o in v)
+               for v in (positions, standard, algo)):
+            raise ValueError('BOOTSTRAP_SNAPSHOT_INVALID')
+        active = {}
+        for p in positions:
+            symbol, side = p.get('symbol'), p.get('positionSide', 'BOTH')
+            amount = D(str(p['positionAmt']))
+            if not amount.is_finite():
+                raise ValueError('BOOTSTRAP_AMOUNT_INVALID')
+            if amount == 0:
+                continue
+            if not symbol or side not in ('BOTH', 'LONG') or amount < 0:
+                raise ValueError('BOOTSTRAP_UNSUPPORTED_POSITION')
+            key = (symbol, side)
+            if key in active:
+                raise ValueError('BOOTSTRAP_DUPLICATE_POSITION')
+            active[key] = p
+
+        orders = standard + algo
+        closing = getattr(self.broker, 'is_closing_order', None)
+        if not callable(closing):
+            raise ValueError('BOOTSTRAP_BROKER_UNSUPPORTED')
+        for o in orders:
+            symbol, side = o.get('symbol'), o.get('positionSide', 'BOTH')
+            if not closing(o) or (symbol, side) not in active:
+                raise ValueError('BOOTSTRAP_PENDING_OR_ORPHAN_ORDER')
+            if o.get('status', o.get('algoStatus', 'NEW')) not in ('NEW', 'PARTIALLY_FILLED'):
+                raise ValueError('BOOTSTRAP_ORDER_STATUS_UNVERIFIED')
+
+        for (symbol, side), p in active.items():
+            entry = D(str(p.get('entryPrice', '0')))
+            amount = D(str(p['positionAmt']))
+            if not entry.is_finite() or entry <= 0:
+                raise ValueError('BOOTSTRAP_ENTRY_PRICE_INVALID')
+            cover = tp_coverage([o for o in orders if o.get('symbol') == symbol],
+                                symbol, entry, amount, side)
+            if cover != 'full':
+                raise ValueError('BOOTSTRAP_TP_MISSING_' + symbol)
+
+        # Compare economically relevant fields; skip volatile timestamps.
+        positions_key = sorted((symbol, side, str(D(str(p['positionAmt']))),
+                                str(D(str(p['entryPrice']))))
+                               for (symbol, side), p in active.items())
+        orders_key = sorted(tuple(str(o.get(k, '')) for k in (
+            'symbol', 'clientOrderId', 'algoId', 'side', 'positionSide',
+            'type', 'orderType', 'status', 'algoStatus', 'origQty',
+            'executedQty', 'quantity', 'price', 'stopPrice', 'triggerPrice',
+            'reduceOnly', 'closePosition')) for o in orders)
+        return positions_key, orders_key
+
+    def run_one_time_account_recovery(self):
+        """One-time user-approved live recovery after verified persistent storage."""
+        if (not self.auto_bootstrap_requested or self.clock() < self.next_bootstrap_check
+                or self.state.get('halt') != 'STATE_HISTORY_UNVERIFIED'
+                or self.state.get('bootstrap_cancelled_20261103')):
+            return
+        self.next_bootstrap_check = self.clock() + 300
+        try:
+            first = self.audited_bootstrap_snapshot()
+            second = self.audited_bootstrap_snapshot()
+            if first != second:
+                raise ValueError('BOOTSTRAP_ACCOUNT_CHANGED')
+            self.unlock_after_verification()
+            if self.state.get('halt'):
+                self.log('[CRASH BOOTSTRAP DENIED] complete account audit refused')
+                return
+            # Persist one-time consumption before rearming or sending any new order.
+            self.auto_bootstrap_requested = False
+            self.state['bootstrap_completed_20261103'] = self.clock()
+            self.save()
+            self.apply_control('on')
+            if not self.enabled.is_set():
+                raise ValueError('BOOTSTRAP_REARM_FAILED')
+            self.alert('✅ OTOMATİK GİRİŞLER AÇIK | '
+                       'Kalıcı disk ve Binance hesap/emir kontrolleri doğrulandı. '
+                       'Eski günlük işlem sayısı dosya taşınması nedeniyle kesin değildir; '
+                       'yeni girişler bu andan itibaren takip edilir.')
+            self.log('[CRASH BOOTSTRAP VERIFIED] two account snapshots consistent; '
+                     'user-approved automatic entry ON; legacy daily count unverified')
+        except Exception as error:
+            self.log('[CRASH BOOTSTRAP DENIED] ' + type(error).__name__
+                     + (':' + str(error)[:100] if isinstance(error, ValueError) else ''))
+
+    def recover_flat_close_halt(self):
+        """A confirmed flat symbol may clear its own TP halt after full account audit."""
+        if not self.pending_flat_close_recovery or self.clock() < self.next_flat_close_check:
+            return
+        self.next_flat_close_check = self.clock() + 300
+        if not str(self.state.get('halt', '')).startswith('TP DOĞRULANAMADI'):
+            self.pending_flat_close_recovery = False
+            return
+        was_on = self.enabled.is_set() and not self.state.get('paused')
+        self.unlock_after_verification()
+        if self.state.get('halt'):
+            self.log('[CRASH FLAT CLOSE RECOVERY] account not fully verified')
+            return
+        self.pending_flat_close_recovery = False
+        if was_on:
+            self.apply_control('on')
+        self.log('[CRASH FLAT CLOSE RECOVERY] verified; '
+                 + ('trading rearmed' if was_on else 'trading remains off'))
 
     def unlock_after_verification(self):
         """Owner-initiated account-wide audit; never arm trading on unlock."""
@@ -882,6 +1006,7 @@ class NightExecutor:
             self.deliver_pending()
             return
         self.process_account_events()
+        self.run_one_time_account_recovery()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
@@ -901,6 +1026,7 @@ class NightExecutor:
                     from crash_manual_tp import ManualTPGuard
                     self.manual_guard = ManualTPGuard(self)
                 self.manual_guard.scan()
+        self.recover_flat_close_halt()
         if self.clock() >= self.next_expiry_scan:
             self.next_expiry_scan = self.clock()+ENTRY_EXPIRY_SCAN_SECONDS
             try:
