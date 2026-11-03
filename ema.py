@@ -7885,11 +7885,11 @@ def _crash_drain_ai(state):
 
 
 def _crash_one_time_fresh_start(directory, broker, report, *, expected_mount='/data', require_mount=True):
-    """One authorized attempt to clear only the old migration halt on /data.
+    """Recover the old migration halt once after successful Binance verification.
 
-    No exchange writes. All pre-existing order state is backed up first.
-    Any active BUY, SHORT, missing TP or API failure leaves trading halted.
-    An attempt marker prevents repeated resets across redeploys.
+    An unsuccessful attempt remains read-only and can be retried on the next
+    restart after the account is fixed. A completed reset is recorded in state,
+    so future deploys cannot clear history or re-arm it again.
     """
     import fcntl
     import json as _json
@@ -7927,14 +7927,16 @@ def _crash_one_time_fresh_start(directory, broker, report, *, expected_mount='/d
                 return False
             if state.get('halt') != 'STATE_HISTORY_UNVERIFIED':
                 return False
-            if attempt_path.exists():
-                report('[CRASH ONCE RESET] SKIP: one-time attempt already used')
-                return False
-            # The marker is persisted before Binance requests; even a denial is once.
-            with attempt_path.open('x', encoding='utf-8') as marker:
-                marker.write('one-time Binance read-only recovery attempt\n')
-                marker.flush()
-                _os.fsync(marker.fileno())
+            # The prior run may have failed because an exchange BUY was pending.
+            # The attempt marker is diagnostic, not a permanent failure latch.
+            # Successful migration alone records the permanent completion flag.
+            if not attempt_path.exists():
+                with attempt_path.open('x', encoding='utf-8') as marker:
+                    marker.write('Binance read-only recovery audit started\n')
+                    marker.flush()
+                    _os.fsync(marker.fileno())
+            else:
+                report('[CRASH ONCE RESET] RETRY: previous Binance audit did not pass')
 
             def positive_decimal(value):
                 result = _Decimal(str(value))
