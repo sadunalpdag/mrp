@@ -1170,10 +1170,19 @@ def safe_float(value, default=0.0):
 
 def log(msg):
     print(msg, flush=True)
+    # The Render dashboard's transient log history is not a research archive.
+    # Persist all Crash/AI research status lines by UTC date on DATA_DIR.
+    try:
+        from research_archive import append_research_runtime
+        append_research_runtime(DATA_DIR, str(msg))
+    except Exception as error:
+        print('[CRASH ARCHIVE WRITE ERR] '+type(error).__name__, flush=True)
     try:
         with open(LOG_FILE,"a",encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except: pass
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\\n")
+    except Exception:
+        pass
+
 
 def safe_load(p,d):
     try:
