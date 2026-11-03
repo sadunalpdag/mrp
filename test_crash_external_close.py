@@ -2,8 +2,8 @@
 import copy
 import tempfile
 import unittest
-from unittest.mock import Mock
-from crash_night import NightExecutor, BrokerError, day
+from unittest.mock import Mock, patch
+from crash_night import NightExecutor, BrokerError, day, persistent_state_guard
 from crash_telegram_control import TelegramControl
 
 
@@ -62,6 +62,25 @@ class RecoveryTests(unittest.TestCase):
     def position(self,symbol='AUSDT',qty='0',side='BOTH'):
         self.b.ps.append({'symbol':symbol,'positionSide':side,
                           'positionAmt':qty,'entryPrice':'10'})
+    def test_ephemeral_path_refuses_any_new_trade(self):
+        with patch('crash_night.os.path.ismount',return_value=True):
+            with tempfile.TemporaryDirectory() as d:
+                e=NightExecutor(d,self.b,self.out,Mock(),lambda:self.now,enabled=True)
+                try:
+                    self.assertEqual(e.state['halt'],'UNSAFE_EPHEMERAL_STATE')
+                    self.assertFalse(e.enabled.is_set())
+                    self.assertIn('Açılamadı',e.apply_control('on'))
+                    self.assertIn('TP dışı',e.apply_control('unlock'))
+                finally:
+                    e.guard.close()
+
+    def test_missing_disk_state_needs_owner_audit(self):
+        with patch('crash_night.os.path.ismount',return_value=True):
+            self.assertEqual(persistent_state_guard('/data/night_execution',False),
+                             'STATE_HISTORY_UNVERIFIED')
+            self.assertIsNone(persistent_state_guard('/data/night_execution',True))
+            self.assertEqual(persistent_state_guard('/tmp/volatile',True),
+                             'UNSAFE_EPHEMERAL_STATE')
     def test_full_manual_close_generalizes_to_two_coins_and_restarts(self):
         a=self.add_order()
         b=self.add_order(symbol='BUSDT')
