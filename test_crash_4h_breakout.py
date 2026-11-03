@@ -51,6 +51,63 @@ class Tests(unittest.TestCase):
             self.assertEqual(fetch.call_count,2)
             self.assertLessEqual(len(b.state["cache"]),30)
 
+    def test_ws_closed_4h_replaces_followup_rest(self):
+        now=[200*PERIOD+600]
+        fetch=Mock(side_effect=lambda route,params: bars(now[0]))
+        class WithWS(Cache):
+            def __init__(self):
+                self.streamed=[]
+                self.subscriptions=[]
+            def set_4h_research_symbols(self, symbols):
+                self.subscriptions.append(list(symbols))
+            def closed_4h_candles(self, symbol):
+                return self.streamed if symbol=="COIN0USDT" else []
+        ws=WithWS()
+        with tempfile.TemporaryDirectory() as tmp:
+            b=BreakoutResearch(tmp,ws,fetch,Mock(),
+                market_symbols=lambda:{f"COIN{i}USDT" for i in range(40)},
+                env={"CRASH_4H_BREAKOUT_ENABLED":"1"},clock=lambda:now[0])
+            b.step()
+            self.assertEqual(fetch.call_count,1)
+            self.assertEqual(b.state["cache"]["COIN0USDT"]["source"],"REST")
+            original=b.state["cache"]["COIN0USDT"]["close_ms"]
+            now[0]+=PERIOD-510   # New 4H close + 90s, inside WS grace.
+            ws.streamed=[bars(now[0])[-1]]
+            b.step()
+            self.assertEqual(fetch.call_count,1)
+            self.assertGreater(b.state["cache"]["COIN0USDT"]["close_ms"],original)
+            self.assertEqual(b.state["cache"]["COIN0USDT"]["source"],"WS")
+            self.assertEqual(len(b.state["cache"]["COIN0USDT"]["rows"]),65)
+
+    def test_gap_requires_paced_rest_repair(self):
+        now=[200*PERIOD+600]
+        fetch=Mock(side_effect=lambda route,params: bars(now[0]))
+        class WithGap(Cache):
+            def __init__(self):
+                self.streamed=[]
+            def set_4h_research_symbols(self, symbols):
+                pass
+            def closed_4h_candles(self, symbol):
+                return self.streamed if symbol=="COIN0USDT" else []
+        ws=WithGap()
+        with tempfile.TemporaryDirectory() as tmp:
+            b=BreakoutResearch(tmp,ws,fetch,Mock(),
+                market_symbols=lambda:{f"COIN{i}USDT" for i in range(40)},
+                env={"CRASH_4H_BREAKOUT_ENABLED":"1"},clock=lambda:now[0])
+            b.step()
+            original=b.state["cache"]["COIN0USDT"]["close_ms"]
+            # Two full 4H intervals later: missing one middle candle.
+            now[0]+=2*PERIOD
+            ws.streamed=[bars(now[0])[-1]]
+            # A different symbol might be chosen first, so other 29 are fresh.
+            latest=int(now[0]//PERIOD)*PERIOD*1000-1
+            for i in range(1,30):
+                b.state["cache"][f"COIN{i}USDT"]={"close_ms":latest,"rows":bars(now[0])}
+            b.step()
+            self.assertEqual(b.state["cache"]["COIN0USDT"]["source"],"REST")
+            self.assertEqual(fetch.call_count,2)
+            self.assertGreater(b.state["cache"]["COIN0USDT"]["close_ms"],original)
+
     def test_no_15m_rest_when_ws_missing(self):
         self.assertEqual(confirm_15m(Cache(),"COIN0USDT",100000),"NO_WS_CANDLES")
 
