@@ -108,12 +108,25 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(order['phase'],'PROTECTED')
         self.assertTrue(self.e.state['halt'])
         self.assertIn('Kilit korunuyor',self.e.apply_control('unlock'))
-    def test_missing_position_row_and_api_error_fail_closed(self):
+    def test_binance_v3_omitted_flat_row_only_safe_when_orderbooks_empty(self):
         order=self.add_order()
+        # Binance V3 omits symbols with no position or open orders.
+        self.b.ps=[]
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'],'CLOSED_EXTERNALLY')
+        self.assertFalse(self.e.state['halt'])
+    def test_other_position_side_does_not_prove_flat_or_unlock(self):
+        order=self.add_order(side='LONG')
+        self.position(qty='-3',side='SHORT')
         self.e.reconcile(order)
         self.assertEqual(order['phase'],'PROTECTED')
         self.assertTrue(self.e.state['halt'])
+    def test_api_error_not_treated_as_flat(self):
+        order=self.add_order()
         self.b.position_errors=BrokerError('-1003')
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'],'PROTECTED')
+        self.assertFalse(self.e.state['halt'])
         self.assertIn('Kilit korunuyor',self.e.apply_control('unlock'))
     def test_open_pending_order_rejects_external_closed_claim(self):
         order=self.add_order()
