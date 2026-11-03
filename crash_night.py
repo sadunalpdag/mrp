@@ -258,6 +258,22 @@ class BinanceBroker:
             **self.close_params(position_side)))
 
 
+def persistent_state_guard(directory, existing_state, mount='/data'):
+    """Refuse new orders if a configured Render disk is unused or unverified.
+
+    Local offline dev/test environments without a mounted /data are unchanged.
+    """
+    if not os.path.ismount(mount):
+        return None
+    disk=os.path.realpath(mount)
+    path=os.path.realpath(directory)
+    if not (path == disk or path.startswith(disk+os.sep)):
+        return 'UNSAFE_EPHEMERAL_STATE'
+    if not existing_state:
+        return 'STATE_HISTORY_UNVERIFIED'
+    return None
+
+
 class NightExecutor:
     def __init__(self, directory, broker, deliver, log, clock=time.time, enabled=False, max_daily=20, manual_tp=False):
         self.broker, self.deliver, self.log, self.clock = broker, deliver, log, clock
@@ -268,7 +284,8 @@ class NightExecutor:
             fcntl.flock(self.guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.state = {'orders': {}, 'outbox': [], 'halt': None}
             marker = self.path+'.initialized'
-            if os.path.exists(self.path):
+            existing_state = os.path.exists(self.path)
+            if existing_state:
                 with open(self.path, encoding='utf-8') as handle:
                     self.state = json.load(handle)
                 if not isinstance(self.state.get('orders'), dict) or not isinstance(self.state.get('outbox'), list):
@@ -276,6 +293,10 @@ class NightExecutor:
             elif os.path.exists(marker):
                 raise ValueError('EXECUTOR_STATE_MISSING')
             self.state.pop('unverified_day', None)
+            storage_halt = persistent_state_guard(directory, existing_state)
+            if storage_halt:
+                self.state['halt'] = storage_halt
+                self.log('[CRASH NIGHT STORAGE HALT] '+storage_halt)
             # Apply new defaults exactly once; later Telegram changes must survive redeploys.
             if not self.state.get('trade_settings_defaults_20261101'):
                 self.state['trade_settings'] = {'max_daily': max_daily, 'max_symbols': 20,
@@ -285,6 +306,8 @@ class NightExecutor:
             else:
                 # Python's off switch always wins; preserve explicit Telegram /otomatik_kapat.
                 self.state['paused'] = not enabled or bool(self.state.get('paused', False))
+            if storage_halt:
+                self.state['paused'] = True
             self.save()
             with open(marker, 'a') as handle:
                 handle.flush()
@@ -311,7 +334,7 @@ class NightExecutor:
         self.protected_poll = {}
         self.enabled = threading.Event()
         self.armed_at = clock()
-        if enabled and not self.state['paused']:
+        if enabled and not self.state['paused'] and not self.state['halt']:
             self.enabled.set()
         self.controls = queue.Queue(maxsize=10)
         self.account_stream = None
@@ -540,7 +563,8 @@ class NightExecutor:
         old_halt = self.state.get('halt')
         if not old_halt:
             return 'ℹ️ Aktif hata kilidi yok. '+self.summary()
-        if not old_halt.startswith('TP DOĞRULANAMADI'):
+        if not (old_halt.startswith('TP DOĞRULANAMADI')
+                or old_halt == 'STATE_HISTORY_UNVERIFIED'):
             return '⚠️ Kilit kaldırılamadı: hata TP dışı olabilir; Binance ve işlem kayıtları ayrıca incelenmeli.'
         self.enabled.clear()
         try:
@@ -826,7 +850,9 @@ class NightExecutor:
             except Exception as error:
                 self.account_resync.set()
                 self.log(f'[CRASH ACCOUNT EVENT ERR] {type(error).__name__}')
-        if (self.manual_tp_enabled and self.ws_manual_symbols and now >= self.ws_manual_after
+        if (self.manual_tp_enabled and self.state.get('halt') not in
+                ('UNSAFE_EPHEMERAL_STATE','STATE_HISTORY_UNVERIFIED')
+                and self.ws_manual_symbols and now >= self.ws_manual_after
                 and self.clock() >= getattr(self.broker, 'cooldown_until', 0)):
             if self.manual_guard is None:
                 from crash_manual_tp import ManualTPGuard
@@ -867,7 +893,9 @@ class NightExecutor:
                     self.protected_poll[key] = self.clock()+TP_POLL_SECONDS
                 if order['phase'] in ('ENTRY_UNKNOWN', 'TP_UNKNOWN', 'PROTECTED'):
                     self.reconcile(order, check_expiry=self.clock() >= self.next_expiry_scan)
-            if self.manual_tp_enabled and self.clock() >= self.next_manual_scan:
+            if (self.manual_tp_enabled and self.state.get('halt') not in
+                    ('UNSAFE_EPHEMERAL_STATE','STATE_HISTORY_UNVERIFIED')
+                    and self.clock() >= self.next_manual_scan):
                 self.next_manual_scan = self.clock()+MANUAL_TP_POLL_SECONDS
                 if self.manual_guard is None:
                     from crash_manual_tp import ManualTPGuard
