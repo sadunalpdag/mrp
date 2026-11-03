@@ -589,9 +589,9 @@ class NightExecutor:
 
             from crash_manual_tp import tp_coverage
             for (symbol, side), p in active.items():
-                orders = self.broker.closing_orders(symbol)
-                if not isinstance(orders, list):
-                    raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
+                # Reuse the two account-wide order snapshots above; no extra
+                # REST requests proportional to historical symbols.
+                orders = [o for o in all_open if o.get('symbol') == symbol]
                 if tp_coverage(orders, symbol, D(str(p['entryPrice'])),
                                D(str(p['positionAmt'])), side) != 'full':
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonunun TP kapsamı tam doğrulanmadı.'
