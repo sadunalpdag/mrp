@@ -72,20 +72,32 @@ Unconfirmed low-volume and overextended (>2% above line) moves are reported
 separately. Near-line candidates use distance -2% to 0%, RSI 35–55, and
 improving EMA25 slope. These are *unvalidated research heuristics*.
 
-**REST discipline:**
-- At most **one 4H kline request per 120 seconds** across the new scanner.
-- Each request requests 65 candles (Binance Futures request weight = 1).
-- An up-to-date four-hour record is reused until the *next closed* 4H candle;
-  no 30-coin bulk request at every scan.
-- Existing `_crash_public_get` global pacing, ban/cooldown and endpoint guards
-  remain in force. No independent requests client or new account queries.
-- Best-effort 15m check reads the *existing WS candle cache* only; no 15m REST
-  calls are added.
-- If market data is unavailable the scanner skips; it never slows or changes
-  the Crash V2 decision loop intentionally. Its sole REST request still shares
-  the public limiter, and live IP conditions may further delay it.
-- 30 uncached candidates take **at least 60 minutes** to bootstrap; events may
-  be observed late or missed, so incomplete horizons are **not** labeled failures.
+**WS-first / REST fallback discipline:**
+- Fetch up to 65 *closed* 4H bars per candidate once at bootstrap, slowly:
+  at most **one 4H REST request per 120 seconds** across the new scanner
+  (65 bars = Binance Futures REST request weight 1).
+- Subsequent 4H candles are consumed from `{symbol}@kline_4h` using the
+  existing futures WebSocket connection. Only events with `k.x == true` and
+  correct 4H alignment are accepted. Bars merge by open timestamp into the
+  persisted 65-bar research history.
+- To limit WS message/CPU load (Binance emits updates to open 4H bars every
+  ~250ms), the 4H research channels are subscribed only in the final 3 minutes
+  **before** a 4H close and first 3 minutes **after** it; up to 30 at once.
+  They are unsubscribed for the rest of the four-hour interval.
+- New closes have a **five-minute grace period** for WebSocket delivery. If
+  the socket was disconnected, a candle is missed, bootstrap is not complete,
+  or sequence continuity fails, the missing history is repaired via the paced
+  shared REST client. The scanner never treats a gapped series as a trend
+  breakout. One failed exchange request does not block the main V2 loop.
+- The existing `_crash_public_get` shared rate limiter, ban/cooldown and
+  endpoint guards remain in force. No dedicated REST client is added.
+- Best-effort 15m confirmation uses existing WS 15m cache; no extra 15m REST.
+- After the initial history, a healthy continuous WS connection ideally needs
+  **zero daily REST requests** for the same 30 symbols; backup requests are
+  demand-driven after gaps, unavailable WS data, or watchlist changes.
+- 30 uncached candidates take **at least 60 minutes** to bootstrap. Events
+  observed late or with incomplete coverage cannot be assumed to have been
+  profitable or unprofitable.
 
 The paper research ledger is written atomically under
 `/data/crash_4h_breakout/breakout_4h_state.json` with event-time flags,
