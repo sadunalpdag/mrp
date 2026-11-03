@@ -1,0 +1,66 @@
+"""Offline 4H research tests: no Binance/network calls."""
+import tempfile
+import unittest
+from unittest.mock import Mock
+
+from crash_4h_breakout import BreakoutResearch, candidates, export_csv, confirm_15m
+
+PERIOD=4*3600
+
+
+class Cache:
+    def snapshot(self, now):
+        return [{"symbol":f"COIN{i}USDT","lastPrice":str(100+i),
+                 "priceChangePercent":"-5","quoteVolume":"15000000"}
+                for i in range(40)]
+    def candles(self, symbol):
+        return []
+
+
+def bars(now):
+    # 65 completed 4H bars including the last completed candle.
+    last=int(now//PERIOD)*PERIOD
+    return [[(last-(65-i)*PERIOD)*1000,"90","100","80","90","100",
+             (last-(64-i)*PERIOD)*1000-1,"15000000",0,0,0,0]
+            for i in range(65)]
+
+
+class Tests(unittest.TestCase):
+    def test_volume_and_bucket_filter(self):
+        tickers=Cache().snapshot(100)
+        selected=candidates(tickers,{x["symbol"] for x in tickers})
+        self.assertEqual(len(selected),30)
+        self.assertEqual(selected[0][0],"COIN0USDT")
+        tickers[0]["quoteVolume"]="1"
+        self.assertNotIn("COIN0USDT",[r[0] for r in candidates(tickers,{x["symbol"] for x in tickers})])
+
+    def test_120_second_pacing_and_reuse_until_new_4h_close(self):
+        now=[200*PERIOD+300]
+        fetch=Mock(side_effect=lambda route,params: bars(now[0]))
+        sent=Mock(return_value={"ok":True})
+        with tempfile.TemporaryDirectory() as tmp:
+            b=BreakoutResearch(tmp,Cache(),fetch,sent,
+                market_symbols=lambda:{f"COIN{i}USDT" for i in range(40)},
+                env={"CRASH_4H_BREAKOUT_ENABLED":"1"},clock=lambda:now[0])
+            b.step()
+            self.assertEqual(fetch.call_count,1)
+            self.assertEqual(fetch.call_args.args[1]["limit"],65)
+            now[0]+=60;b.step()
+            self.assertEqual(fetch.call_count,1)
+            now[0]+=60;b.step()
+            self.assertEqual(fetch.call_count,2)
+            self.assertLessEqual(len(b.state["cache"]),30)
+
+    def test_no_15m_rest_when_ws_missing(self):
+        self.assertEqual(confirm_15m(Cache(),"COIN0USDT",100000),"NO_WS_CANDLES")
+
+    def test_export_missing_horizons_not_falsely_zero(self):
+        s=export_csv([{"event_id":"s","symbol":"AAAUSDT","status":"BREAKOUT",
+            "close_at":1,"close":2,"observations":3,"max_observed_gain_pct":1.2,
+            "completed_horizons":{"1":0.8}}])
+        self.assertIn("0.8",s)
+        self.assertIn("gain_24h",s.splitlines()[0])
+
+
+if __name__=="__main__":
+    unittest.main()

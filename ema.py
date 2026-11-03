@@ -7169,6 +7169,16 @@ def _crash_daily_report(state, now):
             from crash_derivatives import export_csv, summarize
             archive.writestr("derivatives_shadow.csv", export_csv(records))
             archive.writestr("failure_shadow.csv", export_failure_csv(records))
+            # Independent 4H breakout ledger is observational only.
+            try:
+                from crash_4h_breakout import export_csv as breakout_export_csv
+                breakout = globals().get("_CRASH_4H_RESEARCH")
+                if breakout is not None:
+                    with breakout.lock:
+                        events = [dict(e) for e in breakout.state.get("events", [])]
+                    archive.writestr("breakout_4h.csv", breakout_export_csv(events))
+            except Exception as error:
+                log("[BREAKOUT 4H EXPORT ERR] " + type(error).__name__)
             from crash_ai import export_csv as export_ai_csv
             archive.writestr("openai_reviews.csv", export_ai_csv(records))
             ai_market_path = os.path.join(globals().get('DATA_DIR', os.path.dirname(CRASH_BOUNCE_RESEARCH_DIR)), 'ai_top_gainers', 'top_gainers_state.json')
@@ -7215,6 +7225,14 @@ def _crash_daily_report(state, now):
                    "3dk aday taraması; sanal giriş/TP sırası WS aggTrade olaylarından. Gerçek emir değildir. ZIP: fiyatlar ve sonuçlar.")
         pending = report["pending"] = {"path":path,"caption":caption,"period_end":now}
         _crash_save_state(state)
+    # Persist Drive export intent independently of Telegram delivery.
+    # An unavailable Drive never blocks or delays Crash Bounce V2/report delivery.
+    try:
+        drive = globals().get("_CRASH_DRIVE_BACKUP")
+        if drive is not None:
+            drive.enqueue(pending["path"], pending["period_end"])
+    except Exception as error:
+        log("[CRASH DRIVE ENQUEUE ERR] " + type(error).__name__)
     report["retry_after"] = now + 1800
     _crash_save_state(state)
     if not pending.get('summary_sent'):
@@ -8179,6 +8197,23 @@ def _crash_bounce_worker():
         gainers.start()
     except Exception as error:
         log(f'[TOP GAINERS START ERR] {type(error).__name__}; V2 continues')
+    try:
+        from crash_drive_backup import DailyDriveBackup
+        globals()["_CRASH_DRIVE_BACKUP"] = DailyDriveBackup(
+            os.path.join(DATA_DIR, "crash_drive_backup"),
+            _crash_telegram_receipt, log)
+        globals()["_CRASH_DRIVE_BACKUP"].start()
+    except Exception as error:
+        log("[CRASH DRIVE START ERR] " + type(error).__name__ + "; V2 continues")
+    try:
+        from crash_4h_breakout import BreakoutResearch
+        globals()["_CRASH_4H_RESEARCH"] = BreakoutResearch(
+            os.path.join(DATA_DIR, "crash_4h_breakout"),
+            _CRASH_WS_CACHE, _crash_public_get, _crash_telegram_receipt,
+            market_symbols=lambda: _crash_load_market_cache()[0], log=log)
+        globals()["_CRASH_4H_RESEARCH"].start()
+    except Exception as error:
+        log("[BREAKOUT 4H START ERR] " + type(error).__name__ + "; V2 continues")
     while True:
         try:
             if state is None:
