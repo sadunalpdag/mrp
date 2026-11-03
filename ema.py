@@ -7267,6 +7267,10 @@ class CrashBounceWebSocketCache:
         self.send_lock = threading.Lock()
         self.tickers = {}
         self.rows = {}
+        # Small transient WS research cache. Full 4H history lives in the separate
+        # research module; no extra 4H candles are written to the V2 15m cache.
+        self.research_4h_rows = {}
+        self.research_4h_wanted = set()
         self.wanted = set()
         self.trade_wanted = set()
         self.connected = False
@@ -7324,6 +7328,26 @@ class CrashBounceWebSocketCache:
         with self.lock:
             return [list(r) for r in self.rows.get(symbol, [])]
 
+    def closed_4h_candles(self, symbol):
+        """Closed-only 4H updates for optional research; no V2 decision change."""
+        with self.lock:
+            return [list(r) for r in self.research_4h_rows.get(symbol, [])]
+
+    def set_4h_research_symbols(self, symbols):
+        from crash_policy import supported_symbol
+        wanted = {s for s in symbols if supported_symbol(s)}
+        if len(wanted) > 30:
+            raise ValueError("Too many 4H research streams")
+        with self.lock:
+            old, self.research_4h_wanted = self.research_4h_wanted, wanted
+            # Old WS bars are not recent live evidence after a watchlist change.
+            self.research_4h_rows = {
+                s: rows for s, rows in self.research_4h_rows.items()
+                if s in wanted
+            }
+        self._send("UNSUBSCRIBE", old-wanted, "@kline_4h")
+        self._send("SUBSCRIBE", wanted-old, "@kline_4h")
+
     def flush(self):
         with self.lock:
             if not self.dirty:
@@ -7378,14 +7402,30 @@ class CrashBounceWebSocketCache:
                         _crash_enqueue_trade(symbol, float(data["p"]), event_at, int(data["a"]))
             elif isinstance(data, dict) and data.get("e") == "kline":
                 k = data["k"]
-                if k.get("i") != "15m" or k.get("x") is not True:
+                if k.get("x") is not True:
                     return
                 symbol = data["s"]
                 if int(data.get("st",1))!=1 or not supported_symbol(symbol):
                     return
+                interval = k.get("i")
                 row = [k["t"],k["o"],k["h"],k["l"],k["c"],k["v"],k["T"],
                        k.get("q"),k.get("n",0),k.get("V"),k.get("Q"),"0"]
-                self.merge_candles(symbol, [row])
+                if interval == "15m":
+                    self.merge_candles(symbol, [row])
+                elif interval == "4h":
+                    # Only fully closed, exchange-aligned bars are accepted.
+                    # Never call strategy/order code from this WS message.
+                    start, end = int(k["t"]), int(k["T"])
+                    if end-start != 4*3600*1000-1 or start % (4*3600*1000):
+                        return
+                    with self.lock:
+                        if symbol not in self.research_4h_wanted:
+                            return
+                        old = {int(r[0]): r for r in self.research_4h_rows.get(symbol, [])}
+                        old[start] = row
+                        self.research_4h_rows[symbol] = [
+                            old[t] for t in sorted(old)[-4:]
+                        ]
             elif isinstance(data, dict) and "code" in data:
                 log(f"[CRASH WS SERVER ERR] code={data['code']}")
         except (ValueError,TypeError,KeyError,AttributeError):
@@ -7439,8 +7479,11 @@ class CrashBounceWebSocketCache:
             self.tickers={}  # Never carry pre-disconnect prices into a new session.
             wanted=set(self.wanted)
             trade_wanted=set(self.trade_wanted)
+            research_4h_wanted=set(self.research_4h_wanted)
+            self.research_4h_rows={}  # Rebuild only from this connection.
         self._send("SUBSCRIBE", wanted)
         self._send("SUBSCRIBE", trade_wanted, "@aggTrade")
+        self._send("SUBSCRIBE", research_4h_wanted, "@kline_4h")
         log("[CRASH WS OPEN] futures ticker + trade streams connected")
 
     def on_close(self, ws, code, message):
