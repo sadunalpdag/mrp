@@ -213,8 +213,17 @@ class BreakoutResearch:
         latest_close_ms=slot*PERIOD*1000-1
         with self.lock:
             for item in self.state["events"]:
-                if item.get("status")!="BREAKOUT" or now-item["close_at"]>24*3600:
+                if item.get("status")!="BREAKOUT" or now-item["close_at"]>24*3600+120:
                     continue
+                # Finalize horizons from measurements made BEFORE each cutoff.
+                # A later or missing quote must never count as an earlier high.
+                for h in HORIZONS:
+                    key=str(h)
+                    if (now>item["close_at"]+h*3600
+                            and key not in item.get("completed_horizons",{})):
+                        pmax=item.get("partial_max",{}).get(key)
+                        if pmax is not None:
+                            item.setdefault("completed_horizons",{})[key]=round(pmax,3)
                 p=prices.get(item["symbol"])
                 if p is None or p<=0 or now<=item["close_at"]:
                     continue
@@ -226,8 +235,9 @@ class BreakoutResearch:
                 gain=100*(p/item["close"]-1)
                 item["observations"]=item.get("observations",0)+1
                 item["last_observed_at"]=now
-                item["max_observed_gain_pct"]=round(max(
-                    gain,item.get("max_observed_gain_pct") or gain),3)
+                prior_max=item.get("max_observed_gain_pct")
+                item["max_observed_gain_pct"]=round(
+                    gain if prior_max is None else max(gain,prior_max),3)
                 for h in HORIZONS:
                     if now<=item["close_at"]+h*3600:
                         partial=item.setdefault("partial_max",{})
