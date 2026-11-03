@@ -7883,6 +7883,162 @@ def _crash_drain_ai(state):
         _crash_save_state(state)
 
 
+
+def _crash_one_time_fresh_start(directory, broker, report, *, expected_mount='/data', require_mount=True):
+    """One authorized attempt to clear only the old migration halt on /data.
+
+    No exchange writes. All pre-existing order state is backed up first.
+    Any active BUY, SHORT, missing TP or API failure leaves trading halted.
+    An attempt marker prevents repeated resets across redeploys.
+    """
+    import fcntl
+    import json as _json
+    import os as _os
+    from decimal import Decimal as _Decimal
+    from pathlib import Path as _Path
+    from shutil import copyfileobj as _copyfileobj
+    from datetime import datetime as _datetime, timezone as _timezone
+    from crash_manual_tp import tp_coverage
+
+    root = _Path(expected_mount).resolve()
+    target_dir = _Path(directory).resolve()
+    if (require_mount and not _os.path.ismount(expected_mount)) or not target_dir.is_relative_to(root):
+        report('[CRASH ONCE RESET] SKIP: persistent /data not confirmed')
+        return False
+    path = target_dir / 'crash_night_state.json'
+    if not path.is_file():
+        report('[CRASH ONCE RESET] SKIP: prior executor state not found')
+        return False
+    lock_path = _Path(str(path) + '.lock')
+    attempt_path = target_dir / '.crash_once_reset_attempt_20261103'
+    with lock_path.open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            report('[CRASH ONCE RESET] SKIP: executor lock is active')
+            return False
+        try:
+            state = _json.loads(path.read_text(encoding='utf-8'))
+            if (not isinstance(state, dict) or
+                    not isinstance(state.get('orders'), dict) or
+                    not isinstance(state.get('outbox'), list)):
+                raise ValueError('INVALID_EXISTING_STATE')
+            if state.get('one_time_fresh_start_20261103'):
+                return False
+            if state.get('halt') != 'STATE_HISTORY_UNVERIFIED':
+                return False
+            if attempt_path.exists():
+                report('[CRASH ONCE RESET] SKIP: one-time attempt already used')
+                return False
+            # The marker is persisted before Binance requests; even a denial is once.
+            with attempt_path.open('x', encoding='utf-8') as marker:
+                marker.write('one-time Binance read-only recovery attempt\n')
+                marker.flush()
+                _os.fsync(marker.fileno())
+
+            def positive_decimal(value):
+                result = _Decimal(str(value))
+                if not result.is_finite():
+                    raise ValueError('INVALID_BINANCE_NUMBER')
+                return result
+
+            def snapshot():
+                positions = broker.positions()
+                ordinary = broker.open_entry_orders()
+                algo = broker.request('GET', '/fapi/v1/openAlgoOrders')
+                if any(not isinstance(items, list) or
+                       any(not isinstance(item, dict) for item in items)
+                       for items in (positions, ordinary, algo)):
+                    raise ValueError('INVALID_ACCOUNT_SNAPSHOT')
+                active = {}
+                for item in positions:
+                    amount = positive_decimal(item.get('positionAmt'))
+                    if amount == 0:
+                        continue
+                    symbol = item.get('symbol')
+                    side = item.get('positionSide', 'BOTH')
+                    if not symbol or side not in ('LONG', 'BOTH') or amount < 0:
+                        raise ValueError('OPEN_SHORT_OR_UNKNOWN_POSITION')
+                    if (symbol, side) in active:
+                        raise ValueError('DUPLICATE_POSITION')
+                    active[(symbol, side)] = item
+                all_orders = ordinary + algo
+                active_symbols = {symbol for symbol, _ in active}
+                for order in all_orders:
+                    symbol = order.get('symbol')
+                    side = order.get('positionSide', 'BOTH')
+                    if not symbol or order.get('side') == 'BUY':
+                        raise ValueError('OPEN_BUY_ORDER: ' + str(symbol)[:22])
+                    reduced_sell = (order.get('side') == 'SELL' and
+                        (side == 'LONG' or order.get('reduceOnly') in (True, 'true') or
+                         order.get('closePosition') in (True, 'true')))
+                    if not reduced_sell:
+                        raise ValueError('UNSAFE_PENDING_ORDER: ' + str(symbol)[:22])
+                    if symbol in active_symbols and (symbol, side) not in active:
+                        raise ValueError('POSITION_SIDE_MISMATCH')
+                for (symbol, side), pos in active.items():
+                    amount = positive_decimal(pos['positionAmt'])
+                    entry = positive_decimal(pos['entryPrice'])
+                    if amount <= 0 or entry <= 0:
+                        raise ValueError('INVALID_OPEN_POSITION')
+                    entries = [o for o in all_orders if o.get('symbol') == symbol]
+                    if tp_coverage(entries, symbol, entry, amount, side) != 'full':
+                        raise ValueError('OPEN_POSITION_TP_MISSING: ' + symbol[:22])
+                keys = tuple(sorted((symbol, side,
+                       str(positive_decimal(pos['positionAmt'])),
+                       str(positive_decimal(pos['entryPrice'])))
+                       for (symbol, side), pos in active.items()))
+                order_fields = ('symbol','side','positionSide','clientOrderId',
+                    'algoId','status','algoStatus','type','orderType','origQty',
+                    'executedQty','quantity','price','stopPrice','triggerPrice',
+                    'reduceOnly','closePosition')
+                order_keys = tuple(sorted(tuple(str(o.get(k,'')) for k in order_fields)
+                                          for o in all_orders))
+                return keys, order_keys
+
+            first = snapshot()
+            second = snapshot()
+            if first != second:
+                raise ValueError('ACCOUNT_CHANGED_DURING_AUDIT')
+            stamp = _datetime.now(_timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            backup = target_dir / ('crash_night_state.json.pre_once_' + stamp)
+            with path.open('rb') as source, backup.open('xb') as dest:
+                _copyfileobj(source, dest)
+                dest.flush()
+                _os.fsync(dest.fileno())
+            state['orders'] = {}
+            state['outbox'] = []
+            state.pop('daily_counter_override', None)
+            state.pop('manual_tp', None)
+            state.pop('manual_tp_notices', None)
+            state.pop('unverified_day', None)
+            state['halt'] = None
+            state['paused'] = False
+            state['one_time_fresh_start_20261103'] = {
+                'completed_at_utc': stamp, 'backup': backup.name,
+                'verified_open_positions': len(first[0])}
+            tmp = target_dir / 'crash_night_state.json.once_tmp'
+            with tmp.open('x', encoding='utf-8') as dest:
+                _json.dump(state, dest, ensure_ascii=False, allow_nan=False)
+                dest.flush()
+                _os.fsync(dest.fileno())
+            _os.replace(tmp, path)
+            dfd = _os.open(str(target_dir), _os.O_RDONLY)
+            try:
+                _os.fsync(dfd)
+            finally:
+                _os.close(dfd)
+            report('[CRASH ONCE RESET] SUCCESS: previous halt cleared; '
+                   'auto entries enabled; old orders backed up; '
+                   'Binance active longs verified=' + str(len(first[0])))
+            return True
+        except Exception as exc:
+            # No raw exchange messages, tokens, URLs or signed request data in logs.
+            detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            report('[CRASH ONCE RESET] DENIED: ' + detail[:80])
+            return False
+
+
 def _crash_start_services():
     """Python controls startup defaults; configured-chat commands can toggle new entries."""
     global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL
@@ -7900,7 +8056,11 @@ def _crash_start_services():
     if auto_flag or repair_flag or prior or (globals().get('BINANCE_KEY') and globals().get('BINANCE_SECRET')):
         try:
             from crash_night import BinanceBroker, NightExecutor, day
-            executor = NightExecutor(directory, BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
+            broker = BinanceBroker(BINANCE_KEY, BINANCE_SECRET)
+            once_recovery = globals().get('_crash_one_time_fresh_start')
+            if callable(once_recovery):
+                once_recovery(directory, broker, log)
+            executor = NightExecutor(directory, broker,
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 20), manual_tp=bool(repair_flag))
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler (Python varsayılanı): {"AÇIK" if auto_flag else "KAPALI"}\n'
