@@ -501,17 +501,25 @@ class NightExecutor:
             raise ValueError('POSITION_SNAPSHOT_UNVERIFIED')
         matching = [p for p in positions
                     if p.get('symbol') == symbol and p.get('positionSide', 'BOTH') == side]
-        # A missing row is NOT proof of a flat position.
-        if len(matching) != 1:
+        if len(matching) > 1:
             raise ValueError('POSITION_SNAPSHOT_UNVERIFIED')
-        amount = D(str(matching[0]['positionAmt']))
-        if not amount.is_finite() or amount != 0:
+        # Binance V3 only lists symbols with a position or open orders.
+        # An omitted row is acceptable only from a successful FULL account
+        # snapshot, when no other side of the symbol is active and BOTH normal
+        # and algo order books are independently confirmed empty.
+        if matching:
+            amount = D(str(matching[0]['positionAmt']))
+            if not amount.is_finite() or amount != 0:
+                return False
+        elif any(p.get('symbol') == symbol for p in positions):
             return False
-        open_orders = self.broker.closing_orders(symbol)
-        if not isinstance(open_orders, list):
+        normal = self.broker.open_entry_orders()
+        algo = self.broker.open_algo_orders()
+        if not isinstance(normal, list) or not isinstance(algo, list):
             raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
-        # Also block a still-live closing TP or a future BUY that could reopen.
-        if open_orders:
+        # Block any pending order for this symbol, including an orphaned SELL
+        # or future BUY, regardless of whether the position row is omitted.
+        if any(o.get('symbol') == symbol for o in normal + algo):
             return False
         if any(other is not order and other.get('symbol') == symbol
                and other.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN')
