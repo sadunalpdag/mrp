@@ -7209,7 +7209,7 @@ def _crash_daily_report(state, now):
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
                    f"V2 Telegram kabul edilen: {rolling['sent_candidates']} | giriş/TP atlaması: {rolling['missed_entry_above_tp']}\n"
                    f"Gölge zayıf hacim: {low_volume['signals']} sinyal | TP {low_volume['tp']} "
-                 f"| açık {low_volume['open_unresolved']} | timeout {low_volume['timeout']} (7g, engel değil)\n"
+                 f"| açık {low_volume['open_unresolved']} | timeout {low_volume['timeout']} (7g; gerçek BUY engelli)\n"
                  f"Sonuçlananlarda gözlenen TP: {f'%{rate:.1f}' if rate is not None else 'henüz yok'}\n"
                    f"Ort. TP: {f'{avg:.2f} saat' if avg is not None else 'henüz yok'} | veri boşluğu: {rolling['records_with_gaps']}\n"
                    "3dk aday taraması; sanal giriş/TP sırası WS aggTrade olaylarından. Gerçek emir değildir. ZIP: fiyatlar ve sonuçlar.")
