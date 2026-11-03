@@ -452,7 +452,7 @@ class NightExecutor:
             return
         if self.daily_count() >= self.max_daily:
             return
-        if any(o['phase'] not in ('DONE', 'NO_FILL') and o['symbol'] == symbol for o in self.state['orders'].values()):
+        if any(o['phase'] not in ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY') and o['symbol'] == symbol for o in self.state['orders'].values()):
             return
         try:
             p = plan(record, self.broker.info(symbol), self.position_usdt)
@@ -588,6 +588,15 @@ class NightExecutor:
                                D(str(p['positionAmt'])), side) != 'full':
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonunun TP kapsamı tam doğrulanmadı.'
             # An orphaned bot TP could be unsafe even when the account is flat.
+            # Check normal AND conditional orders on every tracked flat symbol.
+            for symbol in {o['symbol'] for o in self.state['orders'].values()}:
+                if any(sym == symbol for sym, side in active):
+                    continue
+                orphan_orders = self.broker.closing_orders(symbol)
+                if not isinstance(orphan_orders, list):
+                    raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
+                if orphan_orders:
+                    return f'⚠️ Kilit korunuyor: {symbol} pozisyonu kapalı fakat bekleyen emir var.'
             for o in all_orders:
                 client_id = str(o.get('clientOrderId', ''))
                 if (client_id.startswith('cbn') and client_id.endswith('t')
@@ -781,7 +790,7 @@ class NightExecutor:
                         self.ws_manual_symbols.add(update['symbol'])
                 elif event.get('e') == 'ACCOUNT_UPDATE':
                     # This is a delta: omitted symbols are NOT closed positions.
-                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in ('DONE','NO_FILL')}
+                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in ('DONE','NO_FILL','CLOSED_EXTERNALLY')}
                     for p in event.get('a', {}).get('P', []):
                         key = ('position', p['s'], p.get('ps','BOTH'))
                         if stamp <= self.account_versions.get(key, -1):
