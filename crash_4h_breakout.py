@@ -1,7 +1,9 @@
 """Paper-only 4H falling-trend breakout research using paced, incremental REST.
 
-Only one 4H kline request per 120 seconds. Reuses closed candles for four
-hours; 15m confirmation uses existing websocket cache (no extra REST).
+Initial history and missing 4H gaps use paced REST (at most one call / 120s).
+Subsequent closed 4H candles come from the existing futures WebSocket.
+4H subscriptions are active only around candle close to reduce WS traffic.
+15m confirmation uses existing websocket cache (no extra REST).
 Never changes Crash Bounce V2 qualification, Telegram signals or orders.
 """
 import csv
@@ -18,6 +20,35 @@ PERIOD = 4 * 3600
 MIN_REST_GAP = 120
 WATCH_COUNT = 30
 HORIZONS = (1, 4, 12, 24)
+FOUR_HOURS_MS = PERIOD * 1000
+WS_CLOSE_WINDOW_SECONDS = 180
+WS_GRACE_SECONDS = 300
+
+
+def merge_closed_4h(saved, streamed, now):
+    """Deduplicate genuine, closed, four-hour-aligned candles by open timestamp."""
+    combined = {}
+    for row in list(saved or []) + list(streamed or []):
+        try:
+            start, end = int(row[0]), int(row[6])
+            if (start % FOUR_HOURS_MS or end-start != FOUR_HOURS_MS-1
+                    or end >= now*1000):
+                continue
+            prices = [float(row[i]) for i in (1,2,3,4)]
+            volume = float(row[7])
+            if (any(not math.isfinite(v) or v <= 0 for v in prices)
+                    or not math.isfinite(volume) or volume < 0):
+                continue
+            combined[start] = list(row)
+        except (IndexError, ValueError, TypeError, OverflowError):
+            continue
+    return [combined[t] for t in sorted(combined)[-65:]]
+
+
+def continuous_4h(rows):
+    return len(rows)>=45 and all(
+        int(rows[i][0])-int(rows[i-1][0]) == FOUR_HOURS_MS
+        for i in range(1,len(rows)))
 
 
 def number(value):
@@ -197,6 +228,30 @@ class BreakoutResearch:
             f.flush();os.fsync(f.fileno())
         os.replace(tmp,self.path)
 
+    def _apply_rows(self, symbol, rows, now, source):
+        """Called under self.lock. Never use a gapped set for a new signal."""
+        if not rows:
+            return False
+        latest=int(rows[-1][6])
+        previous=self.state["cache"].get(symbol,{})
+        # Preserve incoming WS rows even with a gap; queued REST will repair it.
+        if latest<=previous.get("close_ms",0) and continuous_4h(previous.get("rows", [])):
+            return True
+        if not continuous_4h(rows):
+            return False
+        result=analyze(symbol,rows,now)
+        self.state["cache"][symbol] = {
+            "close_ms":latest,"result":result,"fetched_at":now,
+            "source":source,"rows":rows}
+        if result and result["status"]!="NONE" and latest>previous.get("close_ms",0):
+            eid=symbol+":"+str(result["close_ms"])+":"+result["status"]
+            if not any(r.get("event_id")==eid for r in self.state["events"]):
+                result.update(event_id=eid,observations=0,
+                              confirmation_15m=confirm_15m(self.cache,symbol,now),
+                              max_observed_gain_pct=None,gap_count=0)
+                self.state["events"].append(result)
+        return True
+
     def step(self):
         if not self.enabled:
             return
@@ -211,6 +266,18 @@ class BreakoutResearch:
             return
         slot=int(now//PERIOD)
         latest_close_ms=slot*PERIOD*1000-1
+        elapsed=now-slot*PERIOD
+        to_next=(slot+1)*PERIOD-now
+        in_close_window = elapsed <= WS_CLOSE_WINDOW_SECONDS or to_next <= WS_CLOSE_WINDOW_SECONDS
+        # The futures WebSocket is shared with Crash V2. Subscriptions are on
+        # only for the final 3min before a 4H boundary and first 3min after.
+        # This avoids 30 channels emitting every ~250ms throughout all 4h.
+        subscribe=getattr(self.cache,"set_4h_research_symbols",None)
+        if callable(subscribe):
+            try:
+                subscribe([r[0] for r in selected] if in_close_window else [])
+            except Exception as error:
+                self.log("[BREAKOUT 4H WS SUBSCRIBE ERR] "+type(error).__name__)
         with self.lock:
             for item in self.state["events"]:
                 if item.get("status")!="BREAKOUT" or now-item["close_at"]>24*3600+120:
@@ -246,34 +313,35 @@ class BreakoutResearch:
                         pmax=item.get("partial_max",{}).get(str(h))
                         if pmax is not None:
                             item.setdefault("completed_horizons",{})[str(h)]=round(pmax,3)
-            # Do not hit Binance on each loop. If a 4H close is missing, take
-            # exactly one candidate, at least 120s after the previous request.
+            # Process completed 4H bars from the *existing* futures socket.
+            # Saved history is immutable until a new closed bar passes continuity.
+            ws_candles=getattr(self.cache,"closed_4h_candles",None)
             missing=[]
             for symbol,price,change,vol in selected:
                 entry=self.state["cache"].get(symbol,{})
-                if entry.get("close_ms",0)<latest_close_ms:
-                    missing.append(symbol)
+                updates=ws_candles(symbol) if callable(ws_candles) else []
+                rows=merge_closed_4h(entry.get("rows"),updates,now)
+                if (rows and int(rows[-1][6])>=latest_close_ms
+                        and continuous_4h(rows)):
+                    self._apply_rows(symbol,rows,now,"WS" if updates else "REST")
+                if self.state["cache"].get(symbol,{}).get("close_ms",0)<latest_close_ms:
+                    # Warm caches get a five-minute WS grace period after close.
+                    # Uninitialized or gapped histories are repaired slowly via REST.
+                    if not entry.get("rows") or elapsed>=WS_GRACE_SECONDS:
+                        missing.append(symbol)
             if missing and now-self.state["last_rest_attempt"]>=MIN_REST_GAP:
                 symbol=missing[0]
                 # Reserve the slot on disk before network call, including errors.
                 self.state["last_rest_attempt"]=now
                 self.save()
                 try:
-                    rows=self.fetch("/fapi/v1/klines",
+                    raw=self.fetch("/fapi/v1/klines",
                         {"symbol":symbol,"interval":"4h","limit":65})
-                    result=analyze(symbol,rows,now)
-                    last_closed=max((int(r[6]) for r in rows if len(r)>6
-                                     and int(r[6])<now*1000),default=0)
-                    if last_closed:
-                        self.state["cache"][symbol]={"close_ms":last_closed,
-                            "result":result,"fetched_at":now}
-                    if result and result["status"]!="NONE":
-                        eid=symbol+":"+str(result["close_ms"])+":"+result["status"]
-                        if not any(r.get("event_id")==eid for r in self.state["events"]):
-                            result.update(event_id=eid,observations=0,
-                                          confirmation_15m=confirm_15m(self.cache,symbol,now),
-                                          max_observed_gain_pct=None,gap_count=0)
-                            self.state["events"].append(result)
+                    rows=merge_closed_4h([],raw,now)
+                    if continuous_4h(rows):
+                        self._apply_rows(symbol,rows,now,"REST")
+                    else:
+                        self.log("[BREAKOUT 4H REST] insufficient contiguous bars "+symbol)
                 except Exception as error:
                     self.log("[BREAKOUT 4H REST DEFERRED] "+symbol+" "+type(error).__name__)
             self.state["events"]=self.state["events"][-1500:]
@@ -292,7 +360,7 @@ class BreakoutResearch:
                 lines=["🔎 4H DÜŞEN TREND | SANAL ARAŞTIRMA",
                        f"{len(selected)} aday | 4H kırılımı {len(confirmed)} | yaklaşan {len(approaching)}",
                        "Trend: 3 alçalan tepe | hacim >=1.5x | sadece kapanmış 4H mum.",
-                       "REST: en fazla 1 sorgu / 120 sn, önbellek kullanılır."]
+                       "4H WS kapanış mumları + eksik veri için REST (1/120sn)."]
                 for r in (confirmed[:5]+approaching[:5]):
                     lines.append(f"{r['symbol']} {r['status']} | RSI {r['rsi14_4h']} "
                                  f"| hacim {r['volume_ratio_4h']}x | 15m {r['confirmation_15m']}")
