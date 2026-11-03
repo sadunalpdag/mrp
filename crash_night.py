@@ -274,6 +274,20 @@ def persistent_state_guard(directory, existing_state, mount='/data'):
     return None
 
 
+def harmless_orphan_close(order, active_symbols):
+    """A flat-symbol SELL that cannot open a SHORT; quarantine, never cancel."""
+    symbol = order.get('symbol')
+    if not symbol or symbol in active_symbols or order.get('side') != 'SELL':
+        return False
+    side = order.get('positionSide', 'BOTH')
+    if side not in ('BOTH', 'LONG'):
+        return False
+    reducing = (side == 'LONG' or order.get('reduceOnly') in (True, 'true')
+                or order.get('closePosition') in (True, 'true'))
+    return reducing and order.get('status', order.get('algoStatus', 'NEW')) in (
+        'NEW', 'PARTIALLY_FILLED', 'WORKING')
+
+
 class NightExecutor:
     def __init__(self, directory, broker, deliver, log, clock=time.time, enabled=False, max_daily=20, manual_tp=False):
         self.broker, self.deliver, self.log, self.clock = broker, deliver, log, clock
@@ -354,6 +368,7 @@ class NightExecutor:
         self.next_bootstrap_check = 0
         self.pending_flat_close_recovery = False
         self.next_flat_close_check = 0
+        self.next_quarantine_check = 0
 
     def save(self):
         with open(self.path+'.tmp', 'w', encoding='utf-8') as handle:
@@ -489,6 +504,7 @@ class NightExecutor:
         sid, symbol = record.get('signal_id'), record.get('symbol')
         if (not self.enabled.is_set() or observed_at < self.armed_at
                 or not sid or not supported_symbol(symbol) or self.state['halt'] or self.state['outbox']
+                or symbol in self.state.get('quarantined_symbols', [])
                 or not 0 <= now-observed_at <= 120 or observed_at < self.started
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') or sid in self.state['orders']):
@@ -550,13 +566,20 @@ class NightExecutor:
                 return False
         elif any(p.get('symbol') == symbol for p in positions):
             return False
+        # A different hedge side still open is not proof of a flat symbol.
+        for p in positions:
+            if p.get('symbol') == symbol:
+                amount = D(str(p['positionAmt']))
+                if not amount.is_finite() or amount != 0:
+                    return False
         normal = self.broker.open_entry_orders()
         algo = self.broker.open_algo_orders()
         if not isinstance(normal, list) or not isinstance(algo, list):
             raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
-        # Block any pending order for this symbol, including an orphaned SELL
-        # or future BUY, regardless of whether the position row is omitted.
-        if any(o.get('symbol') == symbol for o in normal + algo):
+        # Only truly reduce-only SELL orders on a flat symbol can be isolated.
+        # A pending BUY or a SELL that can open a SHORT still blocks globally.
+        leftovers = [o for o in normal + algo if o.get('symbol') == symbol]
+        if any(not harmless_orphan_close(o, set()) for o in leftovers):
             return False
         if any(other is not order and other.get('symbol') == symbol
                and other.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN')
@@ -564,6 +587,10 @@ class NightExecutor:
             return False
         order.update(phase='CLOSED_EXTERNALLY', externally_closed_at=self.clock(),
                      external_close_tp_status=tp_status)
+        if leftovers:
+            blocked = set(self.state.get('quarantined_symbols', []))
+            blocked.add(symbol)
+            self.state['quarantined_symbols'] = sorted(blocked)
         self.save()
         if (str(self.state.get('halt', '')).startswith('TP DOĞRULANAMADI')
                 and self.state.get('halt_symbol') == symbol):
@@ -573,6 +600,34 @@ class NightExecutor:
                    'Bu kapanış TP başarısı sayılmaz. Yeni giriş güvenlik kilidi otomatik kaldırılmadı.')
         self.log(f'[CRASH NIGHT EXTERNAL CLOSE] {symbol}; side={side}; tp={tp_status}')
         return True
+
+    def refresh_quarantined_symbols(self):
+        """Remove a symbol quarantine only after confirming no position or order."""
+        pending = set(self.state.get('quarantined_symbols', []))
+        if not pending or self.clock() < self.next_quarantine_check:
+            return
+        self.next_quarantine_check = self.clock() + 300
+        try:
+            positions = self.broker.positions()
+            normal = self.broker.open_entry_orders()
+            algos = self.broker.open_algo_orders()
+            if any(not isinstance(v, list) for v in (positions, normal, algos)):
+                raise ValueError('QUARANTINE_SNAPSHOT_INVALID')
+            busy = set()
+            for p in positions:
+                amount = D(str(p['positionAmt']))
+                if not amount.is_finite():
+                    raise ValueError('QUARANTINE_POSITION_INVALID')
+                if amount != 0:
+                    busy.add(p['symbol'])
+            busy.update(o['symbol'] for o in normal + algos)
+            cleared = pending - busy
+            if cleared:
+                self.state['quarantined_symbols'] = sorted(pending - cleared)
+                self.save()
+                self.log('[CRASH QUARANTINE CLEARED] ' + ','.join(sorted(cleared)))
+        except Exception as error:
+            self.log('[CRASH QUARANTINE CHECK DELAYED] ' + type(error).__name__)
 
     def audited_bootstrap_snapshot(self):
         """Read-only Binance full-account fingerprint; never infer flat on error."""
@@ -602,10 +657,16 @@ class NightExecutor:
         closing = getattr(self.broker, 'is_closing_order', None)
         if not callable(closing):
             raise ValueError('BOOTSTRAP_BROKER_UNSUPPORTED')
+        active_symbols = {symbol for symbol, side in active}
         for o in orders:
             symbol, side = o.get('symbol'), o.get('positionSide', 'BOTH')
-            if not closing(o) or (symbol, side) not in active:
-                raise ValueError('BOOTSTRAP_PENDING_OR_ORPHAN_ORDER')
+            if (symbol, side) not in active:
+                if harmless_orphan_close(o, active_symbols):
+                    continue
+                raise ValueError('BOOTSTRAP_UNSAFE_PENDING_' +
+                                 str(symbol)[:30] + '_' + str(o.get('side'))[:8])
+            if not closing(o):
+                raise ValueError('BOOTSTRAP_OPENING_ORDER_' + str(symbol)[:30])
             if o.get('status', o.get('algoStatus', 'NEW')) not in ('NEW', 'PARTIALLY_FILLED'):
                 raise ValueError('BOOTSTRAP_ORDER_STATUS_UNVERIFIED')
 
@@ -642,7 +703,7 @@ class NightExecutor:
             second = self.audited_bootstrap_snapshot()
             if first != second:
                 raise ValueError('BOOTSTRAP_ACCOUNT_CHANGED')
-            self.unlock_after_verification()
+            self.unlock_after_verification(allow_reducing_orphans=True)
             if self.state.get('halt'):
                 self.log('[CRASH BOOTSTRAP DENIED] complete account audit refused')
                 return
@@ -672,7 +733,7 @@ class NightExecutor:
             self.pending_flat_close_recovery = False
             return
         was_on = self.enabled.is_set() and not self.state.get('paused')
-        self.unlock_after_verification()
+        self.unlock_after_verification(allow_reducing_orphans=True)
         if self.state.get('halt'):
             self.log('[CRASH FLAT CLOSE RECOVERY] account not fully verified')
             return
@@ -682,8 +743,8 @@ class NightExecutor:
         self.log('[CRASH FLAT CLOSE RECOVERY] verified; '
                  + ('trading rearmed' if was_on else 'trading remains off'))
 
-    def unlock_after_verification(self):
-        """Owner-initiated account-wide audit; never arm trading on unlock."""
+    def unlock_after_verification(self, allow_reducing_orphans=False):
+        """Account-wide audit; only reducing orphan SELLS may be quarantined."""
         old_halt = self.state.get('halt')
         if not old_halt:
             return 'ℹ️ Aktif hata kilidi yok. '+self.summary()
@@ -755,15 +816,19 @@ class NightExecutor:
             # All ordinary/algo orders were fetched once at account level:
             # DO NOT query every historical symbol (unbounded REST rate-limit).
             tracked = {o['symbol'] for o in self.state['orders'].values()}
+            active_symbols = {symbol for symbol, side in active}
+            isolated = set(self.state.get('quarantined_symbols', []))
             for o in all_open:
-                symbol = o.get('symbol')
-                if symbol in tracked and not any(sym == symbol for sym, side in active):
+                symbol, side = o.get('symbol'), o.get('positionSide', 'BOTH')
+                if (symbol, side) not in active:
+                    if allow_reducing_orphans and harmless_orphan_close(o, active_symbols):
+                        isolated.add(symbol)
+                        continue
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonu kapalı fakat bekleyen emir var.'
-            for o in all_open:
-                client_id = str(o.get('clientOrderId', ''))
-                if (client_id.startswith('cbn') and client_id.endswith('t')
-                        and (o.get('symbol'), o.get('positionSide', 'BOTH')) not in active):
-                    return '⚠️ Kilit korunuyor: pozisyonu kapanmış bir sembolde açık bot TP emri var.'
+                if not self.broker.is_closing_order(o):
+                    return f'⚠️ Kilit korunuyor: {symbol} pozisyonunda açıcı emir var.'
+            if allow_reducing_orphans:
+                self.state['quarantined_symbols'] = sorted(isolated)
         except Exception as error:
             self.log('[CRASH NIGHT UNLOCK CHECK] '+type(error).__name__)
             return '⚠️ Kilit korunuyor: Binance hesap veya emir doğrulaması başarısız ('+type(error).__name__+').'
@@ -1007,6 +1072,7 @@ class NightExecutor:
             return
         self.process_account_events()
         self.run_one_time_account_recovery()
+        self.refresh_quarantined_symbols()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
