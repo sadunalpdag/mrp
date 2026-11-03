@@ -97,6 +97,7 @@ def error_details(error):
         return f'Kod: {error.code} | Neden: {reason}'
     local = {'TP_NOT_ACTIVE': 'TP emri iptal edilmiş, süresi dolmuş veya reddedilmiş.',
              'TP_PROPERTIES_NOT_CONFIRMED': 'TP yönü, fiyatı, miktarı veya reduce-only özelliği uyuşmuyor.',
+             'TP_POSITION_UNVERIFIED': 'TP durumu geçersiz veya bulunamadı; Binance pozisyonu API hatası nedeniyle doğrulanamadı.'
              'ENTRY_RESULT_NOT_FINAL': 'Giriş emrinin nihai sonucu henüz doğrulanamadı.'}
     if isinstance(error, ValueError) and str(error) in local:
         return 'Kod: '+str(error)+' | Neden: '+local[str(error)]
@@ -629,6 +630,7 @@ class NightExecutor:
 
     def reconcile(self, order, check_expiry=True, ws_order=None):
         symbol = order['symbol']
+        tp_at_risk = False
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
                 entry = ws_order if ws_order and ws_order['clientOrderId'] == order['entry_id'] else self.broker.order(symbol, order['entry_id'])
@@ -691,20 +693,26 @@ class NightExecutor:
                     if first:
                         self.alert(f'✅ OTOMATİK GİRİŞ + TP DOĞRULANDI | {symbol}\nMiktar: {order["filled_qty"]} | Giriş limit: {order["price"]}\nTP: {order["tp"]} | 10x | SL yok')
                 else:
+                    tp_at_risk = True
                     if self.confirm_external_close(order, tp.get('status')):
                         return
                     raise ValueError('TP_NOT_ACTIVE')
         except Exception as error:
             if (isinstance(error, BrokerError) and error.code == '-2013'
                     and order.get('phase') in ('TP_UNKNOWN', 'PROTECTED')):
+                tp_at_risk = True
                 try:
                     if self.confirm_external_close(order, 'NOT_FOUND'):
                         return
                 except Exception as check_error:
                     error = check_error
             if isinstance(error, BrokerError) and error.code == '-1003':
-                self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
-                return
+                if not tp_at_risk:
+                    self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
+                    return
+                # The TP is already known invalid/absent; do NOT keep trading
+                # just because the follow-up position check hit the rate limit.
+                error = ValueError('TP_POSITION_UNVERIFIED')
             reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
             if not order.get('warned'):
                 order['warned'] = True
