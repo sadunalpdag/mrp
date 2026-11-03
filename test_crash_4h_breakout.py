@@ -71,6 +71,10 @@ class Tests(unittest.TestCase):
             self.assertEqual(fetch.call_count,1)
             self.assertEqual(b.state["cache"]["COIN0USDT"]["source"],"REST")
             original=b.state["cache"]["COIN0USDT"]["close_ms"]
+            # Other coins were already bootstrapped on prior staggered cycles.
+            for i in range(1,30):
+                b.state["cache"][f"COIN{i}USDT"]={
+                    "close_ms":original,"rows":bars(now[0]),"source":"REST"}
             now[0]+=PERIOD-510   # New 4H close + 90s, inside WS grace.
             ws.streamed=[bars(now[0])[-1]]
             b.step()
