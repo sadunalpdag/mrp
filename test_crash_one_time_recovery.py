@@ -81,14 +81,39 @@ class OneTimeBootstrapTests(unittest.TestCase):
         self.assertIsNone(self.e.state['halt'])
         self.assertTrue(self.e.enabled.is_set())
 
-    def test_orphan_closing_order_blocks_recovery(self):
+    def test_orphan_reduce_only_close_is_quarantined_not_global_halt(self):
         self.b.pending['AUSDT'] = [{
             'symbol': 'AUSDT', 'side': 'SELL', 'positionSide': 'BOTH',
             'reduceOnly': True, 'type': 'LIMIT', 'status': 'NEW',
             'price': '10.1', 'origQty': '5', 'executedQty': '0'}]
         self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertTrue(self.e.enabled.is_set())
+        self.assertEqual(self.e.state['quarantined_symbols'], ['AUSDT'])
+        self.b.pending.clear()
+        self.now += 301
+        self.e.refresh_quarantined_symbols()
+        self.assertEqual(self.e.state['quarantined_symbols'], [])
+
+    def test_orphan_opening_sell_still_blocks_recovery(self):
+        self.b.pending['AUSDT'] = [{
+            'symbol': 'AUSDT', 'side': 'SELL', 'positionSide': 'BOTH',
+            'reduceOnly': False, 'type': 'LIMIT', 'status': 'NEW',
+            'price': '10.1', 'origQty': '5', 'executedQty': '0'}]
+        self.e.step()
         self.assertTrue(self.e.state['halt'])
         self.assertFalse(self.e.enabled.is_set())
+
+    def test_quarantined_symbol_cannot_enter(self):
+        self.e.state['halt'] = None
+        self.e.state['paused'] = False
+        self.e.enabled.set()
+        self.e.state['quarantined_symbols'] = ['AUSDT']
+        self.e.enter({'signal_id':'fresh', 'symbol':'AUSDT', 'entry':'10', 'tp':'10.1',
+                      'v2_status':'STRONG_V2', 'v2_sent':True,
+                      'tracking_status':'OPEN'}, self.now)
+        self.assertFalse(self.e.state['orders'])
+        self.assertFalse(self.b.tp)
 
     def test_api_failure_blocks_recovery_without_mutating_history(self):
         from crash_night import BrokerError
@@ -154,6 +179,17 @@ class FlatCloseAutoUnhaltTests(unittest.TestCase):
         self.assertEqual(self.order['phase'], 'CLOSED_EXTERNALLY')
         self.e.recover_flat_close_halt()
         self.assertTrue(self.e.state['halt'])
+
+    def test_manual_close_with_reduce_only_orphan_does_not_halt(self):
+        self.b.pending['ANYUSDT'] = [{
+            'symbol': 'ANYUSDT', 'side':'SELL','positionSide':'BOTH',
+            'reduceOnly': True, 'type':'LIMIT', 'status':'NEW',
+            'price':'10.1', 'origQty':'5', 'executedQty':'0'}]
+        self.e.reconcile(self.order)
+        self.assertEqual(self.order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertFalse(self.e.state['halt'])
+        self.assertEqual(self.e.state['quarantined_symbols'], ['ANYUSDT'])
+        self.assertTrue(self.e.enabled.is_set())
 
     def test_manual_pause_is_preserved_when_close_recovered(self):
         self.e.halt('TP DOĞRULANAMADI', 'ANYUSDT')
