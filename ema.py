@@ -7884,7 +7884,7 @@ def _crash_drain_ai(state):
 
 
 
-def _crash_one_time_fresh_start(directory, broker, report):
+def _crash_one_time_fresh_start(directory, broker, report, *, expected_mount='/data', require_mount=True):
     """One authorized attempt to clear only the old migration halt on /data.
 
     No exchange writes. All pre-existing order state is backed up first.
@@ -7894,16 +7894,15 @@ def _crash_one_time_fresh_start(directory, broker, report):
     import fcntl
     import json as _json
     import os as _os
-    import re as _re
     from decimal import Decimal as _Decimal
     from pathlib import Path as _Path
     from shutil import copyfileobj as _copyfileobj
     from datetime import datetime as _datetime, timezone as _timezone
     from crash_manual_tp import tp_coverage
 
-    root = _Path('/data').resolve()
+    root = _Path(expected_mount).resolve()
     target_dir = _Path(directory).resolve()
-    if not _os.path.ismount('/data') or not target_dir.is_relative_to(root):
+    if (require_mount and not _os.path.ismount(expected_mount)) or not target_dir.is_relative_to(root):
         report('[CRASH ONCE RESET] SKIP: persistent /data not confirmed')
         return False
     path = target_dir / 'crash_night_state.json'
