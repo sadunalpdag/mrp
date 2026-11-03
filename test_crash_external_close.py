@@ -121,12 +121,12 @@ class RecoveryTests(unittest.TestCase):
         self.e.reconcile(order)
         self.assertEqual(order['phase'],'PROTECTED')
         self.assertTrue(self.e.state['halt'])
-    def test_api_error_not_treated_as_flat(self):
+    def test_api_error_on_cancelled_tp_halts_fail_closed(self):
         order=self.add_order()
         self.b.position_errors=BrokerError('-1003')
         self.e.reconcile(order)
         self.assertEqual(order['phase'],'PROTECTED')
-        self.assertFalse(self.e.state['halt'])
+        self.assertIn('TP DOĞRULANAMADI',self.e.state['halt'])
         self.assertIn('Kilit korunuyor',self.e.apply_control('unlock'))
     def test_open_pending_order_rejects_external_closed_claim(self):
         order=self.add_order()
