@@ -237,6 +237,12 @@ class BinanceBroker:
             raise ValueError('INVALID_ORDER_RESPONSE')
         return result
 
+    def open_algo_orders(self):
+        result = self.request('GET', '/fapi/v1/openAlgoOrders')
+        if not isinstance(result, list):
+            raise ValueError('INVALID_ALGO_ORDER_RESPONSE')
+        return result
+
     def cancel_entry(self, symbol, client_id):
         return self.request('DELETE', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
 
@@ -256,6 +262,7 @@ class NightExecutor:
         self.broker, self.deliver, self.log, self.clock = broker, deliver, log, clock
         os.makedirs(directory, exist_ok=True)
         self.path = os.path.join(directory, 'crash_night_state.json')
+        self.audit_directory = os.path.join(os.getenv('DATA_DIR', directory), 'history', 'trades')
         self.guard = open(self.path+'.lock', 'a')
         try:
             fcntl.flock(self.guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -322,6 +329,59 @@ class NightExecutor:
             os.fsync(handle.fileno())
         os.replace(self.path+'.tmp', self.path)
 
+    def audit_order(self, order, kind, **extra):
+        """Append a compact, secret-free event to the persistent analysis history."""
+        from crash_audit_archive import append_trade_event
+        event = {'kind': kind}
+        if order:
+            for key in ('symbol', 'signal_id', 'phase', 'day', 'entry_id',
+                        'quantity', 'price', 'tp', 'filled_qty', 'position_side'):
+                if key in order:
+                    event[key] = order[key]
+        event.update(extra)
+        try:
+            append_trade_event(self.audit_directory, event, self.clock())
+        except Exception as error:
+            self.log('[CRASH AUDIT WRITE FAILED] ' + type(error).__name__)
+
+    def try_mark_externally_closed(self, order, evidence):
+        """Read-only; never assume TP cancellation alone means a flat account."""
+        from crash_close_recovery import confirmed_flat
+        if not confirmed_flat(self.broker, order['symbol']):
+            return False
+        order['phase'] = 'CLOSED_EXTERNALLY'
+        order['closed_at'] = self.clock()
+        order['close_evidence'] = evidence
+        self.save()
+        self.audit_order(order, 'CLOSED_EXTERNALLY', evidence=evidence)
+        self.alert('ℹ️ OTOMATİK İŞLEM HARİCEN KAPANDI | ' + order['symbol']
+                   + '\nBinance pozisyonu sıfır ve bu sembolde açık giriş/TP/algo emri yok; '
+                   'manuel/harici kapanış olarak kaydedildi. TP başarısı sayılmadı. '
+                   'Eski genel güvenlik kilidi /otomatik_ac komutuyla tam hesap kontrolü sonrası kaldırılabilir.')
+        return True
+
+    def recover_halt_for_on(self):
+        """Only explicit /otomatik_ac can lift a stale TP verification halt."""
+        if not self.state['halt']:
+            return True
+        if not str(self.state['halt']).startswith('TP DOĞRULANAMADI'):
+            return False
+        for order in list(self.state['orders'].values()):
+            if order.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN', 'PROTECTED'):
+                if not self.reconcile(order, check_expiry=False):
+                    return False
+        from crash_close_recovery import account_safe_to_resume
+        if not account_safe_to_resume(self.broker, list(self.state['orders'].values())):
+            return False
+        self.state['halt'] = None
+        for order in self.state['orders'].values():
+            if order.get('phase') == 'PROTECTED':
+                order.pop('warned', None)
+        self.save()
+        self.audit_order(None, 'TP_HALT_CLEARED_AFTER_ACCOUNT_VERIFICATION')
+        self.log('[CRASH NIGHT RECOVERY] TP halt cleared after complete REST verification; user rearm required')
+        return True
+
     def daily_count(self):
         today = day(self.clock())
         raw = sum(o['day'] == today for o in list(self.state['orders'].values()))
@@ -371,7 +431,14 @@ class NightExecutor:
                     f'Paris 00:00 itibarıyla yeni gün sayacı 0 olur. Açık/bekleyen emirler değişmedi; aynı anda sembol sınırı: {self.max_symbols}.')
         if action == 'on':
             if self.state['halt']:
-                return '⚠️ Açılamadı: '+self.state['halt']+'. Binance pozisyonları ve TP emirleri kontrol edilmeli. Komut hata kilidini kaldırmaz.'
+                try:
+                    recovered = self.recover_halt_for_on()
+                except Exception as error:
+                    self.log('[CRASH NIGHT RECOVERY DENIED] ' + type(error).__name__)
+                    recovered = False
+                if not recovered:
+                    return ('⚠️ Açılmadı: ' + str(self.state['halt']) +
+                            '\nTüm pozisyonlar, TP emirleri, bekleyen girişler ve algo emirleri doğrulanmadan güvenlik kilidi kalkmaz.')
             self.enabled.clear()
             while True:
                 try:
@@ -382,6 +449,7 @@ class NightExecutor:
             self.save()
             self.armed_at = self.clock()
             self.enabled.set()
+            self.audit_order(None, 'USER_ENABLED_AUTOMATIC_ENTRIES')
             return ('✅ Otomatik girişler AÇIK. Yalnız yeni giriş geçişleri işlenecek.\n'
                     f'24 saat | 10x | en fazla {self.position_usdt} USDT pozisyon / yaklaşık {self.position_usdt/10} USDT teminat\n'
                     f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla {self.max_symbols} sembol. TP +%1; SL yok.\n'+self.summary())
@@ -414,6 +482,7 @@ class NightExecutor:
 
     def halt(self, reason, symbol):
         self.state['halt'] = reason
+        self.audit_order(None, 'GLOBAL_SAFETY_HALT', symbol=symbol, reason=reason)
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
 
     def deliver_pending(self):
@@ -450,7 +519,7 @@ class NightExecutor:
             return
         if self.daily_count() >= self.max_daily:
             return
-        if any(o['phase'] not in ('DONE', 'NO_FILL') and o['symbol'] == symbol for o in self.state['orders'].values()):
+        if any(o['phase'] not in ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY') and o['symbol'] == symbol for o in self.state['orders'].values()):
             return
         try:
             p = plan(record, self.broker.info(symbol), self.position_usdt)
@@ -466,7 +535,11 @@ class NightExecutor:
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
         order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_kind='GTC', submitted_at=now, entry_id=cid+'e', tp_id=cid+'t', **p)
         self.state['orders'][sid] = order
+        order['signal_id'] = sid
         self.save()  # Persist before POST; unknown responses are never blindly retried.
+        self.audit_order(order, 'ENTRY_ORDER_INTENT',
+                         v2_strength=record.get('strength_score', record.get('strength')),
+                         change_24h=record.get('change_24h'), rsi14=record.get('rsi14'))
         if not self.enabled.is_set():
             order['phase'] = 'NO_FILL'
             self.save()
@@ -509,9 +582,10 @@ class NightExecutor:
                 if qty == 0:
                     order['phase'] = 'NO_FILL'
                     self.save()
+                    self.audit_order(order, 'ENTRY_NO_FILL')
                     reason = '8 saat doldu; bekleyen alış iptal edildi.' if order.get('expiry_cancel_requested') else 'Giriş emri dolmadan kapandı.'
                     self.alert(f'ℹ️ OTOMATİK İŞLEM | {symbol}\n{reason} Açık giriş emri bırakılmadı. Günlük hak kullanıldı.')
-                    return
+                    return True
                 if qty < 0 or qty > D(order['quantity']):
                     raise ValueError('INVALID_FILLED_QUANTITY')
                 order['filled_qty'] = str(qty)
@@ -533,24 +607,40 @@ class NightExecutor:
                 if tp.get('status') == 'FILLED':
                     order['phase'] = 'DONE'
                     self.save()
+                    self.audit_order(order, 'TP_FILLED')
                     self.alert(f'✅ OTOMATİK TP DOLDU | {symbol}\nTP: {order["tp"]}')
                 elif tp.get('status') in ('NEW', 'PARTIALLY_FILLED'):
                     first = order['phase'] != 'PROTECTED'
                     order['phase'] = 'PROTECTED'
                     self.save()
                     if first:
+                        self.audit_order(order, 'ENTRY_PROTECTED_BY_TP')
                         self.alert(f'✅ OTOMATİK GİRİŞ + TP DOĞRULANDI | {symbol}\nMiktar: {order["filled_qty"]} | Giriş limit: {order["price"]}\nTP: {order["tp"]} | 10x | SL yok')
                 else:
+                    if (tp.get('status') in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED')
+                            and self.try_mark_externally_closed(order, str(tp.get('status')))):
+                        return True
                     raise ValueError('TP_NOT_ACTIVE')
+            return True
         except Exception as error:
+            # A historical TP may no longer be queryable after manual Close.
+            # Binance -2013 is NOT itself proof that the position was closed.
+            if (isinstance(error, BrokerError) and error.code == '-2013'
+                    and order['phase'] in ('TP_UNKNOWN', 'PROTECTED')):
+                try:
+                    if self.try_mark_externally_closed(order, 'TP_ORDER_NOT_FOUND'):
+                        return True
+                except Exception as inspection_error:
+                    error = inspection_error
             if isinstance(error, BrokerError) and error.code == '-1003':
                 self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
-                return
+                return False
             reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
             if not order.get('warned'):
                 order['warned'] = True
                 self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]} {type(error).__name__}')
+            return False
 
     def expire_untracked_entries(self):
         # After ephemeral storage loss, identify only this bot's BUY entry IDs.
@@ -644,7 +734,7 @@ class NightExecutor:
                         self.ws_manual_symbols.add(update['symbol'])
                 elif event.get('e') == 'ACCOUNT_UPDATE':
                     # This is a delta: omitted symbols are NOT closed positions.
-                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in ('DONE','NO_FILL')}
+                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in ('DONE','NO_FILL','CLOSED_EXTERNALLY')}
                     for p in event.get('a', {}).get('P', []):
                         key = ('position', p['s'], p.get('ps','BOTH'))
                         if stamp <= self.account_versions.get(key, -1):
