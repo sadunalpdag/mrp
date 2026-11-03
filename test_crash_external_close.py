@@ -27,6 +27,8 @@ class AccountBroker:
         return copy.deepcopy(self.pending.get(symbol, []))
     def open_entry_orders(self):
         return [copy.deepcopy(o) for orders in self.pending.values() for o in orders]
+    def open_algo_orders(self):
+        return []
     def info(self,*args):
         raise AssertionError('no live entry during recovery')
     def buy(self,*args):
