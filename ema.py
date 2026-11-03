@@ -6585,7 +6585,14 @@ def _crash_send_pending(state, now):
         record["v2_delivery_status"] = "ATTEMPTING"
         _crash_save_state(state)
         if globals().get('_CRASH_NIGHT') is not None and _CRASH_NIGHT.enabled.is_set():
-            message = message.replace('Gerçek emir yok.', 'Otomatik GTC limit sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
+            from crash_failure_shadow import entry_block_reason
+            block_reason = entry_block_reason(record)
+            if block_reason:
+                message = message.replace('Gerçek emir yok.',
+                    'Risk etiketi nedeniyle yeni otomatik GTC alış emri GÖNDERİLMEZ.')
+            else:
+                message = message.replace('Gerçek emir yok.',
+                    'Otomatik GTC limit sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
         receipt = _crash_telegram_receipt(message)
         monitor = globals().get('_CRASH_HEALTH')
         if monitor:
@@ -7132,8 +7139,10 @@ def _crash_daily_report(state, now):
                  "Gölge TP-olmama araştırması (tp_nonclosure_shadow_v1) 3 işaret kaydeder: "
                  "zayıf yeşil mum hacmi + zayıf hacim, düşen RSI + kötüleşen EMA eğimi, "
                  "aynı coinde daha düşük seviyede tekrar. Bunlar yalnız sinyal anında bilinen verileri kullanır, "
-                 "TP tahmini değildir ve otomatik emirlere müdahale etmez. "
+                 "Risk etiketli veya değerlendirilemeyen sinyalin yeni gerçek BUY emri engellenir; "
+                 "V2 sinyali, sanal izleme ve mevcut TP emirleri değişmez. "
                  "failure_shadow.csv ve report.json içindeki failure_shadow_rolling'i inceleyin. "
+                 "Bu koşullar tarihsel küçük örneklemden çıkarıldı ve TP olasılığı değildir. "
                  "OPEN sonuçlanmamıştır ve kayıp sayılmaz; TIMEOUT TP'ye ulaşma olasılığına dair kesin kanıt değildir.")
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("report.json", json.dumps({"schema_version":5,
