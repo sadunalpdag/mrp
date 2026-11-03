@@ -440,6 +440,7 @@ class NightExecutor:
 
     def enter(self, record, observed_at):
         from crash_policy import supported_symbol
+        from crash_failure_shadow import entry_block_reason
         now = self.clock()
         sid, symbol = record.get('signal_id'), record.get('symbol')
         if (not self.enabled.is_set() or observed_at < self.armed_at
@@ -447,6 +448,12 @@ class NightExecutor:
                 or not 0 <= now-observed_at <= 120 or observed_at < self.started
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') or sid in self.state['orders']):
+            return
+        # A flagged or unassessed V2 candidate may be alerted and paper-tracked,
+        # but the user opted out of sending live BUY orders for it.
+        risk_block = entry_block_reason(record)
+        if risk_block:
+            self.log(f'[CRASH RISK ENTRY SKIP] {symbol}: {risk_block}')
             return
         if self.daily_count() >= self.max_daily:
             return
@@ -461,7 +468,8 @@ class NightExecutor:
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
-        if not self.enabled.is_set() or not 0 <= now-observed_at <= 120:
+        if (not self.enabled.is_set() or not 0 <= now-observed_at <= 120
+                or entry_block_reason(record) is not None):
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
         order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_kind='GTC', submitted_at=now, entry_id=cid+'e', tp_id=cid+'t', **p)
