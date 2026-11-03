@@ -1,18 +1,16 @@
-"""Prospective Crash Bounce TP non-closure diagnostics (research only).
+"""Research TP-risk flags and user-requested automatic BUY exclusion.
 
-Uses only metrics from the 480 CLOSED candles at candidate creation and
-previously created signals. Never changes V2 qualification, Telegram delivery,
-live trade execution, leverage, position sizing or protective orders.
-
-Hypotheses were selected from a small historical sample, so the flags are
-NOT calibrated TP probabilities or automatic rejection conditions.
+Only historical closed V2 candles and preceding signals are used.
+V2 qualification, Telegram delivery, virtual tracking and existing TP orders
+remain unchanged. This is an experimental risk restriction, not a probability.
 """
 import csv
 import io
 import math
 from collections import Counter
 
-VERSION = "tp_nonclosure_shadow_v1"
+VERSION = "tp_nonclosure_entry_gate_v1"
+FLAG_NAMES = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
 REPEAT_LOOKBACK_SECONDS = 72 * 3600
 
 
@@ -77,7 +75,7 @@ def assess(record, earlier_records):
         "version": VERSION,
         "observed_at": created,
         "blocks_v2": False,
-        "blocks_live_entry": False,
+        "blocks_live_entry": flagged > 0 or known < len(FLAG_NAMES),
         "flags": flags,
         "flag_count": flagged,
         "known_flags": known,
@@ -93,10 +91,27 @@ def assess(record, earlier_records):
     }
 
 
+def entry_block_reason(record):
+    """Fail closed for auto BUY only; never cancel or modify existing TP/orders."""
+    data = record.get("failure_shadow")
+    if not isinstance(data, dict) or data.get("version") != VERSION:
+        return "RISK_ASSESSMENT_MISSING"
+    flags = data.get("flags")
+    if not isinstance(flags, dict):
+        return "RISK_ASSESSMENT_INVALID"
+    triggered = [name for name in FLAG_NAMES if flags.get(name) is True]
+    if triggered:
+        return "RISK_" + ",".join(triggered)
+    if any(type(flags.get(name)) is not bool for name in FLAG_NAMES):
+        return "RISK_METRICS_INCOMPLETE"
+    return None
+
+
 def format_warning(result):
-    """A short, explicitly non-blocking Telegram note."""
+    """Risk notice for Telegram; never suppress the V2 signal itself."""
     if not isinstance(result, dict) or result.get("version") != VERSION:
-        return ""
+        return ("⏸️ RİSK ETİKETİ HESAPLANAMADI: otomatik gerçek alış devre dışı.\n"
+                "V2 sanal takibi devam eder.\n")
     flags = result.get("flags") or {}
     names = {
         "weak_volume": "zayıf yeşil mum hacmi",
@@ -104,14 +119,14 @@ def format_warning(result):
         "repeat_lower_entry": "aynı coinde daha düşük yeni sinyal",
     }
     hits = [label for key, label in names.items() if flags.get(key) is True]
-    known = sum(flags.get(key) is not None for key in names)
-    if hits:
-        label = " | ".join(hits)
-    else:
-        label = "belirgin birleşik işaret yok"
+    known = sum(type(flags.get(key)) is bool for key in names)
+    label = " | ".join(hits) if hits else "belirgin risk işareti yok"
     missing = f" | eksik veri {3-known}/3" if known < 3 else ""
-    return (f"🔎 GÖLGE RİSK: {len(hits)}/3 işaret — {label}{missing}\n"
-            "Deneysel: TP tahmini değil, V2 sinyalini veya otomatik işlemi engellemez.\n")
+    action = ("⛔ RİSKLİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n" if hits else
+              "⏸️ EKSİK VERİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n" if known < 3 else
+              "✅ Risk etiketi yok: normal V2 giriş kontrolü geçerli.\n")
+    return (f"🔎 TP RİSK ETİKETLERİ: {len(hits)}/3 — {label}{missing}\n"
+            + action + "Deneysel; TP olasılığı değildir. Sinyal ve sanal takip devam eder.\n")
 
 
 def summarize(records):
@@ -154,10 +169,12 @@ def summarize(records):
         }
     return {
         "version": VERSION,
-        "v2_and_live_gating": False,
+        "v2_gating": False,
+        "live_entry_gate": "block flagged or incomplete risk assessment",
         "groups": result,
         "notes": "Cohorts overlap. OPEN is unresolved, not a loss. Resolved TP excludes OPEN. "
-                 "Only newly measured V2/WS signals are included. Small samples, no calibrated probability.",
+                 "Only new V2/WS signals measured; risky and unknown labels skip automatic real BUY. "
+                 "Cohorts are selection-biased and not calibrated TP probabilities.",
     }
 
 
