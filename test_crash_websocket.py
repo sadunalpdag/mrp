@@ -60,6 +60,35 @@ class WebSocketTests(unittest.TestCase):
         second=self.g['CrashBounceWebSocketCache'](); second.load()
         self.assertEqual(second.candles('AUSDT'),self.cache.candles('AUSDT'))
 
+    def test_4h_closed_stream_window_does_not_touch_v2_candle_cache(self):
+        ws=Mock()
+        self.cache.ws=ws
+        self.cache.set_4h_research_symbols({'AUSDT'})
+        self.cache.set_4h_research_symbols({'AUSDT'})
+        self.assertEqual(ws.send.call_count,1)
+        self.assertEqual(json.loads(ws.send.call_args.args[0])['params'],
+                         ['ausdt@kline_4h'])
+        ms=4*3600*1000
+        start=(int(self.now*1000)//ms-1)*ms
+        k=dict(i='4h',x=False,t=start,T=start+ms-1,
+               o='1.0',h='1.2',l='0.9',c='1.1',v='100',q='115')
+        self.cache.on_message(None,json.dumps({'e':'kline','s':'AUSDT','k':k}))
+        self.assertEqual(self.cache.closed_4h_candles('AUSDT'),[])
+        k['x']=True
+        for _ in range(2):
+            self.cache.on_message(None,json.dumps({'e':'kline','s':'AUSDT','k':k}))
+        self.assertEqual(len(self.cache.closed_4h_candles('AUSDT')),1)
+        self.assertEqual(self.cache.candles('AUSDT'),[])
+        self.cache.set_4h_research_symbols([])
+        self.assertEqual(self.cache.closed_4h_candles('AUSDT'),[])
+        self.assertEqual(json.loads(ws.send.call_args.args[0])['method'],
+                         'UNSUBSCRIBE')
+        self.cache.set_4h_research_symbols({'AUSDT'})
+        self.cache.on_open(ws)
+        self.assertIn('ausdt@kline_4h',
+            [p for call in ws.send.call_args_list
+             for p in json.loads(call.args[0])['params']])
+
     def test_warmup_disconnect_clear_and_restore_subscriptions(self):
         self.cache.reconcile({'AUSDT'})
         ws=Mock(); self.cache.on_open(ws)
