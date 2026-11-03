@@ -8057,7 +8057,9 @@ def _crash_start_services():
         try:
             from crash_night import BinanceBroker, NightExecutor, day
             broker = BinanceBroker(BINANCE_KEY, BINANCE_SECRET)
-            _crash_one_time_fresh_start(directory, broker, log)
+            once_recovery = globals().get('_crash_one_time_fresh_start')
+            if callable(once_recovery):
+                once_recovery(directory, broker, log)
             executor = NightExecutor(directory, broker,
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 20), manual_tp=bool(repair_flag))
