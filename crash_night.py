@@ -336,6 +336,8 @@ class NightExecutor:
         return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | {stream}"
 
     def apply_control(self, action):
+        if action == 'unlock':
+            return self.unlock_after_verification()
         if action.startswith(('limit:', 'amount:', 'symbols:')):
             kind, raw = action.split(':', 1)
             try:
@@ -477,6 +479,132 @@ class NightExecutor:
             pass
         self.reconcile(order)
 
+    def confirm_external_close(self, order, tp_status):
+        """Reconcile any symbol closed outside this bot; never infer zero from missing data.
+
+        A canceled/absent TP is harmless ONLY after a fresh positive confirmation
+        of a zero position and an empty normal+algo order book for that symbol.
+        No exchange write operation is performed here.
+        """
+        if tp_status not in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED', 'NOT_FOUND'):
+            return False
+        symbol = order['symbol']
+        side = order.get('position_side', 'BOTH')
+        positions = self.broker.positions()
+        if not isinstance(positions, list):
+            raise ValueError('POSITION_SNAPSHOT_UNVERIFIED')
+        matching = [p for p in positions
+                    if p.get('symbol') == symbol and p.get('positionSide', 'BOTH') == side]
+        # A missing row is NOT proof of a flat position.
+        if len(matching) != 1:
+            raise ValueError('POSITION_SNAPSHOT_UNVERIFIED')
+        amount = D(str(matching[0]['positionAmt']))
+        if not amount.is_finite() or amount != 0:
+            return False
+        open_orders = self.broker.closing_orders(symbol)
+        if not isinstance(open_orders, list):
+            raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
+        # Also block a still-live closing TP or a future BUY that could reopen.
+        if open_orders:
+            return False
+        if any(other is not order and other.get('symbol') == symbol
+               and other.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN')
+               for other in self.state['orders'].values()):
+            return False
+        order.update(phase='CLOSED_EXTERNALLY', externally_closed_at=self.clock(),
+                     external_close_tp_status=tp_status)
+        self.save()
+        self.alert(f'ℹ️ HARİCİ KAPANIŞ DOĞRULANDI | {symbol} | {side}\\n'
+                   f'Binance pozisyon miktarı 0 ve açık emir bulunmadı; TP durumu: {tp_status}.\\n'
+                   'Bu kapanış TP başarısı sayılmaz. Yeni giriş güvenlik kilidi otomatik kaldırılmadı.')
+        self.log(f'[CRASH NIGHT EXTERNAL CLOSE] {symbol}; side={side}; tp={tp_status}')
+        return True
+
+    def unlock_after_verification(self):
+        """Owner-initiated account-wide audit; never arm trading on unlock."""
+        old_halt = self.state.get('halt')
+        if not old_halt:
+            return 'ℹ️ Aktif hata kilidi yok. '+self.summary()
+        if not old_halt.startswith('TP DOĞRULANAMADI'):
+            return '⚠️ Kilit kaldırılamadı: hata TP dışı olabilir; Binance ve işlem kayıtları ayrıca incelenmeli.'
+        self.enabled.clear()
+        try:
+            # These reads are safe; unknown entry/TP submission states may not
+            # be silently resolved or retried during an unlock attempt.
+            if any(o.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN')
+                   for o in self.state['orders'].values()):
+                return '⚠️ Kilit korunuyor: sonucu belirsiz giriş veya TP emri var.'
+            for order in self.state['orders'].values():
+                if order.get('phase') == 'PROTECTED':
+                    self.reconcile(order)
+            if any(o.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN')
+                   for o in self.state['orders'].values()):
+                return '⚠️ Kilit korunuyor: doğrulanmamış işlem var.'
+
+            positions = self.broker.positions()
+            all_orders = self.broker.open_entry_orders()
+            if not isinstance(positions, list) or not isinstance(all_orders, list):
+                raise ValueError('ACCOUNT_SNAPSHOT_UNVERIFIED')
+            if any(o.get('side') == 'BUY' for o in all_orders):
+                return '⚠️ Kilit korunuyor: hâlâ bekleyen BUY emri var.'
+            active = {}
+            for p in positions:
+                qty = D(str(p['positionAmt']))
+                if not qty.is_finite():
+                    raise ValueError('POSITION_AMOUNT_UNVERIFIED')
+                if qty == 0:
+                    continue
+                side = p.get('positionSide', 'BOTH')
+                if side not in ('BOTH', 'LONG') or qty <= 0:
+                    return '⚠️ Kilit korunuyor: SHORT veya doğrulanamayan pozisyon var.'
+                key = (p['symbol'], side)
+                if key in active:
+                    raise ValueError('DUPLICATE_POSITION_SNAPSHOT')
+                active[key] = p
+
+            for order in self.state['orders'].values():
+                if order.get('phase') != 'PROTECTED':
+                    continue
+                key = (order['symbol'], order.get('position_side', 'BOTH'))
+                position = active.get(key)
+                if position is None or D(str(position['positionAmt'])) != D(order['filled_qty']):
+                    return f'⚠️ Kilit korunuyor: {order["symbol"]} pozisyon/TP miktarı uyuşmuyor.'
+                # A PROTECTED record must have been freshly read through reconcile.
+                tp = self.broker.order(order['symbol'], order['tp_id'])
+                if (tp.get('status') not in ('NEW', 'PARTIALLY_FILLED')
+                        or tp.get('side') != 'SELL'
+                        or tp.get('positionSide', 'BOTH') != key[1]
+                        or (key[1] == 'BOTH' and tp.get('reduceOnly') not in (True, 'true'))
+                        or D(str(tp['origQty'])) != D(order['filled_qty'])
+                        or D(str(tp['price'])) != D(order['tp'])):
+                    return f'⚠️ Kilit korunuyor: {order["symbol"]} TP doğrulanmadı.'
+
+            from crash_manual_tp import tp_coverage
+            for (symbol, side), p in active.items():
+                orders = self.broker.closing_orders(symbol)
+                if not isinstance(orders, list):
+                    raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
+                if tp_coverage(orders, symbol, D(str(p['entryPrice'])),
+                               D(str(p['positionAmt'])), side) != 'full':
+                    return f'⚠️ Kilit korunuyor: {symbol} pozisyonunun TP kapsamı tam doğrulanmadı.'
+            # An orphaned bot TP could be unsafe even when the account is flat.
+            for o in all_orders:
+                client_id = str(o.get('clientOrderId', ''))
+                if (client_id.startswith('cbn') and client_id.endswith('t')
+                        and (o.get('symbol'), o.get('positionSide', 'BOTH')) not in active):
+                    return '⚠️ Kilit korunuyor: pozisyonu kapanmış bir sembolde açık bot TP emri var.'
+        except Exception as error:
+            self.log('[CRASH NIGHT UNLOCK CHECK] '+type(error).__name__)
+            return '⚠️ Kilit korunuyor: Binance hesap veya emir doğrulaması başarısız ('+type(error).__name__+').'
+        self.state['halt'] = None
+        self.state['paused'] = True
+        self.enabled.clear()
+        self.save()
+        self.alert('✅ TP güvenlik kontrolü tamamlandı. Hata kilidi kaldırıldı. '
+                   'Otomatik girişler KAPALI; işlem açmak için ayrıca /otomatik_ac gönderin.')
+        self.log('[CRASH NIGHT UNLOCK] account audit passed; trading remains OFF')
+        return '✅ Güvenlik kilidi kaldırıldı. Otomatik giriş KAPALI. Önce Binance pozisyonlarını inceleyip /otomatik_ac kullanın.'
+
     def reconcile(self, order, check_expiry=True, ws_order=None):
         symbol = order['symbol']
         try:
@@ -541,8 +669,17 @@ class NightExecutor:
                     if first:
                         self.alert(f'✅ OTOMATİK GİRİŞ + TP DOĞRULANDI | {symbol}\nMiktar: {order["filled_qty"]} | Giriş limit: {order["price"]}\nTP: {order["tp"]} | 10x | SL yok')
                 else:
+                    if self.confirm_external_close(order, tp.get('status')):
+                        return
                     raise ValueError('TP_NOT_ACTIVE')
         except Exception as error:
+            if (isinstance(error, BrokerError) and error.code == '-2013'
+                    and order.get('phase') in ('TP_UNKNOWN', 'PROTECTED')):
+                try:
+                    if self.confirm_external_close(order, 'NOT_FOUND'):
+                        return
+                except Exception as check_error:
+                    error = check_error
             if isinstance(error, BrokerError) and error.code == '-1003':
                 self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
                 return
