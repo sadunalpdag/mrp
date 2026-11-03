@@ -6620,7 +6620,11 @@ def _crash_send_pending(state, now):
                 log(f'[CRASH AI QUEUE ERR] {type(error).__name__}; V2 continues')
             executor = globals().get('_CRASH_NIGHT')
             if executor is not None:
-                executor.submit(record, receipt['accepted_at'])
+                from crash_failure_shadow import entry_block_reason
+                if entry_block_reason(record) is None:
+                    executor.submit(record, receipt['accepted_at'])
+                # Flagged or incomplete labels: Telegram + virtual tracking only.
+                # NightExecutor.enter independently guards the final live BUY.
         else:
             record["v2_delivery_status"] = ("UNKNOWN_DELIVERY" if receipt.get("ambiguous")
                                            else "SEND_FAILED_RETRY")
