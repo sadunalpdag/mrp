@@ -97,7 +97,7 @@ def error_details(error):
         return f'Kod: {error.code} | Neden: {reason}'
     local = {'TP_NOT_ACTIVE': 'TP emri iptal edilmiş, süresi dolmuş veya reddedilmiş.',
              'TP_PROPERTIES_NOT_CONFIRMED': 'TP yönü, fiyatı, miktarı veya reduce-only özelliği uyuşmuyor.',
-             'TP_POSITION_UNVERIFIED': 'TP durumu geçersiz veya bulunamadı; Binance pozisyonu API hatası nedeniyle doğrulanamadı.'
+             'TP_POSITION_UNVERIFIED': 'TP durumu geçersiz veya bulunamadı; Binance pozisyonu API hatası nedeniyle doğrulanamadı.',
              'ENTRY_RESULT_NOT_FINAL': 'Giriş emrinin nihai sonucu henüz doğrulanamadı.'}
     if isinstance(error, ValueError) and str(error) in local:
         return 'Kod: '+str(error)+' | Neden: '+local[str(error)]
