@@ -157,7 +157,7 @@ class ManualTPGuard:
             if (symbols is None or symbol in symbols) and symbol not in active and record['phase'] != 'UNKNOWN':
                 record['absent'] = True
         self.e.save()
-        excluded = {o['symbol'] for o in self.e.state['orders'].values() if o['phase'] not in ('DONE', 'NO_FILL')}
+        excluded = {o['symbol'] for o in self.e.state['orders'].values() if o['phase'] not in ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY')}
         for p in positions:
             symbol = p.get('symbol')
             if symbols is not None and symbol not in symbols:
