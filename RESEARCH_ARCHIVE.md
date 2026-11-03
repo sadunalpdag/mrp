@@ -30,7 +30,7 @@ Mevcut Render panelinde daha önce görünürlüğünü kaybetmiş kayıtlar oto
 
 `crash_night.py`, daha önce `PROTECTED` durumunda bulunan bir işlemde TP iptal/expire/reject veya kayıt yoksa tüm sembollerde şu kontrolü yapar:
 
-1. Binance'den ilgili `symbol + positionSide` pozisyonunu **gerçek `0` miktarı** ile doğrular. API hatası veya sembolün yanıtta bulunmaması, sıfır sayılmaz.
+1. Binance V3'te ilgili `symbol + positionSide` için **gerçek `0` miktarı** veya tam hesap sorgusunda sembolün bulunmaması doğrulanır. V3, açık pozisyonu ya da açık emri olmayan sembolleri yanıttan çıkardığı için kayıp satır ancak **başarılı tam hesap pozisyon sorgusu + normal ve algo açık emir listelerinin aynı sembolde boş olması** halinde kapalı kabul edilir. API hatası veya eksik/bozuk yanıt kesinlikle sıfır sayılmaz.
 2. Aynı sembolde normal/algo açık emir bulunmadığını doğrular; belirsiz veya kısmi işlemde kilidi korur.
 3. Pozisyon gerçekten kapalıysa eski izlemeyi `CLOSED_EXTERNALLY` terminal durumuna geçirir; bunu TP başarısı saymaz. Geçmiş günlük sayaç değişmez.
 4. Mevcut `halt` **otomatik kaldırılmaz**. Yeni girişler başka coinlerde de engellenmeye devam eder.
