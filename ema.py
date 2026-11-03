@@ -37,6 +37,9 @@ except Exception:
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR  = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
+if os.path.ismount('/data') and os.path.realpath(DATA_DIR) != os.path.realpath('/data'):
+    # Preserve order state; do not silently switch existing live positions.
+    print('[CRASH STORAGE WARNING] DATA_DIR is not /data; existing order state needs a safe manual migration.', flush=True)
 
 STATE_FILE       = os.path.join(DATA_DIR,"state.json")
 PARAM_FILE       = os.path.join(DATA_DIR,"params.json")
@@ -1170,10 +1173,23 @@ def safe_float(value, default=0.0):
 
 def log(msg):
     print(msg, flush=True)
+    # The Render dashboard's transient log history is not a research archive.
+    # Persist all Crash/AI research status lines by UTC date on DATA_DIR.
+    try:
+        from research_archive import append_research_runtime
+        # Persist research logs on the existing /data disk when mounted even
+        # if legacy DATA_DIR points elsewhere. Never silently migrate live
+        # order/executor state from its configured directory.
+        archive_root = '/data' if os.path.ismount('/data') else DATA_DIR
+        append_research_runtime(archive_root, str(msg))
+    except Exception as error:
+        print('[CRASH ARCHIVE WRITE ERR] '+type(error).__name__, flush=True)
     try:
         with open(LOG_FILE,"a",encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except: pass
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\\n")
+    except Exception:
+        pass
+
 
 def safe_load(p,d):
     try:
