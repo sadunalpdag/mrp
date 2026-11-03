@@ -514,8 +514,8 @@ class NightExecutor:
         order.update(phase='CLOSED_EXTERNALLY', externally_closed_at=self.clock(),
                      external_close_tp_status=tp_status)
         self.save()
-        self.alert(f'ℹ️ HARİCİ KAPANIŞ DOĞRULANDI | {symbol} | {side}\\n'
-                   f'Binance pozisyon miktarı 0 ve açık emir bulunmadı; TP durumu: {tp_status}.\\n'
+        self.alert(f'ℹ️ HARİCİ KAPANIŞ DOĞRULANDI | {symbol} | {side}\n'
+                   f'Binance pozisyon miktarı 0 ve açık emir bulunmadı; TP durumu: {tp_status}.\n'
                    'Bu kapanış TP başarısı sayılmaz. Yeni giriş güvenlik kilidi otomatik kaldırılmadı.')
         self.log(f'[CRASH NIGHT EXTERNAL CLOSE] {symbol}; side={side}; tp={tp_status}')
         return True
