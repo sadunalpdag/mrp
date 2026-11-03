@@ -6556,7 +6556,9 @@ def _crash_send_pending(state, now):
                 + show("btc_context", "BTC") + "\n"
             )
         from crash_context import format_context
+        from crash_failure_shadow import format_warning
         context_message = format_context(d.get("five_day_context"))
+        failure_shadow_message = format_warning(record.get("failure_shadow"))
         archive_count = d.get('data_sources', {}).get('BINANCE_ARCHIVE', 0)
         bybit_count = d.get('data_sources', {}).get('BYBIT_LINEAR', 0)
         source_message = f'Veri: Binance günlük arşivinden {archive_count} mum tamamlandı.\n' if archive_count else ''
@@ -6572,6 +6574,7 @@ def _crash_send_pending(state, now):
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
                    f"{score_message}"
                    f"{context_message}"
+                   f"{failure_shadow_message}"
                    f"{shadow_message}"
                    "Puan bilgi amaçlı; TP olasılığı değildir.\n"
                    f"Giriş seviyesi: {record['entry']} | anlık: {record.get('last_price')}\n"
@@ -6686,7 +6689,15 @@ def _crash_review_candidate(state, record, now, allow_rest=False):
         if result["status"] == "MISSING_5D_HISTORY":
             return
         record["v2_status"] = result["status"]
-        if not result["qualified"]:
+        if result["qualified"]:
+            # Prospective research only: original as-of candles + earlier signal
+            # history, never outcomes or future snapshots. No entry gate.
+            try:
+                from crash_failure_shadow import assess
+                record["failure_shadow"] = assess(record, state["history"])
+            except Exception as error:
+                log(f"[CRASH FAILURE SHADOW ERR] {record['symbol']}: {type(error).__name__}")
+        else:
             record.update(tracking_status="V2_FILTERED", finished_at=now,
                           v2_reason=result["status"], v2_delivery_status="FILTERED_NOT_SENT")
     latest = state["symbols"].get(record["symbol"])
@@ -7063,6 +7074,7 @@ def _crash_send_report_file(path, caption):
 def _crash_daily_report(state, now):
     import zipfile
     from crash_context import summarize_context
+    from crash_failure_shadow import summarize as summarize_failure, export_csv as export_failure_csv
     from crash_report_schedule import prepare, success
     report = prepare(state.setdefault("report", {}), now)
     if _CRASH_REPORT_REQUEST.is_set():
@@ -7116,7 +7128,13 @@ def _crash_daily_report(state, now):
                  "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
                  "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
                  "Eski kayıtlarda geçmiş sonuçlar bilinmez. UTC epoch saniye; kline zamanları milisaniye. "
-                 "Yeni algoritmaları zaman bazlı eğitim/test ayrımıyla karşılaştırın; gelecek verilerini giriş özelliklerine katmayın.")
+                 "Yeni algoritmaları zaman bazlı eğitim/test ayrımıyla karşılaştırın; gelecek verilerini giriş özelliklerine katmayın. "
+                 "Gölge TP-olmama araştırması (tp_nonclosure_shadow_v1) 3 işaret kaydeder: "
+                 "zayıf yeşil mum hacmi + zayıf hacim, düşen RSI + kötüleşen EMA eğimi, "
+                 "aynı coinde daha düşük seviyede tekrar. Bunlar yalnız sinyal anında bilinen verileri kullanır, "
+                 "TP tahmini değildir ve otomatik emirlere müdahale etmez. "
+                 "failure_shadow.csv ve report.json içindeki failure_shadow_rolling'i inceleyin. "
+                 "OPEN sonuçlanmamıştır ve kayıp sayılmaz; TIMEOUT TP'ye ulaşma olasılığına dair kesin kanıt değildir.")
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("report.json", json.dumps({"schema_version":5,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
@@ -7124,6 +7142,8 @@ def _crash_daily_report(state, now):
                 "rolling_7d_cohort":rolling,
                 "five_day_context_daily":summarize_context(daily),
                 "five_day_context_rolling":summarize_context(filtered),
+                "failure_shadow_daily":summarize_failure(daily),
+                "failure_shadow_rolling":summarize_failure(filtered),
                 "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,
                 "strength_score_version":"continuous_7factor_v1",
                 "strength_score_blocks_delivery":False,
@@ -7135,6 +7155,7 @@ def _crash_daily_report(state, now):
                 "notes":notes}, ensure_ascii=False, indent=2))
             from crash_derivatives import export_csv, summarize
             archive.writestr("derivatives_shadow.csv", export_csv(records))
+            archive.writestr("failure_shadow.csv", export_failure_csv(records))
             from crash_ai import export_csv as export_ai_csv
             archive.writestr("openai_reviews.csv", export_ai_csv(records))
             ai_market_path = os.path.join(globals().get('DATA_DIR', os.path.dirname(CRASH_BOUNCE_RESEARCH_DIR)), 'ai_top_gainers', 'top_gainers_state.json')
@@ -7164,6 +7185,8 @@ def _crash_daily_report(state, now):
         avg = rolling["average_tp_hours"]
         mean_score = rolling["mean_strength_score"]
         mean_score_text = f"{mean_score:.1f}" if mean_score is not None else "veri yok"
+        failure_summary = summarize_failure(filtered)
+        low_volume = failure_summary["groups"]["weak_volume"]
         caption = (f"📊 CRASH BOUNCE — 24h data\nYeni sinyal: {summary['signals']}\n"
                    "V2 güç puanı 0-100: 7 faktör oransal, sinyali engellemez.\n"
                    f"Puanlı aday {rolling['scored_candidates']} | Ort. güç {mean_score_text}/100 "
@@ -7172,7 +7195,9 @@ def _crash_daily_report(state, now):
                    f"Giriş bekleyen {rolling['WAIT_ENTRY']} | açık {rolling['OPEN']} | giriş görülmeyen {rolling['NO_ENTRY_OBSERVED']}\n"
                    f"Giriş öncesi dip kırılan {rolling['INVALIDATED_BEFORE_ENTRY']}\n"
                    f"V2 Telegram kabul edilen: {rolling['sent_candidates']} | giriş/TP atlaması: {rolling['missed_entry_above_tp']}\n"
-                   f"Sonuçlananlarda gözlenen TP: {f'%{rate:.1f}' if rate is not None else 'henüz yok'}\n"
+                   f"Gölge zayıf hacim: {low_volume['signals']} sinyal | TP {low_volume['tp']} "
+                 f"| açık {low_volume['open_unresolved']} | timeout {low_volume['timeout']} (7g, engel değil)\n"
+                 f"Sonuçlananlarda gözlenen TP: {f'%{rate:.1f}' if rate is not None else 'henüz yok'}\n"
                    f"Ort. TP: {f'{avg:.2f} saat' if avg is not None else 'henüz yok'} | veri boşluğu: {rolling['records_with_gaps']}\n"
                    "3dk aday taraması; sanal giriş/TP sırası WS aggTrade olaylarından. Gerçek emir değildir. ZIP: fiyatlar ve sonuçlar.")
         pending = report["pending"] = {"path":path,"caption":caption,"period_end":now}
