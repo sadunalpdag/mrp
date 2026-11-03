@@ -237,6 +237,12 @@ class BinanceBroker:
             raise ValueError('INVALID_ORDER_RESPONSE')
         return result
 
+    def open_algo_orders(self):
+        result = self.request('GET', '/fapi/v1/openAlgoOrders')
+        if not isinstance(result, list):
+            raise ValueError('INVALID_ALGO_ORDER_RESPONSE')
+        return result
+
     def cancel_entry(self, symbol, client_id):
         return self.request('DELETE', '/fapi/v1/order', {'symbol': symbol, 'origClientOrderId': client_id})
 
@@ -543,9 +549,11 @@ class NightExecutor:
 
             positions = self.broker.positions()
             all_orders = self.broker.open_entry_orders()
-            if not isinstance(positions, list) or not isinstance(all_orders, list):
+            all_algos = self.broker.open_algo_orders()
+            if not all(isinstance(snapshot, list) for snapshot in (positions, all_orders, all_algos)):
                 raise ValueError('ACCOUNT_SNAPSHOT_UNVERIFIED')
-            if any(o.get('side') == 'BUY' for o in all_orders):
+            all_open = all_orders + all_algos
+            if any(o.get('side') == 'BUY' for o in all_open):
                 return '⚠️ Kilit korunuyor: hâlâ bekleyen BUY emri var.'
             active = {}
             for p in positions:
@@ -587,17 +595,14 @@ class NightExecutor:
                 if tp_coverage(orders, symbol, D(str(p['entryPrice'])),
                                D(str(p['positionAmt'])), side) != 'full':
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonunun TP kapsamı tam doğrulanmadı.'
-            # An orphaned bot TP could be unsafe even when the account is flat.
-            # Check normal AND conditional orders on every tracked flat symbol.
-            for symbol in {o['symbol'] for o in self.state['orders'].values()}:
-                if any(sym == symbol for sym, side in active):
-                    continue
-                orphan_orders = self.broker.closing_orders(symbol)
-                if not isinstance(orphan_orders, list):
-                    raise ValueError('ORDER_SNAPSHOT_UNVERIFIED')
-                if orphan_orders:
+            # All ordinary/algo orders were fetched once at account level:
+            # DO NOT query every historical symbol (unbounded REST rate-limit).
+            tracked = {o['symbol'] for o in self.state['orders'].values()}
+            for o in all_open:
+                symbol = o.get('symbol')
+                if symbol in tracked and not any(sym == symbol for sym, side in active):
                     return f'⚠️ Kilit korunuyor: {symbol} pozisyonu kapalı fakat bekleyen emir var.'
-            for o in all_orders:
+            for o in all_open:
                 client_id = str(o.get('clientOrderId', ''))
                 if (client_id.startswith('cbn') and client_id.endswith('t')
                         and (o.get('symbol'), o.get('positionSide', 'BOTH')) not in active):
