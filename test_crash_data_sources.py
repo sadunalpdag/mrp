@@ -96,6 +96,28 @@ class SourceTests(unittest.TestCase):
         self.rest.assert_not_called()
         self.s.archive.assert_called_once_with('BTCUSDT',self.today-DAY)
 
+    def test_research_rest_disabled_still_uses_archive_and_never_calls_binance(self):
+        start = self.today-DAY
+        self.s = DataSources(self.tmp.name, self.rest, lambda:False, self.log,
+                             clock=lambda:self.now, allow_binance_rest=False)
+        self.s.archive = Mock(return_value=[tagged(r, 'BINANCE_ARCHIVE') for r in rows(start, 1)])
+        out = self.s.resolve('BTCUSDT', start, start+2*STEP, [])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][12], 'BINANCE_ARCHIVE')
+        self.rest.assert_not_called()
+        self.assertTrue(any('RESEARCH' in str(c) or 'research Binance REST disabled' in str(c)
+                            for c in self.log.call_args_list))
+
+    def test_research_rest_disabled_never_rechecks_full_bybit_snapshot(self):
+        start = self.today-DAY
+        self.s = DataSources(self.tmp.name, self.rest, lambda:False, self.log,
+                             clock=lambda:self.now, allow_binance_rest=False)
+        self.s.archive = Mock(return_value=[])
+        cached = [tagged(r, 'BYBIT_LINEAR') for r in rows(start, 2)]
+        out = self.s.resolve('BTCUSDT', start, start+2*STEP, cached)
+        self.assertEqual(len(out), 2)
+        self.rest.assert_not_called()
+
     def test_rest_error_falls_through_and_invalid_archive_is_rejected(self):
         self.rest.side_effect=RuntimeError('offline')
         start=self.today-DAY
