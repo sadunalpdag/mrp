@@ -108,8 +108,12 @@ class WebSocketTests(unittest.TestCase):
         self.g['_crash_seed_attempts'][:]=[self.now]*24
         self.g['_crash_get_candles']('BUSDT')
         self.assertEqual(self.g['_crash_public_get'].call_count,1)
-        damaged=[list(r) for r in self.rows]; damaged[5][0]+=1
-        self.assertFalse(self.g['_crash_cached_candles_valid'](damaged,self.now))
+        one=[list(r) for i,r in enumerate(self.rows) if i != 5]
+        self.assertTrue(self.g['_crash_cached_candles_valid'](one,self.now))
+        two=[list(r) for i,r in enumerate(self.rows) if i not in (5,8)]
+        self.assertTrue(self.g['_crash_cached_candles_valid'](two,self.now))
+        three=[list(r) for i,r in enumerate(self.rows) if i not in (5,8,10)]
+        self.assertFalse(self.g['_crash_cached_candles_valid'](three,self.now))
 
     def test_worker_reports_and_scans_ws_during_rest_cooldown(self):
         self.g['time'].sleep=Mock(side_effect=StopIteration)
