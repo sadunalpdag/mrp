@@ -1,6 +1,7 @@
 """Offline tests for shared Binance IP request-weight scheduler."""
 import unittest
 from unittest.mock import Mock,patch
+from types import SimpleNamespace
 from crash_rest_budget import (
     IpBudget, RateDeferred, estimated_weight, priority_for,
     RESEARCH_CEILING,ACCOUNT_CEILING,PROTECT_CEILING,
@@ -72,7 +73,9 @@ class SharedIpBudgetTests(unittest.TestCase):
         broker=BinanceBroker('test_key','test_secret')
         response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'735'})
         response.json.return_value={'ok':True}
-        with patch('crash_rest_budget.BUDGET',self.b),patch('requests.request',return_value=response) as req:
+        req=Mock(return_value=response)
+        with patch('crash_rest_budget.BUDGET',self.b),patch.dict(
+                'sys.modules',{'requests':SimpleNamespace(request=req)}):
             self.assertEqual(broker.request('GET','/fapi/v1/exchangeInfo',signed=False),{'ok':True})
             self.assertEqual(req.call_count,1)
             with self.assertRaises(BrokerError) as blocked:
