@@ -6344,15 +6344,23 @@ _CRASH_TRADE_BUFFER_OVERFLOW = False
 def crash_bounce_plan(klines, last_price, tick_size, now_ms):
     """4h CLOSED-candle low + 0.3%; levels only, never an order/fill."""
     closed = [r for r in klines if len(r) > 6 and int(r[6]) < now_ms]
-    if len(closed) < 16:
+    # Permit up to two genuinely missing CLOSED candles in the 4h window,
+    # without manufacturing an OHLCV bar or moving the 4h reference window.
+    # Latest observed close must still be fresh (<30 minutes).
+    closed.sort(key=lambda r: int(r[0]))
+    if len(closed) < 14:
         return None
-    closed = closed[-16:]
-    if now_ms - int(closed[-1][6]) > 30 * 60 * 1000:
+    last = closed[-1]
+    if not 0 <= now_ms - int(last[6]) <= 30 * 60 * 1000:
         return None
-    if any(int(b[0]) - int(a[0]) != 15 * 60 * 1000
-           for a, b in zip(closed, closed[1:])):
+    step = 15 * 60 * 1000
+    last_open = int(last[0])
+    recent = {int(r[0]):r for r in closed
+              if last_open-15*step <= int(r[0]) <= last_open
+              and (last_open-int(r[0])) % step == 0}
+    if len(recent) < 14:
         return None
-    lows = [Decimal(str(r[3])) for r in closed]
+    lows = [Decimal(str(r[3])) for r in recent.values()]
     price, tick = Decimal(str(last_price)), Decimal(str(tick_size))
     if any(not x.is_finite() or x <= 0 for x in lows + [price, tick]):
         return None
@@ -6366,6 +6374,8 @@ def crash_bounce_plan(klines, last_price, tick_size, now_ms):
     return {"entry": format(entry, "f"), "tp": format(tp, "f"),
             "reference_low": format(low, "f"), "tick_size": format(tick, "f"),
             "last_price": format(price, "f"),
+            "recent_4h_observed": len(recent),
+            "recent_4h_missing": 16 - len(recent),
             "confirmation": "Dip korunmalı; giriş seviyesi aşağıdan yukarı geçilmeli."}
 
 
@@ -6583,7 +6593,10 @@ def _crash_send_pending(state, now):
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
                    f"RSI14 (15m): {d['rsi14']:.2f}\n"
                    f"5 günlük veri: {d['candles']}/480 kapalı mum\n"
-                   f"{source_message}"
+                   + (f"⚠️ {480-d['candles']} mum eksik: tahmini mum eklenmedi; "
+                      "göstergeler gerçek mumlardan hesaplandı.\n"
+                      if d['candles'] < 480 else "")
+                   + f"{source_message}"
                    f"5 günlük değişim: %{d['return_5d_pct']:+.2f}\n"
                    f"{score_message}"
                    f"{context_message}"
@@ -6692,7 +6705,7 @@ def _crash_v2_assess_candidate(record, now, allow_rest=False):
         # One asynchronous owner writes the cache; never duplicate its REST work.
         _crash_queue_history(record, 'signal', as_of)
         log(f"[CRASH V2 HISTORY WAIT] {record['symbol']}: 5 gunluk veri kuyrukta; "
-            "tek isci, indirmeler arasi en az 60 sn; aday sure siniri korunuyor")
+            "tek isci; indirmeler arasi en az 180 sn; 1-2 eksige tolerans; aday sure siniri korunuyor")
     return result
 
 
@@ -7608,11 +7621,23 @@ def _crash_write_json(path, data):
 
 
 def _crash_cached_candles_valid(rows, now):
-    if len(rows)<16:
+    # Closed and timestamp-aligned to the last observed candle, with at most
+    # two absent 15m slots. Do not fill gaps with fabricated price/volume.
+    try:
+        closed = sorted((r for r in rows if len(r) >= 7 and int(r[6]) < now*1000),
+                        key=lambda r: int(r[0]))
+        if len(closed) < 14:
+            return False
+        last = closed[-1]
+        if not 0 <= now*1000-int(last[6]) <= 1800000:
+            return False
+        last_open = int(last[0])
+        timestamps = {int(r[0]) for r in closed
+                      if last_open-15*900000 <= int(r[0]) <= last_open
+                      and (last_open-int(r[0])) % 900000 == 0}
+        return len(timestamps) >= 14
+    except (TypeError, ValueError, IndexError, OverflowError):
         return False
-    recent=rows[-16:]
-    return (0<=now*1000-int(recent[-1][6])<=1800000 and
-            all(int(b[0])-int(a[0])==900000 for a,b in zip(recent,recent[1:])))
 
 
 def _crash_data_wait_detail(symbol, rows, now, last_price, tick_size):
@@ -7728,7 +7753,8 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     if not tickers:
         log(f"[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data; {_CRASH_WS_CACHE.health(now)}")
         return
-    scan_metrics = dict(candles_ok=0, candles_wait=0, candidates=0, scan_errors=0)
+    scan_metrics = dict(candles_ok=0, candles_wait=0, candles_partial=0,
+                        candidates=0, scan_errors=0)
     # Rank the trading futures universe before applying threshold/cooldown.
     # Do not replace a cooldown coin with the 21st loser.
     ranked = []
@@ -7789,6 +7815,10 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                 log(f"[CRASH BOUNCE WAIT] {symbol}: {_crash_data_wait_detail(symbol, klines, now, ticker['lastPrice'], market[symbol])}")
                 continue
             scan_metrics["candles_ok"] += 1
+            if plan.get("recent_4h_missing", 0):
+                scan_metrics["candles_partial"] += 1
+                log(f'[CRASH CANDLE TOLERANCE] {symbol}; 4h='
+                    f'{plan["recent_4h_observed"]}/16; 1-2 eksik gerçek mum kabul edildi')
             if previous and Decimal(plan["entry"]) > Decimal(str(previous["entry"])) * Decimal("0.98"):
                 continue
             features = _crash_features(klines, ticker, now)
@@ -8196,15 +8226,10 @@ def _crash_bounce_worker():
         _crash_start_ai()
     except Exception as error:
         log(f'[CRASH AI START ERR] {type(error).__name__}; V2 continues')
-    try:
-        from ai_top_gainers import TopGainers
-        gainers = TopGainers(
-            os.path.join(DATA_DIR, 'ai_top_gainers'), _CRASH_WS_CACHE,
-            _crash_public_get, _crash_telegram_receipt, log,
-            market_symbols=lambda: _crash_load_market_cache()[0])
-        gainers.start()
-    except Exception as error:
-        log(f'[TOP GAINERS START ERR] {type(error).__name__}; V2 continues')
+    # Operator requested AI Top Gainers completely disabled: no worker,
+    # no BTC hourly/daily reports, no additional Binance REST load.
+    # Historical AI Top Gainers files remain untouched.
+    log('[TOP GAINERS] OFF | kullanici istegi; CRASH V2 etkilenmez')
     while True:
         try:
             if state is None:
