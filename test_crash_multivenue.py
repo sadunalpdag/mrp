@@ -61,7 +61,10 @@ class MultiVenueTests(unittest.TestCase):
         self.assertGreater(self.cb.global_cooldown,self.now[0])
 
     def test_spot_mismatch_fails_closed(self):
-        self.get.return_value=response(candles(self.start,3,"1.6"))
+        wrong=candles(self.start,3,"1.6")
+        for row in wrong:
+            row[2]="1.8"  # Valid OHLC; deliberately different from Binance close.
+        self.get.return_value=response(wrong)
         self.assertEqual(self.cb.fill_missing("BTCUSDT",self.start,self.end,
                          [self.start+STEP],candles(self.start,1)),[])
         self.assertTrue(any("CROSS_EXCHANGE_PRICE_MISMATCH" in str(c)
