@@ -10,8 +10,26 @@ import math
 from collections import Counter
 
 VERSION = "tp_nonclosure_entry_gate_v1"
+SIZING_VERSION = "risk_count_sizing_v1"
 FLAG_NAMES = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
 REPEAT_LOOKBACK_SECONDS = 72 * 3600
+
+
+def position_fraction(record):
+    """0/1 flags = full; 2 = half; 3 = none. Unknown data fails closed.
+
+    Inspect the stored signal-time flag booleans, never outcome or claimed
+    flag_count. Old recorded labels can be evaluated with the new rule without
+    rewriting their historical risk assessment.
+    """
+    data = record.get("failure_shadow")
+    if not isinstance(data, dict) or data.get("version") != VERSION:
+        return None
+    flags = data.get("flags")
+    if not isinstance(flags, dict) or any(type(flags.get(k)) is not bool for k in FLAG_NAMES):
+        return None
+    count = sum(flags[k] for k in FLAG_NAMES)
+    return 0.0 if count == 3 else 0.5 if count == 2 else 1.0
 
 
 def number(value, minimum=None, maximum=None):
@@ -75,7 +93,10 @@ def assess(record, earlier_records):
         "version": VERSION,
         "observed_at": created,
         "blocks_v2": False,
-        "blocks_live_entry": flagged > 0 or known < len(FLAG_NAMES),
+        "blocks_live_entry": flagged == len(FLAG_NAMES) or known < len(FLAG_NAMES),
+        "sizing_policy_version": SIZING_VERSION,
+        "position_fraction": (None if known < len(FLAG_NAMES)
+                              else 0.0 if flagged == 3 else 0.5 if flagged == 2 else 1.0),
         "flags": flags,
         "flag_count": flagged,
         "known_flags": known,
@@ -92,18 +113,17 @@ def assess(record, earlier_records):
 
 
 def entry_block_reason(record):
-    """Fail closed for auto BUY only; never cancel or modify existing TP/orders."""
+    """New BUYs blocked only on three true risk flags or incomplete assessment."""
     data = record.get("failure_shadow")
     if not isinstance(data, dict) or data.get("version") != VERSION:
         return "RISK_ASSESSMENT_MISSING"
     flags = data.get("flags")
     if not isinstance(flags, dict):
         return "RISK_ASSESSMENT_INVALID"
-    triggered = [name for name in FLAG_NAMES if flags.get(name) is True]
-    if triggered:
-        return "RISK_" + ",".join(triggered)
     if any(type(flags.get(name)) is not bool for name in FLAG_NAMES):
         return "RISK_METRICS_INCOMPLETE"
+    if all(flags[name] is True for name in FLAG_NAMES):
+        return "RISK_3_OF_3"
     return None
 
 
@@ -122,14 +142,20 @@ def format_warning(result):
     known = sum(type(flags.get(key)) is bool for key in names)
     label = " | ".join(hits) if hits else "belirgin risk işareti yok"
     missing = f" | eksik veri {3-known}/3" if known < 3 else ""
-    action = ("⛔ RİSKLİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n" if hits else
-              "⏸️ EKSİK VERİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n" if known < 3 else
-              "✅ Risk etiketi yok: normal V2 giriş kontrolü geçerli.\n")
-    return (f"🔎 TP RİSK ETİKETLERİ: {len(hits)}/3 — {label}{missing}\n"
-            + action + "Deneysel; TP olasılığı değildir. Sinyal ve sanal takip devam eder.\n")
+    fraction = None if known < 3 else (0.0 if len(hits) == 3
+                                    else 0.5 if len(hits) == 2 else 1.0)
+    action = ("⏸️ EKSİK VERİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\\n"
+              if fraction is None else
+              "⛔ 3/3 RİSK: otomatik GERÇEK ALIŞ YAPILMAYACAK.\\n"
+              if fraction == 0 else
+              "⚖️ 2/3 RİSK: otomatik pozisyon tutarının %50'si kullanılacak.\\n"
+              if fraction == 0.5 else
+              "✅ 0–1/3 RİSK: otomatik pozisyon tutarının %100'ü kullanılacak.\\n")
+    return (f"🔎 TP RİSK ETİKETLERİ: {len(hits)}/3 — {label}{missing}\\n"
+            + action + "Deneysel; TP olasılığı değildir. Sinyal ve sanal takip devam eder.\\n")
 
 
-def summarize(records):
+def summarize(records, executor_orders=None):
     """Compare prospective, same-model cohorts without counting OPEN as loss.
 
     Cohort groups overlap; counts cannot be summed. Missing flags are unknown,
@@ -152,6 +178,7 @@ def summarize(records):
                        and r["failure_shadow"].get("flag_count") == 0],
         "missing_some_data": [r for r in selected if r["failure_shadow"].get("known_flags", 0) < 3],
     }
+    executor_orders = executor_orders or {}
     result = {}
     for name, items in groups.items():
         counts = Counter(item.get("tracking_status", "UNKNOWN") for item in items)
@@ -167,18 +194,51 @@ def summarize(records):
                 ("TP", "TIMEOUT", "OPEN", "WAIT_ENTRY")),
             "resolved_tp_pct": round(100 * counts["TP"] / closed, 1) if closed else None,
         }
+    # Only new signal-time sizing decisions belong to the prospective policy
+    # cohort; old records are kept in the original risk-only cohort above.
+    prospective = [r for r in selected
+                   if (r.get("failure_shadow") or {}).get("sizing_policy_version") == SIZING_VERSION]
+    exclusive = {
+        "zero_flags_full": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+                            and r["failure_shadow"].get("flag_count")==0],
+        "one_flag_full": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+                           and r["failure_shadow"].get("flag_count")==1],
+        "two_flags_half": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+                            and r["failure_shadow"].get("flag_count")==2],
+        "three_flags_blocked": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+                                 and r["failure_shadow"].get("flag_count")==3],
+        "incomplete_blocked": [r for r in prospective if r["failure_shadow"].get("known_flags",0)<3],
+    }
+    sizing = {}
+    for name, items in exclusive.items():
+        status = Counter(r.get("tracking_status") for r in items)
+        orders = [executor_orders[r["signal_id"]] for r in items
+                  if r.get("signal_id") in executor_orders
+                  and executor_orders[r["signal_id"]].get("risk_sizing_version") == SIZING_VERSION]
+        sizing[name] = {
+            "signals": len(items),
+            "paper_tp": status["TP"],
+            "paper_timeout": status["TIMEOUT"],
+            "paper_open": status["OPEN"],
+            "real_orders_created": len(orders),
+            "real_target_usdt_total": round(sum(float(o.get("risk_target_usdt",0))
+                                                for o in orders), 4),
+            "real_order_phases": dict(Counter(o.get("phase","UNKNOWN") for o in orders)),
+        }
     return {
         "version": VERSION,
+        "sizing_policy_version": SIZING_VERSION,
         "v2_gating": False,
-        "live_entry_gate": "block flagged or incomplete risk assessment",
+        "live_entry_gate": "0/1 flags full; 2 flags half; 3 flags or unknown blocked",
         "groups": result,
+        "sizing_cohorts_prospective": sizing,
         "notes": "Cohorts overlap. OPEN is unresolved, not a loss. Resolved TP excludes OPEN. "
-                 "Only new V2/WS signals measured; risky and unknown labels skip automatic real BUY. "
+                 "Only new V2/WS signals measured; 0/1 risk flags full-size, two half-size, three or unknown block real BUY. "
                  "Cohorts are selection-biased and not calibrated TP probabilities.",
     }
 
 
-def export_csv(records):
+def export_csv(records, executor_orders=None):
     """CSV research observations tied to immutable candidate-time flags."""
     fields = [
         "signal_id", "symbol", "created_at", "tracking_model", "tracking_status",
@@ -186,8 +246,13 @@ def export_csv(records):
         "volume_ratio_vs_prior_12h", "rsi_delta_1h",
         "ema25_slope_change_1h_pp", "repeat_prior_entry_drop_pct",
         "weak_volume", "falling_rsi_ema", "repeat_lower_entry", "flag_count",
-        "known_flags", "max_adverse_pct", "max_favorable_pct", "tp_hours",
+        "known_flags", "risk_sizing_version", "risk_position_fraction",
+        "risk_position_action", "real_order_phase", "real_configured_usdt",
+        "real_target_usdt", "real_effective_notional_usdt",
+        "real_order_quantity", "real_filled_quantity",
+        "max_adverse_pct", "max_favorable_pct", "tp_hours",
     ]
+    executor_orders = executor_orders or {}
     buffer = io.StringIO()
     out = csv.DictWriter(buffer, fieldnames=fields)
     out.writeheader()
@@ -198,9 +263,23 @@ def export_csv(records):
         metrics, flags = shadow.get("metrics") or {}, shadow.get("flags") or {}
         strength = (record.get("v2_features") or {}).get("strength_score") or {}
         values = {k: record.get(k) for k in fields}
+        fraction = shadow.get("position_fraction") if shadow.get("sizing_policy_version")==SIZING_VERSION else None
         values.update(score=strength.get("score"),
                       flag_count=shadow.get("flag_count"),
-                      known_flags=shadow.get("known_flags"))
+                      known_flags=shadow.get("known_flags"),
+                      risk_sizing_version=shadow.get("sizing_policy_version"),
+                      risk_position_fraction=fraction,
+                      risk_position_action=("UNKNOWN" if fraction is None else
+                                            "BLOCK" if fraction == 0 else
+                                            "HALF" if fraction == 0.5 else "FULL"))
+        order = executor_orders.get(record.get("signal_id")) or {}
+        if order.get("risk_sizing_version") == SIZING_VERSION:
+            values.update(real_order_phase=order.get("phase"),
+                          real_configured_usdt=order.get("risk_configured_usdt"),
+                          real_target_usdt=order.get("risk_target_usdt"),
+                          real_effective_notional_usdt=order.get("risk_effective_notional_usdt"),
+                          real_order_quantity=order.get("quantity"),
+                          real_filled_quantity=order.get("filled_qty"))
         for k in metrics:
             if k in values:
                 values[k] = metrics[k]
