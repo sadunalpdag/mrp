@@ -13,8 +13,8 @@ import time
 # Leave generous headroom for other clients on a shared Render egress IP.
 # These are conservative software caps, NOT exchange guarantees.
 RESEARCH_CEILING = 180
-ACCOUNT_CEILING = 700
-PROTECT_CEILING = 1100
+ACCOUNT_CEILING = 1400
+PROTECT_CEILING = 1750
 PACED_SECONDS = {"research": 20.0, "account": 3.0, "protect": 0.5}
 
 
