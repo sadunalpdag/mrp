@@ -70,7 +70,7 @@ class SharedIpBudgetTests(unittest.TestCase):
     def test_actual_broker_request_observes_weight_and_respects_budget(self):
         from crash_night import BinanceBroker, BrokerError
         broker=BinanceBroker('test_key','test_secret')
-        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'699'})
+        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'735'})
         response.json.return_value={'ok':True}
         with patch('crash_rest_budget.BUDGET',self.b),patch('requests.request',return_value=response) as req:
             self.assertEqual(broker.request('GET','/fapi/v1/exchangeInfo',signed=False),{'ok':True})
