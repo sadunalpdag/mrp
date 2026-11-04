@@ -144,15 +144,15 @@ def format_warning(result):
     missing = f" | eksik veri {3-known}/3" if known < 3 else ""
     fraction = None if known < 3 else (0.0 if len(hits) == 3
                                     else 0.5 if len(hits) == 2 else 1.0)
-    action = ("⏸️ EKSİK VERİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\\n"
+    action = ("⏸️ EKSİK VERİ: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n"
               if fraction is None else
-              "⛔ 3/3 RİSK: otomatik GERÇEK ALIŞ YAPILMAYACAK.\\n"
+              "⛔ 3/3 RİSK: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n"
               if fraction == 0 else
-              "⚖️ 2/3 RİSK: otomatik pozisyon tutarının %50'si kullanılacak.\\n"
+              "⚖️ 2/3 RİSK: otomatik pozisyon tutarının %50'si kullanılacak.\n"
               if fraction == 0.5 else
-              "✅ 0–1/3 RİSK: otomatik pozisyon tutarının %100'ü kullanılacak.\\n")
-    return (f"🔎 TP RİSK ETİKETLERİ: {len(hits)}/3 — {label}{missing}\\n"
-            + action + "Deneysel; TP olasılığı değildir. Sinyal ve sanal takip devam eder.\\n")
+              "✅ 0–1/3 RİSK: otomatik pozisyon tutarının %100'ü kullanılacak.\n")
+    return (f"🔎 TP RİSK ETİKETLERİ: {len(hits)}/3 — {label}{missing}\n"
+            + action + "Deneysel; TP olasılığı değildir. Sinyal ve sanal takip devam eder.\n")
 
 
 def summarize(records, executor_orders=None):
