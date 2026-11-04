@@ -159,7 +159,9 @@ class TopGainers:
     def __init__(self, directory, cache, fetch, telegram, log=print,
                  post=None, clock=time.time, env=None, market_symbols=None):
         self.env=os.environ if env is None else env
-        self.enabled=self.env.get("TOP_GAINERS_ENABLED","1")=="1"
+        # Opt-in only. The main Crash worker never starts this module after
+        # the operator disabled AI Gainers; a standalone run is also off by default.
+        self.enabled=self.env.get("TOP_GAINERS_ENABLED","0")=="1"
         self.key=self.env.get("OPENAI_API_KEY","").strip()
         self.cache,self.fetch,self.telegram,self.log,self.post,self.clock=cache,fetch,telegram,log,post,clock
         self.market_symbols=market_symbols

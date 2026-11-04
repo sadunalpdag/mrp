@@ -20,11 +20,34 @@ class CrashV2Tests(unittest.TestCase):
         self.assertEqual(data["candles"], 480)
         self.assertGreater(data["recovery_4h_pct"], 1)
 
-    def test_history_missing_fail_closed(self):
+    def test_missing_latest_closed_candle_fails_closed(self):
         rows = self.rows(2000000000)
         result = crash_v2.assess_entry(rows[:-1], [], 2000000000)
         self.assertFalse(result["qualified"])
         self.assertEqual(result["candles"], 479)
+
+    def test_one_or_two_missing_old_candles_are_tolerated_without_imputation(self):
+        rows = self.rows(2000000000)
+        for missing_at in ((100,), (100, 251), (465, 468)):
+            with self.subTest(missing_at=missing_at):
+                observed = [r for i, r in enumerate(rows) if i not in missing_at]
+                result = crash_v2.assess_entry(observed, [], 2000000000)
+                self.assertTrue(result["qualified"])
+                self.assertEqual(result["candles"], 480-len(missing_at))
+                self.assertEqual(result["missing_candles"], len(missing_at))
+                self.assertEqual(result["strength_score"]["observed_candles"],
+                                 480-len(missing_at))
+                self.assertIsNone(result["five_day_context"])
+                self.assertEqual(result["last_closed_open_ms"], rows[-1][0])
+
+    def test_three_missing_candles_still_fail_closed(self):
+        rows = self.rows(2000000000)
+        result = crash_v2.assess_entry(
+            [r for i,r in enumerate(rows) if i not in (100, 120, 250)],
+            [], 2000000000)
+        self.assertEqual(result["status"], "MISSING_5D_HISTORY")
+        self.assertFalse(result["qualified"])
+        self.assertEqual(result["candles"], 477)
 
     def test_closed_ws_tail_can_fill_gap(self):
         rows = self.rows(2000000000)

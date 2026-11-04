@@ -86,8 +86,16 @@ class BybitReference:
             finally:
                 response.close()
             if not isinstance(payload, dict) or payload.get('retCode') != 0:
-                raise ValueError('BYBIT_CODE_' + str(payload.get('retCode', 'INVALID'))[:24]
-                                 if isinstance(payload, dict) else 'INVALID_RESPONSE')
+                code = str(payload.get('retCode', 'INVALID'))[:24] if isinstance(payload, dict) else 'INVALID'
+                if code in ('10001', '10029'):
+                    # Unsupported contract / invalid query for this symbol.
+                    # Avoid revisiting the same failed single-bar lookup every
+                    # 30 minutes while other symbols still need missing data.
+                    self.next_symbol[symbol] = now + 86400
+                    self.log(f'[CRASH BYBIT UNAVAILABLE] {symbol}; '
+                             f'code={code}; retry_after=86400s')
+                    return []
+                raise ValueError('BYBIT_CODE_' + code)
             result = payload.get('result')
             if (not isinstance(result, dict) or result.get('symbol') != symbol
                     or result.get('category') != 'linear'):

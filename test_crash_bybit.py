@@ -96,6 +96,20 @@ class BybitGapTests(unittest.TestCase):
                         self.missing,self.archive),[])
         self.get.assert_called_once()
 
+    def test_invalid_bybit_symbol_request_10001_has_24h_backoff(self):
+        response=Mock(status_code=200)
+        response.json.return_value={'retCode':10001,'retMsg':'Request parameter error'}
+        self.get.return_value=response
+        self.assertEqual(self.b.fill_missing('BTCUSDT',self.start,self.end,
+                          self.missing,self.archive),[])
+        self.assertEqual(self.b.next_symbol['BTCUSDT'],self.now+86400)
+        self.assertTrue(any('CRASH BYBIT UNAVAILABLE' in str(x)
+                            for x in self.log.call_args_list))
+        self.now+=1800
+        self.assertEqual(self.b.fill_missing('BTCUSDT',self.start,self.end,
+                          self.missing,self.archive),[])
+        self.get.assert_called_once()
+
     def test_mixed_480_candles_qualify_for_v2_and_binance_replaces_bybit(self):
         self.get.return_value=payload(candles(self.start+308*STEP,172))
         is_blocked=True

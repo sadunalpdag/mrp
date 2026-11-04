@@ -182,9 +182,20 @@ class HistoryCollector:
                 if event['complete'] and not any(event['data_sources'].get(src,0) for src in ('BYBIT_LINEAR','COINBASE_SPOT')):
                     self.jobs.pop(key, None)
                 else:
+                    # One or two missing bars no longer block V2 eligibility
+                    # (validated independently at candidate time). Back off
+                    # these repetitive 479/480 jobs for an hour so other
+                    # symbols get access to the paced fallback worker.
+                    near_complete = COUNT-2 <= event['candle_count'] < COUNT
                     self.jobs[key]['retry_after'] = now + (
-                        1800 if event['complete'] else (300 if self.resolver else 1800))
+                        3600 if near_complete else
+                        1800 if event['complete'] else
+                        300 if self.resolver else 1800)
                 self._write(self.path, self.jobs)
+            if COUNT-2 <= event['candle_count'] < COUNT:
+                self.log(f"[CRASH HISTORY NEAR_COMPLETE] {job['symbol']}; "
+                         f"real_candles={event['candle_count']}/480; "
+                         "1-2 eksik; sonraki tamamlamayi bir saat ertele")
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
         except HistoryPacingWait:
             with self.lock:

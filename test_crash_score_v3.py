@@ -72,9 +72,14 @@ class ProportionalScoreTests(unittest.TestCase):
         self.assertFalse(damaged['qualified'])
         self.assertNotIn('strength_score',damaged)
 
-    def test_requires_full_candle_window(self):
+    def test_requires_at_least_478_real_candles(self):
+        observed=self.to_ohlcv(self.rows())
+        self.assertEqual(score_candidate(observed[:-1])['observed_candles'],479)
+        partial=score_candidate(observed[:-2],btc_change_24h=0)
+        self.assertEqual(partial['missing_candles'],2)
+        self.assertLess(partial['coverage_pct'],100.0)
         with self.assertRaises(ValueError):
-            score_candidate(self.to_ohlcv(self.rows()[:-1]))
+            score_candidate(observed[:-3])
 
 
 if __name__=="__main__":
