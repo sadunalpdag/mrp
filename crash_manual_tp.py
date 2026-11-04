@@ -3,6 +3,7 @@
 No API calls at import. Disabled unless explicitly configured by the operator.
 """
 import hashlib
+import math
 from decimal import Decimal as D
 from crash_night import BrokerError, error_details, rounded
 from crash_policy import supported_symbol
@@ -103,10 +104,26 @@ class ManualTPGuard:
     def fail(self, symbol, error, record=None):
         if isinstance(error, BrokerError) and error.code == '-1003':
             now = self.e.clock()
-            if now >= self.notices.get('API_RATE_LIMIT', 0):
-                self.notices['API_RATE_LIMIT'] = now+300
-                wait = max(0, int(getattr(self.b, 'cooldown_until', now)-now))
-                self.e.alert(f'⚠️ API SORGULAMASI BEKLETİLDİ | {symbol}\nKod: -1003\nAPI istek sınırı aşıldı; işlem modülü {wait} sn bekleyecek. TP eksikliği doğrulanmadı; mevcut emirler iptal edilmedi.')
+            deferred = getattr(error, 'deferred_reason', None)
+            key = 'LOCAL_IP_BUDGET' if deferred else 'API_RATE_LIMIT'
+            if now >= self.notices.get(key, 0):
+                self.notices[key] = now+300
+                if deferred:
+                    wait = max(1, math.ceil(float(error.deferred_seconds or 0)))
+                    self.e.alert(f'⏳ YEREL API KORUMASI | {symbol}\n'
+                                 f'Kod: LOCAL_IP_BUDGET ({deferred})\n'
+                                 f'Binance sorgusu GÖNDERİLMEDİ; yaklaşık {wait} sn sonra '
+                                 'yeniden denenebilir. TP durumu doğrulanamadı; '
+                                 'mevcut emirler iptal edilmedi.')
+                else:
+                    # Actual exchange -1003 can have an unknown cooldown.
+                    remaining = getattr(self.b, 'cooldown_until', now) - now
+                    duration = (f'{math.ceil(remaining)} sn' if remaining > 0
+                                else 'bilinmeyen süre')
+                    self.e.alert(f'⚠️ API SORGULAMASI BEKLETİLDİ | {symbol}\n'
+                                 f'Kod: -1003\nBinance istek sınırı veya aktif '
+                                 f'API engeli; bekleme: {duration}. TP eksikliği '
+                                 'doğrulanmadı; mevcut emirler iptal edilmedi.')
             return
         if isinstance(error, ValueError) and str(error) in LOCAL_REASONS:
             self.warn(symbol, str(error), LOCAL_REASONS[str(error)], record)
@@ -170,6 +187,8 @@ class ManualTPGuard:
                 self.inspect(p)
             except Exception as error:
                 self.fail(symbol, error, self.state.get(symbol))
+                if isinstance(error, BrokerError) and error.code == '-1003':
+                    break  # Do not query the remaining coins during any rate pause.
             if self.e.clock() < getattr(self.b, 'cooldown_until', 0):
                 break
 
@@ -205,7 +224,9 @@ class ManualTPGuard:
             return
         if r['phase'] == 'HOLD' or r['attempts'] >= 2 or self.e.clock() < r['retry_at']:
             return
-        qty_text, target = repair_plan(p, self.b.info(symbol))
+        # A new BUY is still account-tier; manual TP checks need protective capacity.
+        info = getattr(self.b, 'protected_info', self.b.info)(symbol)
+        qty_text, target = repair_plan(p, info)
         r['tp'] = target
         # Refresh position AND both order sets immediately before submission.
         latest = next((x for x in self.b.positions() if x['symbol']==symbol and x.get('positionSide', 'BOTH') == position_side and D(x['positionAmt'])>0), None)
@@ -226,6 +247,16 @@ class ManualTPGuard:
             self.b.repair_tp(symbol, qty_text, target, r['client_id'], **kwargs)
         except Exception as error:
             r['submit_error'] = error_details(error)
+            if isinstance(error, BrokerError) and error.deferred_reason:
+                # Local budget refused before HTTP. No order was submitted:
+                # do not consume an actual TP placement attempt.
+                r['phase'] = 'READY'
+                r['attempts'] -= 1
+                r['retry_at'] = self.e.clock() + max(1, math.ceil(float(error.deferred_seconds or 0)))
+                r.pop('client_id', None)
+                self.e.save()
+                self.fail(symbol, error, r)
+                return
             if (isinstance(error, BrokerError) and not error.uncertain
                     and error.code in {'-1021', '-1022', '-2014', '-2015', '-2019', '-2022', '-1111',
                                        '-1013', '-1015', '-1003', '-4014', '-4023', '-4061', '-4164', '-5022'}):

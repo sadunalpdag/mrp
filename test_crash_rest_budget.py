@@ -85,6 +85,30 @@ class SharedIpBudgetTests(unittest.TestCase):
         broker.info('BTCUSDT')
         self.assertEqual(broker.request.call_count,4)
 
+    def test_tp_coverage_reads_use_reserved_capacity_above_account_ceiling(self):
+        from crash_night import BinanceBroker, BrokerError
+        broker = BinanceBroker('test_key', 'test_secret')
+        self.b.observe({'X-MBX-USED-WEIGHT-1M': '1519'}, 200)
+        response = Mock(status_code=200, headers={'X-MBX-USED-WEIGHT-1M': '1519'})
+        response.json.return_value = []
+        req = Mock(return_value=response)
+        with patch('crash_rest_budget.BUDGET', self.b), patch.dict(
+                'sys.modules', {'requests': SimpleNamespace(request=req)}):
+            self.assertEqual(broker.positions(), [])
+            self.assertEqual(broker.closing_orders('BTCUSDT'), [])
+            self.assertEqual(req.call_count, 3)
+            with self.assertRaises(BrokerError) as blocked:
+                broker.request('GET', '/fapi/v1/openOrders')
+            self.assertEqual(blocked.exception.code, '-1003')
+            self.assertEqual(blocked.exception.deferred_reason, 'IP_WEIGHT_SOFT_CEILING')
+            self.assertGreater(blocked.exception.deferred_seconds, 0)
+            self.assertEqual(req.call_count, 3)
+            with self.assertRaises(ValueError):
+                broker.request('POST', '/fapi/v1/order',
+                               {'symbol':'BTCUSDT','side':'BUY'},
+                               budget_priority='protect')
+            self.assertEqual(req.call_count, 3)
+
     def test_actual_broker_request_observes_weight_and_respects_budget(self):
         from crash_night import BinanceBroker, BrokerError
         broker=BinanceBroker('test_key','test_secret')
@@ -98,6 +122,8 @@ class SharedIpBudgetTests(unittest.TestCase):
             with self.assertRaises(BrokerError) as blocked:
                 broker.request('GET','/fapi/v1/openOrders')
             self.assertEqual(blocked.exception.code,'-1003')
+            self.assertEqual(blocked.exception.deferred_reason, 'IP_WEIGHT_SOFT_CEILING')
+            self.assertGreater(blocked.exception.deferred_seconds, 0)
             self.assertEqual(req.call_count,1)
             self.assertEqual(broker.request('GET','/fapi/v1/order',{'symbol':'BTCUSDT'}),{'ok':True})
             self.assertEqual(req.call_count,2)
