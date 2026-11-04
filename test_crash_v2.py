@@ -85,6 +85,28 @@ class CrashV2Tests(unittest.TestCase):
         self.assertEqual(submitted['tracking_status'],'WAIT_ENTRY')
         self.assertEqual(observed,101)
 
+    def test_risk_size_policy_queues_zero_one_two_but_not_three(self):
+        from crash_failure_shadow import entry_block_reason, position_fraction
+        scenarios=[
+            ((False,False,False),True,1.0),
+            ((True,False,False),True,1.0),
+            ((True,True,False),True,0.5),
+            ((True,True,True),False,0.0),
+        ]
+        for vals,allowed,fraction in scenarios:
+            with self.subTest(flags=vals):
+                env,_=self._delivery_context()
+                executor=Mock()
+                env['_CRASH_NIGHT']=executor
+                state,record=self._candidate()
+                record['failure_shadow']['flags']=dict(
+                    zip(('weak_volume','falling_rsi_ema','repeat_lower_entry'),vals))
+                self.assertEqual(position_fraction(record),fraction)
+                self.assertEqual(entry_block_reason(record) is None,allowed)
+                env['_crash_send_pending'](state,105)
+                self.assertEqual(executor.submit.call_count,int(allowed))
+                self.assertTrue(record['v2_sent'])
+
     def test_failed_signal_delivery_never_submits_gtc(self):
         env, receipt = self._delivery_context()
         executor=Mock();env['_CRASH_NIGHT']=executor
