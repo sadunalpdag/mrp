@@ -84,15 +84,23 @@ ERROR_REASONS = {
 
 class BrokerError(Exception):
     """Only a numeric API code, never raw API messages or signed URLs."""
-    def __init__(self, code, uncertain=False):
+    def __init__(self, code, uncertain=False, deferred_reason=None, deferred_seconds=None):
         raw = str(code).removeprefix('BINANCE_')
         self.code = raw if raw.lstrip('-').isdigit() else 'UNKNOWN'
         self.uncertain = uncertain or self.code == 'UNKNOWN'
+        # Set ONLY when the local scheduler refused a request before HTTP.
+        # Such a deferral must not be reported as an exchange -1003 response.
+        self.deferred_reason = deferred_reason
+        self.deferred_seconds = deferred_seconds
         super().__init__('BINANCE_'+self.code)
 
 
 def error_details(error):
     if isinstance(error, BrokerError):
+        if error.deferred_reason:
+            return ('Kod: LOCAL_IP_BUDGET | Neden: Binance isteği gönderilmedi; '
+                    f'yerel koruma {error.deferred_reason}, '
+                    f'yaklaşık {max(1, int(float(error.deferred_seconds or 0) + 0.999))} sn bekleme.')
         reason = ERROR_REASONS.get(error.code, 'Binance yanıtı doğrulanamadı.' if error.uncertain else 'Binance isteği reddetti; hata kodunu kontrol edin.')
         return f'Kod: {error.code} | Neden: {reason}'
     local = {'TP_NOT_ACTIVE': 'TP emri iptal edilmiş, süresi dolmuş veya reddedilmiş.',
@@ -111,7 +119,7 @@ class BinanceBroker:
         self.cooldown_until = 0
         self.rate_failures = 0
 
-    def request(self, method, path, params=None, signed=True):
+    def request(self, method, path, params=None, signed=True, budget_priority=None):
         import requests
         import hmac
         from urllib.parse import urlencode
@@ -121,11 +129,21 @@ class BinanceBroker:
         params = dict(params or {})
         # Reserve before signing or sending. Local deferrals NEVER issue a
         # Binance request and NEVER masquerade as a successful BUY/TP.
+        if budget_priority not in (None, 'protect'):
+            raise ValueError('INVALID_BUDGET_PRIORITY')
+        # Protection overrides are restricted to verified position/order queries.
+        # New BUY and preflight requests cannot consume TP-reserved capacity.
+        if budget_priority == 'protect' and not (method == 'GET' and path in (
+                '/fapi/v3/positionRisk', '/fapi/v1/openOrders',
+                '/fapi/v1/openAlgoOrders', '/fapi/v1/exchangeInfo',
+                '/fapi/v1/ticker/bookTicker')):
+            raise ValueError('UNSAFE_PROTECTION_PRIORITY')
         try:
-            BUDGET.reserve(priority_for(method, path, params),
+            BUDGET.reserve(budget_priority or priority_for(method, path, params),
                            estimated_weight(path, params))
-        except RateDeferred:
-            raise BrokerError('-1003') from None
+        except RateDeferred as deferred:
+            raise BrokerError('-1003', deferred_reason=deferred.reason,
+                              deferred_seconds=deferred.seconds) from None
         if signed:
             params.update(timestamp=int(time.time()*1000), recvWindow=5000)
         query = urlencode(params)
@@ -163,20 +181,25 @@ class BinanceBroker:
         return body
 
     def positions(self):
-        result = self.request('GET', '/fapi/v3/positionRisk')
+        # Only used by TP-repair scans. Always read LIVE positions.
+        result = self.request('GET', '/fapi/v3/positionRisk',
+                              budget_priority='protect')
         if not isinstance(result, list):
             raise ValueError('INVALID_POSITION_RESPONSE')
         return result
 
     def closing_orders(self, symbol):
-        normal = self.request('GET', '/fapi/v1/openOrders', {'symbol': symbol})
-        algo = self.request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol})
+        normal = self.request('GET', '/fapi/v1/openOrders', {'symbol': symbol},
+                              budget_priority='protect')
+        algo = self.request('GET', '/fapi/v1/openAlgoOrders', {'symbol': symbol},
+                            budget_priority='protect')
         if not isinstance(normal, list) or not isinstance(algo, list):
             raise ValueError('INVALID_ORDER_RESPONSE')
         return normal + algo
 
     def best_bid(self, symbol):
-        result = self.request('GET', '/fapi/v1/ticker/bookTicker', {'symbol': symbol}, signed=False)
+        result = self.request('GET', '/fapi/v1/ticker/bookTicker', {'symbol': symbol},
+                              signed=False, budget_priority='protect')
         return D(result['bidPrice'])
 
     def repair_tp(self, symbol, qty, price, client_id, position_side="BOTH"):
@@ -185,14 +208,19 @@ class BinanceBroker:
             timeInForce='GTX', quantity=qty, price=price, newClientOrderId=client_id,
             **self.close_params(position_side)))
 
-    def info(self, symbol):
+    def protected_info(self, symbol):
+        # Only use from an existing-position TP-repair flow.
+        return self.info(symbol, budget_priority='protect')
+
+    def info(self, symbol, budget_priority=None):
         # Exchange filters rarely change. Reuse the validated snapshot for
         # 30 minutes instead of downloading ALL symbols for every candidate.
         # Never cache balances, positions, open orders or TP verification.
         now = time.time()
         cached = getattr(self, '_exchange_info_cache', None)
         if cached is None or now >= cached[0]:
-            data = self.request('GET', '/fapi/v1/exchangeInfo', signed=False)
+            data = self.request('GET', '/fapi/v1/exchangeInfo',
+                                signed=False, budget_priority=budget_priority)
             symbols = data.get('symbols') if isinstance(data, dict) else None
             if not isinstance(symbols, list) or not symbols:
                 raise ValueError('INVALID_EXCHANGE_INFO')
