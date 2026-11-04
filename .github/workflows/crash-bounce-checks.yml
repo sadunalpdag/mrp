@@ -1,7 +1,7 @@
 name: Crash Bounce V2 checks
 on:
   push:
-    branches: [master, feature/ai-top-gainers-4h, feature/ai-top-gainers-four-analysts-20261031, fix/crash-two-missing-candles-tolerance-disable-gainers]
+    branches: [master, feature/ai-top-gainers-4h, feature/ai-top-gainers-four-analysts-20261031]
     paths:
       - 'ema.py'
       - 'ai_top_gainers.py'
