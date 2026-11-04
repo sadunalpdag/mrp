@@ -44,7 +44,7 @@ class SharedIpBudgetTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason,'IP_WEIGHT_SOFT_CEILING')
         self.b.reserve('protect',5)
         self.assertLess(self.b.stats()['reserved_weight'], PROTECT_CEILING)
-        self.b.observe({'X-MBX-USED-WEIGHT-1M':'1050'},200)
+        self.b.observe({'X-MBX-USED-WEIGHT-1M':'1750'},200)
         with self.assertRaises(RateDeferred):
             self.b.reserve('protect',1)
 
