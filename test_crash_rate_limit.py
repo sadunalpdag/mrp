@@ -9,7 +9,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 class RateTests(unittest.TestCase):
@@ -75,6 +75,21 @@ class RateTests(unittest.TestCase):
         self.response(headers={'X-MBX-USED-WEIGHT-1M':'1300'})
         self.g['_crash_public_get']('/fapi/v1/klines')
         self.assertGreater(self.g['_crash_cooldown_until'],self.now)
+
+    def test_research_off_keeps_metadata_but_never_calls_market_rest(self):
+        self.response(status=200, data={'symbols': [], 'rateLimits': []})
+        with patch.dict(os.environ, {'CRASH_RESEARCH_REST_ENABLED': '0'}):
+            for endpoint in ('/fapi/v1/klines', '/api/v3/klines',
+                             '/futures/data/openInterestHist', '/fapi/v1/fundingRate'):
+                with self.assertRaisesRegex(RuntimeError, 'RESEARCH_BINANCE_REST_DISABLED'):
+                    self.g['_crash_public_get'](endpoint)
+            self.g['requests'].get.assert_not_called()
+            # Symbol metadata is allowed so the WS futures scanner can
+            # validate tradable symbols after the saved cache expires.
+            self.g['_crash_public_get']('/fapi/v1/exchangeInfo')
+            self.assertEqual(self.g['requests'].get.call_count, 1)
+            self.assertIn('/fapi/v1/exchangeInfo',
+                          self.g['requests'].get.call_args.args[0])
 
     def test_endpoint_allowlist_and_cooldown_corruption_fail_closed(self):
         with self.assertRaises(ValueError): self.g['_crash_public_get']('/fapi/v1/ticker/price')
