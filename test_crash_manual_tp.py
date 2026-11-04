@@ -55,6 +55,38 @@ class ManualTests(unittest.TestCase):
         self.assertIn('AUSDT',message);self.assertIn('300 sn',message)
         self.assertIn('TP eksikliği doğrulanmadı',message)
 
+    def test_local_budget_wait_is_not_a_binance_1003_or_zero_seconds(self):
+        self.b.positions = Mock(side_effect=BrokerError(
+            '-1003', deferred_reason='IP_WEIGHT_SOFT_CEILING', deferred_seconds=35.4))
+        self.g.scan()
+        self.assertFalse(self.b.posts)
+        msg = self.e.state['outbox'][-1]['text']
+        self.assertIn('YEREL API KORUMASI', msg)
+        self.assertIn('LOCAL_IP_BUDGET', msg)
+        self.assertIn('36 sn', msg)
+        self.assertIn('GÖNDERİLMEDİ', msg)
+        self.assertNotIn('Kod: -1003', msg)
+        self.assertNotIn('0 sn', msg)
+        self.assertIn('TP durumu doğrulanamadı', msg)
+
+    def test_local_tp_post_deferral_keeps_attempt_and_position_safe(self):
+        # The fake broker raises without a network send; only a local guard refused.
+        self.b.failure = BrokerError('-1003', deferred_reason='IP_WEIGHT_SOFT_CEILING',
+                                     deferred_seconds=38)
+        self.g.scan()
+        record = self.g.state['AUSDT']
+        self.assertEqual(record['phase'], 'READY')
+        self.assertEqual(record['attempts'], 0)
+        self.assertEqual(record['retry_at'], self.now + 38)
+        self.assertNotIn('client_id', record)
+        self.assertIn('LOCAL_IP_BUDGET', self.e.state['outbox'][-1]['text'])
+        self.b.failure = None
+        self.now += 38
+        self.g.scan()
+        self.assertEqual(record['phase'], 'PROTECTED')
+        self.assertEqual(record['attempts'], 1)
+        self.assertEqual(len(self.b.posts), 2)
+
     def test_manual_daytime_long_missing_tp_repaired_verified(self):
         self.g.scan();self.assertEqual(len(self.b.posts),1)
         self.assertEqual(tuple(D(v) for v in self.b.posts[0][1:3]),(D('5'),D('10.1')))
