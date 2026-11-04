@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock
 
 from crash_failure_shadow import (
-    VERSION, assess, entry_block_reason, export_csv, format_warning, summarize,
+    VERSION, assess, entry_block_reason, position_fraction, export_csv, format_warning, summarize,
 )
 from crash_night import NightExecutor
 from test_crash_services import FakeBroker, timestamp
@@ -45,21 +45,24 @@ class NonclosureLabelsTests(unittest.TestCase):
         self.assertFalse(shadow["blocks_live_entry"])
         self.assertIsNone(entry_block_reason(r))
 
-    def test_weak_green_share_and_volume_blocks_auto_buy(self):
+    def test_weak_green_share_and_volume_uses_full_size(self):
         r = candidate(green=.17, volume=1.27, rsi=2, ema=.02)
         shadow = self.risk(r)
         self.assertEqual(shadow["flags"], {
             "weak_volume": True, "falling_rsi_ema": False,
             "repeat_lower_entry": False})
         self.assertEqual(shadow["flag_count"], 1)
-        self.assertIn("RISK_weak_volume", entry_block_reason(r))
-        self.assertIn("GERÇEK ALIŞ YAPILMAYACAK", format_warning(shadow))
+        self.assertIsNone(entry_block_reason(r))
+        self.assertEqual(position_fraction(r), 1.0)
+        self.assertEqual(shadow["position_fraction"], 1.0)
+        self.assertIn("%100", format_warning(shadow))
 
-    def test_falling_rsi_and_ema_blocks_auto_buy(self):
+    def test_falling_rsi_and_ema_uses_full_size(self):
         r = candidate(rsi=-6, ema=-.11)
         shadow = self.risk(r)
         self.assertTrue(shadow["flags"]["falling_rsi_ema"])
-        self.assertIsNotNone(entry_block_reason(r))
+        self.assertIsNone(entry_block_reason(r))
+        self.assertEqual(position_fraction(r), 1.0)
 
     def test_repeat_lower_prior_strong_signal_only(self):
         older = candidate(symbol="AUSDT", at=1_000_000-3600, entry="11")
@@ -67,7 +70,8 @@ class NonclosureLabelsTests(unittest.TestCase):
         shadow = self.risk(r, [older])
         self.assertTrue(shadow["flags"]["repeat_lower_entry"])
         self.assertLess(shadow["metrics"]["repeat_prior_entry_drop_pct"], -2)
-        self.assertIn("repeat_lower_entry", entry_block_reason(r))
+        self.assertIsNone(entry_block_reason(r))
+        self.assertEqual(position_fraction(r), 1.0)
         older["created_at"] = 1_000_001
         self.assertFalse(assess(r, [older])["flags"]["repeat_lower_entry"])
 
@@ -101,28 +105,69 @@ class NonclosureLabelsTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[2]["weak_volume"], "True")
 
-    def test_entry_safety_guard_blocks_post_and_does_not_count_risky(self):
+    def test_two_risks_half_sized_and_three_risks_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             broker = FakeBroker()
             clock = timestamp("2026-11-03T20:00:00")
             executor = NightExecutor(directory, broker, Mock(return_value={"ok":True}),
                                      Mock(), lambda:clock, enabled=True, max_daily=20)
             self.addCleanup(executor.guard.close)
-            r = candidate()
-            r["signal_id"] = "risk-1"
-            r["created_at"] = clock - 1
+            older = candidate(symbol="AUSDT", at=clock-3600, entry="11")
+            two = candidate(green=.1, volume=1.1, rsi=-6, ema=-.11)
+            two.update(created_at=clock-1, signal_id="two-risks")
+            shadow = self.risk(two)
+            self.assertEqual(shadow["flag_count"],2)
+            self.assertEqual(position_fraction(two),.5)
+            self.assertIsNone(entry_block_reason(two))
+            self.assertIn("%50",format_warning(shadow))
+            executor.enter(two,clock)
+            self.assertEqual(len(broker.buys),1)
+            self.assertEqual(executor.daily_count(),1)
+            order=executor.state["orders"]["two-risks"]
+            self.assertEqual(order["risk_flag_count"],2)
+            self.assertEqual(order["risk_position_fraction"],.5)
+            self.assertEqual(order["risk_configured_usdt"],"500")
+            self.assertEqual(order["risk_target_usdt"],"250.0")
+            self.assertLessEqual(float(order["risk_effective_notional_usdt"]),250)
+
+        with tempfile.TemporaryDirectory() as directory:
+            broker = FakeBroker()
+            clock = timestamp("2026-11-03T20:00:00")
+            executor = NightExecutor(directory, broker, Mock(return_value={"ok":True}),
+                                     Mock(), lambda:clock, enabled=True, max_daily=20)
+            self.addCleanup(executor.guard.close)
+            three = candidate(green=.1, volume=1.1, rsi=-6, ema=-.11)
+            three.update(created_at=clock-1, signal_id="three-risks")
+            shadow=self.risk(three,[older])
+            self.assertEqual(shadow["flag_count"],3)
+            self.assertEqual(shadow["position_fraction"],0)
+            self.assertEqual(entry_block_reason(three),"RISK_3_OF_3")
+            self.assertIn("YAPILMAYACAK",format_warning(shadow))
+            executor.enter(three,clock)
+            self.assertEqual(len(broker.buys),0)
+            self.assertEqual(executor.daily_count(),0)
+
+    def test_one_risk_trades_full_notional_and_logs_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=FakeBroker()
+            clock=timestamp("2026-11-03T20:00:00")
+            executor=NightExecutor(directory,broker,Mock(return_value={"ok":True}),
+                                   Mock(),lambda:clock,enabled=True)
+            self.addCleanup(executor.guard.close)
+            r=candidate(green=.1,volume=1.1)
+            r.update(created_at=clock-1,signal_id="one-risk")
             self.risk(r)
-            clean = dict(r)
-            clean["signal_id"] = "clean-1"
-            risky = candidate(green=.1, volume=1.1)
-            risky.update(created_at=clock-1, signal_id="risky-2")
-            self.risk(risky)
-            executor.enter(risky, clock)
-            self.assertEqual(len(broker.buys), 0)
-            self.assertEqual(executor.daily_count(), 0)
-            executor.enter(clean, clock)
-            self.assertEqual(len(broker.buys), 1)
-            self.assertEqual(executor.daily_count(), 1)
+            executor.enter(r,clock)
+            self.assertEqual(len(broker.buys),1)
+            order=executor.state["orders"]["one-risk"]
+            self.assertEqual(order["risk_flag_count"],1)
+            self.assertEqual(order["risk_target_usdt"],"500.0")
+            self.assertEqual(position_fraction(r),1.0)
+            result=summarize([r],executor.state["orders"])
+            self.assertEqual(result["sizing_cohorts_prospective"]["one_flag_full"]["real_orders_created"],1)
+            data=list(csv.DictReader(io.StringIO(export_csv([r],executor.state["orders"]))))
+            self.assertEqual(data[0]["real_target_usdt"],"500.0")
+            self.assertEqual(data[0]["risk_position_action"],"FULL")
 
     def test_missing_assessment_blocks_live_entry(self):
         with tempfile.TemporaryDirectory() as directory:
