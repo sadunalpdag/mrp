@@ -33,7 +33,7 @@ class SharedIpBudgetTests(unittest.TestCase):
         self.b.reserve('protect',5)
         self.assertLess(self.now[0]-start,1)
         self.b.reserve('research',2)
-        self.assertGreaterEqual(self.now[0]-start,8)
+        self.assertGreaterEqual(self.now[0]-start,20)
         self.assertEqual(self.b.stats()['reserved_weight'],9)
 
     def test_server_header_suppresses_research_but_retains_tp_capacity(self):
@@ -68,10 +68,27 @@ class SharedIpBudgetTests(unittest.TestCase):
         with self.assertRaises(RateDeferred):
             self.b.reserve('protect',1)
 
+    def test_exchange_info_cached_but_account_queries_not_cached(self):
+        from crash_night import BinanceBroker
+        broker=BinanceBroker('key','secret')
+        info={'symbols':[{'symbol':'BTCUSDT','filters':[]},
+                         {'symbol':'ETHUSDT','filters':[]}]}
+        broker.request=Mock(side_effect=lambda method,path,**kw:
+                            info if path.endswith('exchangeInfo') else [])
+        self.assertEqual(broker.info('BTCUSDT')['symbol'],'BTCUSDT')
+        self.assertEqual(broker.info('ETHUSDT')['symbol'],'ETHUSDT')
+        self.assertEqual(broker.request.call_count,1)
+        broker.positions()
+        broker.positions()
+        self.assertEqual(broker.request.call_count,3)
+        broker._exchange_info_cache=(0,broker._exchange_info_cache[1])
+        broker.info('BTCUSDT')
+        self.assertEqual(broker.request.call_count,4)
+
     def test_actual_broker_request_observes_weight_and_respects_budget(self):
         from crash_night import BinanceBroker, BrokerError
         broker=BinanceBroker('test_key','test_secret')
-        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'1390'})
+        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'690'})
         response.json.return_value={'ok':True}
         req=Mock(return_value=response)
         with patch('crash_rest_budget.BUDGET',self.b),patch.dict(

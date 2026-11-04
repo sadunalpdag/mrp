@@ -10,10 +10,12 @@ import threading
 import time
 
 # Well below the usual 2400/minute; absolute ceilings for ALL local calls.
-RESEARCH_CEILING = 400
-ACCOUNT_CEILING = 1400
-PROTECT_CEILING = 1750
-PACED_SECONDS = {"research": 8.0, "account": 1.25, "protect": 0.25}
+# Leave generous headroom for other clients on a shared Render egress IP.
+# These are conservative software caps, NOT exchange guarantees.
+RESEARCH_CEILING = 180
+ACCOUNT_CEILING = 700
+PROTECT_CEILING = 1100
+PACED_SECONDS = {"research": 20.0, "account": 3.0, "protect": 0.5}
 
 
 class RateDeferred(RuntimeError):
@@ -69,6 +71,7 @@ class IpBudget:
         self.next_per_kind = {k: 0.0 for k in PACED_SECONDS}
         self.next_global = 0.0
         self.last_notice = {}
+        self.research_next_allowed = 0.0
 
     def _roll(self, now):
         minute = int(now // 60)
@@ -103,6 +106,12 @@ class IpBudget:
                     wait = (int(now // 60)+1)*60 + 5 - now
                     self._notice(kind, "IP_WEIGHT_SOFT_CEILING", wait, now)
                     raise RateDeferred(kind, wait, "IP_WEIGHT_SOFT_CEILING")
+                # Once external/server IP usage is high, stop background
+                # research for the rest of the minute, keeping TP capacity.
+                if kind == "research" and self.server_used >= RESEARCH_CEILING:
+                    wait = (int(now // 60)+1)*60 + 5 - now
+                    self._notice(kind, "RESEARCH_SERVER_WEIGHT", wait, now)
+                    raise RateDeferred(kind, wait, "RESEARCH_SERVER_WEIGHT")
                 remaining = max(self.next_per_kind[kind], self.next_global) - now
                 if remaining <= 0:
                     self.estimated_used = projected
