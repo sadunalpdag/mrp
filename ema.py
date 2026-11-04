@@ -6589,14 +6589,17 @@ def _crash_send_pending(state, now):
         record["v2_delivery_status"] = "ATTEMPTING"
         _crash_save_state(state)
         if globals().get('_CRASH_NIGHT') is not None and _CRASH_NIGHT.enabled.is_set():
-            from crash_failure_shadow import entry_block_reason
+            from crash_failure_shadow import entry_block_reason, position_fraction
             block_reason = entry_block_reason(record)
             if block_reason:
                 message = message.replace('Gerçek emir yok.',
-                    'Risk etiketi nedeniyle yeni otomatik GTC alış emri GÖNDERİLMEZ.')
+                    '3 risk kriteri veya eksik risk verisi: otomatik GTC alış emri GÖNDERİLMEZ.')
             else:
+                fraction = position_fraction(record)
+                size_label = '%50' if fraction == 0.5 else '%100'
                 message = message.replace('Gerçek emir yok.',
-                    'Otomatik GTC limit sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
+                    f'Otomatik GTC limit için risk bazlı tutar: {size_label}. '
+                    'Gerçek emir sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
         receipt = _crash_telegram_receipt(message)
         monitor = globals().get('_CRASH_HEALTH')
         if monitor:
@@ -6627,8 +6630,8 @@ def _crash_send_pending(state, now):
                 from crash_failure_shadow import entry_block_reason
                 if entry_block_reason(record) is None:
                     executor.submit(record, receipt['accepted_at'])
-                # Flagged or incomplete labels: Telegram + virtual tracking only.
-                # NightExecutor.enter independently guards the final live BUY.
+                # Three true risk flags or incomplete labels: Telegram + virtual tracking only.
+                # NightExecutor.enter independently rechecks sizing and safety before real BUY.
         else:
             record["v2_delivery_status"] = ("UNKNOWN_DELIVERY" if receipt.get("ambiguous")
                                            else "SEND_FAILED_RETRY")
@@ -7119,6 +7122,10 @@ def _crash_daily_report(state, now):
         rolling = _crash_summary(filtered)
         os.makedirs(CRASH_BOUNCE_RESEARCH_DIR, exist_ok=True)
         path = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, f"crash_data_{int(now)}.zip")
+        executor = globals().get('_CRASH_NIGHT')
+        execution_orders = (executor.state.get('orders', {})
+                            if executor is not None and isinstance(getattr(executor,'state',None),dict)
+                            else {})
         notes = ("GÜNCEL V2: yalnız Crash Bounce çalışır, Fibonacci devre dışıdır. "
                  "7 faktörlü sürekli 0-100 güç puanı (continuous_7factor_v1); "
                  "dip, RSI yönü, hacim, EMA eğim iyileşmesi, ATR, düşüş hızı ve BTC. "
@@ -7151,7 +7158,9 @@ def _crash_daily_report(state, now):
                  "Gölge TP-olmama araştırması (tp_nonclosure_shadow_v1) 3 işaret kaydeder: "
                  "zayıf yeşil mum hacmi + zayıf hacim, düşen RSI + kötüleşen EMA eğimi, "
                  "aynı coinde daha düşük seviyede tekrar. Bunlar yalnız sinyal anında bilinen verileri kullanır, "
-                 "Risk etiketli veya değerlendirilemeyen sinyalin yeni gerçek BUY emri engellenir; "
+                 "0 veya 1 risk kriterinde tam tutar, 2 kriterde yarım tutar, 3 kriterde veya eksik risk verisinde alış yoktur. "
+                 "Pozisyon tutarı kaldıraç teminatı değil, emrin USDT büyüklüğüdür. "
+                 "Bu politika yalnız yeni BUY için uygulanır; önceki emirlerin TP'si değiştirilmez. "
                  "V2 sinyali, sanal izleme ve mevcut TP emirleri değişmez. "
                  "failure_shadow.csv ve report.json içindeki failure_shadow_rolling'i inceleyin. "
                  "Bu koşullar tarihsel küçük örneklemden çıkarıldı ve TP olasılığı değildir. "
@@ -7163,8 +7172,8 @@ def _crash_daily_report(state, now):
                 "rolling_7d_cohort":rolling,
                 "five_day_context_daily":summarize_context(daily),
                 "five_day_context_rolling":summarize_context(filtered),
-                "failure_shadow_daily":summarize_failure(daily),
-                "failure_shadow_rolling":summarize_failure(filtered),
+                "failure_shadow_daily":summarize_failure(daily, execution_orders),
+                "failure_shadow_rolling":summarize_failure(filtered, execution_orders),
                 "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,
                 "strength_score_version":"continuous_7factor_v1",
                 "strength_score_blocks_delivery":False,
@@ -7176,7 +7185,7 @@ def _crash_daily_report(state, now):
                 "notes":notes}, ensure_ascii=False, indent=2))
             from crash_derivatives import export_csv, summarize
             archive.writestr("derivatives_shadow.csv", export_csv(records))
-            archive.writestr("failure_shadow.csv", export_failure_csv(records))
+            archive.writestr("failure_shadow.csv", export_failure_csv(records, execution_orders))
             from crash_ai import export_csv as export_ai_csv
             archive.writestr("openai_reviews.csv", export_ai_csv(records))
             ai_market_path = os.path.join(globals().get('DATA_DIR', os.path.dirname(CRASH_BOUNCE_RESEARCH_DIR)), 'ai_top_gainers', 'top_gainers_state.json')
