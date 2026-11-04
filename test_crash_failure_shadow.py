@@ -169,6 +169,64 @@ class NonclosureLabelsTests(unittest.TestCase):
             self.assertEqual(data[0]["real_target_usdt"],"500.0")
             self.assertEqual(data[0]["risk_position_action"],"FULL")
 
+    def test_half_amount_follows_telegram_amount_and_exchange_minimum(self):
+        import copy
+        from test_crash_services import INFO
+        with tempfile.TemporaryDirectory() as directory:
+            broker=FakeBroker()
+            clock=timestamp("2026-11-03T20:00:00")
+            executor=NightExecutor(directory,broker,Mock(return_value={"ok":True}),
+                                   Mock(),lambda:clock,enabled=True)
+            self.addCleanup(executor.guard.close)
+            self.assertIn("700",executor.apply_control("amount:700"))
+            two=candidate(green=.1,volume=1.0,rsi=-6,ema=-.11)
+            two.update(signal_id="half-700",created_at=clock-1)
+            self.risk(two)
+            executor.enter(two,clock)
+            order=executor.state["orders"]["half-700"]
+            self.assertEqual(order["risk_configured_usdt"],"700")
+            self.assertEqual(order["risk_target_usdt"],"350.0")
+            self.assertLessEqual(float(order["risk_effective_notional_usdt"]),350)
+            self.assertEqual(executor.daily_count(),1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            broker=FakeBroker()
+            info=copy.deepcopy(INFO)
+            for filt in info["filters"]:
+                if filt["filterType"]=="MIN_NOTIONAL":
+                    filt["notional"]="300"
+            broker.info=lambda symbol:info
+            clock=timestamp("2026-11-03T20:00:00")
+            executor=NightExecutor(directory,broker,Mock(return_value={"ok":True}),
+                                   Mock(),lambda:clock,enabled=True)
+            self.addCleanup(executor.guard.close)
+            two=candidate(green=.1,volume=1.0,rsi=-6,ema=-.11)
+            two.update(signal_id="half-too-small",created_at=clock-1)
+            self.risk(two)
+            executor.enter(two,clock)
+            self.assertEqual(len(broker.buys),0)
+            self.assertEqual(executor.daily_count(),0)
+            self.assertNotIn("half-too-small",executor.state["orders"])
+            self.assertIn("TP/giriş ön kontrolü başarısız",executor.state["outbox"][-1]["text"])
+
+    def test_preflight_rechecks_3_flags_before_buy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker=FakeBroker()
+            clock=timestamp("2026-11-03T20:00:00")
+            executor=NightExecutor(directory,broker,Mock(return_value={"ok":True}),
+                                   Mock(),lambda:clock,enabled=True)
+            self.addCleanup(executor.guard.close)
+            two=candidate(green=.1,volume=1.0,rsi=-6,ema=-.11)
+            two.update(signal_id="race-to-three",created_at=clock-1)
+            self.risk(two)
+            def preflight(symbol):
+                two["failure_shadow"]["flags"]["repeat_lower_entry"]=True
+                return "BOTH"
+            broker.preflight=preflight
+            executor.enter(two,clock)
+            self.assertEqual(len(broker.buys),0)
+            self.assertNotIn("race-to-three",executor.state["orders"])
+
     def test_missing_assessment_blocks_live_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             broker = FakeBroker()
