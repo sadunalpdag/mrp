@@ -72,12 +72,13 @@ def _atr_capacity(atr_pct):
 def score_candidate(candles, btc_change_24h=None):
     """Produce fractional component scores and underlying observable measurements.
 
-    `candles` must be 480 already-validated chronological closed OHLCV tuples.
+    `candles` must be 478-480 validated chronological real closed OHLCV
+    tuples from one fixed 5-day window; no OHLCV is invented.
     Missing external BTC data are *excluded* from denominator rather than
     silently awarded 0/5 or 5/5; coverage is always reported.
     """
-    if len(candles) != 480:
-        raise ValueError("Need 480 fully closed candles")
+    if not 478 <= len(candles) <= 480:
+        raise ValueError("Need at least 478 of the 480 real closed candles")
     opens = [float(c[0]) for c in candles]
     highs = [float(c[1]) for c in candles]
     lows = [float(c[2]) for c in candles]
@@ -163,7 +164,9 @@ def score_candidate(candles, btc_change_24h=None):
     return {
         "version": VERSION, "score": round(score, 1) if score is not None else None,
         "raw_points": round(raw, 2), "available_points": available,
-        "coverage_pct": round(available, 1),
+        "coverage_pct": round(available * len(candles) / 480, 1),
+        "observed_candles": len(candles),
+        "missing_candles": 480 - len(candles),
         "components": {k: {"points": v, "max_points": WEIGHTS[k]}
                        for k,v in points.items()},
         "metrics": {
