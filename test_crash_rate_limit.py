@@ -31,7 +31,8 @@ class RateTests(unittest.TestCase):
                       _crash_weight_window=-1, _crash_weight_used=0,
                       _crash_ip_weight_limit=2400, _crash_backoff=0,
                       _CRASH_PUBLIC_LOCK=threading.RLock(),
-                      _crash_bounce_worker=Mock(), _crash_start_services=Mock(), _CRASH_NIGHT=None)
+                      _crash_bounce_worker=Mock(), _crash_start_services=Mock(), _CRASH_NIGHT=None,
+                      _CRASH_IP_BUDGET=Mock())
         exec(compile(subset,'ema.py','exec'), self.g)
 
     def response(self, status=200, headers=None, data=None):

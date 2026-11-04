@@ -397,6 +397,9 @@ class NightTests(unittest.TestCase):
 class BrokerTests(unittest.TestCase):
     def setUp(self):
         self.b=BinanceBroker('fake','fake')
+        self.budget_patch = patch('crash_rest_budget.BUDGET', Mock())
+        self.budget_patch.start()
+        self.addCleanup(self.budget_patch.stop)
 
     def test_buy_uses_waiting_gtc_with_limit_cap(self):
         self.b.request=Mock()
