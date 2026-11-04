@@ -60,6 +60,18 @@ class HistoryTests(unittest.TestCase):
         self.worker.step(now=101)
         self.fetch.assert_not_called()
 
+    def test_one_missing_bar_has_hour_backoff_not_queue_starvation(self):
+        from types import SimpleNamespace
+        self.worker.resolver = SimpleNamespace(
+            resolve=lambda symbol,start,end,cached: rows(start,479))
+        self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),
+                           'warmup',self.job['as_of'])
+        self.worker.step(now=100)
+        item=self.worker.jobs['test:warmup']
+        self.assertEqual(item['retry_after'],3700)
+        self.assertEqual(len(self.worker._read(
+            self.tmp.name+'/TESTUSDT.json', [])),479)
+
     def test_emit_and_remove_job(self):
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),'signal',self.job['as_of'])
         self.worker.step(now=100)
