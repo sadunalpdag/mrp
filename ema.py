@@ -6413,8 +6413,17 @@ def _crash_public_get_locked(path, params=None):
     _crash_wait_until(_crash_next_request)
     _crash_next_request = time.time() + 1.0
     _crash_weight_used += weight
+    # Use the same budget as BinanceBroker: research is paced and cannot
+    # spend the capacity reserved for live entry reconciliation and TP.
+    budget = globals().get("_CRASH_IP_BUDGET")
+    if budget is None:
+        from crash_rest_budget import BUDGET as budget
+    from crash_rest_budget import estimated_weight
+    budget.reserve("research", estimated_weight(path, params))
     base = "https://api.binance.com" if path.startswith("/api/v3/") else BINANCE_FAPI
     response = requests.get(base + path, params=params, timeout=10)
+    budget.observe(response.headers, response.status_code,
+                   response.headers.get("Retry-After", 0))
     if response.status_code in (403, 418, 429):
         floor = 900 if response.status_code in (403, 418) else 120
         _crash_backoff = min(86400, max(floor, _crash_backoff * 2))
