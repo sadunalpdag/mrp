@@ -186,8 +186,23 @@ class BinanceBroker:
             **self.close_params(position_side)))
 
     def info(self, symbol):
-        data = self.request('GET', '/fapi/v1/exchangeInfo', signed=False)
-        return next(s for s in data['symbols'] if s['symbol'] == symbol)
+        # Exchange filters rarely change. Reuse the validated snapshot for
+        # 30 minutes instead of downloading ALL symbols for every candidate.
+        # Never cache balances, positions, open orders or TP verification.
+        now = time.time()
+        cached = getattr(self, '_exchange_info_cache', None)
+        if cached is None or now >= cached[0]:
+            data = self.request('GET', '/fapi/v1/exchangeInfo', signed=False)
+            symbols = data.get('symbols') if isinstance(data, dict) else None
+            if not isinstance(symbols, list) or not symbols:
+                raise ValueError('INVALID_EXCHANGE_INFO')
+            lookup = {item['symbol']: item for item in symbols
+                      if isinstance(item, dict) and isinstance(item.get('symbol'), str)}
+            if not lookup:
+                raise ValueError('INVALID_EXCHANGE_INFO')
+            self._exchange_info_cache = (now + 1800, lookup)
+            cached = self._exchange_info_cache
+        return cached[1][symbol]
 
     @staticmethod
     def close_params(position_side):
