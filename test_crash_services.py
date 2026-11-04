@@ -372,6 +372,104 @@ class NightTests(unittest.TestCase):
         self.now=timestamp('2026-10-28T12:00:00'); self.e.step()
         self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
 
+    def make_halted_cancelled_tp(self):
+        self.enter()
+        self.e.deliver_pending()
+        order = self.e.state['orders']['signal-1']
+        self.b.orders[order['tp_id']]['status'] = 'CANCELED'
+        self.e.reconcile(order)
+        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
+        self.assertTrue(order['warned'])
+        return order
+
+    def test_manually_closed_flat_tp_halt_recovers_safely(self):
+        order = self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='0', positionSide='BOTH')])
+        self.b.closing_orders = Mock(return_value=[])
+        self.now += 10
+        self.assertTrue(self.e.recover_closed_tp_halt())
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertEqual(order['close_verification'],
+                         'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
+        self.assertEqual(self.e.daily_count(), 1)
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertEqual(len(self.b.tps), 1)
+        self.assertTrue(self.e.enabled.is_set())
+        self.assertIn('TP HATA KİLİDİ TEMİZLENDİ',
+                      self.e.state['outbox'][-1]['text'])
+        self.e.save(); self.e.guard.close(); self.e = self.make()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(self.e.state['orders']['signal-1']['phase'],
+                         'CLOSED_EXTERNALLY')
+
+    def test_tp_halt_kept_while_position_still_open(self):
+        order = self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5', positionSide='BOTH')])
+        self.b.closing_orders = Mock(return_value=[])
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.b.closing_orders.assert_not_called()
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'PROTECTED')
+
+    def test_tp_halt_kept_with_open_order_even_when_position_flat(self):
+        self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[
+            dict(symbol='AUSDT', side='SELL', type='LIMIT', status='NEW')])
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.assertTrue(self.e.state['halt'])
+
+    def test_tp_halt_kept_if_live_account_query_fails_or_is_invalid(self):
+        self.make_halted_cancelled_tp()
+        self.b.positions = Mock(side_effect=BrokerError('-1003'))
+        self.b.closing_orders = Mock(return_value=[])
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.b.positions.side_effect = None
+        self.b.positions.return_value = {'not': 'a verified snapshot'}
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.b.positions.return_value = []
+        self.b.closing_orders.return_value = {'unknown': 'open orders'}
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.assertTrue(self.e.state['halt'])
+
+    def test_tp_halt_kept_if_another_entry_or_unverified_tp_exists(self):
+        self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.e.state['orders']['uncertain'] = dict(symbol='BUSDT', phase='ENTRY_UNKNOWN')
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.e.state['orders']['uncertain']['phase'] = 'TP_UNKNOWN'
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.b.positions.assert_not_called()
+        self.assertTrue(self.e.state['halt'])
+
+    def test_halt_recovery_never_overrides_explicit_off_or_other_errors(self):
+        self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.e.apply_control('off')
+        self.assertTrue(self.e.recover_closed_tp_halt())
+        self.assertFalse(self.e.enabled.is_set())
+        self.assertTrue(self.e.state['paused'])
+        self.e.state['halt'] = 'EXECUTOR_ERROR'
+        self.assertFalse(self.e.recover_closed_tp_halt())
+        self.assertEqual(self.e.state['halt'], 'EXECUTOR_ERROR')
+
+    def test_step_clears_only_verified_flat_tp_halt_after_old_close(self):
+        order = self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.now += 301
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.b.positions.assert_called_once()
+        self.b.closing_orders.assert_called_once_with('AUSDT')
+        self.assertEqual(len(self.b.buys), 1)
+
     def test_bad_state_and_multiple_processes_fail_closed(self):
         with self.assertRaises(BlockingIOError): self.make()
         self.e.guard.close()

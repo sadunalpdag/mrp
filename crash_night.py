@@ -22,6 +22,7 @@ ORDER_POLL_SECONDS = 5 * 60
 TP_POLL_SECONDS = 5 * 60
 MANUAL_TP_POLL_SECONDS = 5 * 60
 ENTRY_EXPIRY_SCAN_SECONDS = 15 * 60
+TERMINAL_PHASES = ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY')
 
 
 def night(now):
@@ -354,6 +355,7 @@ class NightExecutor:
         self.next_poll = 0
         self.next_expiry_scan = 0
         self.next_manual_scan = 0
+        self.next_halt_recheck = 0
         self.protected_poll = {}
         self.enabled = threading.Event()
         self.armed_at = clock()
@@ -469,6 +471,75 @@ class NightExecutor:
         self.state['halt'] = reason
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
 
+    def recover_closed_tp_halt(self):
+        """Release a persisted TP halt only after authoritative LIVE flat+order checks.
+
+        A manual Binance close can leave a TP_UNKNOWN order and the old
+        executor halt indefinitely. This is reconciliation only: never
+        cancel or create orders, never treat WS deltas as a full snapshot,
+        and never unlock while positions/any open orders are present.
+        """
+        reason = self.state.get('halt')
+        if not isinstance(reason, str) or not reason.startswith('TP DOĞRULANAMADI'):
+            return False
+        orders = list(self.state['orders'].values())
+        # Every unresolved TP problem that could have caused this halt must
+        # be accounted for. Do not unlock unknown entry executions.
+        if any(o.get('phase') == 'ENTRY_UNKNOWN' for o in orders):
+            return False
+        affected = [o for o in orders if o.get('warned') and
+                    o.get('phase') in ('TP_UNKNOWN', 'PROTECTED', 'DONE') and
+                    isinstance(o.get('symbol'), str) and o['symbol']]
+        if not affected or any(o.get('phase') == 'TP_UNKNOWN' and not o.get('warned')
+                               for o in orders):
+            return False
+        symbols = {o['symbol'] for o in affected}
+        try:
+            positions = self.broker.positions()  # Fresh signed REST snapshot.
+            if not isinstance(positions, list):
+                raise ValueError('INVALID_POSITION_RESPONSE')
+            # Any exposure on the affected symbols (including hedge SHORT)
+            # makes an automatic unlock unsafe.
+            for p in positions:
+                if p.get('symbol') in symbols and D(str(p['positionAmt'])) != 0:
+                    return False
+            for symbol in sorted(symbols):
+                open_orders = self.broker.closing_orders(symbol)
+                if not isinstance(open_orders, list):
+                    raise ValueError('INVALID_ORDER_RESPONSE')
+                # Queries include standard AND conditional open orders.
+                # Even a manually placed pending order requires review.
+                if open_orders:
+                    return False
+        except Exception as error:
+            # A rate limit, 5xx, timeout or invalid payload is NOT a
+            # confirmed flat account. Keep existing error hold.
+            self.log(f'[CRASH TP HALT REVIEW WAIT] {type(error).__name__}; eski kilit korundu')
+            return False
+
+        now = self.clock()
+        for order in affected:
+            if order['phase'] != 'DONE':
+                order['phase'] = 'CLOSED_EXTERNALLY'
+                order['flat_confirmed_at'] = now
+                order['close_verification'] = 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS'
+        self.state['halt'] = None
+        # Never reuse queued pre-verification signals.
+        self.armed_at = now
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.save()
+        self.log(f'[CRASH TP HALT CLEARED] flat+no open orders confirmed: {",".join(sorted(symbols))}; executor settings unchanged')
+        self.alert('✅ TP HATA KİLİDİ TEMİZLENDİ | ' +
+                   ', '.join(sorted(symbols)) +
+                   '\nBinance canlı sorgusunda pozisyon sıfır ve açık/koşullu emir bulunmadı. '
+                   'Eski işlem haricen kapanmış olarak kaydedildi. '
+                   'Otomatik girişin açık/kapalı ayarı değiştirilmedi; sadece yeni sinyaller geçerlidir.')
+        return True
+
     def deliver_pending(self):
         if not self.state['outbox']:
             return
@@ -516,7 +587,7 @@ class NightExecutor:
         risk_count = sum(flags.values())
         if self.daily_count() >= self.max_daily:
             return
-        if any(o['phase'] not in ('DONE', 'NO_FILL') and o['symbol'] == symbol for o in self.state['orders'].values()):
+        if any(o['phase'] not in TERMINAL_PHASES and o['symbol'] == symbol for o in self.state['orders'].values()):
             return
         try:
             p = plan(record, self.broker.info(symbol), target_usdt)
@@ -723,7 +794,7 @@ class NightExecutor:
                         self.ws_manual_symbols.add(update['symbol'])
                 elif event.get('e') == 'ACCOUNT_UPDATE':
                     # This is a delta: omitted symbols are NOT closed positions.
-                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in ('DONE','NO_FILL')}
+                    tracked = {o['symbol'] for o in self.state['orders'].values() if o['phase'] not in TERMINAL_PHASES}
                     for p in event.get('a', {}).get('P', []):
                         key = ('position', p['s'], p.get('ps','BOTH'))
                         if stamp <= self.account_versions.get(key, -1):
@@ -768,6 +839,9 @@ class NightExecutor:
             self.deliver_pending()
             return
         self.process_account_events()
+        if self.state.get('halt') and self.clock() >= self.next_halt_recheck:
+            self.next_halt_recheck = self.clock() + MANUAL_TP_POLL_SECONDS
+            self.recover_closed_tp_halt()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
