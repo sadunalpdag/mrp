@@ -186,9 +186,10 @@ class HistoryCollector:
                     # (validated independently at candidate time). Back off
                     # these repetitive 479/480 jobs for an hour so other
                     # symbols get access to the paced fallback worker.
-                    near_complete = event['candle_count'] >= COUNT-2
+                    near_complete = COUNT-2 <= event['candle_count'] < COUNT
                     self.jobs[key]['retry_after'] = now + (
                         3600 if near_complete else
+                        1800 if event['complete'] else
                         300 if self.resolver else 1800)
                 self._write(self.path, self.jobs)
             if COUNT-2 <= event['candle_count'] < COUNT:
