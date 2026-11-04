@@ -55,6 +55,23 @@ class CrashBounceTests(unittest.TestCase):
         self.assertEqual(plan["tp"],"1.003")
         self.assertGreaterEqual(Decimal(plan["tp"])/Decimal(plan["entry"]),Decimal("1.01"))
 
+    def test_one_or_two_missing_recent_4h_bars_still_produce_candidate(self):
+        for holes in ((5,), (5, 8)):
+            with self.subTest(holes=holes):
+                candles=[r for i,r in enumerate(self.rows) if i not in holes]
+                plan=self.g["crash_bounce_plan"](candles,"1",".001",self.now*1000)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan["recent_4h_missing"],len(holes))
+                self.assertEqual(plan["recent_4h_observed"],16-len(holes))
+        candles=[r for i,r in enumerate(self.rows) if i not in (5,8,10)]
+        self.assertIsNone(self.g["crash_bounce_plan"](
+            candles,"1",".001",self.now*1000))
+        old_now=self.now
+        self.now+=3600
+        self.assertIsNone(self.g["crash_bounce_plan"](
+            self.rows,"1",".001",self.now*1000))
+        self.now=old_now
+
     def test_qualified_v2_alerts_immediately_before_entry(self):
         self.tickers=[dict(symbol="AUSDT",priceChangePercent="-15",lastPrice="1")]
         state={"history":[],"symbols":{}}
