@@ -44,8 +44,10 @@ def source_counts(rows):
 
 
 class DataSources:
-    def __init__(self, directory, rest, blocked, log, get=None, clock=time.time, bybit=None, coinbase=None):
+    def __init__(self, directory, rest, blocked, log, get=None, clock=time.time,
+                 bybit=None, coinbase=None, allow_binance_rest=True):
         self.directory,self.rest,self.blocked,self.log=directory,rest,blocked,log
+        self.allow_binance_rest = bool(allow_binance_rest)
         self.get,self.clock=get,clock
         self.retry={}
         self.binance_recheck={}
@@ -171,7 +173,10 @@ class DataSources:
         gaps=missing()
         recheck=bool(old_alternates and self.clock()>=self.binance_recheck.get(symbol,0))
         work=gaps if gaps else (old_alternates if recheck else [])
-        if work and not blocked:
+        if work and not self.allow_binance_rest:
+            self.log(f'[CRASH DATA REST SKIPPED] {symbol}; research Binance REST disabled; '
+                     'WS/cache/archive/Bybit/Coinbase only; account+TP preserved')
+        elif work and not blocked:
             first=work[0]
             finish=first+STEP
             while (finish<end and (finish not in found or source(found[finish]) in alternate_tags)
