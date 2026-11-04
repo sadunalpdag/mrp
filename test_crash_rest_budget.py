@@ -33,7 +33,7 @@ class SharedIpBudgetTests(unittest.TestCase):
         self.b.reserve('protect',5)
         self.assertLess(self.now[0]-start,1)
         self.b.reserve('research',2)
-        self.assertGreaterEqual(self.now[0]-start,8)
+        self.assertGreaterEqual(self.now[0]-start,20)
         self.assertEqual(self.b.stats()['reserved_weight'],9)
 
     def test_server_header_suppresses_research_but_retains_tp_capacity(self):
@@ -71,7 +71,7 @@ class SharedIpBudgetTests(unittest.TestCase):
     def test_actual_broker_request_observes_weight_and_respects_budget(self):
         from crash_night import BinanceBroker, BrokerError
         broker=BinanceBroker('test_key','test_secret')
-        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'1390'})
+        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'690'})
         response.json.return_value={'ok':True}
         req=Mock(return_value=response)
         with patch('crash_rest_budget.BUDGET',self.b),patch.dict(
