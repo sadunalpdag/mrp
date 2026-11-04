@@ -107,14 +107,14 @@ class HistoryCollector:
             from crash_data_sources import valid_rows
             for t, row in valid_rows(self.ws_rows(job['symbol']), start, end).items():
                 old = cached.get(t)
-                if (old is None or len(row) <= 12 or row[12] != 'BYBIT_LINEAR'
-                        or (len(old) > 12 and old[12] == 'BYBIT_LINEAR')):
+                if (old is None or len(row) <= 12 or row[12] not in ('BYBIT_LINEAR','COINBASE_SPOT')
+                        or (len(old) > 12 and old[12] in ('BYBIT_LINEAR','COINBASE_SPOT'))):
                     cached[t] = row
         expected = list(range(start, end, STEP))
         missing = [t for t in expected if t not in cached]
-        bybit_cached = any(len(r)>12 and r[12]=='BYBIT_LINEAR'
+        alternate_cached = any(len(r)>12 and r[12] in ('BYBIT_LINEAR','COINBASE_SPOT')
                            for t,r in cached.items() if start <= t < end)
-        if missing or (bybit_cached and self.resolver is not None):
+        if missing or (alternate_cached and self.resolver is not None):
             if scheduled_at is not None:
                 if scheduled_at < self.next_download:
                     raise HistoryPacingWait()
@@ -149,9 +149,11 @@ class HistoryCollector:
                     interval='15m', expected_candles=COUNT, candle_count=len(snapshot),
                     complete=len(snapshot)==COUNT, missing_candles=COUNT-len(snapshot),
                     closed_15m_ohlcv=snapshot)
-        if event['data_sources'].get('BYBIT_LINEAR'):
+        if (event['data_sources'].get('BYBIT_LINEAR') or
+                event['data_sources'].get('COINBASE_SPOT')):
             self.log(f'[CRASH HISTORY MIXED] {job["symbol"]}; '
-                     f'bybit={event["data_sources"]["BYBIT_LINEAR"]}; '
+                     f'bybit={event["data_sources"].get("BYBIT_LINEAR",0)}; '
+                     f'coinbase={event["data_sources"].get("COINBASE_SPOT",0)}; '
                      'Binance=oncelikli; karma_veri_ile_sinyal_hesaplanabilir')
         return event
 
@@ -177,7 +179,7 @@ class HistoryCollector:
             if job['phase'] != 'warmup':
                 self.emit(event, time.time())
             with self.lock:
-                if event['complete'] and not event['data_sources'].get('BYBIT_LINEAR', 0):
+                if event['complete'] and not any(event['data_sources'].get(src,0) for src in ('BYBIT_LINEAR','COINBASE_SPOT')):
                     self.jobs.pop(key, None)
                 else:
                     self.jobs[key]['retry_after'] = now + (

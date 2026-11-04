@@ -7,7 +7,8 @@ from crash_data_sources import STEP, valid_rows, tagged
 
 COUNT = 480
 PER_SYMBOL_RETRY_SECONDS = 1800
-MAX_REQUESTS_PER_HOUR = 24
+MAX_REQUESTS_PER_HOUR = 12
+MIN_REQUEST_GAP_SECONDS = 180
 
 
 class BybitReference:
@@ -15,6 +16,8 @@ class BybitReference:
         self.directory, self.log, self.get, self.clock = directory, log, get, clock
         self.next_symbol = {}
         self.requests = []
+        self.next_request = 0
+        self.global_cooldown = 0
         os.makedirs(directory, exist_ok=True)
 
     def fill_missing(self, symbol, start, end, missing, binance_rows):
@@ -52,9 +55,11 @@ class BybitReference:
         now = self.clock()
         self.requests = [t for t in self.requests if now - t < 3600]
         if (now < self.next_symbol.get(symbol, 0)
-                or len(self.requests) >= MAX_REQUESTS_PER_HOUR):
+                or len(self.requests) >= MAX_REQUESTS_PER_HOUR
+                or now < self.next_request or now < self.global_cooldown):
             return []
         self.requests.append(now)
+        self.next_request = now + MIN_REQUEST_GAP_SECONDS
         self.next_symbol[symbol] = now + PER_SYMBOL_RETRY_SECONDS
         get = self.get
         if get is None:
@@ -67,6 +72,14 @@ class BybitReference:
                         'limit':int((request_end-request_start)//STEP)},
                 headers={}, timeout=(5, 10), allow_redirects=False)
             try:
+                if response.status_code == 429:
+                    try:
+                        delay=max(300,min(3600,int(float(response.headers.get('Retry-After',300)))))
+                    except (ValueError,TypeError):
+                        delay=600
+                    self.global_cooldown=now+delay
+                    self.log(f'[CRASH BYBIT LIMIT] HTTP_429; retry_seconds={delay}')
+                    return []
                 if response.status_code != 200:
                     raise ValueError('HTTP_' + str(response.status_code))
                 payload = response.json()
