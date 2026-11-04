@@ -7407,6 +7407,16 @@ class CrashBounceWebSocketCache:
                 row = [k["t"],k["o"],k["h"],k["l"],k["c"],k["v"],k["T"],
                        k.get("q"),k.get("n",0),k.get("V"),k.get("Q"),"0"]
                 self.merge_candles(symbol, [row])
+                # Read-only shadow feed. Pass ONLY this actual closed WS event;
+                # never forward REST, archive, or alternate-venue cache rows.
+                feed = globals().get("_CRASH_DAY_TRADER_WS_FEED")
+                if feed is not None:
+                    try:
+                        feed.submit(symbol, row)
+                    except Exception as error:
+                        if time.time()-self.last_warning>60:
+                            self.last_warning=time.time()
+                            log(f"[DAY TRADER WS FEED ERR] {type(error).__name__}")
             elif isinstance(data, dict) and "code" in data:
                 log(f"[CRASH WS SERVER ERR] code={data['code']}")
         except (ValueError,TypeError,KeyError,AttributeError):
@@ -7605,6 +7615,7 @@ def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False)
 
 
 _CRASH_WS_CACHE = CrashBounceWebSocketCache()
+_CRASH_DAY_TRADER_WS_FEED = None  # Separate WS-only research feed, never orders.
 _crash_seed_retry = {}
 _crash_seed_attempts = []
 _crash_seed_errors = {}
@@ -15300,6 +15311,19 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     _crash_start_services()
+    global _CRASH_DAY_TRADER_WS_FEED
+    # A single existing Binance Futures WS socket feeds both V2 and the
+    # read-only crypto Day Trader dataset. No extra REST or WS subscription.
+    if os.getenv("CRASH_DAY_TRADER_WS_ENABLED", "1") != "0":
+        try:
+            from day_trader_ws_feed import DayTraderWsFeed
+            feed_dir = os.path.join(DATA_DIR, "day_trader_ws")
+            _CRASH_DAY_TRADER_WS_FEED = DayTraderWsFeed(feed_dir, log=log)
+            _CRASH_DAY_TRADER_WS_FEED.start()
+            log(f"[DAY TRADER WS] ACTIVE | 15m closed only | file={feed_dir} | no REST")
+        except Exception as error:
+            _CRASH_DAY_TRADER_WS_FEED = None
+            log(f"[DAY TRADER WS START ERR] {type(error).__name__}; V2 unaffected")
     log(f"[START] CRASH BOUNCE V2 ONLY; Fibonacci disabled; executor={_CRASH_NIGHT.summary() if _CRASH_NIGHT else 'off'}")
     # REST cooldown applies only to metadata/history; WS may start immediately.
     _crash_bounce_worker()

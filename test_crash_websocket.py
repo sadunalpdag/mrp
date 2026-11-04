@@ -60,6 +60,23 @@ class WebSocketTests(unittest.TestCase):
         second=self.g['CrashBounceWebSocketCache'](); second.load()
         self.assertEqual(second.candles('AUSDT'),self.cache.candles('AUSDT'))
 
+    def test_day_trader_bridge_receives_only_genuine_closed_ws_events(self):
+        feed=Mock()
+        self.g['_CRASH_DAY_TRADER_WS_FEED']=feed
+        r=self.rows[-1]
+        k=dict(i='15m',x=False,t=r[0],o=r[1],h=r[2],
+               l=r[3],c=r[4],v=r[5],T=r[6])
+        self.cache.on_message(None,json.dumps({'e':'kline','s':'AUSDT','k':k}))
+        feed.submit.assert_not_called()
+        k['x']=True
+        self.cache.on_message(None,json.dumps({'e':'kline','s':'AUSDT','k':k}))
+        feed.submit.assert_called_once()
+        self.assertEqual(feed.submit.call_args.args[0],'AUSDT')
+        feed.reset_mock()
+        self.cache.merge_candles('AUSDT',self.rows)
+        feed.submit.assert_not_called()
+        self.g['_crash_public_get'].assert_not_called()
+
     def test_warmup_disconnect_clear_and_restore_subscriptions(self):
         self.cache.reconcile({'AUSDT'})
         ws=Mock(); self.cache.on_open(ws)
