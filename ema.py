@@ -6561,10 +6561,14 @@ def _crash_send_pending(state, now):
         failure_shadow_message = format_warning(record.get("failure_shadow"))
         archive_count = d.get('data_sources', {}).get('BINANCE_ARCHIVE', 0)
         bybit_count = d.get('data_sources', {}).get('BYBIT_LINEAR', 0)
+        coinbase_count = d.get('data_sources', {}).get('COINBASE_SPOT', 0)
         source_message = f'Veri: Binance günlük arşivinden {archive_count} mum tamamlandı.\n' if archive_count else ''
         if bybit_count:
             source_message += (f'⚠️ Eksik {bybit_count} mum Bybit USDT Futures ile tamamlandı; '
                                'fiyat/hacim borsaya göre farklı olabilir.\n')
+        if coinbase_count:
+            source_message += (f'⚠️ Eksik {coinbase_count} mum Coinbase SPOT USD ile tamamlandı; '
+                               'vadeli işlem fiyatı/hacmi farklıdır.\n')
         message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
@@ -6657,8 +6661,8 @@ def _crash_v2_validate_entry(record, now):
         selected = valid_rows(rows, end-480*900000, end)
         for t, candle in valid_rows(ws_rows, end-480*900000, end).items():
             prev = selected.get(t)
-            if (prev is None or len(candle)<=12 or candle[12]!='BYBIT_LINEAR'
-                    or (len(prev)>12 and prev[12]=='BYBIT_LINEAR')):
+            if (prev is None or len(candle)<=12 or candle[12] not in ('BYBIT_LINEAR','COINBASE_SPOT')
+                    or (len(prev)>12 and prev[12] in ('BYBIT_LINEAR','COINBASE_SPOT'))):
                 selected[t] = candle
         result['data_sources'] = source_counts(list(selected.values()))
         return result
@@ -6896,10 +6900,14 @@ def _crash_queue_history(record, phase, now):
                 log(message)
 
             from crash_bybit import BybitReference
+            from crash_coinbase import CoinbaseReference
             bybit = BybitReference(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'bybit_reference'), log)
+            coinbase = CoinbaseReference(
+                os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'coinbase_reference'), log)
             resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
-                _crash_public_get, blocked, _crash_history_log, bybit=bybit)
+                _crash_public_get, blocked, _crash_history_log,
+                bybit=bybit, coinbase=coinbase)
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
@@ -7294,7 +7302,7 @@ class CrashBounceWebSocketCache:
                         continue
                     old = merged.get(int(row[0]))
                     if (len(row)>12 and row[12]=='BYBIT_LINEAR' and old is not None
-                            and (len(old)<=12 or old[12]!='BYBIT_LINEAR')):
+                            and (len(old)<=12 or old[12] not in ('BYBIT_LINEAR','COINBASE_SPOT'))):
                         continue  # Never overwrite a Binance candle with a Bybit one.
                     merged[int(row[0])] = list(row)
                 except (ValueError, TypeError, IndexError):
@@ -7636,7 +7644,7 @@ def _crash_get_candles(symbol):
         merged = valid_rows(saved, end-480*900000, end)
         for t, candle in valid_rows(rows, end-480*900000, end).items():
             previous = merged.get(t)
-            if (previous is None or len(candle)<=12 or candle[12]!='BYBIT_LINEAR'
+            if (previous is None or len(candle)<=12 or candle[12] not in ('BYBIT_LINEAR','COINBASE_SPOT')
                     or (len(previous)>12 and previous[12]=='BYBIT_LINEAR')):
                 merged[t] = candle
         rows = [merged[t] for t in sorted(merged)][-64:]
