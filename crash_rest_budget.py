@@ -11,8 +11,8 @@ import time
 
 # Well below the usual 2400/minute; absolute ceilings for ALL local calls.
 RESEARCH_CEILING = 400
-ACCOUNT_CEILING = 750
-PROTECT_CEILING = 1050
+ACCOUNT_CEILING = 1400
+PROTECT_CEILING = 1750
 PACED_SECONDS = {"research": 8.0, "account": 1.25, "protect": 0.25}
 
 

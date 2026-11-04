@@ -9,10 +9,10 @@ be larger than the market worker's local counter.
 
 - Market research (15m klines / BTC hourly / OI / spot) has an **IP soft
   cap of 400/minute** and is paced at a minimum **8 seconds** per call.
-- Signed broker account/preflight calls have a soft cap **750/minute**,
+- Signed broker account/preflight calls have a soft cap **1400/minute**,
   paced a minimum **1.25 seconds** between requests.
 - TP placement, BUY order status checks, and expiration cancellations
-  have a separate **protect tier capped at 1050/minute**, paced at 0.25s.
+  have a separate **protect tier capped at 1750/minute**, paced at 0.25s.
 - A response's **actual** `X-MBX-USED-WEIGHT-1M` is folded into the
   shared estimate, so load from other code using the same Render IP
   is visible at the next response.
