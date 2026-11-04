@@ -117,7 +117,15 @@ class BinanceBroker:
         from urllib.parse import urlencode
         if time.time() < self.cooldown_until:
             raise BrokerError('-1003')
+        from crash_rest_budget import BUDGET, RateDeferred, estimated_weight, priority_for
         params = dict(params or {})
+        # Reserve before signing or sending. Local deferrals NEVER issue a
+        # Binance request and NEVER masquerade as a successful BUY/TP.
+        try:
+            BUDGET.reserve(priority_for(method, path, params),
+                           estimated_weight(path, params))
+        except RateDeferred:
+            raise BrokerError('-1003') from None
         if signed:
             params.update(timestamp=int(time.time()*1000), recvWindow=5000)
         query = urlencode(params)
@@ -132,6 +140,8 @@ class BinanceBroker:
                 body = {}
         except Exception:
             raise BrokerError('UNKNOWN', uncertain=True) from None
+        BUDGET.observe(response.headers, response.status_code,
+                       response.headers.get("Retry-After", 0))
         api_code = str(body.get('code', '')) if isinstance(body, dict) else ''
         if response.status_code in (429, 418) or api_code == '-1003':
             self.rate_failures += 1
