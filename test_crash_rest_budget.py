@@ -68,6 +68,23 @@ class SharedIpBudgetTests(unittest.TestCase):
         with self.assertRaises(RateDeferred):
             self.b.reserve('protect',1)
 
+    def test_exchange_info_cached_but_account_queries_not_cached(self):
+        from crash_night import BinanceBroker
+        broker=BinanceBroker('key','secret')
+        info={'symbols':[{'symbol':'BTCUSDT','filters':[]},
+                         {'symbol':'ETHUSDT','filters':[]}]}
+        broker.request=Mock(side_effect=lambda method,path,**kw:
+                            info if path.endswith('exchangeInfo') else [])
+        self.assertEqual(broker.info('BTCUSDT')['symbol'],'BTCUSDT')
+        self.assertEqual(broker.info('ETHUSDT')['symbol'],'ETHUSDT')
+        self.assertEqual(broker.request.call_count,1)
+        broker.positions()
+        broker.positions()
+        self.assertEqual(broker.request.call_count,3)
+        broker._exchange_info_cache=(0,broker._exchange_info_cache[1])
+        broker.info('BTCUSDT')
+        self.assertEqual(broker.request.call_count,4)
+
     def test_actual_broker_request_observes_weight_and_respects_budget(self):
         from crash_night import BinanceBroker, BrokerError
         broker=BinanceBroker('test_key','test_secret')
