@@ -7,7 +7,7 @@ import time
 
 STEP = 900000
 COUNT = 480
-DOWNLOAD_INTERVAL = 60
+DOWNLOAD_INTERVAL = 180
 
 
 class HistoryPacingWait(Exception):
@@ -131,7 +131,7 @@ class HistoryCollector:
                     missing_end += STEP
                 self.log(f"[CRASH HISTORY DOWNLOAD] {job['symbol']}; "
                          f"cached={COUNT-len(missing)}/480; missing={len(missing)}; "
-                         f"request_candles={(missing_end-missing[0])//STEP}; next_request_after=60s")
+                         f"request_candles={(missing_end-missing[0])//STEP}; next_request_after=180s")
                 rows = self.fetch('/fapi/v1/klines', dict(symbol=job['symbol'], interval='15m',
                                   startTime=missing[0], endTime=missing_end-1, limit=499))
                 fresh = self.validated(rows)
@@ -162,7 +162,7 @@ class HistoryCollector:
         if self.blocked() and self.resolver is None:
             return
         self.attempts = [t for t in self.attempts if now-t < 3600]
-        if len(self.attempts) >= 24:
+        if len(self.attempts) >= 18:
             return
         with self.lock:
             ready = [(k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now]
