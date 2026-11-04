@@ -440,7 +440,7 @@ class NightExecutor:
 
     def enter(self, record, observed_at):
         from crash_policy import supported_symbol
-        from crash_failure_shadow import entry_block_reason
+        from crash_failure_shadow import entry_block_reason, position_fraction, SIZING_VERSION
         now = self.clock()
         sid, symbol = record.get('signal_id'), record.get('symbol')
         if (not self.enabled.is_set() or observed_at < self.armed_at
@@ -449,18 +449,24 @@ class NightExecutor:
                 or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
                 or record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') or sid in self.state['orders']):
             return
-        # A flagged or unassessed V2 candidate may be alerted and paper-tracked,
-        # but the user opted out of sending live BUY orders for it.
+        # Three concurrent risk flags or incomplete assessment fail closed.
+        # Zero/one flags use the configured notional; two flags use half.
+        # This is an entry-only decision. Existing orders/TPs are untouched.
         risk_block = entry_block_reason(record)
-        if risk_block:
-            self.log(f'[CRASH RISK ENTRY SKIP] {symbol}: {risk_block}')
+        fraction = position_fraction(record)
+        if risk_block or fraction is None or fraction <= 0:
+            self.log(f'[CRASH RISK ENTRY SKIP] {symbol}: {risk_block or "INVALID_RISK_FRACTION"}')
             return
+        configured_usdt = self.position_usdt
+        target_usdt = configured_usdt * D(str(fraction))
+        flags = record['failure_shadow']['flags']
+        risk_count = sum(flags.values())
         if self.daily_count() >= self.max_daily:
             return
         if any(o['phase'] not in ('DONE', 'NO_FILL') and o['symbol'] == symbol for o in self.state['orders'].values()):
             return
         try:
-            p = plan(record, self.broker.info(symbol), self.position_usdt)
+            p = plan(record, self.broker.info(symbol), target_usdt)
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
@@ -469,12 +475,24 @@ class NightExecutor:
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
         if (not self.enabled.is_set() or not 0 <= now-observed_at <= 120
-                or entry_block_reason(record) is not None):
+                or entry_block_reason(record) is not None
+                or position_fraction(record) != fraction):
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
-        order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN', entry_kind='GTC', submitted_at=now, entry_id=cid+'e', tp_id=cid+'t', **p)
+        order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN',
+                     entry_kind='GTC', submitted_at=now, entry_id=cid+'e',
+                     tp_id=cid+'t', risk_sizing_version=SIZING_VERSION,
+                     risk_flags={k: flags[k] for k in ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")},
+                     risk_flag_count=risk_count, risk_position_fraction=fraction,
+                     risk_configured_usdt=str(configured_usdt),
+                     risk_target_usdt=str(target_usdt),
+                     risk_effective_notional_usdt=str(D(p['quantity'])*D(p['price'])), **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
+        self.log(f'[CRASH RISK SIZING] {symbol}; flags={risk_count}/3; '
+                 f'fraction={fraction}; base_usdt={configured_usdt}; '
+                 f'target_usdt={target_usdt}; quantity={p["quantity"]}; '
+                 f'estimated_notional_usdt={order["risk_effective_notional_usdt"]}')
         if not self.enabled.is_set():
             order['phase'] = 'NO_FILL'
             self.save()
