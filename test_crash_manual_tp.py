@@ -165,6 +165,15 @@ class ManualTests(unittest.TestCase):
         self.e.state['orders'].clear();self.b.ps[0]['positionAmt']='-5'
         self.g.scan();self.assertFalse(self.b.posts)
 
+    def test_externally_closed_order_does_not_hide_later_new_manual_long(self):
+        self.e.state['orders']['old']=dict(symbol='AUSDT',
+            phase='CLOSED_EXTERNALLY',day=day(self.now))
+        # The old verified-flat position no longer blocks TP checking a
+        # genuinely new live manual long of the same symbol.
+        self.g.scan()
+        self.assertEqual(len(self.b.posts), 1)
+        self.assertEqual(self.g.state['AUSDT']['phase'], 'PROTECTED')
+
     def test_hedge_mode_repairs_long_and_verifies(self):
         self.b.dual=True;self.b.ps[0]['positionSide']='LONG'
         self.g.scan();self.assertEqual(len(self.b.posts),1)
