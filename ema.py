@@ -6411,6 +6411,12 @@ def _crash_public_get_locked(path, params=None):
     if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/klines", "/api/v3/klines",
                     "/futures/data/openInterestHist", "/fapi/v1/fundingRate"):
         raise ValueError("Crash-only endpoint not allowed")
+    # Research can never consume the Binance IP budget intended for account
+    # positions, BUY reconciliation or TP. Exchange metadata remains available
+    # once a day, to keep the live V2 futures symbol universe validated.
+    if (path != "/fapi/v1/exchangeInfo"
+            and os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1"):
+        raise RuntimeError("RESEARCH_BINANCE_REST_DISABLED")
     if time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned():
         raise RuntimeError("Binance REST cooldown active")
     weight = 5
@@ -6932,7 +6938,8 @@ def _crash_queue_history(record, phase, now):
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'coinbase_reference'), log)
             resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
                 _crash_public_get, blocked, _crash_history_log,
-                bybit=bybit, coinbase=coinbase)
+                bybit=bybit, coinbase=coinbase,
+                allow_binance_rest=os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") == "1")
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
@@ -7914,6 +7921,9 @@ def _crash_control_action(action):
 
 def _crash_start_shadow():
     global _CRASH_SHADOW
+    if os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1":
+        log("[CRASH DERIVATIVES] PAUSED | nonessential Binance REST disabled; V2 and TP unaffected")
+        return
     from crash_derivatives import ShadowCollector
     def blocked():
         broker = getattr(globals().get('_CRASH_NIGHT'), 'broker', None)
@@ -15311,6 +15321,10 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     _crash_start_services()
+    if os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1":
+        log("[CRASH REST PRIORITY] research Binance klines/spot/OI/funding disabled; "
+            "WS + saved cache + daily archive + Bybit/Coinbase retained; "
+            "account, orders and TP REST UNCHANGED")
     global _CRASH_DAY_TRADER_WS_FEED
     # A single existing Binance Futures WS socket feeds both V2 and the
     # read-only crypto Day Trader dataset. No extra REST or WS subscription.
