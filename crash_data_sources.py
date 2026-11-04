@@ -1,4 +1,4 @@
-"""Closed Binance USD-M 15m: local cache/WS -> daily archive -> REST gaps -> Bybit.
+"""Closed Binance USD-M 15m: WS/cache -> archive -> Bybit -> Coinbase -> REST.
 All fallbacks are source-tagged; Binance is preferred whenever available.
 """
 import csv
@@ -44,12 +44,13 @@ def source_counts(rows):
 
 
 class DataSources:
-    def __init__(self, directory, rest, blocked, log, get=None, clock=time.time, bybit=None):
+    def __init__(self, directory, rest, blocked, log, get=None, clock=time.time, bybit=None, coinbase=None):
         self.directory,self.rest,self.blocked,self.log=directory,rest,blocked,log
         self.get,self.clock=get,clock
         self.retry={}
         self.binance_recheck={}
         self.bybit=bybit
+        self.coinbase=coinbase
         self.next_http=0
         os.makedirs(directory,exist_ok=True)
 
@@ -138,8 +139,9 @@ class DataSources:
             added=0
             for t,row in valid_rows(rows,start,end).items():
                 if (t not in found or
-                        (source(found[t])=='BYBIT_LINEAR' and
-                         (src is not None or source(row)!='BYBIT_LINEAR'))):
+                        (source(found[t]) in ('BYBIT_LINEAR','COINBASE_SPOT') and
+                         (src == 'BINANCE_REST' or source(row) not in
+                          ('BYBIT_LINEAR','COINBASE_SPOT')))):
                     found[t]=tagged(row,src) if src else row
                     added+=1
             return added
@@ -148,47 +150,51 @@ class DataSources:
         # Binance daily archives. The archive host has a separate request
         # budget and cached ZIPs are not downloaded again.
         today=int(self.clock()*1000)//DAY*DAY
-        needed_days=missing()+bybit_times()
+        needed_days=missing()+[t for t in expected if t in found and source(found[t]) in ("BYBIT_LINEAR","COINBASE_SPOT")]
         for day in sorted({t//DAY*DAY for t in needed_days if t//DAY*DAY<today}):
             add(self.archive(symbol,day))
 
-        # Only query the gaps left AFTER cache, WS and archive. A single REST
-        # call is bounded to at most 192 consecutive 15m candles (not 480).
-        # Keep a 30m backoff for later Binance replacement of Bybit candles.
+        # Public-data fallback priority:
+        # Binance WS/cache/archive -> Bybit linear -> Coinbase spot -> Binance REST.
+        # The two external venues are rate-paced independently. Binance REST
+        # is the last resort, not the first request that triggers an IP ban.
+        # Keep the existing 30-minute Binance recheck for non-Binance rows.
         gaps=missing()
-        old_bybit=bybit_times()
         blocked=self.blocked()
-        recheck=bool(old_bybit and self.clock()>=self.binance_recheck.get(symbol,0))
-        work=gaps if gaps else (old_bybit if recheck else [])
-        rest_added=0
+        alternate_tags=("BYBIT_LINEAR","COINBASE_SPOT")
+        old_alternates=[t for t in expected if t in found
+                        and source(found[t]) in alternate_tags]
+        if gaps and self.bybit is not None:
+            add(self.bybit.fill_missing(symbol,start,end,missing(),list(found.values())))
+        if missing() and self.coinbase is not None:
+            add(self.coinbase.fill_missing(symbol,start,end,missing(),list(found.values())))
+        gaps=missing()
+        recheck=bool(old_alternates and self.clock()>=self.binance_recheck.get(symbol,0))
+        work=gaps if gaps else (old_alternates if recheck else [])
         if work and not blocked:
             first=work[0]
             finish=first+STEP
-            while (finish<end and (finish not in found or source(found[finish])=='BYBIT_LINEAR')
+            while (finish<end and (finish not in found or source(found[finish]) in alternate_tags)
                    and (finish-first)//STEP<REST_MAX_CANDLES):
                 finish+=STEP
             request_candles=(finish-first)//STEP
             try:
                 if not gaps:
                     self.binance_recheck[symbol]=self.clock()+1800
-                rest_added=add(self.rest('/fapi/v1/klines', {
-                    'symbol':symbol, 'interval':'15m',
-                    'startTime':first, 'endTime':finish-1,
-                    'limit':request_candles}), 'BINANCE_REST')
-                self.log(f'[CRASH DATA REST GAPS] {symbol}; '
-                         f'istenen={request_candles}; alinan={rest_added}; '
-                         f'arsiv_oncelikli=1')
+                received=self.rest('/fapi/v1/klines', {
+                    'symbol':symbol,'interval':'15m',
+                    'startTime':first,'endTime':finish-1,
+                    'limit':request_candles})
+                count=add(received,'BINANCE_REST')
+                self.log(f'[CRASH DATA REST LAST_RESORT] {symbol}; '
+                         f'asked={request_candles}; filled={count}; '
+                         f'bybit_coinbase_first=1')
             except Exception as error:
                 self.log(f'[CRASH DATA REST WAIT] {symbol}; '
-                         f'type={type(error).__name__}; yedek kaynaklara geciliyor')
-        elif gaps and blocked:
-            self.log(f'[CRASH DATA REST WAIT] {symbol}; REST_BEKLEMESI; yedek kaynaklar aktif')
-
-        # If REST is working, allow later queue passes to fetch any additional
-        # gaps without immediately loading Bybit. If REST is blocked or could
-        # not supply missing rows, Bybit may fill ONLY those missing timestamps.
-        if missing() and self.bybit is not None and (blocked or rest_added==0):
-            add(self.bybit.fill_missing(symbol,start,end,missing(),list(found.values())))
+                         f'type={type(error).__name__}; alternatives_already_tried=1')
+        elif work and blocked:
+            self.log(f'[CRASH DATA REST WAIT] {symbol}; REST_BEKLEMESI; '
+                     'binance_ip_protected=1')
 
         rows=[found[t] for t in sorted(found)]
         self.log(f'[CRASH DATA SOURCES] {symbol}; candles={len(rows)}/{len(expected)}; '
