@@ -56,7 +56,7 @@ class HistoryTests(unittest.TestCase):
         self.worker.step(now=100)
         self.fetch.assert_not_called()
         self.worker.blocked=lambda:False
-        self.worker.attempts=[100]*24
+        self.worker.attempts=[100]*18
         self.worker.step(now=101)
         self.fetch.assert_not_called()
 
@@ -74,9 +74,9 @@ class ScheduledHistoryTests(HistoryTests):
         self.worker.step(now=115)
         self.assertEqual(self.fetch.call_count,1)
         other=HistoryCollector(self.tmp.name,self.fetch,self.emit,lambda:False,Mock())
-        other.step(now=159)
+        other.step(now=279)
         self.assertEqual(self.fetch.call_count,1)
-        other.step(now=160)
+        other.step(now=280)
         self.assertEqual(self.fetch.call_count,2)
 
     def test_gap_request_does_not_redownload_cached_tail(self):
