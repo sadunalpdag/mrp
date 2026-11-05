@@ -656,6 +656,8 @@ class NightTests(unittest.TestCase):
     def test_30_min_lock_audit_shows_pending_conditions(self):
         self.e.state['halt'] = 'EXECUTOR_ERROR'
         self.e.state['orders']['unknown'] = dict(phase='ENTRY_UNKNOWN')
+        self.e.reconcile = Mock()
+        self.e.expire_untracked_entries = Mock()
         self.e.step()
         logs = [c.args[0] for c in self.e.log.call_args_list]
         self.assertTrue(any('CRASH LOCK AUDIT 30M' in x
