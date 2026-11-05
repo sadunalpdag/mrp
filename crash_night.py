@@ -1003,11 +1003,12 @@ class NightExecutor:
         self.log(f'[CRASH EXTERNAL CLOSE CONFIRMED] {symbol}; '
                  'live positions=0, normal+algo orders=0; TP fill NOT assumed')
         # Send information without adding a new entry-blocking outbox item.
-        self._deliver_skip_notice(
-            f'ℹ️ POZİSYON HARİCEN KAPATILDI | {symbol}\n'
-            'Binance canlı sorgusunda bu coinde açık pozisyon, normal emir ve '
-            'koşullu emir bulunmadı. TP dolumu varsayılmadı. '
-            'Diğer coinlerdeki işlemler etkilenmedi.')
+        message = (f'ℹ️ POZİSYON HARİCEN KAPATILDI | {symbol}\n'
+                   'Binance canlı sorgusunda bu coinde açık pozisyon, normal emir ve '
+                   'koşullu emir bulunmadı. TP dolumu varsayılmadı. '
+                   'Diğer coinlerdeki işlemler etkilenmedi.')
+        threading.Thread(target=self._deliver_skip_notice, args=(message,),
+                         name='crash-external-close-notice', daemon=True).start()
         return True
 
     def reconcile(self, order, check_expiry=True, ws_order=None):
