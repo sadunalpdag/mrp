@@ -21,6 +21,7 @@ ENTRY_TTL_SECONDS = 8 * 3600
 ORDER_POLL_SECONDS = 5 * 60
 TP_POLL_SECONDS = 5 * 60
 MANUAL_TP_POLL_SECONDS = 5 * 60
+LOCK_AUDIT_SECONDS = 30 * 60
 ENTRY_EXPIRY_SCAN_SECONDS = 15 * 60
 TERMINAL_PHASES = ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY')
 
@@ -373,6 +374,8 @@ class NightExecutor:
         self.next_expiry_scan = 0
         self.next_manual_scan = 0
         self.next_halt_recheck = 0
+        self.next_lock_audit = 0
+        self.skip_notice_after = {}
         self.protected_poll = {}
         self.enabled = threading.Event()
         self.armed_at = clock()
@@ -491,6 +494,104 @@ class NightExecutor:
     def halt(self, reason, symbol):
         self.state['halt'] = reason
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
+
+    def recover_mixed_halt(self):
+        """Resolve simultaneous TP and BUY uncertainty only from live Binance proof.
+
+        Two legacy recovery methods individually reject the other's unknown
+        phase. Verify BOTH atomically to avoid a permanent manual-close lock.
+        Never send or cancel orders, and never infer flatness from WS deltas.
+        """
+        reason = self.state.get('halt')
+        if not isinstance(reason, str) or not reason.startswith(
+                ('TP DOĞRULANAMADI', 'GİRİŞ SONUCU BELİRSİZ')):
+            return False
+        orders = list(self.state['orders'].values())
+        unknown = [o for o in orders if o.get('phase') == 'ENTRY_UNKNOWN']
+        tp_affected = [o for o in orders if o.get('warned') and
+                       o.get('phase') in ('TP_UNKNOWN', 'PROTECTED', 'DONE')]
+        if not unknown or not tp_affected:
+            return False
+        if (any(not o.get('warned') or not o.get('symbol') or
+                not o.get('entry_id') or not o.get('quantity') for o in unknown)
+                or any(o.get('phase') == 'TP_UNKNOWN' and not o.get('warned')
+                       for o in orders)
+                or any(not o.get('symbol') for o in tp_affected)):
+            return False
+
+        symbols = {o['symbol'] for o in unknown + tp_affected}
+        resolved = []
+        try:
+            positions = self.broker.positions()
+            if not isinstance(positions, list):
+                raise ValueError('INVALID_POSITION_RESPONSE')
+            for position in positions:
+                if position.get('symbol') in symbols and D(str(position['positionAmt'])) != 0:
+                    return False
+            for symbol in sorted(symbols):
+                # Includes regular AND conditional/algo orders.
+                open_orders = self.broker.closing_orders(symbol)
+                if not isinstance(open_orders, list):
+                    raise ValueError('INVALID_ORDER_RESPONSE')
+                if open_orders:
+                    return False
+
+            for order in unknown:
+                try:
+                    entry = self.broker.order(order['symbol'], order['entry_id'])
+                except BrokerError as error:
+                    if error.code == '-2013' and not error.uncertain:
+                        resolved.append((order, 'NO_FILL', 'ORDER_NOT_FOUND_FLAT'))
+                        continue
+                    raise
+                if (not isinstance(entry, dict)
+                        or entry.get('symbol') != order['symbol']
+                        or entry.get('clientOrderId') != order['entry_id']
+                        or entry.get('side') != 'BUY'):
+                    raise ValueError('ENTRY_IDENTITY_NOT_CONFIRMED')
+                status = entry.get('status')
+                filled = D(str(entry['executedQty']))
+                if filled < 0 or filled > D(str(order['quantity'])):
+                    raise ValueError('INVALID_FILLED_QUANTITY')
+                if status in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED') and filled == 0:
+                    resolved.append((order, 'NO_FILL', 'ORDER_FINAL_ZERO_FILL'))
+                elif status in ('FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH') and filled > 0:
+                    resolved.append((order, 'CLOSED_EXTERNALLY', 'LIVE_FLAT_AFTER_FILL'))
+                else:
+                    return False
+        except Exception as error:
+            code = error.code if isinstance(error, BrokerError) else type(error).__name__
+            self.log(f'[CRASH MIXED HALT REVIEW WAIT] code={code}; halt retained')
+            return False
+
+        now = self.clock()
+        for order, phase, proof in resolved:
+            order['phase'] = phase
+            order['entry_reconcile_proof'] = proof
+            order['flat_confirmed_at'] = now
+        for order in tp_affected:
+            if order['phase'] != 'DONE':
+                order['phase'] = 'CLOSED_EXTERNALLY'
+                order['flat_confirmed_at'] = now
+                order['close_verification'] = 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS'
+        self.state['halt'] = None
+        self.armed_at = now
+        self.preflight_retries.clear()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.save()
+        labels = ', '.join(sorted(symbols))
+        self.log(f'[CRASH MIXED HALT CLEARED] {labels}; live flat, no normal/algo '
+                 'orders and original BUY client IDs reconciled; old signals discarded')
+        self.alert(f'✅ KARMA İŞLEM KİLİDİ TEMİZLENDİ | {labels}\n'
+                   'Binance canlı kontrolünde açık pozisyon/emir bulunmadı; '
+                   'belirsiz alışlar orijinal emir kimliğiyle doğrulandı. '
+                   'TP dolumu varsayılmadı. Otomatik ayar korunuyor, '
+                   'yalnız yeni sinyaller işlenebilir.')
+        return True
 
     def recover_closed_tp_halt(self):
         """Release a persisted TP halt only after authoritative LIVE flat+order checks.
@@ -657,24 +758,72 @@ class NightExecutor:
             self.save()
         # An unacknowledged alert blocks new entries until delivery succeeds.
 
+    def _deliver_skip_notice(self, message):
+        """Informational only: never persist as an entry-blocking safety alert."""
+        try:
+            receipt = self.deliver(message)
+            if not receipt.get('ok'):
+                self.log('[CRASH ENTRY SKIP NOTICE] Telegram unavailable; '
+                         'safety outbox unchanged')
+        except Exception as error:
+            self.log(f'[CRASH ENTRY SKIP NOTICE ERR] {type(error).__name__}')
+
+    def entry_skip(self, symbol, reason):
+        """Always log rejection; send optional deduplicated, nonblocking notice."""
+        self.log(f'[CRASH ENTRY SKIP] {symbol}; reason={reason}; '
+                 f'daily={self.daily_count()}/{self.max_daily}; '
+                 f'halt={bool(self.state.get("halt"))}; outbox={len(self.state["outbox"])}')
+        notices = {
+            'DAILY_LIMIT': 'Günlük giriş sınırı doldu.',
+            'EXISTING_ORDER': 'Aynı coin için mevcut giriş/pozisyon kaydı var.',
+            'SIGNAL_EXPIRED': 'Girişin 120 saniyelik geçerlilik süresi doldu.',
+            'SIGNAL_EXPIRED_AFTER_PREFLIGHT': 'Ön kontrol sırasında sinyalin süresi doldu.',
+            'QUEUE_FULL': 'Otomatik giriş kuyruğu dolu.',
+        }
+        # A safety halt already has its own durable warning. Do NOT put
+        # optional skip notices into the blocking outbox: a failed Telegram
+        # delivery must not block tomorrow's otherwise valid new entries.
+        if (reason in notices and not self.state['outbox']
+                and self.clock() >= self.skip_notice_after.get(reason, 0)):
+            self.skip_notice_after[reason] = self.clock() + LOCK_AUDIT_SECONDS
+            message = (f'⏸️ OTOMATİK ALIŞ ENGELLENDİ | {symbol}\n'
+                       f'Neden: {notices[reason]} '
+                       'Mevcut emirler ve TP koruması değiştirilmedi.')
+            threading.Thread(target=self._deliver_skip_notice,
+                             args=(message,), name='crash-entry-skip-notice',
+                             daemon=True).start()
+
     def submit(self, record, observed_at):
-        if not self.enabled.is_set() or observed_at < self.armed_at:
+        symbol = record.get('symbol', 'UNKNOWN')
+        if not self.enabled.is_set():
+            self.entry_skip(symbol, 'AUTO_OFF')
+            return
+        if observed_at < self.armed_at:
+            self.entry_skip(symbol, 'SIGNAL_BEFORE_ARM')
             return
         try:
             self.queue.put_nowait((dict(record), observed_at))
         except queue.Full:
-            self.log('[CRASH NIGHT SKIP] QUEUE_FULL')
+            self.entry_skip(symbol, 'QUEUE_FULL')
 
     def enter(self, record, observed_at):
         from crash_policy import supported_symbol
         from crash_failure_shadow import entry_block_reason, position_fraction, SIZING_VERSION
         now = self.clock()
         sid, symbol = record.get('signal_id'), record.get('symbol')
-        if (not self.enabled.is_set() or observed_at < self.armed_at
-                or not sid or not supported_symbol(symbol) or self.state['halt'] or self.state['outbox']
-                or not 0 <= now-observed_at <= 120 or observed_at < self.started
-                or record.get('v2_status') != 'STRONG_V2' or record.get('v2_sent') is not True
-                or record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') or sid in self.state['orders']):
+        reason = (
+            'AUTO_OFF' if not self.enabled.is_set() else
+            'SIGNAL_BEFORE_ARM' if observed_at < self.armed_at else
+            'INVALID_SIGNAL' if not sid or not supported_symbol(symbol) else
+            'HALTED' if self.state['halt'] else
+            'ALERT_PENDING' if self.state['outbox'] else
+            'SIGNAL_EXPIRED' if not 0 <= now-observed_at <= 120 or observed_at < self.started else
+            'V2_NOT_APPROVED' if record.get('v2_status') != 'STRONG_V2'
+                or record.get('v2_sent') is not True else
+            'TRACKING_INACTIVE' if record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') else
+            'DUPLICATE_SIGNAL' if sid in self.state['orders'] else None)
+        if reason:
+            self.entry_skip(symbol, reason)
             return
         # Three concurrent risk flags or incomplete assessment fail closed.
         # Zero/one flags use the configured notional; two flags use half.
@@ -683,14 +832,17 @@ class NightExecutor:
         fraction = position_fraction(record)
         if risk_block or fraction is None or fraction <= 0:
             self.log(f'[CRASH RISK ENTRY SKIP] {symbol}: {risk_block or "INVALID_RISK_FRACTION"}')
+            self.entry_skip(symbol, 'RISK_BLOCKED')
             return
         configured_usdt = self.position_usdt
         target_usdt = configured_usdt * D(str(fraction))
         flags = record['failure_shadow']['flags']
         risk_count = sum(flags.values())
         if self.daily_count() >= self.max_daily:
+            self.entry_skip(symbol, 'DAILY_LIMIT')
             return
         if any(o['phase'] not in TERMINAL_PHASES and o['symbol'] == symbol for o in self.state['orders'].values()):
+            self.entry_skip(symbol, 'EXISTING_ORDER')
             return
         try:
             p = plan(record, self.broker.info(symbol), target_usdt)
@@ -727,6 +879,9 @@ class NightExecutor:
         if (not self.enabled.is_set() or not 0 <= now-observed_at <= 120
                 or entry_block_reason(record) is not None
                 or position_fraction(record) != fraction):
+            self.entry_skip(symbol, 'SIGNAL_EXPIRED_AFTER_PREFLIGHT'
+                            if not 0 <= now-observed_at <= 120 else
+                            'PRECHECK_CHANGED')
             return
         cid = 'cbn'+hashlib.sha256(sid.encode()).hexdigest()[:24]
         order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN',
@@ -990,8 +1145,22 @@ class NightExecutor:
         self.process_account_events()
         if self.state.get('halt') and self.clock() >= self.next_halt_recheck:
             self.next_halt_recheck = self.clock() + MANUAL_TP_POLL_SECONDS
-            self.recover_closed_tp_halt()
-            self.recover_unknown_entry_halt()
+            self.recover_mixed_halt()
+            if self.state.get('halt'):
+                self.recover_closed_tp_halt()
+            if self.state.get('halt'):
+                self.recover_unknown_entry_halt()
+        if self.clock() >= self.next_lock_audit:
+            self.next_lock_audit = self.clock() + LOCK_AUDIT_SECONDS
+            entry_unknown = sum(o.get('phase') == 'ENTRY_UNKNOWN'
+                                for o in self.state['orders'].values())
+            tp_unknown = sum(o.get('phase') == 'TP_UNKNOWN'
+                             for o in self.state['orders'].values())
+            if self.state.get('halt') or entry_unknown or tp_unknown:
+                self.log(f'[CRASH LOCK AUDIT 30M] halt={self.state.get("halt") or "none"}; '
+                         f'entry_unknown={entry_unknown}; tp_unknown={tp_unknown}; '
+                         f'auto_enabled={self.enabled.is_set()}; '
+                         f'alert_pending={len(self.state["outbox"])}')
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS

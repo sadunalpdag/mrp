@@ -577,6 +577,106 @@ class NightTests(unittest.TestCase):
         self.b.closing_orders=Mock(return_value=[])
         return self.e.state['orders']['old']
 
+    def make_mixed_halt(self):
+        tp = self.make_halted_cancelled_tp()
+        old = dict(day=day(self.now), symbol='BUSDT',
+                   entry_id='cbn'+'b'*24+'e', quantity='5',
+                   phase='ENTRY_UNKNOWN', warned=True, price='10', tp='10.1')
+        self.e.state['orders']['old'] = old
+        self.e.save()
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        return tp, old
+
+    def test_mixed_halt_manual_close_recovers_both_atomically(self):
+        tp, old = self.make_mixed_halt()
+        count = self.e.daily_count()
+        buys, tps = len(self.b.buys), len(self.b.tps)
+        self.assertTrue(self.e.recover_mixed_halt())
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(old['phase'], 'NO_FILL')
+        self.assertEqual(old['entry_reconcile_proof'], 'ORDER_NOT_FOUND_FLAT')
+        self.assertEqual(tp['phase'], 'CLOSED_EXTERNALLY')
+        self.assertEqual(tp['close_verification'], 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
+        self.assertEqual(self.e.daily_count(), count)
+        self.assertEqual((len(self.b.buys), len(self.b.tps)), (buys, tps))
+        self.assertTrue(self.e.enabled.is_set())
+        self.assertEqual(self.b.closing_orders.call_count, 2)
+
+    def test_mixed_halt_kept_if_position_or_algo_order_exists(self):
+        tp, old = self.make_mixed_halt()
+        self.b.positions.return_value = [dict(symbol='BUSDT', positionAmt='1')]
+        self.assertFalse(self.e.recover_mixed_halt())
+        self.b.closing_orders.assert_not_called()
+        self.b.positions.return_value = []
+        self.b.closing_orders.side_effect = lambda symbol: (
+            [dict(symbol=symbol, status='NEW')] if symbol == 'BUSDT' else [])
+        self.assertFalse(self.e.recover_mixed_halt())
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(old['phase'], 'ENTRY_UNKNOWN')
+        self.assertEqual(tp['phase'], 'PROTECTED')
+        self.b.order.assert_not_called()
+
+    def test_mixed_halt_never_unlocks_unknown_client_or_api_failure(self):
+        tp, old = self.make_mixed_halt()
+        self.b.order.side_effect = BrokerError('-1003')
+        self.assertFalse(self.e.recover_mixed_halt())
+        self.b.order.side_effect = None
+        self.b.order.return_value = dict(symbol='BUSDT', clientOrderId=old['entry_id'],
+                                         side='BUY', status='NEW', executedQty='0')
+        self.assertFalse(self.e.recover_mixed_halt())
+        self.assertEqual(old['phase'], 'ENTRY_UNKNOWN')
+        self.assertEqual(tp['phase'], 'PROTECTED')
+        self.assertTrue(self.e.state['halt'])
+
+    def test_mixed_halt_auto_recheck_and_explicit_off(self):
+        tp, old = self.make_mixed_halt()
+        self.e.apply_control('off')
+        self.now += 301
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertFalse(self.e.enabled.is_set())
+        self.assertTrue(self.e.state['paused'])
+        self.assertEqual(old['phase'], 'NO_FILL')
+        self.assertEqual(tp['phase'], 'CLOSED_EXTERNALLY')
+        self.assertFalse(self.b.buys[1:] if len(self.b.buys) > 1 else [])
+
+    def test_entry_skip_reports_reason_without_duplicate_notice(self):
+        self.e.state['halt'] = 'TP DOĞRULANAMADI'
+        self.e.enter(dict(self.r), self.now)
+        self.assertIn('CRASH ENTRY SKIP', self.e.log.call_args.args[0])
+        self.assertIn('HALTED', self.e.log.call_args.args[0])
+        self.assertFalse(self.e.state['outbox'])
+        self.e.enter(dict(self.r), self.now)
+        self.assertFalse(self.e.state['outbox'])
+        self.assertFalse(self.b.buys)
+        with patch('crash_night.threading.Thread') as thread:
+            self.e.entry_skip('AUSDT', 'DAILY_LIMIT')
+            self.e.entry_skip('AUSDT', 'DAILY_LIMIT')
+            thread.assert_called_once()
+        # Informational notifications must never block legitimate future BUYs.
+        self.assertFalse(self.e.state['outbox'])
+
+    def test_30_min_lock_audit_shows_pending_conditions(self):
+        self.e.state['halt'] = 'EXECUTOR_ERROR'
+        self.e.state['orders']['unknown'] = dict(phase='ENTRY_UNKNOWN')
+        self.e.reconcile = Mock()
+        self.e.expire_untracked_entries = Mock()
+        self.e.step()
+        logs = [c.args[0] for c in self.e.log.call_args_list]
+        self.assertTrue(any('CRASH LOCK AUDIT 30M' in x
+                            and 'entry_unknown=1' in x for x in logs))
+        self.e.log.reset_mock()
+        self.now += 1799
+        self.e.step()
+        self.assertFalse(any('CRASH LOCK AUDIT 30M' in c.args[0]
+                             for c in self.e.log.call_args_list))
+        self.now += 1
+        self.e.step()
+        self.assertTrue(any('CRASH LOCK AUDIT 30M' in c.args[0]
+                            for c in self.e.log.call_args_list))
+
     def test_stale_entry_halt_safe_recovery_when_client_order_not_found(self):
         old=self.add_unknown_halt()
         self.b.order=Mock(side_effect=BrokerError('-2013'))
