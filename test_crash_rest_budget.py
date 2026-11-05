@@ -17,6 +17,10 @@ class SharedIpBudgetTests(unittest.TestCase):
         self.now[0]+=delta
 
     def test_estimated_weights_and_priority(self):
+        self.assertEqual(estimated_weight('/fapi/v1/order', method='POST'),0)
+        self.assertEqual(estimated_weight('/fapi/v1/order', {'symbol':'BTCUSDT'}, method='GET'),1)
+        self.assertEqual(estimated_weight('/fapi/v1/order', method='DELETE'),1)
+        self.assertEqual(estimated_weight('/fapi/v1/leverage', method='POST'),1)
         self.assertEqual(estimated_weight('/fapi/v1/openOrders'),40)
         self.assertEqual(estimated_weight('/fapi/v1/openOrders',{'symbol':'BTCUSDT'}),1)
         self.assertEqual(estimated_weight('/fapi/v1/openAlgoOrders'),40)
@@ -108,6 +112,26 @@ class SharedIpBudgetTests(unittest.TestCase):
                                {'symbol':'BTCUSDT','side':'BUY'},
                                budget_priority='protect')
             self.assertEqual(req.call_count, 3)
+
+    def test_zero_ip_weight_buy_does_not_bypass_actual_exchange_cooldown(self):
+        from crash_night import BinanceBroker, BrokerError
+        broker=BinanceBroker('test_key','test_secret')
+        self.b.observe({'X-MBX-USED-WEIGHT-1M':'1399'},200)
+        response=Mock(status_code=200,headers={'X-MBX-USED-WEIGHT-1M':'1399'})
+        response.json.return_value={'orderId':1}
+        http=Mock(return_value=response)
+        with patch('crash_rest_budget.BUDGET',self.b),patch.dict(
+                'sys.modules', {'requests':SimpleNamespace(request=http)}):
+            self.assertEqual(broker.request('POST','/fapi/v1/order',
+                {'symbol':'BTCUSDT','side':'BUY'},signed=False),{'orderId':1})
+            self.assertEqual(http.call_count,1)
+            # A real Binance IP ban is never bypassed, even for weight=0.
+            self.b.observe({'X-MBX-USED-WEIGHT-1M':'2400'},429,'120')
+            with self.assertRaises(BrokerError) as error:
+                broker.request('POST','/fapi/v1/order',
+                    {'symbol':'BTCUSDT','side':'BUY'},signed=False)
+            self.assertTrue(error.exception.not_sent)
+            self.assertEqual(http.call_count,1)
 
     def test_actual_broker_request_observes_weight_and_respects_budget(self):
         from crash_night import BinanceBroker, BrokerError
