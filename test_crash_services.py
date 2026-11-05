@@ -417,7 +417,7 @@ class NightTests(unittest.TestCase):
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
         self.b.closing_orders.assert_not_called()
-        self.assertIn('OPEN_POSITION',
+        self.assertIn('POSITION_OPEN',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
 
     def test_manual_close_with_open_normal_or_algo_order_has_no_quarantine(self):
