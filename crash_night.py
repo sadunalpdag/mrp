@@ -386,6 +386,7 @@ class NightExecutor:
         self.next_manual_scan = 0
         self.next_halt_recheck = 0
         self.next_quarantine_scan = 0
+        self.next_manual_close_scan = 0
         self.next_lock_audit = 0
         self.skip_notice_after = {}
         self.protected_poll = {}
@@ -1111,6 +1112,58 @@ class NightExecutor:
                          name='crash-external-close-notice', daemon=True).start()
         return True
 
+    def review_protected_manual_closes(self):
+        """Find manual exits even when the old bot TP still reports NEW.
+
+        One account snapshot per five-minute sweep. Only symbols that are
+        already flat proceed to signed TP-ID and order/position verification.
+        An unconfirmed API result never closes a trade or cancels an order.
+        """
+        active = [o for o in self.state['orders'].values()
+                  if o.get('phase') in ('TP_UNKNOWN', 'PROTECTED')
+                  and o.get('symbol') and o.get('tp_id')]
+        if not active or not callable(getattr(self.broker, 'positions', None)):
+            return
+        try:
+            positions = self.broker.positions()
+            if not isinstance(positions, list):
+                raise ValueError('INVALID_POSITION_RESPONSE')
+        except Exception as error:
+            code = error.code if isinstance(error, BrokerError) else type(error).__name__
+            self.log(f'[CRASH MANUAL CLOSE SCAN WAIT] code={code}')
+            return
+        for order in active:
+            symbol = order['symbol']
+            try:
+                if not self._flat_from_snapshot(positions, {symbol}):
+                    continue
+                tp = None
+                try:
+                    tp = self.broker.order(symbol, order['tp_id'])
+                except BrokerError as error:
+                    if error.code != '-2013' or error.uncertain:
+                        raise
+                if tp is not None:
+                    if (not isinstance(tp, dict)
+                            or tp.get('symbol') != symbol
+                            or tp.get('clientOrderId') != order['tp_id']
+                            or tp.get('side') != 'SELL'
+                            or tp.get('status') not in (
+                                'NEW', 'PARTIALLY_FILLED', 'FILLED', 'CANCELED',
+                                'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED')):
+                        self.log(f'[CRASH MANUAL CLOSE SCAN WAIT] {symbol}; '
+                                 'TP_IDENTITY_OR_STATUS_INVALID')
+                        continue
+                    if tp['status'] == 'FILLED':
+                        # Keep an actual TP execution classified as DONE, never
+                        # claim a manual exit just because exposure is zero.
+                        self.reconcile(order, check_expiry=False, ws_order=tp)
+                        continue
+                self._confirm_external_close(order)
+            except Exception as error:
+                code = error.code if isinstance(error, BrokerError) else type(error).__name__
+                self.log(f'[CRASH MANUAL CLOSE SCAN WAIT] {symbol}; code={code}')
+
     def reconcile(self, order, check_expiry=True, ws_order=None):
         symbol = order['symbol']
         try:
@@ -1359,6 +1412,9 @@ class NightExecutor:
                          f'auto_enabled={self.enabled.is_set()}; '
                          f'alert_pending={len(self.state["outbox"])}; '
                          f'quarantine={",".join(sorted(self.state["symbol_quarantine"])) or "none"}')
+        if self.clock() >= self.next_manual_close_scan:
+            self.next_manual_close_scan = self.clock() + MANUAL_TP_POLL_SECONDS
+            self.review_protected_manual_closes()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
