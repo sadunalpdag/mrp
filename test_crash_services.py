@@ -619,6 +619,27 @@ class BrokerTests(unittest.TestCase):
             with self.assertRaises(ValueError): self.b.preflight('AUSDT')
             self.assertFalse(any(c.args[0]=='POST' for c in self.b.request.call_args_list))
 
+    def test_preflight_reports_pending_bot_orders_without_extra_http_or_cancel(self):
+        import re
+        self.b.max_symbols=20
+        bot=dict(symbol='BUSDT',side='BUY',type='LIMIT',
+                 clientOrderId='cbn'+'a'*24+'e',positionSide='BOTH')
+        manual=dict(symbol='CUSDT',side='BUY',type='LIMIT',
+                    clientOrderId='manual-order',positionSide='BOTH')
+        tp=dict(symbol='DUSDT',side='SELL',type='LIMIT',
+                reduceOnly=True,positionSide='BOTH')
+        self.b.request=Mock(side_effect=[
+            {'dualSidePosition':False},[],[bot,manual,tp],[],
+            {'leverage':10}])
+        with patch('builtins.print') as output:
+            self.assertEqual(self.b.preflight('AUSDT'),'BOTH')
+        self.assertEqual(self.b.request.call_count,5)
+        emitted=' '.join(str(arg) for call in output.call_args_list for arg in call.args)
+        self.assertIn('bot_pending_buy=1',emitted)
+        self.assertIn('normal_open=3',emitted)
+        self.assertIn('no orders cancelled',emitted)
+        self.assertNotIn('DELETE',[c.args[0] for c in self.b.request.call_args_list])
+
     def test_three_pending_two_closing_orders_only_count_three_slots(self):
         orders=[dict(symbol=f'P{i}',side='BUY',positionSide='LONG') for i in range(3)]
         orders += [dict(symbol='C1',side='SELL',positionSide='LONG')]
