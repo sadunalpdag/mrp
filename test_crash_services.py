@@ -488,6 +488,75 @@ class NightTests(unittest.TestCase):
         self.assertEqual(self.b.buy.call_count, 2)
         self.assertEqual(self.e.daily_count(), 0)
 
+    def test_local_preflight_ceiling_retry_is_nonblocking_and_places_once(self):
+        # The first preflight never reached BUY: schedule one check after the
+        # minute reset, with the original upcross time and full live preflight.
+        self.b.preflight = Mock(side_effect=[
+            BrokerError('-1003', deferred_reason='IP_WEIGHT_SOFT_CEILING',
+                        deferred_seconds=21, not_sent=True), None])
+        self.enter()
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.e.state['outbox'])
+        self.assertEqual(self.e.preflight_retries['signal-1']['attempts'], 1)
+        self.assertEqual(self.e.daily_count(), 0)
+        self.now += 20
+        self.e.step()
+        self.assertFalse(self.b.buys)  # Not yet due; safety checks continue.
+        self.now += 3
+        self.e.step()
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertEqual(len(self.b.tps), 1)
+        self.assertEqual(self.e.state['orders']['signal-1']['phase'], 'PROTECTED')
+        self.assertFalse(self.e.preflight_retries)
+        self.assertEqual(self.e.daily_count(), 1)
+
+    def test_two_local_preflight_retries_then_final_deferral_no_buy(self):
+        err = BrokerError('-1003', deferred_reason='IP_WEIGHT_SOFT_CEILING',
+                          deferred_seconds=10, not_sent=True)
+        self.b.preflight = Mock(side_effect=[err, err, err])
+        self.enter()
+        self.now += 12
+        self.e.step()
+        self.assertEqual(self.e.preflight_retries['signal-1']['attempts'], 2)
+        self.now += 12
+        self.e.step()
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.e.preflight_retries)
+        self.assertEqual(self.e.daily_count(), 0)
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('LOCAL_IP_BUDGET', self.e.state['outbox'][-1]['text'])
+
+    def test_real_exchange_error_does_not_retry_preflight(self):
+        self.b.preflight=Mock(side_effect=BrokerError('-1003'))
+        self.enter()
+        self.assertFalse(self.e.preflight_retries)
+        self.assertFalse(self.b.buys)
+        self.assertTrue(self.e.state['outbox'])
+
+    def test_expired_local_preflight_is_never_executed_after_original_window(self):
+        self.b.preflight=Mock(side_effect=BrokerError(
+            '-1003',deferred_reason='IP_WEIGHT_SOFT_CEILING',
+            deferred_seconds=45,not_sent=True))
+        self.enter()
+        self.assertEqual(len(self.e.preflight_retries),1)
+        self.now += 121
+        self.e.step()
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.e.preflight_retries)
+        self.b.preflight.assert_called_once()
+
+    def test_manual_off_cancels_pending_preflight_without_buy(self):
+        self.b.preflight=Mock(side_effect=BrokerError(
+            '-1003',deferred_reason='IP_WEIGHT_SOFT_CEILING',
+            deferred_seconds=10,not_sent=True))
+        self.enter()
+        self.e.apply_control('off')
+        self.now += 12
+        self.e.step()
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.e.preflight_retries)
+        self.assertFalse(self.e.enabled.is_set())
+
     def test_persisted_local_deferral_keeps_daily_counter_consistent(self):
         self.b.buy = Mock(side_effect=BrokerError('-1003',
             not_sent=True))
