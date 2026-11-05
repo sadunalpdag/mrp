@@ -723,6 +723,13 @@ class NightExecutor:
             if remaining is None:
                 continue
             del self.state['symbol_quarantine'][symbol]
+            for order in self.state['orders'].values():
+                if (order.get('symbol') == symbol
+                        and order.get('phase') == 'CLOSED_EXTERNALLY'
+                        and order.get('close_verification') == 'LIVE_POSITION_ZERO_QUARANTINED'):
+                    order['close_verification'] = (
+                        'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT'
+                        if remaining else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
             self.save()
             self.log(f'[CRASH LEGACY QUARANTINE CLEARED] {symbol}; '
                      f'flat confirmed; manual_open_orders={remaining}; no new quarantine')
