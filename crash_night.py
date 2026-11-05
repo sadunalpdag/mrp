@@ -337,6 +337,9 @@ class NightExecutor:
             elif os.path.exists(marker):
                 raise ValueError('EXECUTOR_STATE_MISSING')
             self.state.pop('unverified_day', None)
+            self.state.setdefault('symbol_quarantine', {})
+            if not isinstance(self.state['symbol_quarantine'], dict):
+                raise ValueError('INVALID_SYMBOL_QUARANTINE')
             # Apply new defaults exactly once; later Telegram changes must survive redeploys.
             if not self.state.get('trade_settings_defaults_20261101'):
                 self.state['trade_settings'] = {'max_daily': max_daily, 'max_symbols': 20,
@@ -374,6 +377,7 @@ class NightExecutor:
         self.next_expiry_scan = 0
         self.next_manual_scan = 0
         self.next_halt_recheck = 0
+        self.next_quarantine_scan = 0
         self.next_lock_audit = 0
         self.skip_notice_after = {}
         self.protected_poll = {}
@@ -411,7 +415,8 @@ class NightExecutor:
         stream = self.account_stream.summary() if self.account_stream else 'Hesap WS: baslatilmadi / REST yedek'
         pending_check = sum(o.get('phase') == 'ENTRY_UNKNOWN'
                             for o in self.state['orders'].values())
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | {stream}"
+        quarantined = ','.join(sorted(self.state['symbol_quarantine'])) or 'yok'
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | karantina: {quarantined} | {stream}"
 
     def apply_control(self, action):
         if action.startswith(('limit:', 'amount:', 'symbols:')):
@@ -593,27 +598,106 @@ class NightExecutor:
                    'yalnız yeni sinyaller işlenebilir.')
         return True
 
-    def recover_closed_tp_halt(self):
-        """Release a persisted TP halt only after authoritative LIVE flat+order checks.
+    @staticmethod
+    def _quarantinable_orders(symbol, opened):
+        """Never isolate malformed responses or an unresolved bot-owned BUY.
 
-        A manual Binance close can leave a TP_UNKNOWN order and the old
-        executor halt indefinitely. This is reconciliation only: never
-        cancel or create orders, never treat WS deltas as a full snapshot,
-        and never unlock while positions/any open orders are present.
+        Other account orders remain untouched and keep THIS symbol blocked;
+        they are not evidence that an unrelated coin's automated BUY is unsafe.
+        """
+        if not isinstance(opened, list):
+            raise ValueError('INVALID_ORDER_RESPONSE')
+        for order in opened:
+            if (not isinstance(order, dict) or order.get('symbol') != symbol
+                    or order.get('side') not in ('BUY', 'SELL')):
+                return False
+            if (order['side'] == 'BUY' and re.fullmatch(
+                    r'cbn[0-9a-f]{24}e', str(order.get('clientOrderId', '')))):
+                return False
+        return True
+
+    @staticmethod
+    def _flat_from_snapshot(positions, symbols):
+        """Authoritative all-sides flat check; invalid responses fail closed."""
+        if not isinstance(positions, list):
+            raise ValueError('INVALID_POSITION_RESPONSE')
+        for position in positions:
+            if not isinstance(position, dict):
+                raise ValueError('INVALID_POSITION_RESPONSE')
+            if position.get('symbol') in symbols:
+                amount = D(str(position['positionAmt']))
+                if not amount.is_finite():
+                    raise ValueError('INVALID_POSITION_AMOUNT')
+                if amount != 0:
+                    return False
+        return True
+
+    def _place_quarantine(self, symbol, opened, now):
+        """Store a local-only no-BUY hold; never cancel a user's existing order."""
+        if not opened:
+            return
+        old = self.state['symbol_quarantine'].get(symbol)
+        self.state['symbol_quarantine'][symbol] = {
+            'since': (old or {}).get('since', now),
+            'open_orders': len(opened),
+            'reason': 'FLAT_WITH_EXISTING_ORDERS',
+        }
+        types = sorted({str(o.get('type', o.get('orderType', 'UNKNOWN'))) for o in opened})
+        sides = sorted({o.get('side', 'UNKNOWN') for o in opened})
+        self.log(f'[CRASH SYMBOL QUARANTINE] {symbol}; orders={len(opened)}; '
+                 f'sides={",".join(sides)}; types={",".join(types)}; '
+                 'other symbols unaffected; no orders cancelled')
+
+    def review_quarantined_symbols(self):
+        """Refresh stale order holds every five minutes without touching orders."""
+        for symbol in list(self.state['symbol_quarantine']):
+            try:
+                if not self._flat_from_snapshot(self.broker.positions(), {symbol}):
+                    self.log(f'[CRASH QUARANTINE WAIT] {symbol}; POSITION_OPEN')
+                    continue
+                opened = self.broker.closing_orders(symbol)
+                if not isinstance(opened, list):
+                    raise ValueError('INVALID_ORDER_RESPONSE')
+                if opened:
+                    # The quarantine intentionally stays even for manual orders.
+                    continue
+                if not self._flat_from_snapshot(self.broker.positions(), {symbol}):
+                    self.log(f'[CRASH QUARANTINE WAIT] {symbol}; POSITION_CHANGED')
+                    continue
+            except Exception as error:
+                code = error.code if isinstance(error, BrokerError) else type(error).__name__
+                self.log(f'[CRASH QUARANTINE WAIT] {symbol}; VERIFY_FAILED={code}')
+                continue
+            del self.state['symbol_quarantine'][symbol]
+            self.save()
+            self.log(f'[CRASH SYMBOL QUARANTINE CLEARED] {symbol}; '
+                     'flat and no normal/algo orders; new signals only')
+            notice = (f'✅ COIN KARANTİNASI BİTTİ | {symbol}\n'
+                      'Binance canlı kontrolünde açık pozisyon ve normal/koşullu '
+                      'emir yok. Yalnız yeni sinyaller değerlendirilecek.')
+            threading.Thread(target=self._deliver_skip_notice, args=(notice,),
+                             name='crash-quarantine-clear', daemon=True).start()
+
+    def recover_closed_tp_halt(self):
+        """Release a TP-only global halt via flat proof, isolating leftover orders.
+
+        A manually closed, flat coin with residual *account* orders is
+        quarantined locally instead of halting unrelated V2 trading. Never
+        quarantine uncertain bot BUYs, non-flat positions or failed queries.
         """
         reason = self.state.get('halt')
         if not isinstance(reason, str) or not reason.startswith('TP DOĞRULANAMADI'):
             return False
         orders = list(self.state['orders'].values())
-        # Every unresolved TP problem that could have caused this halt must
-        # be accounted for. Do not unlock unknown entry executions.
         if any(o.get('phase') == 'ENTRY_UNKNOWN' for o in orders):
             self.log('[CRASH TP HALT BLOCK] ENTRY_UNKNOWN; original BUY not reconciled')
             return False
         affected = [o for o in orders if o.get('warned') and
                     (o.get('phase') in ('TP_UNKNOWN', 'PROTECTED', 'DONE')
                      or (o.get('phase') == 'CLOSED_EXTERNALLY' and
-                         o.get('close_verification') == 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')) and
+                         o.get('close_verification') in (
+                             'LIVE_POSITION_ZERO_NO_OPEN_ORDERS',
+                             'LIVE_POSITION_ZERO_QUARANTINED'))) and
                     isinstance(o.get('symbol'), str) and o['symbol']]
         if not affected:
             self.log('[CRASH TP HALT BLOCK] NO_VERIFIABLE_AFFECTED_ORDER')
@@ -622,59 +706,72 @@ class NightExecutor:
             self.log('[CRASH TP HALT BLOCK] UNWARNED_TP_UNKNOWN')
             return False
         symbols = {o['symbol'] for o in affected}
+        pending = {}
         try:
-            positions = self.broker.positions()  # Fresh signed REST snapshot.
-            if not isinstance(positions, list):
-                raise ValueError('INVALID_POSITION_RESPONSE')
-            # Any exposure on the affected symbols (including hedge SHORT)
-            # makes an automatic unlock unsafe.
-            for p in positions:
-                if not isinstance(p, dict):
-                    raise ValueError('INVALID_POSITION_RESPONSE')
-                if p.get('symbol') in symbols:
-                    qty = D(str(p['positionAmt']))
-                    if not qty.is_finite():
-                        raise ValueError('INVALID_POSITION_AMOUNT')
-                    if qty != 0:
-                        self.log(f'[CRASH TP HALT BLOCK] {p["symbol"]}; OPEN_POSITION')
-                        return False
+            if not self._flat_from_snapshot(self.broker.positions(), symbols):
+                self.log('[CRASH TP HALT BLOCK] AFFECTED_POSITION_OPEN')
+                return False
             for symbol in sorted(symbols):
-                open_orders = self.broker.closing_orders(symbol)
-                if not isinstance(open_orders, list):
+                opened = self.broker.closing_orders(symbol)
+                if not isinstance(opened, list):
                     raise ValueError('INVALID_ORDER_RESPONSE')
-                # Queries include standard AND conditional open orders.
-                # Even a manually placed pending order requires review.
-                if open_orders:
+                if opened and not self._quarantinable_orders(symbol, opened):
                     self.log(f'[CRASH TP HALT BLOCK] {symbol}; '
-                             f'OPEN_NORMAL_OR_ALGO_ORDERS={len(open_orders)}')
+                             'UNVERIFIED_OR_BOT_PENDING_ORDER')
+                    return False
+                pending[symbol] = opened
+            if any(pending.values()):
+                # Recheck after retrieving every order set, preventing a stale
+                # flat snapshot from permitting buys during a manual re-entry.
+                if not self._flat_from_snapshot(self.broker.positions(), symbols):
+                    self.log('[CRASH TP HALT BLOCK] POSITION_CHANGED')
                     return False
         except Exception as error:
-            # A rate limit, 5xx, timeout or invalid payload is NOT a
-            # confirmed flat account. Keep existing error hold.
-            self.log(f'[CRASH TP HALT REVIEW WAIT] {type(error).__name__}; eski kilit korundu')
+            code = error.code if isinstance(error, BrokerError) else type(error).__name__
+            self.log(f'[CRASH TP HALT REVIEW WAIT] code={code}; eski kilit korundu')
             return False
 
         now = self.clock()
         for order in affected:
+            symbol = order['symbol']
             if order['phase'] != 'DONE':
                 order['phase'] = 'CLOSED_EXTERNALLY'
                 order['flat_confirmed_at'] = now
-                order['close_verification'] = 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS'
+                order['close_verification'] = (
+                    'LIVE_POSITION_ZERO_QUARANTINED' if pending[symbol]
+                    else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
+        for symbol, opened in pending.items():
+            self._place_quarantine(symbol, opened, now)
         self.state['halt'] = None
-        # Never reuse queued pre-verification signals.
         self.armed_at = now
+        self.preflight_retries.clear()
         while True:
             try:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
         self.save()
-        self.log(f'[CRASH TP HALT CLEARED] flat+no open orders confirmed: {",".join(sorted(symbols))}; executor settings unchanged')
-        self.alert('✅ TP HATA KİLİDİ TEMİZLENDİ | ' +
-                   ', '.join(sorted(symbols)) +
-                   '\nBinance canlı sorgusunda pozisyon sıfır ve açık/koşullu emir bulunmadı. '
-                   'Eski işlem haricen kapanmış olarak kaydedildi. '
-                   'Otomatik girişin açık/kapalı ayarı değiştirilmedi; sadece yeni sinyaller geçerlidir.')
+        isolated = sorted(s for s, opened in pending.items() if opened)
+        if isolated:
+            self.log(f'[CRASH TP HALT ISOLATED] {",".join(isolated)}; '
+                     'global lock cleared; affected coins cannot BUY; '
+                     'all existing orders retained')
+            notice = (f'✅ OTOMATİK İŞLEM TEKRAR AKTİF | '
+                      f'karantina: {",".join(isolated)}\n'
+                      'İlgili coinlerin pozisyonları Binance üzerinden sıfır '
+                      'doğrulandı; kalan emirler iptal edilmedi. '
+                      'Bu coinlerde alış engelli, diğer coinler yeni sinyal alabilir.')
+            threading.Thread(target=self._deliver_skip_notice, args=(notice,),
+                             name='crash-halt-isolated', daemon=True).start()
+        else:
+            self.log(f'[CRASH TP HALT CLEARED] flat+no open orders confirmed: '
+                     f'{",".join(sorted(symbols))}; executor settings unchanged')
+            self.alert('✅ TP HATA KİLİDİ TEMİZLENDİ | ' +
+                       ', '.join(sorted(symbols)) +
+                       '\nBinance canlı sorgusunda pozisyon sıfır ve açık/koşullu emir bulunmadı. '
+                       'Eski işlem haricen kapanmış olarak kaydedildi. '
+                       'Otomatik girişin açık/kapalı ayarı değiştirilmedi; '
+                       'sadece yeni sinyaller geçerlidir.')
         return True
 
     def recover_unknown_entry_halt(self):
@@ -794,6 +891,7 @@ class NightExecutor:
             'SIGNAL_EXPIRED': 'Girişin 120 saniyelik geçerlilik süresi doldu.',
             'SIGNAL_EXPIRED_AFTER_PREFLIGHT': 'Ön kontrol sırasında sinyalin süresi doldu.',
             'QUEUE_FULL': 'Otomatik giriş kuyruğu dolu.',
+            'SYMBOL_QUARANTINED': 'Coin karantinada; kalan emirler kontrol ediliyor.',
         }
         # A safety halt already has its own durable warning. Do NOT put
         # optional skip notices into the blocking outbox: a failed Telegram
@@ -831,6 +929,7 @@ class NightExecutor:
             'SIGNAL_BEFORE_ARM' if observed_at < self.armed_at else
             'INVALID_SIGNAL' if not sid or not supported_symbol(symbol) else
             'HALTED' if self.state['halt'] else
+            'SYMBOL_QUARANTINED' if symbol in self.state['symbol_quarantine'] else
             'ALERT_PENDING' if self.state['outbox'] else
             'SIGNAL_EXPIRED' if not 0 <= now-observed_at <= 120 or observed_at < self.started else
             'V2_NOT_APPROVED' if record.get('v2_status') != 'STRONG_V2'
@@ -981,9 +1080,9 @@ class NightExecutor:
             opened = self.broker.closing_orders(symbol)
             if not isinstance(opened, list):
                 raise ValueError('INVALID_ORDER_RESPONSE')
-            if opened:
+            if opened and not self._quarantinable_orders(symbol, opened):
                 self.log(f'[CRASH EXTERNAL CLOSE WAIT] {symbol}; '
-                         f'OPEN_NORMAL_OR_ALGO_ORDERS={len(opened)}')
+                         'UNVERIFIED_OR_BOT_PENDING_ORDER')
                 return False
             # A second snapshot guards against an intervening manual re-entry.
             if not flat_positions():
@@ -997,16 +1096,25 @@ class NightExecutor:
         now = self.clock()
         order['phase'] = 'CLOSED_EXTERNALLY'
         order['flat_confirmed_at'] = now
-        order['close_verification'] = 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS'
+        if opened:
+            self._place_quarantine(symbol, opened, now)
+        order['close_verification'] = (
+            'LIVE_POSITION_ZERO_QUARANTINED' if opened
+            else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
         order['external_close_reason'] = 'TP_NOT_ACTIVE_POSITION_FLAT'
         self.save()
         self.log(f'[CRASH EXTERNAL CLOSE CONFIRMED] {symbol}; '
-                 'live positions=0, normal+algo orders=0; TP fill NOT assumed')
+                 f'live positions=0, normal+algo orders={len(opened)}; '
+                 'TP fill NOT assumed')
         # Send information without adding a new entry-blocking outbox item.
         message = (f'ℹ️ POZİSYON HARİCEN KAPATILDI | {symbol}\n'
-                   'Binance canlı sorgusunda bu coinde açık pozisyon, normal emir ve '
-                   'koşullu emir bulunmadı. TP dolumu varsayılmadı. '
-                   'Diğer coinlerdeki işlemler etkilenmedi.')
+                   'Binance canlı kontrolünde pozisyon sıfır. '
+                   f'Kalan emir: {len(opened)}; coin karantinaya alındı. '
+                   'Emirler iptal edilmedi; diğer coinler etkilenmedi.'
+                   if opened else
+                   f'ℹ️ POZİSYON HARİCEN KAPATILDI | {symbol}\n'
+                   'Binance canlı sorgusunda bu coinde açık pozisyon ve emir yok. '
+                   'TP dolumu varsayılmadı. Diğer coinler etkilenmedi.')
         threading.Thread(target=self._deliver_skip_notice, args=(message,),
                          name='crash-external-close-notice', daemon=True).start()
         return True
@@ -1243,17 +1351,22 @@ class NightExecutor:
                 self.recover_closed_tp_halt()
             if self.state.get('halt'):
                 self.recover_unknown_entry_halt()
+        if (self.state['symbol_quarantine']
+                and self.clock() >= self.next_quarantine_scan):
+            self.next_quarantine_scan = self.clock() + MANUAL_TP_POLL_SECONDS
+            self.review_quarantined_symbols()
         if self.clock() >= self.next_lock_audit:
             self.next_lock_audit = self.clock() + LOCK_AUDIT_SECONDS
             entry_unknown = sum(o.get('phase') == 'ENTRY_UNKNOWN'
                                 for o in self.state['orders'].values())
             tp_unknown = sum(o.get('phase') == 'TP_UNKNOWN'
                              for o in self.state['orders'].values())
-            if self.state.get('halt') or entry_unknown or tp_unknown:
+            if self.state.get('halt') or entry_unknown or tp_unknown or self.state['symbol_quarantine']:
                 self.log(f'[CRASH LOCK AUDIT 30M] halt={self.state.get("halt") or "none"}; '
                          f'entry_unknown={entry_unknown}; tp_unknown={tp_unknown}; '
                          f'auto_enabled={self.enabled.is_set()}; '
-                         f'alert_pending={len(self.state["outbox"])}')
+                         f'alert_pending={len(self.state["outbox"])}; '
+                         f'quarantine={",".join(sorted(self.state["symbol_quarantine"])) or "none"}')
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
