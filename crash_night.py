@@ -1033,10 +1033,13 @@ class NightExecutor:
             else:
                 # Reuse the original observed_at; enter() rechecks all live
                 # position/orders, daily limits, risk and paused/halt flags.
-                self.preflight_retries[sid] = dict(retry, retry_at=now)
+                current = dict(retry, retry_at=now)
+                self.preflight_retries[sid] = current
                 self.enter(retry['record'], retry['observed_at'])
-                # If enter() succeeded, an ineligible record is safely dropped.
-                self.preflight_retries.pop(sid, None)
+                # Keep a newly rescheduled retry; clean up only if enter()
+                # did not replace the placeholder with a future due time.
+                if self.preflight_retries.get(sid) is current:
+                    self.preflight_retries.pop(sid, None)
             return
         try:
             record, observed_at = self.queue.get_nowait()
