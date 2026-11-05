@@ -417,30 +417,31 @@ class NightTests(unittest.TestCase):
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
         self.b.closing_orders.assert_not_called()
-        self.assertIn('OPEN_POSITION',
+        self.assertIn('POSITION_OPEN',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
 
-    def test_manual_close_with_open_normal_or_algo_order_isolates_coin(self):
+    def test_manual_close_with_open_normal_or_algo_order_has_no_quarantine(self):
         self.enter()
         order = self.e.state['orders']['signal-1']
         self.b.order = Mock(side_effect=BrokerError('-2013'))
         self.b.positions = Mock(return_value=[])
-        opened = [dict(symbol='AUSDT', side='SELL', type='TAKE_PROFIT_MARKET',
-                       algoStatus='NEW', closePosition=True)]
+        opened = [dict(symbol='AUSDT', side='BUY', type='LIMIT', status='NEW',
+                       clientOrderId='manual-buy')]
         self.b.closing_orders = Mock(return_value=opened)
         with patch('crash_night.threading.Thread') as thread:
             self.e.reconcile(order)
             thread.assert_called_once()
         self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
-        self.assertEqual(order['close_verification'], 'LIVE_POSITION_ZERO_QUARANTINED')
+        self.assertEqual(order['close_verification'],
+                         'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT')
+        self.assertFalse(self.e.state['symbol_quarantine'])
         self.assertIsNone(self.e.state['halt'])
-        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(self.b.positions.call_count, 2)
-        self.assertEqual(opened[0]['algoStatus'], 'NEW')
-        self.assertEqual((len(self.b.buys), len(self.b.tps)), (1, 1))
-        self.assertIn('CRASH SYMBOL QUARANTINE',
+        self.assertEqual(opened[0]['status'], 'NEW')
+        self.assertEqual((len(self.b.buys), len(self.b.tps)), (1, 1)
+                         )
+        self.assertIn('CRASH MANUAL ORDERS KEPT',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
-
     def test_manual_close_verification_failure_does_not_unlock(self):
         self.enter()
         order = self.e.state['orders']['signal-1']
@@ -511,8 +512,8 @@ class NightTests(unittest.TestCase):
         self.assertEqual(len(self.b.buys), 1)
         self.assertEqual(len(self.b.tps), 1)
         self.assertTrue(self.e.enabled.is_set())
-        self.assertIn('TP HATA KİLİDİ TEMİZLENDİ',
-                      self.e.state['outbox'][-1]['text'])
+        self.assertIn('CRASH TP HALT CLEARED',
+                      '\n'.join(c.args[0] for c in self.e.log.call_args_list))
         self.e.save(); self.e.guard.close(); self.e = self.make()
         self.assertIsNone(self.e.state['halt'])
         self.assertEqual(self.e.state['orders']['signal-1']['phase'],
@@ -528,21 +529,27 @@ class NightTests(unittest.TestCase):
         self.assertTrue(self.e.state['halt'])
         self.assertEqual(order['phase'], 'PROTECTED')
 
-    def test_tp_halt_with_open_order_isolates_coin_and_unlocks_other_buys(self):
+    def test_tp_halt_flat_with_manual_orders_closes_without_quarantine(self):
         order = self.make_halted_cancelled_tp()
         self.b.positions = Mock(return_value=[
             dict(symbol='AUSDT', positionAmt='0'),
             dict(symbol='BUSDT', positionAmt='5')])
-        opened = [dict(symbol='AUSDT', side='SELL', type='LIMIT', status='NEW')]
+        opened = [dict(symbol='AUSDT', side='BUY', type='LIMIT',
+                       status='NEW', clientOrderId='manual-bid')]
         self.b.closing_orders = Mock(return_value=opened)
         with patch('crash_night.threading.Thread'):
             self.assertTrue(self.e.recover_closed_tp_halt())
         self.assertIsNone(self.e.state['halt'])
         self.assertTrue(self.e.enabled.is_set())
         self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
-        self.assertEqual(order['close_verification'], 'LIVE_POSITION_ZERO_QUARANTINED')
-        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
-        self.assertEqual(opened[0]['status'], 'NEW')  # Never cancel user orders.
+        self.assertEqual(order['close_verification'],
+                         'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT')
+        self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertEqual(opened[0]['status'], 'NEW')
+        # Real Binance preflight rejects manual orders on same symbol.
+        self.b.preflight = Mock(side_effect=lambda sym: (
+            (_ for _ in ()).throw(ValueError('EXISTING_SYMBOL_ORDER'))
+            if sym == 'AUSDT' else None))
         self.e.deliver_pending()
         self.enter(signal_id='new-ake', symbol='AUSDT')
         self.assertEqual(len(self.b.buys), 1)
@@ -550,8 +557,7 @@ class NightTests(unittest.TestCase):
         self.enter(signal_id='new-busdt', symbol='BUSDT')
         self.assertEqual(len(self.b.buys), 2)
         self.assertEqual(self.b.buys[-1][0], 'BUSDT')
-
-    def test_quarantine_survives_restart_and_preserves_explicit_off(self):
+    def test_manual_close_does_not_restore_quarantine_on_restart_or_override_off(self):
         self.make_halted_cancelled_tp()
         self.b.positions = Mock(return_value=[])
         self.b.closing_orders = Mock(return_value=[
@@ -561,31 +567,26 @@ class NightTests(unittest.TestCase):
         self.e.apply_control('off')
         self.e.guard.close()
         self.e = self.make()
-        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertFalse(self.e.enabled.is_set())
         self.assertTrue(self.e.state['paused'])
         self.enter(signal_id='fresh-busdt', symbol='BUSDT')
-        self.assertEqual(len(self.b.buys), 1)  # Manual OFF never overridden.
-
-    def test_quarantine_recheck_clears_after_live_flat_and_zero_orders(self):
-        self.make_halted_cancelled_tp()
+        self.assertEqual(len(self.b.buys), 1)
+    def test_legacy_quarantine_clears_with_manual_limit_still_open(self):
+        self.e.state['symbol_quarantine']['AUSDT'] = {
+            'since': self.now, 'open_orders': 1,
+            'reason': 'FLAT_WITH_EXISTING_ORDERS'}
+        self.e.save()
         self.b.positions = Mock(return_value=[])
-        self.b.closing_orders = Mock(return_value=[
-            dict(symbol='AUSDT', side='SELL', status='NEW')])
-        with patch('crash_night.threading.Thread'):
-            self.assertTrue(self.e.recover_closed_tp_halt())
-        with patch('crash_night.threading.Thread'):
-            self.e.review_quarantined_symbols()
-        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
-        self.b.closing_orders.return_value = []
+        manual = dict(symbol='AUSDT', side='BUY', type='LIMIT',
+                      status='NEW', clientOrderId='manual-order')
+        self.b.closing_orders = Mock(return_value=[manual])
         with patch('crash_night.threading.Thread'):
             self.e.review_quarantined_symbols()
         self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
-        self.assertIsNone(self.e.state['halt'])
-        self.e.deliver_pending()
-        self.enter(signal_id='new-entry-after-clean', symbol='AUSDT')
-        self.assertEqual(len(self.b.buys), 2)
-
+        self.assertEqual(manual['status'], 'NEW')
+        self.e.guard.close(); self.e=self.make()
+        self.assertFalse(self.e.state['symbol_quarantine'])
     def test_unknown_bot_buy_does_not_downgrade_global_safety_hold(self):
         order = self.make_halted_cancelled_tp()
         self.b.positions = Mock(return_value=[])
@@ -596,7 +597,7 @@ class NightTests(unittest.TestCase):
         self.assertTrue(self.e.state['halt'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
-        self.assertIn('UNVERIFIED_OR_BOT_PENDING_ORDER',
+        self.assertIn('BOT_BUY_STILL_OPEN',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
 
     def test_malformed_or_mismatched_order_not_quarantined(self):
@@ -607,21 +608,138 @@ class NightTests(unittest.TestCase):
         self.assertTrue(self.e.state['halt'])
         self.assertFalse(self.e.state['symbol_quarantine'])
 
-    def test_quarantine_recheck_preserves_hold_when_position_open_or_api_fails(self):
-        self.make_halted_cancelled_tp()
-        self.b.positions = Mock(return_value=[])
+    def test_legacy_quarantine_remains_if_position_open_or_api_fails(self):
+        self.e.state['symbol_quarantine']['AUSDT'] = {
+            'since': self.now, 'open_orders': 1}
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='2')])
         self.b.closing_orders = Mock(return_value=[
             dict(symbol='AUSDT', side='SELL', status='NEW')])
-        with patch('crash_night.threading.Thread'):
-            self.assertTrue(self.e.recover_closed_tp_halt())
-        self.b.positions.return_value = [dict(symbol='AUSDT', positionAmt='2')]
         self.e.review_quarantined_symbols()
         self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.b.positions.side_effect = BrokerError('-1003')
         self.e.review_quarantined_symbols()
         self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
-        self.assertFalse(self.e.state['halt'])
+        self.assertEqual(len(self.b.buys), 0)
+    def test_repeated_manual_closes_never_build_a_quarantine_list(self):
+        self.e.state['orders'] = {
+            sym: dict(day=day(self.now), symbol=sym, phase='TP_UNKNOWN',
+                      warned=True, tp_id='some-not-active-tp', filled_qty='1')
+            for sym in ('AUSDT', 'BUSDT', 'CUSDT')}
+        self.e.state['halt'] = 'TP DOĞRULANAMADI'
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(side_effect=lambda sym: [
+            dict(symbol=sym, side='BUY', type='LIMIT', status='NEW',
+                 clientOrderId='manual-'+sym)])
+        with patch('crash_night.threading.Thread'):
+            self.assertTrue(self.e.recover_closed_tp_halt())
+        self.assertFalse(self.e.state['symbol_quarantine'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(self.b.closing_orders.call_count, 3)
+        self.assertTrue(all(o['phase'] == 'CLOSED_EXTERNALLY'
+                            for o in self.e.state['orders'].values()))
+
+    def test_only_exact_owned_tp_is_cancelled_after_live_flat_proof(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        owned = dict(symbol='AUSDT', side='SELL', type='LIMIT',
+                     status='NEW', clientOrderId=order['tp_id'],
+                     positionSide='BOTH', reduceOnly=True,
+                     price=order['tp'], origQty=order['filled_qty'])
+        manual = dict(symbol='AUSDT', side='BUY', type='LIMIT',
+                      status='NEW', clientOrderId='user-pending-buy')
+        self.b.closing_orders = Mock(side_effect=[[owned, manual], [manual]])
+        self.b.cancel_owned_tp = Mock(return_value={})
+        with patch('crash_night.threading.Thread'):
+            self.e.reconcile(order)
+        self.b.cancel_owned_tp.assert_called_once_with('AUSDT', order['tp_id'])
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertIsNone(self.e.state['halt'])
+        self.assertFalse(self.e.state['symbol_quarantine'])
+        self.assertEqual(manual['status'], 'NEW')
+
+    def test_owned_tp_cancel_error_with_still_open_order_keeps_safety_halt(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        owned = dict(symbol='AUSDT', side='SELL', type='LIMIT',
+                     status='NEW', clientOrderId=order['tp_id'],
+                     positionSide='BOTH', reduceOnly=True,
+                     price=order['tp'], origQty=order['filled_qty'])
+        self.b.closing_orders = Mock(return_value=[owned])
+        self.b.cancel_owned_tp = Mock(side_effect=BrokerError('UNKNOWN', uncertain=True))
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertTrue(self.e.state['halt'])
+        self.b.cancel_owned_tp.assert_called_once()
+
+    def test_owned_tp_mismatch_is_never_cancelled(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        mismatched = dict(symbol='AUSDT', side='SELL', type='LIMIT',
+                          status='NEW', clientOrderId=order['tp_id'],
+                          positionSide='BOTH', reduceOnly=True,
+                          price='999.99', origQty=order['filled_qty'])
+        self.b.closing_orders = Mock(return_value=[mismatched])
+        self.b.cancel_owned_tp = Mock()
+        self.e.reconcile(order)
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.b.cancel_owned_tp.assert_not_called()
+
+    def test_periodic_scan_finishes_manual_close_with_tp_still_new(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        tp = dict(symbol='AUSDT', clientOrderId=order['tp_id'],
+                  side='SELL', type='LIMIT', status='NEW',
+                  positionSide='BOTH', reduceOnly=True,
+                  origQty=order['filled_qty'], price=order['tp'])
+        self.b.positions = Mock(return_value=[])
+        self.b.order = Mock(return_value=tp)
+        self.b.closing_orders = Mock(side_effect=[[tp], []])
+        self.b.cancel_owned_tp = Mock(return_value={})
+        with patch('crash_night.threading.Thread'):
+            self.e.step()
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertIsNone(self.e.state['halt'])
+        self.assertFalse(self.e.state['symbol_quarantine'])
         self.assertEqual(len(self.b.buys), 1)
+        self.b.cancel_owned_tp.assert_called_once_with('AUSDT', order['tp_id'])
+
+    def test_periodic_scan_preserves_actual_filled_tp_classification(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.orders[order['tp_id']].update(
+            symbol='AUSDT', clientOrderId=order['tp_id'],
+            type='LIMIT', side='SELL', status='FILLED',
+            positionSide='BOTH', reduceOnly=True)
+        self.b.positions = Mock(return_value=[])
+        self.b.cancel_owned_tp = Mock()
+        self.e.step()
+        self.assertEqual(order['phase'], 'DONE')
+        self.assertIsNone(self.e.state['halt'])
+        self.b.cancel_owned_tp.assert_not_called()
+
+    def test_periodic_scan_never_closes_an_open_position_or_on_api_failure(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5')])
+        self.b.cancel_owned_tp = Mock()
+        self.e.step()
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertIsNone(self.e.state['halt'])
+        self.b.cancel_owned_tp.assert_not_called()
+        self.b.positions.side_effect = BrokerError('-1003')
+        self.now += 301
+        self.e.step()
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.b.cancel_owned_tp.assert_not_called()
 
     def test_tp_halt_kept_if_live_account_query_fails_or_is_invalid(self):
         self.make_halted_cancelled_tp()
@@ -667,7 +785,7 @@ class NightTests(unittest.TestCase):
         self.e.step()
         self.assertIsNone(self.e.state['halt'])
         self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
-        self.b.positions.assert_called_once()
+        self.assertEqual(self.b.positions.call_count, 2)
         self.b.closing_orders.assert_called_once_with('AUSDT')
         self.assertEqual(len(self.b.buys), 1)
 
