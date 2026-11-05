@@ -24,9 +24,21 @@ class RateDeferred(RuntimeError):
         super().__init__(f"BINANCE_IP_BUDGET_{reason}: retry_after={self.seconds:.1f}s")
 
 
-def estimated_weight(path, params=None):
-    """Deliberately overestimate unknown endpoints; never undercount all-symbol."""
+def estimated_weight(path, params=None, method=None):
+    """Account for documented USD-M IP weight; still fail closed on unknowns.
+
+    New futures orders consume ORDER-COUNT limits but zero REQUEST_WEIGHT.
+    The order counter and exchange 429/418 protections are separate from
+    this IP weight estimator and are never bypassed.
+    """
     params = params or {}
+    if path == "/fapi/v1/order":
+        if method == "POST":
+            return 0  # Binance IP weight 0, ORDERS 10s/1m counters still apply.
+        if method in ("GET", "DELETE"):
+            return 1
+    if path == "/fapi/v1/leverage" and method == "POST":
+        return 1
     if path in ("/fapi/v1/klines", "/api/v3/klines"):
         try:
             size = int(params.get("limit", 500))
