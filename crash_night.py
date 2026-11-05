@@ -364,6 +364,10 @@ class NightExecutor:
         self.manual_guard = None
         self.started = clock()
         self.queue = queue.Queue(maxsize=100)
+        # Short, in-memory retries ONLY for locally deferred, pre-HTTP
+        # preflight. Never retry a BUY whose HTTP request may have reached
+        # Binance. On restart an unsent candidate may be safely discarded.
+        self.preflight_retries = {}
         self.thread = None
         self.next_poll = 0
         self.next_expiry_scan = 0
@@ -693,7 +697,30 @@ class NightExecutor:
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
-            self.alert(f'⚠️ OTOMATİK GİRİŞ YAPILMADI | {symbol}\nTP/giriş ön kontrolü başarısız: {type(error).__name__}: {str(error)[:240] if isinstance(error, (ValueError, BrokerError)) else "CHECK_FAILED"}')
+            if (isinstance(error, BrokerError) and error.not_sent
+                    and error.deferred_reason == 'IP_WEIGHT_SOFT_CEILING'):
+                retry = self.preflight_retries.get(sid, {})
+                attempts = int(retry.get('attempts', 0))
+                retry_at = self.clock() + max(1.0, float(error.deferred_seconds or 1)) + 1
+                # Keep the same original real trade-cross timestamp; do not
+                # manufacture a new signal or exceed the existing 120s window.
+                if (attempts < 2 and retry_at < observed_at + 120
+                        and len(self.preflight_retries) < 25):
+                    self.preflight_retries[sid] = dict(
+                        record=dict(record), observed_at=observed_at,
+                        retry_at=retry_at, attempts=attempts+1)
+                    self.log(f'[CRASH NIGHT PREFLIGHT DEFERRED] {symbol}; '
+                             f'local_IP_weight; attempt={attempts+1}/2; '
+                             f'retry_after_s={int(retry_at-self.clock())}; '
+                             'no BUY sent; TP checks remain prioritized')
+                    return
+            self.preflight_retries.pop(sid, None)
+            reason = ('LOCAL_IP_BUDGET' if isinstance(error, BrokerError)
+                      and error.not_sent and error.deferred_reason == 'IP_WEIGHT_SOFT_CEILING'
+                      else (str(error)[:240] if isinstance(error, (ValueError, BrokerError))
+                            else 'CHECK_FAILED'))
+            self.alert(f'⚠️ OTOMATİK GİRİŞ YAPILMADI | {symbol}\n'
+                       f'TP/giriş ön kontrolü başarısız: {type(error).__name__}: {reason}')
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
@@ -991,6 +1018,29 @@ class NightExecutor:
                     raise
                 self.log('[CRASH API COOLDOWN] eski giriş taraması ertelendi')
         self.deliver_pending()
+        # Never sleep inside the executor: maintain account WS, TP and
+        # protective polls while waiting for a safe next-minute preflight.
+        now = self.clock()
+        due = [(sid, retry) for sid, retry in self.preflight_retries.items()
+               if now >= retry['retry_at']]
+        if due:
+            sid, retry = min(due, key=lambda item: item[1]['retry_at'])
+            self.preflight_retries.pop(sid, None)
+            if (now - retry['observed_at'] >= 120
+                    or not self.enabled.is_set() or self.state.get('halt')):
+                self.log(f'[CRASH NIGHT PREFLIGHT EXPIRED] {retry["record"]["symbol"]}; '
+                         'recheck window closed or auto unavailable; no BUY sent')
+            else:
+                # Reuse the original observed_at; enter() rechecks all live
+                # position/orders, daily limits, risk and paused/halt flags.
+                current = dict(retry, retry_at=now)
+                self.preflight_retries[sid] = current
+                self.enter(retry['record'], retry['observed_at'])
+                # Keep a newly rescheduled retry; clean up only if enter()
+                # did not replace the placeholder with a future due time.
+                if self.preflight_retries.get(sid) is current:
+                    self.preflight_retries.pop(sid, None)
+            return
         try:
             record, observed_at = self.queue.get_nowait()
         except queue.Empty:
