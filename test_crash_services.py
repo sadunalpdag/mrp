@@ -470,6 +470,105 @@ class NightTests(unittest.TestCase):
         self.b.closing_orders.assert_called_once_with('AUSDT')
         self.assertEqual(len(self.b.buys), 1)
 
+    def test_local_budget_deferred_buy_never_halts_or_counts_daily(self):
+        self.b.buy = Mock(side_effect=BrokerError('-1003',
+            deferred_reason='IP_WEIGHT_SOFT_CEILING',
+            deferred_seconds=11, not_sent=True))
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.assertEqual(order['phase'], 'NO_FILL')
+        self.assertTrue(order['entry_never_sent'])
+        self.assertEqual(self.e.daily_count(), 0)
+        self.assertIsNone(self.e.state['halt'])
+        self.assertFalse(self.b.tps)
+        self.assertEqual(self.b.buy.call_count, 1)
+        self.assertIn('ALIŞ GÖNDERİLMEDİ', self.e.state['outbox'][-1]['text'])
+        self.e.deliver_pending()
+        self.enter(signal_id='signal-2', symbol='BUSDT')
+        self.assertEqual(self.b.buy.call_count, 2)
+        self.assertEqual(self.e.daily_count(), 0)
+
+    def test_persisted_local_deferral_keeps_daily_counter_consistent(self):
+        self.b.buy = Mock(side_effect=BrokerError('-1003',
+            not_sent=True))
+        self.enter()
+        self.assertEqual(self.e.daily_count(), 0)
+        self.e.apply_control('counter:2')
+        self.assertEqual(self.e.daily_count(), 2)
+        self.e.guard.close(); self.e=self.make()
+        self.assertEqual(self.e.daily_count(), 2)
+
+    def add_unknown_halt(self):
+        self.e.state['orders']['old']=dict(
+            day=day(self.now), symbol='AUSDT', entry_id='cbn'+'a'*24+'e',
+            quantity='5', phase='ENTRY_UNKNOWN', warned=True, price='10', tp='10.1')
+        self.e.state['halt'] = 'GİRİŞ SONUCU BELİRSİZ'
+        self.e.save()
+        self.b.positions=Mock(return_value=[])
+        self.b.closing_orders=Mock(return_value=[])
+        return self.e.state['orders']['old']
+
+    def test_stale_entry_halt_safe_recovery_when_client_order_not_found(self):
+        old=self.add_unknown_halt()
+        self.b.order=Mock(side_effect=BrokerError('-2013'))
+        self.assertTrue(self.e.recover_unknown_entry_halt())
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(old['phase'], 'NO_FILL')
+        self.assertEqual(old['entry_reconcile_proof'], 'ORDER_NOT_FOUND_FLAT')
+        self.b.positions.assert_called_once()
+        self.b.closing_orders.assert_called_once_with('AUSDT')
+        self.assertTrue(self.e.enabled.is_set())
+        self.e.guard.close(); self.e=self.make()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(self.e.state['orders']['old']['phase'], 'NO_FILL')
+
+    def test_stale_entry_halt_recovers_filled_then_manual_close_without_tp_claim(self):
+        old=self.add_unknown_halt()
+        self.b.order=Mock(return_value=dict(
+            symbol='AUSDT', clientOrderId=old['entry_id'],
+            side='BUY', status='FILLED', executedQty='5'))
+        self.assertTrue(self.e.recover_unknown_entry_halt())
+        self.assertEqual(old['phase'], 'CLOSED_EXTERNALLY')
+        self.assertEqual(self.e.daily_count(), 1)
+
+    def test_stale_entry_halt_never_unlocks_open_position_order_or_api_error(self):
+        old=self.add_unknown_halt()
+        self.b.order=Mock(side_effect=BrokerError('-2013'))
+        self.b.positions.return_value=[dict(symbol='AUSDT', positionAmt='5')]
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        self.b.positions.return_value=[]
+        self.b.closing_orders.return_value=[dict(symbol='AUSDT', status='NEW')]
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        self.b.closing_orders.return_value=[]
+        self.b.order.side_effect=BrokerError('-1003')
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        self.b.order.side_effect=BrokerError('UNKNOWN', uncertain=True)
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        self.assertEqual(old['phase'], 'ENTRY_UNKNOWN')
+        self.assertTrue(self.e.state['halt'])
+
+    def test_stale_entry_halt_rejects_inconsistent_entry_and_respects_off(self):
+        old=self.add_unknown_halt()
+        self.b.order=Mock(return_value=dict(
+            symbol='AUSDT',clientOrderId=old['entry_id'],
+            side='BUY',status='NEW',executedQty='0'))
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        self.b.order.return_value.update(status='CANCELED')
+        self.e.apply_control('off')
+        self.assertTrue(self.e.recover_unknown_entry_halt())
+        self.assertFalse(self.e.enabled.is_set())
+        self.assertTrue(self.e.state['paused'])
+
+    def test_recover_halt_step_after_5min_verification(self):
+        old=self.add_unknown_halt()
+        self.b.order=Mock(side_effect=BrokerError('-2013'))
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(old['phase'], 'NO_FILL')
+        self.b.positions.assert_called_once()
+        self.b.order.assert_called_once()
+        self.assertFalse(self.b.buys)
+
     def test_bad_state_and_multiple_processes_fail_closed(self):
         with self.assertRaises(BlockingIOError): self.make()
         self.e.guard.close()
