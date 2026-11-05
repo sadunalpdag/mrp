@@ -85,7 +85,7 @@ ERROR_REASONS = {
 
 class BrokerError(Exception):
     """Only a numeric API code, never raw API messages or signed URLs."""
-    def __init__(self, code, uncertain=False, deferred_reason=None, deferred_seconds=None):
+    def __init__(self, code, uncertain=False, deferred_reason=None, deferred_seconds=None, not_sent=False):
         raw = str(code).removeprefix('BINANCE_')
         self.code = raw if raw.lstrip('-').isdigit() else 'UNKNOWN'
         self.uncertain = uncertain or self.code == 'UNKNOWN'
@@ -93,6 +93,7 @@ class BrokerError(Exception):
         # Such a deferral must not be reported as an exchange -1003 response.
         self.deferred_reason = deferred_reason
         self.deferred_seconds = deferred_seconds
+        self.not_sent = bool(not_sent)  # Raised before HTTP, unlike an uncertain exchange response.
         super().__init__('BINANCE_'+self.code)
 
 
@@ -125,7 +126,7 @@ class BinanceBroker:
         import hmac
         from urllib.parse import urlencode
         if time.time() < self.cooldown_until:
-            raise BrokerError('-1003')
+            raise BrokerError('-1003', not_sent=True)
         from crash_rest_budget import BUDGET, RateDeferred, estimated_weight, priority_for
         params = dict(params or {})
         # Reserve before signing or sending. Local deferrals NEVER issue a
@@ -144,7 +145,7 @@ class BinanceBroker:
                            estimated_weight(path, params))
         except RateDeferred as deferred:
             raise BrokerError('-1003', deferred_reason=deferred.reason,
-                              deferred_seconds=deferred.seconds) from None
+                              deferred_seconds=deferred.seconds, not_sent=True) from None
         if signed:
             params.update(timestamp=int(time.time()*1000), recvWindow=5000)
         query = urlencode(params)
@@ -379,7 +380,8 @@ class NightExecutor:
 
     def daily_count(self):
         today = day(self.clock())
-        raw = sum(o['day'] == today for o in list(self.state['orders'].values()))
+        raw = sum(o['day'] == today and not o.get('entry_never_sent', False)
+                  for o in list(self.state['orders'].values()))
         adjustment = self.state.get('daily_counter_override', {})
         if adjustment.get('day') == today:
             return max(0, adjustment['count'] + raw - adjustment['raw_at_set'])
@@ -420,7 +422,8 @@ class NightExecutor:
             today = day(self.clock())
             before = self.daily_count()
             self.state['daily_counter_override'] = dict(day=today, count=int(value),
-                raw_at_set=sum(o['day'] == today for o in self.state['orders'].values()))
+                raw_at_set=sum(o['day'] == today and not o.get('entry_never_sent', False)
+                               for o in self.state['orders'].values()))
             self.save()
             return (f'✅ Günlük kullanılan giriş sayısı: {before} → {int(value)} / {self.max_daily}\n'
                     f'Paris 00:00 itibarıyla yeni gün sayacı 0 olur. Açık/bekleyen emirler değişmedi; aynı anda sembol sınırı: {self.max_symbols}.')
@@ -540,6 +543,88 @@ class NightExecutor:
                    'Otomatik girişin açık/kapalı ayarı değiştirilmedi; sadece yeni sinyaller geçerlidir.')
         return True
 
+    def recover_unknown_entry_halt(self):
+        """Resolve a previous ENTRY_UNKNOWN hold only from live Binance proof.
+
+        No orders are submitted or cancelled here. A missing account response,
+        a pending entry, or unverified fills must leave the safety halt intact.
+        """
+        reason = self.state.get('halt')
+        if not isinstance(reason, str) or not reason.startswith('GİRİŞ SONUCU BELİRSİZ'):
+            return False
+        records = list(self.state['orders'].values())
+        unknown = [o for o in records if o.get('phase') == 'ENTRY_UNKNOWN']
+        if (not unknown or any(not o.get('warned') or not o.get('symbol') or
+                               not o.get('entry_id') for o in unknown)
+                or any(o.get('phase') == 'TP_UNKNOWN' for o in records)):
+            return False
+        symbols = {o['symbol'] for o in unknown}
+        try:
+            positions = self.broker.positions()
+            if not isinstance(positions, list):
+                raise ValueError('INVALID_POSITION_RESPONSE')
+            for p in positions:
+                if p.get('symbol') in symbols and D(str(p['positionAmt'])) != 0:
+                    return False
+            for symbol in sorted(symbols):
+                opened = self.broker.closing_orders(symbol)
+                if not isinstance(opened, list):
+                    raise ValueError('INVALID_ORDER_RESPONSE')
+                if opened:  # Includes regular BUY and algo orders.
+                    return False
+            resolved = []
+            for order in unknown:
+                try:
+                    entry = self.broker.order(order['symbol'], order['entry_id'])
+                except BrokerError as error:
+                    if error.code == '-2013' and not error.uncertain:
+                        # The original entry ID is absent; account is flat
+                        # and there are no open orders for its symbol.
+                        resolved.append((order, 'NO_FILL', 'ORDER_NOT_FOUND_FLAT'))
+                        continue
+                    raise
+                if (not isinstance(entry, dict)
+                        or entry.get('symbol') != order['symbol']
+                        or entry.get('clientOrderId') != order['entry_id']
+                        or entry.get('side') != 'BUY'):
+                    raise ValueError('ENTRY_IDENTITY_NOT_CONFIRMED')
+                status = entry.get('status')
+                filled = D(str(entry['executedQty']))
+                if filled < 0 or filled > D(str(order['quantity'])):
+                    raise ValueError('INVALID_FILLED_QUANTITY')
+                if status in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED') and filled == 0:
+                    resolved.append((order, 'NO_FILL', 'ORDER_FINAL_ZERO_FILL'))
+                elif status in ('FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH') and filled > 0:
+                    # Only the account is confirmed flat, not a winning TP.
+                    resolved.append((order, 'CLOSED_EXTERNALLY', 'LIVE_FLAT_AFTER_FILL'))
+                else:
+                    return False
+        except Exception as error:
+            code = error.code if isinstance(error, BrokerError) else type(error).__name__
+            self.log(f'[CRASH ENTRY HALT REVIEW WAIT] code={code}; safety hold retained')
+            return False
+        now = self.clock()
+        for order, phase, proof in resolved:
+            order['phase'] = phase
+            order['entry_reconcile_proof'] = proof
+            order['flat_confirmed_at'] = now
+        self.state['halt'] = None
+        self.armed_at = now
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.save()
+        labels = ', '.join(sorted(symbols))
+        self.log(f'[CRASH ENTRY HALT CLEARED] {labels}; '
+                 'live flat+no orders+client-ID resolution; auto setting unchanged')
+        self.alert(f'✅ BELİRSİZ ALIŞ KİLİDİ TEMİZLENDİ | {labels}\n'
+                   'Binance pozisyon ve açık emir sorguları doğrulandı. '
+                   'Eski sinyaller tekrar gönderilmeyecek. '
+                   'Otomatik işlem açık/kapalı ayarı korunuyor.')
+        return True
+
     def deliver_pending(self):
         if not self.state['outbox']:
             return
@@ -623,8 +708,29 @@ class NightExecutor:
             return
         try:
             self.broker.buy(symbol, p, order['entry_id'])
-        except Exception:
-            pass
+        except BrokerError as error:
+            if error.not_sent:
+                # No POST was sent: NEVER query a nonexistent client order,
+                # invent a fill, or permanently halt automatic trading.
+                order['phase'] = 'NO_FILL'
+                order['entry_never_sent'] = True
+                order['entry_submit_error'] = error_details(error)
+                self.save()
+                self.log(f'[CRASH NIGHT ENTRY NOT SENT] {symbol}; '
+                         f'reason={error.deferred_reason or "EXCHANGE_COOLDOWN"}; '
+                         'BUY HTTP not attempted; old signal not retried')
+                self.alert(f'⏳ OTOMATİK ALIŞ GÖNDERİLMEDİ | {symbol}\n'
+                           'Binance REST koruması alış isteğini göndermeden erteledi. '
+                           'Bu sinyalde alım yapılmadı ve günlük giriş hakkı tüketilmedi. '
+                           'Yeni uygun sinyaller izlenmeye devam ediyor.')
+                return
+            # A POST may have reached Binance; never issue a second BUY.
+            self.log(f'[CRASH NIGHT BUY RESPONSE] {symbol}; '
+                     f'code={error.code}; uncertain={error.uncertain}; '
+                     'original client ID will be reconciled')
+        except Exception as error:
+            self.log(f'[CRASH NIGHT BUY RESPONSE] {symbol}; '
+                     f'type={type(error).__name__}; original client ID will be reconciled')
         self.reconcile(order)
 
     def reconcile(self, order, check_expiry=True, ws_order=None):
@@ -700,7 +806,9 @@ class NightExecutor:
             if not order.get('warned'):
                 order['warned'] = True
                 self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
-            self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]} {type(error).__name__}')
+            code = error.code if isinstance(error, BrokerError) else type(error).__name__
+            self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]}; '
+                     f'code={code}; deferred={getattr(error, "deferred_reason", None)}')
 
     def expire_untracked_entries(self):
         # After ephemeral storage loss, identify only this bot's BUY entry IDs.
@@ -842,6 +950,7 @@ class NightExecutor:
         if self.state.get('halt') and self.clock() >= self.next_halt_recheck:
             self.next_halt_recheck = self.clock() + MANUAL_TP_POLL_SECONDS
             self.recover_closed_tp_halt()
+            self.recover_unknown_entry_halt()
         # Manage protective orders even outside the entry window or when halted.
         if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
