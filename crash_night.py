@@ -278,6 +278,18 @@ class BinanceBroker:
         if any(o['symbol'] == symbol for o in algo_orders):
             raise ValueError('EXISTING_SYMBOL_ALGO_ORDER')
         self.check_slots(active, orders+algo_orders)
+        # Operator visibility without another REST call or any cancellation.
+        # Only explicitly tagged bot BUY orders count as the bot's own pending
+        # entries; manual orders and closing/TP orders are never modified.
+        bot_pending = [o for o in orders if
+                       o.get('side') == 'BUY' and o.get('type') == 'LIMIT' and
+                       re.fullmatch(r'cbn[0-9a-f]{24}e',
+                                    str(o.get('clientOrderId', '')))]
+        print(f'[CRASH ENTRY PREFLIGHT] {symbol}; active_symbols={len(active)}; '
+              f'normal_open={len(orders)}; algo_open={len(algo_orders)}; '
+              f'bot_pending_buy={len(bot_pending)}; '
+              f'symbol_limit={getattr(self, "max_symbols", 5)}; '
+              'no orders cancelled', flush=True)
         result = self.request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': 10})
         if result.get('leverage') != 10:
             raise ValueError('LEVERAGE_NOT_CONFIRMED')
@@ -390,7 +402,9 @@ class NightExecutor:
     def summary(self):
         count = self.daily_count()
         stream = self.account_stream.summary() if self.account_stream else 'Hesap WS: baslatilmadi / REST yedek'
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | {stream}"
+        pending_check = sum(o.get('phase') == 'ENTRY_UNKNOWN'
+                            for o in self.state['orders'].values())
+        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | {stream}"
 
     def apply_control(self, action):
         if action.startswith(('limit:', 'amount:', 'symbols:')):
