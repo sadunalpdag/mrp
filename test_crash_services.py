@@ -647,11 +647,16 @@ class NightTests(unittest.TestCase):
         self.e.enter(dict(self.r), self.now)
         self.assertIn('CRASH ENTRY SKIP', self.e.log.call_args.args[0])
         self.assertIn('HALTED', self.e.log.call_args.args[0])
-        self.assertEqual(len(self.e.state['outbox']), 1)
-        self.e.deliver_pending()
+        self.assertFalse(self.e.state['outbox'])
         self.e.enter(dict(self.r), self.now)
         self.assertFalse(self.e.state['outbox'])
         self.assertFalse(self.b.buys)
+        with patch('crash_night.threading.Thread') as thread:
+            self.e.entry_skip('AUSDT', 'DAILY_LIMIT')
+            self.e.entry_skip('AUSDT', 'DAILY_LIMIT')
+            thread.assert_called_once()
+        # Informational notifications must never block legitimate future BUYs.
+        self.assertFalse(self.e.state['outbox'])
 
     def test_30_min_lock_audit_shows_pending_conditions(self):
         self.e.state['halt'] = 'EXECUTOR_ERROR'
