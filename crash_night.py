@@ -632,6 +632,10 @@ class NightExecutor:
         closed and is retried at the normal five-minute cadence.
         """
         try:
+            if any(o.get('symbol') == symbol and o.get('phase') == 'ENTRY_UNKNOWN'
+                   for o in self.state['orders'].values()):
+                self.log(f'[CRASH MANUAL CLOSE WAIT] {symbol}; ENTRY_UNKNOWN')
+                return None
             if not self._flat_from_snapshot(self.broker.positions(), {symbol}):
                 self.log(f'[CRASH MANUAL CLOSE WAIT] {symbol}; POSITION_OPEN')
                 return None
@@ -661,7 +665,9 @@ class NightExecutor:
                             or live.get('positionSide', 'BOTH') != position_side
                             or (position_side == 'BOTH'
                                 and live.get('reduceOnly') not in (True, 'true'))
-                            or not re.fullmatch(r'cbn[0-9a-f]{24}t', cid)):
+                            or not re.fullmatch(r'cbn[0-9a-f]{24}t', cid)
+                            or D(str(live.get('price', 'NaN'))) != D(str(tracked_tp.get('tp', 'NaN')))
+                            or D(str(live.get('origQty', 'NaN'))) != D(str(tracked_tp.get('filled_qty', 'NaN')))):
                         self.log(f'[CRASH MANUAL CLOSE WAIT] {symbol}; '
                                  'TRACKED_TP_PROPERTIES_MISMATCH')
                         return None
@@ -682,7 +688,8 @@ class NightExecutor:
                 opened = self.broker.closing_orders(symbol)
                 if not isinstance(opened, list):
                     raise ValueError('INVALID_ORDER_RESPONSE')
-                if any(not isinstance(o, dict) for o in opened):
+                if any(not isinstance(o, dict) or o.get('symbol') != symbol
+                       or o.get('side') not in ('BUY', 'SELL') for o in opened):
                     raise ValueError('INVALID_ORDER_RESPONSE')
                 if any(o.get('clientOrderId') in own_tps for o in opened):
                     self.log(f'[CRASH MANUAL CLOSE WAIT] {symbol}; BOT_TP_STILL_OPEN')
