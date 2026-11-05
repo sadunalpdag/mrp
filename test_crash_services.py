@@ -692,6 +692,55 @@ class NightTests(unittest.TestCase):
         self.assertEqual(order['phase'], 'PROTECTED')
         self.b.cancel_owned_tp.assert_not_called()
 
+    def test_periodic_scan_finishes_manual_close_with_tp_still_new(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        tp = dict(symbol='AUSDT', clientOrderId=order['tp_id'],
+                  side='SELL', type='LIMIT', status='NEW',
+                  positionSide='BOTH', reduceOnly=True,
+                  origQty=order['filled_qty'], price=order['tp'])
+        self.b.positions = Mock(return_value=[])
+        self.b.order = Mock(return_value=tp)
+        self.b.closing_orders = Mock(side_effect=[[tp], []])
+        self.b.cancel_owned_tp = Mock(return_value={})
+        with patch('crash_night.threading.Thread'):
+            self.e.step()
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertIsNone(self.e.state['halt'])
+        self.assertFalse(self.e.state['symbol_quarantine'])
+        self.assertEqual(len(self.b.buys), 1)
+        self.b.cancel_owned_tp.assert_called_once_with('AUSDT', order['tp_id'])
+
+    def test_periodic_scan_preserves_actual_filled_tp_classification(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.orders[order['tp_id']].update(
+            symbol='AUSDT', clientOrderId=order['tp_id'],
+            type='LIMIT', side='SELL', status='FILLED',
+            positionSide='BOTH', reduceOnly=True)
+        self.b.positions = Mock(return_value=[])
+        self.b.cancel_owned_tp = Mock()
+        self.e.step()
+        self.assertEqual(order['phase'], 'DONE')
+        self.assertIsNone(self.e.state['halt'])
+        self.b.cancel_owned_tp.assert_not_called()
+
+    def test_periodic_scan_never_closes_an_open_position_or_on_api_failure(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5')])
+        self.b.cancel_owned_tp = Mock()
+        self.e.step()
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertIsNone(self.e.state['halt'])
+        self.b.cancel_owned_tp.assert_not_called()
+        self.b.positions.side_effect = BrokerError('-1003')
+        self.now += 301
+        self.e.step()
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.b.cancel_owned_tp.assert_not_called()
+
     def test_tp_halt_kept_if_live_account_query_fails_or_is_invalid(self):
         self.make_halted_cancelled_tp()
         self.b.positions = Mock(side_effect=BrokerError('-1003'))
