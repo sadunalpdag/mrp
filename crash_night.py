@@ -608,12 +608,18 @@ class NightExecutor:
         # Every unresolved TP problem that could have caused this halt must
         # be accounted for. Do not unlock unknown entry executions.
         if any(o.get('phase') == 'ENTRY_UNKNOWN' for o in orders):
+            self.log('[CRASH TP HALT BLOCK] ENTRY_UNKNOWN; original BUY not reconciled')
             return False
         affected = [o for o in orders if o.get('warned') and
-                    o.get('phase') in ('TP_UNKNOWN', 'PROTECTED', 'DONE') and
+                    (o.get('phase') in ('TP_UNKNOWN', 'PROTECTED', 'DONE')
+                     or (o.get('phase') == 'CLOSED_EXTERNALLY' and
+                         o.get('close_verification') == 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')) and
                     isinstance(o.get('symbol'), str) and o['symbol']]
-        if not affected or any(o.get('phase') == 'TP_UNKNOWN' and not o.get('warned')
-                               for o in orders):
+        if not affected:
+            self.log('[CRASH TP HALT BLOCK] NO_VERIFIABLE_AFFECTED_ORDER')
+            return False
+        if any(o.get('phase') == 'TP_UNKNOWN' and not o.get('warned') for o in orders):
+            self.log('[CRASH TP HALT BLOCK] UNWARNED_TP_UNKNOWN')
             return False
         symbols = {o['symbol'] for o in affected}
         try:
@@ -623,8 +629,15 @@ class NightExecutor:
             # Any exposure on the affected symbols (including hedge SHORT)
             # makes an automatic unlock unsafe.
             for p in positions:
-                if p.get('symbol') in symbols and D(str(p['positionAmt'])) != 0:
-                    return False
+                if not isinstance(p, dict):
+                    raise ValueError('INVALID_POSITION_RESPONSE')
+                if p.get('symbol') in symbols:
+                    qty = D(str(p['positionAmt']))
+                    if not qty.is_finite():
+                        raise ValueError('INVALID_POSITION_AMOUNT')
+                    if qty != 0:
+                        self.log(f'[CRASH TP HALT BLOCK] {p["symbol"]}; OPEN_POSITION')
+                        return False
             for symbol in sorted(symbols):
                 open_orders = self.broker.closing_orders(symbol)
                 if not isinstance(open_orders, list):
@@ -632,6 +645,8 @@ class NightExecutor:
                 # Queries include standard AND conditional open orders.
                 # Even a manually placed pending order requires review.
                 if open_orders:
+                    self.log(f'[CRASH TP HALT BLOCK] {symbol}; '
+                             f'OPEN_NORMAL_OR_ALGO_ORDERS={len(open_orders)}')
                     return False
         except Exception as error:
             # A rate limit, 5xx, timeout or invalid payload is NOT a
@@ -929,6 +944,72 @@ class NightExecutor:
                      f'type={type(error).__name__}; original client ID will be reconciled')
         self.reconcile(order)
 
+    def _confirm_external_close(self, order):
+        """Recognize a manually/external closed long before TP-not-found can halt.
+
+        Uses only fresh, signed Binance position snapshots and BOTH regular and
+        algo open orders for the affected symbol. Never cancel, submit or assume
+        the TP filled. Ignore market WS deltas: they are not account snapshots.
+        """
+        symbol = order.get('symbol')
+        if (order.get('phase') not in ('TP_UNKNOWN', 'PROTECTED')
+                or not symbol or
+                any(o is not order and o.get('symbol') == symbol and
+                    o.get('phase') == 'ENTRY_UNKNOWN'
+                    for o in self.state['orders'].values())):
+            return False
+
+        def flat_positions():
+            positions = self.broker.positions()
+            if not isinstance(positions, list):
+                raise ValueError('INVALID_POSITION_RESPONSE')
+            for position in positions:
+                if not isinstance(position, dict):
+                    raise ValueError('INVALID_POSITION_RESPONSE')
+                if position.get('symbol') == symbol:
+                    qty = D(str(position['positionAmt']))
+                    if not qty.is_finite():
+                        raise ValueError('INVALID_POSITION_AMOUNT')
+                    if qty != 0:  # Any LONG or SHORT exposure blocks recognition.
+                        return False
+            return True
+
+        try:
+            if not flat_positions():
+                self.log(f'[CRASH EXTERNAL CLOSE WAIT] {symbol}; OPEN_POSITION')
+                return False
+            opened = self.broker.closing_orders(symbol)
+            if not isinstance(opened, list):
+                raise ValueError('INVALID_ORDER_RESPONSE')
+            if opened:
+                self.log(f'[CRASH EXTERNAL CLOSE WAIT] {symbol}; '
+                         f'OPEN_NORMAL_OR_ALGO_ORDERS={len(opened)}')
+                return False
+            # A second snapshot guards against an intervening manual re-entry.
+            if not flat_positions():
+                self.log(f'[CRASH EXTERNAL CLOSE WAIT] {symbol}; POSITION_CHANGED')
+                return False
+        except Exception as error:
+            code = error.code if isinstance(error, BrokerError) else type(error).__name__
+            self.log(f'[CRASH EXTERNAL CLOSE WAIT] {symbol}; VERIFY_FAILED={code}')
+            return False
+
+        now = self.clock()
+        order['phase'] = 'CLOSED_EXTERNALLY'
+        order['flat_confirmed_at'] = now
+        order['close_verification'] = 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS'
+        order['external_close_reason'] = 'TP_NOT_ACTIVE_POSITION_FLAT'
+        self.save()
+        self.log(f'[CRASH EXTERNAL CLOSE CONFIRMED] {symbol}; '
+                 'live positions=0, normal+algo orders=0; TP fill NOT assumed')
+        # Send information without adding a new entry-blocking outbox item.
+        self._deliver_skip_notice(
+            f'ℹ️ POZİSYON HARİCEN KAPATILDI | {symbol}\n'
+            'Binance canlı sorgusunda bu coinde açık pozisyon, normal emir ve '
+            'koşullu emir bulunmadı. TP dolumu varsayılmadı. '
+            'Diğer coinlerdeki işlemler etkilenmedi.')
+        return True
+
     def reconcile(self, order, check_expiry=True, ws_order=None):
         symbol = order['symbol']
         try:
@@ -998,6 +1079,17 @@ class NightExecutor:
             if isinstance(error, BrokerError) and error.code == '-1003':
                 self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
                 return
+            # Missing/cancelled TP after an operator closes a position is a
+            # normal terminal event, IF the affected symbol is proven flat
+            # and no normal/algo orders remain. Do not relax unresolved BUYs.
+            missing_tp = (
+                (isinstance(error, BrokerError) and error.code == '-2013'
+                 and not error.uncertain)
+                or (isinstance(error, ValueError)
+                    and str(error) == 'TP_NOT_ACTIVE'))
+            if missing_tp and order['phase'] in ('TP_UNKNOWN', 'PROTECTED'):
+                if self._confirm_external_close(order):
+                    return
             reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
             if not order.get('warned'):
                 order['warned'] = True
