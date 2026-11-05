@@ -382,6 +382,114 @@ class NightTests(unittest.TestCase):
         self.assertTrue(order['warned'])
         return order
 
+    def test_exchange_confirmed_manual_close_does_not_create_tp_halt(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        # Another coin may stay open: only the affected symbol must be flat.
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='0', positionSide='BOTH'),
+            dict(symbol='BUSDT', positionAmt='5', positionSide='BOTH')])
+        self.b.closing_orders = Mock(return_value=[])
+        with patch('crash_night.threading.Thread') as thread:
+            self.e.reconcile(order)
+            thread.assert_called_once()
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertEqual(order['external_close_reason'], 'TP_NOT_ACTIVE_POSITION_FLAT')
+        self.assertEqual(order['close_verification'],
+                         'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual((len(self.b.buys), len(self.b.tps)), (1, 1))
+        self.assertEqual(self.b.positions.call_count, 2)
+        self.b.closing_orders.assert_called_once_with('AUSDT')
+        self.assertIn('CRASH EXTERNAL CLOSE CONFIRMED',
+                      '\n'.join(c.args[0] for c in self.e.log.call_args_list))
+
+    def test_missing_tp_with_live_position_keeps_safety_halt(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5', positionSide='BOTH')])
+        self.b.closing_orders = Mock(return_value=[])
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
+        self.b.closing_orders.assert_not_called()
+        self.assertIn('OPEN_POSITION',
+                      '\n'.join(c.args[0] for c in self.e.log.call_args_list))
+
+    def test_manual_close_with_open_normal_or_algo_order_keeps_halt(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[
+            dict(symbol='AUSDT', side='SELL', type='TAKE_PROFIT_MARKET',
+                 algoStatus='NEW')])
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(self.b.positions.call_count, 1)
+        self.assertIn('OPEN_NORMAL_OR_ALGO_ORDERS',
+                      '\n'.join(c.args[0] for c in self.e.log.call_args_list))
+
+    def test_manual_close_verification_failure_does_not_unlock(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(side_effect=BrokerError('-1003'))
+        self.b.closing_orders = Mock(return_value=[])
+        self.e.reconcile(order)
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertIn('VERIFY_FAILED=-1003',
+                      '\n'.join(c.args[0] for c in self.e.log.call_args_list))
+        self.b.positions.side_effect = None
+        self.b.positions.return_value = [dict(symbol='AUSDT', positionAmt='NaN')]
+        self.assertFalse(self.e._confirm_external_close(order))
+        self.assertEqual(order['phase'], 'PROTECTED')
+
+    def test_manual_close_recheck_must_be_still_flat(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(side_effect=[
+            [dict(symbol='AUSDT', positionAmt='0')],
+            [dict(symbol='AUSDT', positionAmt='2')]])
+        self.b.closing_orders = Mock(return_value=[])
+        self.e.reconcile(order)
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertIn('POSITION_CHANGED',
+                      '\n'.join(c.args[0] for c in self.e.log.call_args_list))
+
+    def test_manual_close_does_not_clear_unknown_buy_for_same_symbol(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.e.state['orders']['uncertain'] = {
+            'symbol': 'AUSDT', 'phase': 'ENTRY_UNKNOWN', 'entry_id': 'unknown'}
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.e.reconcile(order)
+        self.assertEqual(order['phase'], 'PROTECTED')
+        self.assertTrue(self.e.state['halt'])
+        self.b.positions.assert_not_called()
+
+    def test_persisted_warned_manual_close_can_release_prior_tp_halt(self):
+        order = self.make_halted_cancelled_tp()
+        order['phase'] = 'CLOSED_EXTERNALLY'
+        order['close_verification'] = 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS'
+        self.e.save()
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.assertTrue(self.e.recover_closed_tp_halt())
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
+        self.assertTrue(self.e.enabled.is_set())
+
     def test_manually_closed_flat_tp_halt_recovers_safely(self):
         order = self.make_halted_cancelled_tp()
         self.b.positions = Mock(return_value=[
