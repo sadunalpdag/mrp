@@ -758,12 +758,18 @@ class NightExecutor:
             self.save()
         # An unacknowledged alert blocks new entries until delivery succeeds.
 
-    def entry_skip(self, symbol, reason):
-        """One decision log per eligible signal; bounded Telegram notices.
+    def _deliver_skip_notice(self, message):
+        """Informational only: never persist as an entry-blocking safety alert."""
+        try:
+            receipt = self.deliver(message)
+            if not receipt.get('ok'):
+                self.log('[CRASH ENTRY SKIP NOTICE] Telegram unavailable; '
+                         'safety outbox unchanged')
+        except Exception as error:
+            self.log(f'[CRASH ENTRY SKIP NOTICE ERR] {type(error).__name__}')
 
-        Unsent informational alerts must not pile up behind a failed safety
-        alert. Safety holds and the normal outbox blocking policy are unchanged.
-        """
+    def entry_skip(self, symbol, reason):
+        """Always log rejection; send optional deduplicated, nonblocking notice."""
         self.log(f'[CRASH ENTRY SKIP] {symbol}; reason={reason}; '
                  f'daily={self.daily_count()}/{self.max_daily}; '
                  f'halt={bool(self.state.get("halt"))}; outbox={len(self.state["outbox"])}')
@@ -773,14 +779,19 @@ class NightExecutor:
             'SIGNAL_EXPIRED': 'Girişin 120 saniyelik geçerlilik süresi doldu.',
             'SIGNAL_EXPIRED_AFTER_PREFLIGHT': 'Ön kontrol sırasında sinyalin süresi doldu.',
             'QUEUE_FULL': 'Otomatik giriş kuyruğu dolu.',
-            'HALTED': 'Emir/TP güvenlik kilidi çözülmedi.',
         }
+        # A safety halt already has its own durable warning. Do NOT put
+        # optional skip notices into the blocking outbox: a failed Telegram
+        # delivery must not block tomorrow's otherwise valid new entries.
         if (reason in notices and not self.state['outbox']
                 and self.clock() >= self.skip_notice_after.get(reason, 0)):
             self.skip_notice_after[reason] = self.clock() + LOCK_AUDIT_SECONDS
-            self.alert(f'⏸️ OTOMATİK ALIŞ ENGELLENDİ | {symbol}\n'
+            message = (f'⏸️ OTOMATİK ALIŞ ENGELLENDİ | {symbol}\n'
                        f'Neden: {notices[reason]} '
                        'Mevcut emirler ve TP koruması değiştirilmedi.')
+            threading.Thread(target=self._deliver_skip_notice,
+                             args=(message,), name='crash-entry-skip-notice',
+                             daemon=True).start()
 
     def submit(self, record, observed_at):
         symbol = record.get('symbol', 'UNKNOWN')
