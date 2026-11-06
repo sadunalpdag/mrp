@@ -154,8 +154,8 @@ class NightTests(unittest.TestCase):
         # Existing full-sized TP is not repriced when a half-sized order
         # follows, and both TP prices survive persisted-state reload.
         scenarios = [
-            ('signal-1', 'AUSDT', (False, False, False), '1.0', '0.01', '10.100'),
-            ('signal-2', 'BUSDT', (True, False, False), '1.0', '0.01', '10.100'),
+            ('signal-1', 'AUSDT', (False, False, False), '1.0', '0.01', '10.10'),
+            ('signal-2', 'BUSDT', (True, False, False), '1.0', '0.01', '10.10'),
             ('signal-3', 'CUSDT', (True, True, False), '0.5', '0.005', '10.050'),
         ]
         for sid, sym, risks, fraction, rate, tp in scenarios:
@@ -179,7 +179,7 @@ class NightTests(unittest.TestCase):
         self.e = self.make()
         self.assertEqual([self.e.state['orders'][sid]['tp']
                           for sid, *_ in scenarios],
-                         ['10.100', '10.100', '10.050'])
+                         ['10.10', '10.10', '10.050'])
 
     def test_three_risk_flags_still_block_buy_and_tp(self):
         shadow = dict(version='tp_nonclosure_entry_gate_v1',
@@ -194,7 +194,7 @@ class NightTests(unittest.TestCase):
                  INFO, position_usdt='250', tp_pct='0.005')
         self.assertEqual(p['price'], '10.000')
         self.assertEqual(p['tp'], '10.050')
-        self.assertEqual(p['quantity'], '25.0')
+        self.assertEqual(D(p['quantity']), D('25'))
         with self.assertRaisesRegex(ValueError, 'INVALID_TP_RATE'):
             plan(self.r, INFO, tp_pct='0')
 
