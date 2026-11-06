@@ -150,6 +150,54 @@ class NightTests(unittest.TestCase):
         p=self.b.buys[0][1]
         self.assertLessEqual(D(p['quantity'])*D(p['price']),D('500'))
 
+    def test_new_risk_tier_tp_percent_and_preserve_old_orders(self):
+        # Existing full-sized TP is not repriced when a half-sized order
+        # follows, and both TP prices survive persisted-state reload.
+        scenarios = [
+            ('signal-1', 'AUSDT', (False, False, False), '1.0', '0.01', '10.100'),
+            ('signal-2', 'BUSDT', (True, False, False), '1.0', '0.01', '10.100'),
+            ('signal-3', 'CUSDT', (True, True, False), '0.5', '0.005', '10.050'),
+        ]
+        for sid, sym, risks, fraction, rate, tp in scenarios:
+            self.e.deliver_pending()
+            shadow = dict(version='tp_nonclosure_entry_gate_v1',
+                          flags=dict(zip(
+                              ('weak_volume', 'falling_rsi_ema',
+                               'repeat_lower_entry'), risks)))
+            self.enter(signal_id=sid, symbol=sym, failure_shadow=shadow)
+            order = self.e.state['orders'][sid]
+            self.assertEqual(order['risk_position_fraction'], float(fraction))
+            self.assertEqual(order['risk_tp_pct'], rate)
+            self.assertEqual(order['risk_tp_policy_version'], 'risk_tier_tp_v1')
+            self.assertEqual(order['tp'], tp)
+            self.assertEqual(self.b.tps[-1][2], tp)
+            self.assertLessEqual(D(order['risk_effective_notional_usdt']),
+                                 D('500') * D(fraction))
+            self.assertEqual(order['phase'], 'PROTECTED')
+        self.e.save()
+        self.e.guard.close()
+        self.e = self.make()
+        self.assertEqual([self.e.state['orders'][sid]['tp']
+                          for sid, *_ in scenarios],
+                         ['10.100', '10.100', '10.050'])
+
+    def test_three_risk_flags_still_block_buy_and_tp(self):
+        shadow = dict(version='tp_nonclosure_entry_gate_v1',
+                      flags=dict(weak_volume=True, falling_rsi_ema=True,
+                                 repeat_lower_entry=True))
+        self.enter(failure_shadow=shadow)
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.b.tps)
+
+    def test_half_risk_tp_rounds_up_to_exchange_tick(self):
+        p = plan(dict(self.r, entry='10.0004', tp='10.10001'),
+                 INFO, position_usdt='250', tp_pct='0.005')
+        self.assertEqual(p['price'], '10.000')
+        self.assertEqual(p['tp'], '10.050')
+        self.assertEqual(p['quantity'], '25.0')
+        with self.assertRaisesRegex(ValueError, 'INVALID_TP_RATE'):
+            plan(self.r, INFO, tp_pct='0')
+
     def test_hedge_entry_and_tp_survive_reconcile(self):
         self.b.preflight=lambda symbol:'LONG'
         original=self.b.tp
