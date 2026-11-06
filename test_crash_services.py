@@ -1131,6 +1131,122 @@ class NightTests(unittest.TestCase):
         self.assertTrue(self.e.state['halt'])
         self.assertFalse(self.b.buys)
 
+    def test_stale_buy_is_retired_only_after_two_signed_flat_checks(self):
+        # A real BUY POST might have reached Binance; -2013 alone is not
+        # evidence of NO_FILL. Check positions + normal/algo open orders twice.
+        def sent(symbol, p, cid):
+            self.b.buys.append((symbol, p, cid))
+        self.b.buy = sent
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.enter(tracking_status='WAIT_ENTRY')
+        order = self.e.state['orders']['signal-1']
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.now += 30
+        self.e.step()
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.assertEqual(order['entry_missing_first_seen_at'], self.now)
+        self.assertFalse(self.b.tps)
+        self.now += 59
+        self.e.step()
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        with patch('crash_night.threading.Thread'):
+            self.now += 1
+            self.e.step()
+        self.assertEqual(order['phase'], 'ENTRY_NOT_FOUND_FLAT')
+        self.assertEqual(order['entry_reconcile_proof'],
+                         'TWO_SIGNED_FLAT_NO_OPEN_ORDERS_ID_NOT_FOUND')
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertFalse(self.b.tps)
+        self.assertEqual(self.e.daily_count(), 1)
+        self.assertEqual(self.b.positions.call_count, 2)
+        self.assertEqual(self.b.closing_orders.call_count, 2)
+        self.assertIn('entry_unknown=1', '\\n'.join(
+            c.args[0] for c in self.e.log.call_args_list))
+        self.assertIn('CRASH ENTRY HOUSEKEEPING CLEARED', '\\n'.join(
+            c.args[0] for c in self.e.log.call_args_list))
+
+    def test_stale_buy_housekeeping_runs_with_auto_explicitly_off(self):
+        def sent(symbol, p, cid):
+            self.b.buys.append((symbol, p, cid))
+        self.b.buy = sent
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.enter()
+        self.e.apply_control('off')
+        self.now += 30
+        self.e.step()
+        with patch('crash_night.threading.Thread'):
+            self.now += 60
+            self.e.step()
+        self.assertEqual(self.e.state['orders']['signal-1']['phase'],
+                         'ENTRY_NOT_FOUND_FLAT')
+        self.assertFalse(self.e.enabled.is_set())
+        self.assertTrue(self.e.state['paused'])
+        self.assertEqual(len(self.b.buys), 1)
+
+    def test_missing_buy_flat_observation_is_reset_by_conflicting_order(self):
+        def sent(symbol, p, cid):
+            self.b.buys.append((symbol, p, cid))
+        self.b.buy = sent
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.now += 30
+        self.e.reconcile(order)
+        self.assertIn('entry_missing_first_seen_at', order)
+        self.b.closing_orders.return_value = [dict(
+            symbol='AUSDT', clientOrderId=order['entry_id'], side='BUY',
+            type='LIMIT', positionSide='BOTH', status='PARTIALLY_FILLED',
+            executedQty='1', origQty=order['quantity'], price=order['price'])]
+        self.now += 60
+        self.e.reconcile(order)
+        self.assertTrue(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.assertNotIn('entry_missing_first_seen_at', order)
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertFalse(self.b.tps)
+
+    def test_missing_buy_api_error_keeps_safety_halt_and_no_second_buy(self):
+        def sent(symbol, p, cid):
+            self.b.buys.append((symbol, p, cid))
+        self.b.buy = sent
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.now += 30
+        self.e.reconcile(order)
+        self.assertIn('entry_missing_first_seen_at', order)
+        self.b.positions.side_effect = BrokerError('-1003')
+        self.now += 60
+        self.e.reconcile(order)
+        self.assertTrue(self.e.state['halt'].startswith(
+            'GİRİŞ SONUCU BELİRSİZ'))
+        self.assertNotIn('entry_missing_first_seen_at', order)
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.assertEqual(len(self.b.buys), 1)
+
+    def test_prior_tp_halt_cannot_be_overwritten_by_stale_buy(self):
+        order = self.e.state['orders']['old'] = dict(
+            day=day(self.now), symbol='AUSDT', entry_id='some-client',
+            quantity='5', price='10', tp='10.1', phase='ENTRY_UNKNOWN',
+            warned=False)
+        self.e.state['halt'] = 'TP DOĞRULANAMADI\\n-2022'
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.now += 30
+        self.e.reconcile(order)
+        self.assertEqual(self.e.state['halt'], 'TP DOĞRULANAMADI\\n-2022')
+        self.assertFalse(self.b.buys)
+        self.assertTrue(order['warned'])
+
     def test_stale_entry_halt_safe_recovery_when_client_order_not_found(self):
         old=self.add_unknown_halt()
         self.b.order=Mock(side_effect=BrokerError('-2013'))
