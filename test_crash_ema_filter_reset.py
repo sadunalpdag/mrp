@@ -71,6 +71,7 @@ class TestEmaFilterReset(unittest.TestCase):
         status = Mock(id=88)
         tracking = Mock(id=99)
         workbook = Mock()
+        workbook.worksheets.return_value = [FakeTab()]
         workbook.add_worksheet.return_value = Mock(id=12)
         workbook.worksheet.side_effect = [status, tracking]
         result = reset.reset_sheet(workbook)
