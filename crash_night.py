@@ -40,13 +40,21 @@ def rounded(value, step, up=False):
         rounding=ROUND_UP if up else ROUND_DOWN)*D(str(step))
 
 
-def plan(record, info, position_usdt='50'):
+def plan(record, info, position_usdt='50', tp_pct='0.01'):
     if info.get('status') != 'TRADING' or info.get('contractType') != 'PERPETUAL':
         raise ValueError('SYMBOL_NOT_TRADING_PERPETUAL')
     filters = {f['filterType']: f for f in info['filters']}
     pf, lot = filters['PRICE_FILTER'], filters['LOT_SIZE']
     entry = rounded(record['entry'], pf['tickSize'])
-    tp = rounded(max(D(str(record['tp'])), entry*D('1.01')), pf['tickSize'], True)
+    rate = D(str(tp_pct))
+    if rate not in (D('0.005'), D('0.01')):
+        raise ValueError('INVALID_TP_RATE')
+    # Full-sized entries retain the original 1% signal target. Half-sized,
+    # 2/3-risk entries use a new 0.5% target from the rounded entry price;
+    # never inherit the 1% TP from the original V2 signal.
+    target = (max(D(str(record['tp'])), entry * (D('1') + rate))
+              if rate == D('0.01') else entry * (D('1') + rate))
+    tp = rounded(target, pf['tickSize'], True)
     if entry <= 0 or tp <= entry:
         raise ValueError('INVALID_PRICE')
     for price in (entry, tp):
@@ -989,6 +997,7 @@ class NightExecutor:
         target_usdt = configured_usdt * D(str(fraction))
         flags = record['failure_shadow']['flags']
         risk_count = sum(flags.values())
+        tp_pct = D('0.005') if risk_count == 2 else D('0.01')
         if self.daily_count() >= self.max_daily:
             self.entry_skip(symbol, 'DAILY_LIMIT')
             return
@@ -996,7 +1005,7 @@ class NightExecutor:
             self.entry_skip(symbol, 'EXISTING_ORDER')
             return
         try:
-            p = plan(record, self.broker.info(symbol), target_usdt)
+            p = plan(record, self.broker.info(symbol), target_usdt, tp_pct=tp_pct)
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
@@ -1042,12 +1051,14 @@ class NightExecutor:
                      risk_flag_count=risk_count, risk_position_fraction=fraction,
                      risk_configured_usdt=str(configured_usdt),
                      risk_target_usdt=str(target_usdt),
+                     risk_tp_pct=str(tp_pct), risk_tp_policy_version='risk_tier_tp_v1',
                      risk_effective_notional_usdt=str(D(p['quantity'])*D(p['price'])), **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
         self.log(f'[CRASH RISK SIZING] {symbol}; flags={risk_count}/3; '
                  f'fraction={fraction}; base_usdt={configured_usdt}; '
-                 f'target_usdt={target_usdt}; quantity={p["quantity"]}; '
+                 f'target_usdt={target_usdt}; tp_pct={tp_pct}; tp_price={p["tp"]}; '
+                 f'quantity={p["quantity"]}; '
                  f'estimated_notional_usdt={order["risk_effective_notional_usdt"]}')
         if not self.enabled.is_set():
             order['phase'] = 'NO_FILL'
