@@ -1044,6 +1044,93 @@ class NightTests(unittest.TestCase):
         self.assertTrue(any('CRASH LOCK AUDIT 30M' in c.args[0]
                             for c in self.e.log.call_args_list))
 
+    def test_fresh_buy_rest_2013_waits_for_account_ws_new(self):
+        def pending(symbol, p, cid):
+            self.b.buys.append((symbol, p, cid))
+            self.b.orders[cid] = dict(status='NEW', executedQty='0',
+                                      time=self.now * 1000)
+        self.b.buy = pending
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.enter(tracking_status='WAIT_ENTRY')
+        order = self.e.state['orders']['signal-1']
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.assertEqual(order['entry_lookup_retry_at'], self.now + 30)
+        self.assertFalse(order.get('warned', False))
+        self.assertEqual(len(self.b.buys), 1)
+        self.e.reconcile(order, check_expiry=False, ws_order=dict(
+            clientOrderId=order['entry_id'], status='NEW', executedQty='0',
+            time=self.now * 1000))
+        self.assertIsNone(self.e.state['halt'])
+        self.assertNotIn('entry_lookup_retry_at', order)
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertFalse(self.b.tps)
+
+    def test_recent_lookup_2013_retries_and_verifies_pending_without_halt(self):
+        def pending(symbol, p, cid):
+            self.b.buys.append((symbol, p, cid))
+        self.b.buy = pending
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.enter(tracking_status='WAIT_ENTRY')
+        order = self.e.state['orders']['signal-1']
+        live = dict(symbol='AUSDT', clientOrderId=order['entry_id'],
+                    side='BUY', type='LIMIT', status='NEW',
+                    positionSide='BOTH', executedQty='0',
+                    origQty=order['quantity'], price=order['price'])
+        self.b.positions = Mock(return_value=[
+            dict(symbol='ANOTHERUSDT', positionAmt='10')])
+        self.b.closing_orders = Mock(return_value=[live])
+        self.now += 30
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.assertNotIn('entry_lookup_retry_at', order)
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertFalse(self.b.tps)
+
+    def test_pending_bot_buy_clears_global_halt_only_if_live_unfilled(self):
+        old = self.add_unknown_halt()
+        old['position_side'] = 'BOTH'
+        other = dict(day=day(self.now), symbol='BUSDT', phase='ENTRY_UNKNOWN',
+                     entry_id='cbn' + 'b' * 24 + 'e', tp_id='tp2',
+                     quantity='10', price='20', position_side='BOTH',
+                     warned=False)
+        self.e.state['orders']['other'] = other
+        self.b.positions = Mock(return_value=[
+            dict(symbol='MANUALUSDT', positionAmt='7')])
+        def live(order):
+            return dict(symbol=order['symbol'], clientOrderId=order['entry_id'],
+                        side='BUY', type='LIMIT', status='NEW',
+                        positionSide='BOTH', executedQty='0',
+                        origQty=order['quantity'], price=order['price'])
+        self.b.closing_orders = Mock(side_effect=lambda symbol: [
+            live(old if symbol == 'AUSDT' else other)])
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.assertTrue(self.e.recover_unknown_entry_halt())
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(old['phase'], 'ENTRY_UNKNOWN')
+        self.assertEqual(other['phase'], 'ENTRY_UNKNOWN')
+        self.assertFalse(old['warned'])
+        self.assertFalse(other['warned'])
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.b.tps)
+
+    def test_partial_or_mismatched_pending_buy_cannot_unlock_halt(self):
+        old = self.add_unknown_halt()
+        self.b.positions = Mock(return_value=[])
+        opened = dict(symbol='AUSDT', clientOrderId=old['entry_id'],
+                      side='BUY', type='LIMIT', status='NEW',
+                      positionSide='BOTH', executedQty='1',
+                      origQty=old['quantity'], price=old['price'])
+        self.b.closing_orders = Mock(return_value=[opened])
+        self.b.order = Mock(side_effect=BrokerError('-2013'))
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        opened['executedQty'] = '0'
+        opened['clientOrderId'] = 'some-other-buy'
+        self.assertFalse(self.e.recover_unknown_entry_halt())
+        self.assertTrue(self.e.state['halt'])
+        self.assertFalse(self.b.buys)
+
     def test_stale_entry_halt_safe_recovery_when_client_order_not_found(self):
         old=self.add_unknown_halt()
         self.b.order=Mock(side_effect=BrokerError('-2013'))
