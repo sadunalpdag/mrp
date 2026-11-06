@@ -1413,7 +1413,13 @@ class NightExecutor:
                         if proof == 'ABSENT':
                             self._observe_missing_entry(order)
                             return
+                        # A conflicting live order or exposure invalidates
+                        # the first empty observation: consecutive proof only.
+                        order.pop('entry_missing_first_seen_at', None)
+                        self.save()
                 except Exception as verify_error:
+                    order.pop('entry_missing_first_seen_at', None)
+                    self.save()
                     code = (verify_error.code if isinstance(verify_error, BrokerError)
                             else type(verify_error).__name__)
                     self.log(f'[CRASH ENTRY LOOKUP VERIFY WAIT] {symbol}; code={code}')
@@ -1431,13 +1437,15 @@ class NightExecutor:
                 if self._confirm_external_close(order):
                     return
             reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
-            if not order.get('warned'):
+            if not self.state.get('halt'):
+                # Legacy records may have warned=True from an earlier halt.
+                # They must not bypass a newly detected unsafe condition.
                 order['warned'] = True
-                if not self.state.get('halt'):
-                    self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
-                else:
-                    # Never replace an earlier safety cause (e.g. TP failure).
-                    self.save()
+                self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
+            elif not order.get('warned'):
+                order['warned'] = True
+                # Never replace an earlier safety cause (e.g. TP failure).
+                self.save()
             code = error.code if isinstance(error, BrokerError) else type(error).__name__
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]}; '
                      f'code={code}; deferred={getattr(error, "deferred_reason", None)}')
