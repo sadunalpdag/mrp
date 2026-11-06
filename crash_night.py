@@ -1233,6 +1233,10 @@ class NightExecutor:
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
                 entry = ws_order if ws_order and ws_order['clientOrderId'] == order['entry_id'] else self.broker.order(symbol, order['entry_id'])
+                if ws_order and ws_order.get('clientOrderId') == order['entry_id']:
+                    # Binance account WS is authoritative for a matching NEW
+                    # entry; discard an earlier -2013 REST propagation retry.
+                    order.pop('entry_lookup_retry_at', None)
                 status = entry.get('status')
                 qty = D(entry['executedQty'])
                 if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
@@ -1297,6 +1301,35 @@ class NightExecutor:
             if isinstance(error, BrokerError) and error.code == '-1003':
                 self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
                 return
+            if (isinstance(error, BrokerError) and error.code == '-2013'
+                    and not error.uncertain and order['phase'] == 'ENTRY_UNKNOWN'):
+                # Binance may return -2013 in the first seconds *after* a
+                # successful BUY POST, before its order lookup is indexed.
+                # ARIAUSDT: -2013 followed by account-WS NEW one second later.
+                # Hold just the original entry for one short retry; NEVER
+                # resubmit BUY or mark it NO_FILL merely from this -2013.
+                submitted = float(order.get('submitted_at') or 0)
+                age = self.clock() - submitted
+                if not order.get('warned') and 0 <= age < 30:
+                    order['entry_lookup_retry_at'] = submitted + 30
+                    self.save()
+                    self.log(f'[CRASH ENTRY LOOKUP GRACE] {symbol}; '
+                             f'age_s={int(age)}; retry in <=30s; no duplicate BUY')
+                    return
+                order.pop('entry_lookup_retry_at', None)
+                try:
+                    if self._pending_buy_confirmed_live(order):
+                        order['entry_pending_verified_at'] = self.clock()
+                        self.save()
+                        self.log(f'[CRASH ENTRY LOOKUP VERIFIED] {symbol}; '
+                                 'live flat + exact NEW unfilled BUY; no global halt')
+                        return
+                except Exception as verify_error:
+                    code = (verify_error.code if isinstance(verify_error, BrokerError)
+                            else type(verify_error).__name__)
+                    self.log(f'[CRASH ENTRY LOOKUP VERIFY WAIT] {symbol}; code={code}')
+                # An unknown fill, position, or failed account query retains
+                # the original fail-closed safety behavior below.
             # Missing/cancelled TP after an operator closes a position is a
             # normal terminal event, IF the affected symbol is proven flat
             # and no normal/algo orders remain. Do not relax unresolved BUYs.
@@ -1480,7 +1513,13 @@ class NightExecutor:
             self.next_manual_close_scan = self.clock() + MANUAL_TP_POLL_SECONDS
             self.review_protected_manual_closes()
         # Manage protective orders even outside the entry window or when halted.
-        if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
+        entry_lookup_due = any(
+            o.get('phase') == 'ENTRY_UNKNOWN' and
+            o.get('entry_lookup_retry_at') is not None and
+            self.clock() >= float(o['entry_lookup_retry_at'])
+            for o in self.state['orders'].values())
+        if (self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan
+                or entry_lookup_due):
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
             for order in list(self.state['orders'].values()):
                 if order['phase'] == 'PROTECTED':
