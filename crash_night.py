@@ -40,13 +40,21 @@ def rounded(value, step, up=False):
         rounding=ROUND_UP if up else ROUND_DOWN)*D(str(step))
 
 
-def plan(record, info, position_usdt='50'):
+def plan(record, info, position_usdt='50', tp_pct='0.01'):
     if info.get('status') != 'TRADING' or info.get('contractType') != 'PERPETUAL':
         raise ValueError('SYMBOL_NOT_TRADING_PERPETUAL')
     filters = {f['filterType']: f for f in info['filters']}
     pf, lot = filters['PRICE_FILTER'], filters['LOT_SIZE']
     entry = rounded(record['entry'], pf['tickSize'])
-    tp = rounded(max(D(str(record['tp'])), entry*D('1.01')), pf['tickSize'], True)
+    rate = D(str(tp_pct))
+    if rate not in (D('0.005'), D('0.01')):
+        raise ValueError('INVALID_TP_RATE')
+    # Full-sized entries retain the original 1% signal target. Half-sized,
+    # 2/3-risk entries use a new 0.5% target from the rounded entry price;
+    # never inherit the 1% TP from the original V2 signal.
+    target = (max(D(str(record['tp'])), entry * (D('1') + rate))
+              if rate == D('0.01') else entry * (D('1') + rate))
+    tp = rounded(target, pf['tickSize'], True)
     if entry <= 0 or tp <= entry:
         raise ValueError('INVALID_PRICE')
     for price in (entry, tp):
@@ -811,44 +819,84 @@ class NightExecutor:
                          name='crash-manual-close-verified', daemon=True).start()
         return True
 
-    def recover_unknown_entry_halt(self):
-        """Resolve a previous ENTRY_UNKNOWN hold only from live Binance proof.
+    @staticmethod
+    def _matching_open_unfilled_buy(order, opened):
+        """Verify a LIVE, unfilled original bot BUY; never infer from -2013."""
+        if (not isinstance(opened, list) or len(opened) != 1
+                or not isinstance(opened[0], dict)):
+            return False
+        entry = opened[0]
+        try:
+            return (entry.get('symbol') == order['symbol']
+                    and entry.get('clientOrderId') == order['entry_id']
+                    and entry.get('side') == 'BUY'
+                    and entry.get('type') == 'LIMIT'
+                    and entry.get('status') == 'NEW'
+                    and entry.get('positionSide', 'BOTH') ==
+                        order.get('position_side', 'BOTH')
+                    and D(str(entry['executedQty'])) == 0
+                    and D(str(entry['origQty'])) == D(str(order['quantity']))
+                    and D(str(entry['price'])) == D(str(order['price'])))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
 
-        No orders are submitted or cancelled here. A missing account response,
-        a pending entry, or unverified fills must leave the safety halt intact.
+    def _pending_buy_confirmed_live(self, order):
+        """Signed account snapshot proves no exposure and exact unfilled BUY."""
+        if not self._flat_from_snapshot(self.broker.positions(), {order['symbol']}):
+            return False
+        return self._matching_open_unfilled_buy(
+            order, self.broker.closing_orders(order['symbol']))
+
+    def recover_unknown_entry_halt(self):
+        """Clear stale global BUY halt when every unknown symbol is safely verified.
+
+        Already-pending, unfilled LIMIT BUYs are *normal*, not failed orders:
+        retain their original IDs/phase and normal expiry/TP monitoring. A
+        missing order may be settled only after signed flat + no open orders.
+        Any exposure, partially filled BUY, unmatched order, or API ambiguity
+        retains the global safety stop. No new or duplicate orders are sent.
         """
         reason = self.state.get('halt')
         if not isinstance(reason, str) or not reason.startswith('GİRİŞ SONUCU BELİRSİZ'):
             return False
         records = list(self.state['orders'].values())
         unknown = [o for o in records if o.get('phase') == 'ENTRY_UNKNOWN']
-        if (not unknown or any(not o.get('warned') or not o.get('symbol') or
-                               not o.get('entry_id') for o in unknown)
+        if (not unknown or any(not o.get('symbol') or not o.get('entry_id')
+                               or not o.get('quantity') or not o.get('price')
+                               for o in unknown)
                 or any(o.get('phase') == 'TP_UNKNOWN' for o in records)):
             return False
         symbols = {o['symbol'] for o in unknown}
+        resolved = []
         try:
-            positions = self.broker.positions()
-            if not isinstance(positions, list):
-                raise ValueError('INVALID_POSITION_RESPONSE')
-            for p in positions:
-                if p.get('symbol') in symbols and D(str(p['positionAmt'])) != 0:
-                    return False
+            if not self._flat_from_snapshot(self.broker.positions(), symbols):
+                return False
+            open_by_symbol = {}
             for symbol in sorted(symbols):
                 opened = self.broker.closing_orders(symbol)
                 if not isinstance(opened, list):
                     raise ValueError('INVALID_ORDER_RESPONSE')
-                if opened:  # Includes regular BUY and algo orders.
-                    return False
-            resolved = []
+                open_by_symbol[symbol] = opened
+                # An unrelated entry, TP or operator order here makes the
+                # original BUY ambiguous. Do not clear the entire hold.
+                tracked = [o for o in unknown if o['symbol'] == symbol]
+                if opened:
+                    if (len(tracked) != 1
+                            or not self._matching_open_unfilled_buy(
+                                tracked[0], opened)):
+                        return False
             for order in unknown:
+                pending = bool(open_by_symbol[order['symbol']])
                 try:
                     entry = self.broker.order(order['symbol'], order['entry_id'])
                 except BrokerError as error:
                     if error.code == '-2013' and not error.uncertain:
-                        # The original entry ID is absent; account is flat
-                        # and there are no open orders for its symbol.
-                        resolved.append((order, 'NO_FILL', 'ORDER_NOT_FOUND_FLAT'))
+                        if pending:
+                            resolved.append((order, 'ENTRY_UNKNOWN',
+                                             'ORIGINAL_BUY_OPEN_UNFILLED'))
+                        else:
+                            resolved.append((order, 'NO_FILL',
+                                             'ORDER_NOT_FOUND_FLAT'))
                         continue
                     raise
                 if (not isinstance(entry, dict)
@@ -860,11 +908,17 @@ class NightExecutor:
                 filled = D(str(entry['executedQty']))
                 if filled < 0 or filled > D(str(order['quantity'])):
                     raise ValueError('INVALID_FILLED_QUANTITY')
-                if status in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED') and filled == 0:
+                if status == 'NEW' and filled == 0 and pending:
+                    resolved.append((order, 'ENTRY_UNKNOWN',
+                                     'ORIGINAL_BUY_OPEN_UNFILLED'))
+                elif (status in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH',
+                                 'REJECTED') and filled == 0 and not pending):
                     resolved.append((order, 'NO_FILL', 'ORDER_FINAL_ZERO_FILL'))
-                elif status in ('FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH') and filled > 0:
-                    # Only the account is confirmed flat, not a winning TP.
-                    resolved.append((order, 'CLOSED_EXTERNALLY', 'LIVE_FLAT_AFTER_FILL'))
+                elif (status in ('FILLED', 'CANCELED', 'EXPIRED',
+                                 'EXPIRED_IN_MATCH') and filled > 0
+                      and not pending):
+                    resolved.append((order, 'CLOSED_EXTERNALLY',
+                                     'LIVE_FLAT_AFTER_FILL'))
                 else:
                     return False
         except Exception as error:
@@ -875,9 +929,14 @@ class NightExecutor:
         for order, phase, proof in resolved:
             order['phase'] = phase
             order['entry_reconcile_proof'] = proof
-            order['flat_confirmed_at'] = now
+            if phase == 'ENTRY_UNKNOWN':
+                order['warned'] = False
+                order['entry_pending_verified_at'] = now
+            else:
+                order['flat_confirmed_at'] = now
         self.state['halt'] = None
         self.armed_at = now
+        self.preflight_retries.clear()
         while True:
             try:
                 self.queue.get_nowait()
@@ -885,12 +944,14 @@ class NightExecutor:
                 break
         self.save()
         labels = ', '.join(sorted(symbols))
+        waiting = sum(phase == 'ENTRY_UNKNOWN' for _, phase, _ in resolved)
         self.log(f'[CRASH ENTRY HALT CLEARED] {labels}; '
-                 'live flat+no orders+client-ID resolution; auto setting unchanged')
+                 f'pending_verified={waiting}; flat verified; '
+                 'open original BUYs remain tracked; old signals discarded')
         self.alert(f'✅ BELİRSİZ ALIŞ KİLİDİ TEMİZLENDİ | {labels}\n'
-                   'Binance pozisyon ve açık emir sorguları doğrulandı. '
-                   'Eski sinyaller tekrar gönderilmeyecek. '
-                   'Otomatik işlem açık/kapalı ayarı korunuyor.')
+                   f'Binance canlı doğrulaması tamamlandı. Bekleyen orijinal '
+                   f'alış: {waiting}. Hiçbir emir yeniden gönderilmedi veya '
+                   'iptal edilmedi. Yeni sinyal ve güvenlik kontrolleri korunuyor.')
         return True
 
     def deliver_pending(self):
@@ -989,6 +1050,7 @@ class NightExecutor:
         target_usdt = configured_usdt * D(str(fraction))
         flags = record['failure_shadow']['flags']
         risk_count = sum(flags.values())
+        tp_pct = D('0.005') if risk_count == 2 else D('0.01')
         if self.daily_count() >= self.max_daily:
             self.entry_skip(symbol, 'DAILY_LIMIT')
             return
@@ -996,7 +1058,7 @@ class NightExecutor:
             self.entry_skip(symbol, 'EXISTING_ORDER')
             return
         try:
-            p = plan(record, self.broker.info(symbol), target_usdt)
+            p = plan(record, self.broker.info(symbol), target_usdt, tp_pct=tp_pct)
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
@@ -1042,12 +1104,14 @@ class NightExecutor:
                      risk_flag_count=risk_count, risk_position_fraction=fraction,
                      risk_configured_usdt=str(configured_usdt),
                      risk_target_usdt=str(target_usdt),
+                     risk_tp_pct=str(tp_pct), risk_tp_policy_version='risk_tier_tp_v1',
                      risk_effective_notional_usdt=str(D(p['quantity'])*D(p['price'])), **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
         self.log(f'[CRASH RISK SIZING] {symbol}; flags={risk_count}/3; '
                  f'fraction={fraction}; base_usdt={configured_usdt}; '
-                 f'target_usdt={target_usdt}; quantity={p["quantity"]}; '
+                 f'target_usdt={target_usdt}; tp_pct={tp_pct}; tp_price={p["tp"]}; '
+                 f'quantity={p["quantity"]}; '
                  f'estimated_notional_usdt={order["risk_effective_notional_usdt"]}')
         if not self.enabled.is_set():
             order['phase'] = 'NO_FILL'
@@ -1169,6 +1233,10 @@ class NightExecutor:
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
                 entry = ws_order if ws_order and ws_order['clientOrderId'] == order['entry_id'] else self.broker.order(symbol, order['entry_id'])
+                if ws_order and ws_order.get('clientOrderId') == order['entry_id']:
+                    # Binance account WS is authoritative for a matching NEW
+                    # entry; discard an earlier -2013 REST propagation retry.
+                    order.pop('entry_lookup_retry_at', None)
                 status = entry.get('status')
                 qty = D(entry['executedQty'])
                 if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
@@ -1233,6 +1301,35 @@ class NightExecutor:
             if isinstance(error, BrokerError) and error.code == '-1003':
                 self.log(f'[CRASH API COOLDOWN] {symbol}; sorgulama ertelendi')
                 return
+            if (isinstance(error, BrokerError) and error.code == '-2013'
+                    and not error.uncertain and order['phase'] == 'ENTRY_UNKNOWN'):
+                # Binance may return -2013 in the first seconds *after* a
+                # successful BUY POST, before its order lookup is indexed.
+                # ARIAUSDT: -2013 followed by account-WS NEW one second later.
+                # Hold just the original entry for one short retry; NEVER
+                # resubmit BUY or mark it NO_FILL merely from this -2013.
+                submitted = float(order.get('submitted_at') or 0)
+                age = self.clock() - submitted
+                if not order.get('warned') and 0 <= age < 30:
+                    order['entry_lookup_retry_at'] = submitted + 30
+                    self.save()
+                    self.log(f'[CRASH ENTRY LOOKUP GRACE] {symbol}; '
+                             f'age_s={int(age)}; retry in <=30s; no duplicate BUY')
+                    return
+                order.pop('entry_lookup_retry_at', None)
+                try:
+                    if self._pending_buy_confirmed_live(order):
+                        order['entry_pending_verified_at'] = self.clock()
+                        self.save()
+                        self.log(f'[CRASH ENTRY LOOKUP VERIFIED] {symbol}; '
+                                 'live flat + exact NEW unfilled BUY; no global halt')
+                        return
+                except Exception as verify_error:
+                    code = (verify_error.code if isinstance(verify_error, BrokerError)
+                            else type(verify_error).__name__)
+                    self.log(f'[CRASH ENTRY LOOKUP VERIFY WAIT] {symbol}; code={code}')
+                # An unknown fill, position, or failed account query retains
+                # the original fail-closed safety behavior below.
             # Missing/cancelled TP after an operator closes a position is a
             # normal terminal event, IF the affected symbol is proven flat
             # and no normal/algo orders remain. Do not relax unresolved BUYs.
@@ -1416,7 +1513,13 @@ class NightExecutor:
             self.next_manual_close_scan = self.clock() + MANUAL_TP_POLL_SECONDS
             self.review_protected_manual_closes()
         # Manage protective orders even outside the entry window or when halted.
-        if self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan:
+        entry_lookup_due = any(
+            o.get('phase') == 'ENTRY_UNKNOWN' and
+            o.get('entry_lookup_retry_at') is not None and
+            self.clock() >= float(o['entry_lookup_retry_at'])
+            for o in self.state['orders'].values())
+        if (self.clock() >= self.next_poll or self.clock() >= self.next_expiry_scan
+                or entry_lookup_due):
             self.next_poll = self.clock()+ORDER_POLL_SECONDS
             for order in list(self.state['orders'].values()):
                 if order['phase'] == 'PROTECTED':

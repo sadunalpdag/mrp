@@ -148,9 +148,9 @@ def format_warning(result):
               if fraction is None else
               "⛔ 3/3 RİSK: otomatik GERÇEK ALIŞ YAPILMAYACAK.\n"
               if fraction == 0 else
-              "⚖️ 2/3 RİSK: otomatik pozisyon tutarının %50'si kullanılacak.\n"
+              "⚖️ 2/3 RİSK: otomatik pozisyon tutarının %50'si kullanılacak; yeni işlemin TP hedefi %0,5.\n"
               if fraction == 0.5 else
-              "✅ 0–1/3 RİSK: otomatik pozisyon tutarının %100'ü kullanılacak.\n")
+              "✅ 0–1/3 RİSK: otomatik pozisyon tutarının %100'ü kullanılacak; yeni işlemin TP hedefi %1.\n")
     return (f"🔎 TP RİSK ETİKETLERİ: {len(hits)}/3 — {label}{missing}\n"
             + action + "Deneysel; TP olasılığı değildir. Sinyal ve sanal takip devam eder.\n")
 
