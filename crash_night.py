@@ -23,7 +23,11 @@ TP_POLL_SECONDS = 5 * 60
 MANUAL_TP_POLL_SECONDS = 5 * 60
 LOCK_AUDIT_SECONDS = 30 * 60
 ENTRY_EXPIRY_SCAN_SECONDS = 15 * 60
-TERMINAL_PHASES = ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY')
+# Missing BUY lookups can lag a live order; two signed snapshots must agree
+# before retiring an old record. This never resubmits or cancels a BUY.
+MISSING_ENTRY_CONFIRM_SECONDS = 60
+TERMINAL_PHASES = ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY',
+                   'ENTRY_NOT_FOUND_FLAT')
 
 
 def night(now):
@@ -396,6 +400,7 @@ class NightExecutor:
         self.next_quarantine_scan = 0
         self.next_manual_close_scan = 0
         self.next_lock_audit = 0
+        self.next_safety_housekeeping = 0
         self.skip_notice_after = {}
         self.protected_poll = {}
         self.enabled = threading.Event()
@@ -840,12 +845,87 @@ class NightExecutor:
         except (KeyError, TypeError, ValueError, ArithmeticError):
             return False
 
+    def _entry_live_proof(self, order):
+        """Return PENDING/ABSENT/UNSAFE from signed LIVE account data.
+
+        Only the exact original unfilled bot BUY is an acceptable pending
+        order. No position, partial fill, other order, or unreliable response
+        may be inferred to be safe. Includes both normal and algo orders.
+        """
+        if not self._flat_from_snapshot(self.broker.positions(),
+                                        {order['symbol']}):
+            return 'UNSAFE'
+        opened = self.broker.closing_orders(order['symbol'])
+        if not isinstance(opened, list):
+            raise ValueError('INVALID_ORDER_RESPONSE')
+        if not opened:
+            return 'ABSENT'
+        if self._matching_open_unfilled_buy(order, opened):
+            return 'PENDING'
+        return 'UNSAFE'
+
     def _pending_buy_confirmed_live(self, order):
-        """Signed account snapshot proves no exposure and exact unfilled BUY."""
-        if not self._flat_from_snapshot(self.broker.positions(), {order['symbol']}):
-            return False
-        return self._matching_open_unfilled_buy(
-            order, self.broker.closing_orders(order['symbol']))
+        return self._entry_live_proof(order) == 'PENDING'
+
+    def _observe_missing_entry(self, order):
+        """Retire only after two *separate* flat+empty signed checks.
+
+        Binance -2013 alone does not prove the BUY never filled. Keep a
+        terminal category that makes no unsupported fill/P&L assertion.
+        Position and open-order preflight continue to prevent duplicate BUYs.
+        """
+        now = self.clock()
+        first = order.get('entry_missing_first_seen_at')
+        if first is None or not 0 <= now - float(first) <= ENTRY_TTL_SECONDS:
+            order['entry_missing_first_seen_at'] = now
+            order['entry_lookup_retry_at'] = now + MISSING_ENTRY_CONFIRM_SECONDS
+            self.save()
+            self.log(f'[CRASH ENTRY ABSENT FIRST CHECK] {order["symbol"]}; '
+                     'live flat + no normal/algo orders; recheck required')
+            return
+        if now - float(first) < MISSING_ENTRY_CONFIRM_SECONDS:
+            order['entry_lookup_retry_at'] = (
+                float(first) + MISSING_ENTRY_CONFIRM_SECONDS)
+            self.save()
+            return
+        order['phase'] = 'ENTRY_NOT_FOUND_FLAT'
+        order['entry_reconcile_proof'] = 'TWO_SIGNED_FLAT_NO_OPEN_ORDERS_ID_NOT_FOUND'
+        order['flat_confirmed_at'] = now
+        order.pop('entry_missing_first_seen_at', None)
+        order.pop('entry_lookup_retry_at', None)
+        order.pop('warned', None)
+        self.save()
+        self.log(f'[CRASH ENTRY HOUSEKEEPING CLEARED] {order["symbol"]}; '
+                 'original BUY not found twice; flat + no orders confirmed; '
+                 'fill/PnL NOT assumed; no order submitted or cancelled')
+        threading.Thread(target=self._deliver_skip_notice,
+                         args=(f'ℹ️ ESKİ ALIŞ KAYDI KONTROL EDİLDİ | '
+                               f'{order["symbol"]}\n'
+                               'Binance iki ayrı kontrolde pozisyon ve açık emir '
+                               'göstermedi. Eski emir bulunamadı; gerçekleştiği '
+                               'veya hiç dolmadığı varsayılmadı. Yeni emir '
+                               'gönderilmedi veya iptal edilmedi.',),
+                         name='crash-entry-housekeeping-notice',
+                         daemon=True).start()
+
+    def safety_housekeeping(self):
+        """Periodic daytime/nighttime check, independent of fresh signals.
+
+        Do not add high-weight REST calls: normal five-minute reconciles,
+        TP repairs and halt recovery already perform signed verification.
+        This audit runs even when entries are manually disabled or halted,
+        without changing either the setting or an unresolved safety stop.
+        """
+        unknown = sum(o.get('phase') == 'ENTRY_UNKNOWN'
+                      for o in self.state['orders'].values())
+        unprotected = sum(o.get('phase') == 'TP_UNKNOWN'
+                          for o in self.state['orders'].values())
+        self.log(f'[CRASH SAFETY HOUSEKEEPING 5M] '
+                 f'halt={self.state.get("halt") or "none"}; '
+                 f'entry_unknown={unknown}; tp_unknown={unprotected}; '
+                 f'auto_enabled={self.enabled.is_set()}; '
+                 'live checks continue via existing reconciliation; '
+                 'no blind unlock, no extra REST')
 
     def recover_unknown_entry_halt(self):
         """Clear stale global BUY halt when every unknown symbol is safely verified.
@@ -1233,10 +1313,10 @@ class NightExecutor:
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
                 entry = ws_order if ws_order and ws_order['clientOrderId'] == order['entry_id'] else self.broker.order(symbol, order['entry_id'])
-                if ws_order and ws_order.get('clientOrderId') == order['entry_id']:
-                    # Binance account WS is authoritative for a matching NEW
-                    # entry; discard an earlier -2013 REST propagation retry.
-                    order.pop('entry_lookup_retry_at', None)
+                # A successful exact-ID REST/WS lookup disproves the prior
+                # -2013; do not retire a subsequently visible live order.
+                order.pop('entry_lookup_retry_at', None)
+                order.pop('entry_missing_first_seen_at', None)
                 status = entry.get('status')
                 qty = D(entry['executedQty'])
                 if order.get('entry_kind') == 'GTC' and status in ('NEW', 'PARTIALLY_FILLED'):
@@ -1318,18 +1398,27 @@ class NightExecutor:
                     return
                 order.pop('entry_lookup_retry_at', None)
                 try:
-                    if self._pending_buy_confirmed_live(order):
-                        order['entry_pending_verified_at'] = self.clock()
-                        self.save()
-                        self.log(f'[CRASH ENTRY LOOKUP VERIFIED] {symbol}; '
-                                 'live flat + exact NEW unfilled BUY; no global halt')
-                        return
+                    # An existing global halt may mix TP and entry failures:
+                    # only the atomic recover_* routines may clear it.
+                    if not self.state.get('halt'):
+                        proof = self._entry_live_proof(order)
+                        if proof == 'PENDING':
+                            order.pop('entry_missing_first_seen_at', None)
+                            order['entry_pending_verified_at'] = self.clock()
+                            order.pop('warned', None)
+                            self.save()
+                            self.log(f'[CRASH ENTRY LOOKUP VERIFIED] {symbol}; '
+                                     'live flat + exact NEW unfilled BUY; no global halt')
+                            return
+                        if proof == 'ABSENT':
+                            self._observe_missing_entry(order)
+                            return
                 except Exception as verify_error:
                     code = (verify_error.code if isinstance(verify_error, BrokerError)
                             else type(verify_error).__name__)
                     self.log(f'[CRASH ENTRY LOOKUP VERIFY WAIT] {symbol}; code={code}')
-                # An unknown fill, position, or failed account query retains
-                # the original fail-closed safety behavior below.
+                # Open exposure, partial fill, conflicting order or failed
+                # account query must retain fail-closed safety behavior.
             # Missing/cancelled TP after an operator closes a position is a
             # normal terminal event, IF the affected symbol is proven flat
             # and no normal/algo orders remain. Do not relax unresolved BUYs.
@@ -1344,7 +1433,11 @@ class NightExecutor:
             reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
             if not order.get('warned'):
                 order['warned'] = True
-                self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
+                if not self.state.get('halt'):
+                    self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
+                else:
+                    # Never replace an earlier safety cause (e.g. TP failure).
+                    self.save()
             code = error.code if isinstance(error, BrokerError) else type(error).__name__
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]}; '
                      f'code={code}; deferred={getattr(error, "deferred_reason", None)}')
@@ -1486,6 +1579,9 @@ class NightExecutor:
             self.deliver_pending()
             return
         self.process_account_events()
+        if self.clock() >= self.next_safety_housekeeping:
+            self.next_safety_housekeeping = self.clock() + ORDER_POLL_SECONDS
+            self.safety_housekeeping()
         if self.state.get('halt') and self.clock() >= self.next_halt_recheck:
             self.next_halt_recheck = self.clock() + MANUAL_TP_POLL_SECONDS
             self.recover_mixed_halt()
