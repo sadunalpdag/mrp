@@ -819,44 +819,84 @@ class NightExecutor:
                          name='crash-manual-close-verified', daemon=True).start()
         return True
 
-    def recover_unknown_entry_halt(self):
-        """Resolve a previous ENTRY_UNKNOWN hold only from live Binance proof.
+    @staticmethod
+    def _matching_open_unfilled_buy(order, opened):
+        """Verify a LIVE, unfilled original bot BUY; never infer from -2013."""
+        if (not isinstance(opened, list) or len(opened) != 1
+                or not isinstance(opened[0], dict)):
+            return False
+        entry = opened[0]
+        try:
+            return (entry.get('symbol') == order['symbol']
+                    and entry.get('clientOrderId') == order['entry_id']
+                    and entry.get('side') == 'BUY'
+                    and entry.get('type') == 'LIMIT'
+                    and entry.get('status') == 'NEW'
+                    and entry.get('positionSide', 'BOTH') ==
+                        order.get('position_side', 'BOTH')
+                    and D(str(entry['executedQty'])) == 0
+                    and D(str(entry['origQty'])) == D(str(order['quantity']))
+                    and D(str(entry['price'])) == D(str(order['price'])))
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            return False
 
-        No orders are submitted or cancelled here. A missing account response,
-        a pending entry, or unverified fills must leave the safety halt intact.
+    def _pending_buy_confirmed_live(self, order):
+        """Signed account snapshot proves no exposure and exact unfilled BUY."""
+        if not self._flat_from_snapshot(self.broker.positions(), {order['symbol']}):
+            return False
+        return self._matching_open_unfilled_buy(
+            order, self.broker.closing_orders(order['symbol']))
+
+    def recover_unknown_entry_halt(self):
+        """Clear stale global BUY halt when every unknown symbol is safely verified.
+
+        Already-pending, unfilled LIMIT BUYs are *normal*, not failed orders:
+        retain their original IDs/phase and normal expiry/TP monitoring. A
+        missing order may be settled only after signed flat + no open orders.
+        Any exposure, partially filled BUY, unmatched order, or API ambiguity
+        retains the global safety stop. No new or duplicate orders are sent.
         """
         reason = self.state.get('halt')
         if not isinstance(reason, str) or not reason.startswith('GİRİŞ SONUCU BELİRSİZ'):
             return False
         records = list(self.state['orders'].values())
         unknown = [o for o in records if o.get('phase') == 'ENTRY_UNKNOWN']
-        if (not unknown or any(not o.get('warned') or not o.get('symbol') or
-                               not o.get('entry_id') for o in unknown)
+        if (not unknown or any(not o.get('symbol') or not o.get('entry_id')
+                               or not o.get('quantity') or not o.get('price')
+                               for o in unknown)
                 or any(o.get('phase') == 'TP_UNKNOWN' for o in records)):
             return False
         symbols = {o['symbol'] for o in unknown}
+        resolved = []
         try:
-            positions = self.broker.positions()
-            if not isinstance(positions, list):
-                raise ValueError('INVALID_POSITION_RESPONSE')
-            for p in positions:
-                if p.get('symbol') in symbols and D(str(p['positionAmt'])) != 0:
-                    return False
+            if not self._flat_from_snapshot(self.broker.positions(), symbols):
+                return False
+            open_by_symbol = {}
             for symbol in sorted(symbols):
                 opened = self.broker.closing_orders(symbol)
                 if not isinstance(opened, list):
                     raise ValueError('INVALID_ORDER_RESPONSE')
-                if opened:  # Includes regular BUY and algo orders.
-                    return False
-            resolved = []
+                open_by_symbol[symbol] = opened
+                # An unrelated entry, TP or operator order here makes the
+                # original BUY ambiguous. Do not clear the entire hold.
+                tracked = [o for o in unknown if o['symbol'] == symbol]
+                if opened:
+                    if (len(tracked) != 1
+                            or not self._matching_open_unfilled_buy(
+                                tracked[0], opened)):
+                        return False
             for order in unknown:
+                pending = bool(open_by_symbol[order['symbol']])
                 try:
                     entry = self.broker.order(order['symbol'], order['entry_id'])
                 except BrokerError as error:
                     if error.code == '-2013' and not error.uncertain:
-                        # The original entry ID is absent; account is flat
-                        # and there are no open orders for its symbol.
-                        resolved.append((order, 'NO_FILL', 'ORDER_NOT_FOUND_FLAT'))
+                        if pending:
+                            resolved.append((order, 'ENTRY_UNKNOWN',
+                                             'ORIGINAL_BUY_OPEN_UNFILLED'))
+                        else:
+                            resolved.append((order, 'NO_FILL',
+                                             'ORDER_NOT_FOUND_FLAT'))
                         continue
                     raise
                 if (not isinstance(entry, dict)
@@ -868,11 +908,17 @@ class NightExecutor:
                 filled = D(str(entry['executedQty']))
                 if filled < 0 or filled > D(str(order['quantity'])):
                     raise ValueError('INVALID_FILLED_QUANTITY')
-                if status in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED') and filled == 0:
+                if status == 'NEW' and filled == 0 and pending:
+                    resolved.append((order, 'ENTRY_UNKNOWN',
+                                     'ORIGINAL_BUY_OPEN_UNFILLED'))
+                elif (status in ('CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH',
+                                 'REJECTED') and filled == 0 and not pending):
                     resolved.append((order, 'NO_FILL', 'ORDER_FINAL_ZERO_FILL'))
-                elif status in ('FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH') and filled > 0:
-                    # Only the account is confirmed flat, not a winning TP.
-                    resolved.append((order, 'CLOSED_EXTERNALLY', 'LIVE_FLAT_AFTER_FILL'))
+                elif (status in ('FILLED', 'CANCELED', 'EXPIRED',
+                                 'EXPIRED_IN_MATCH') and filled > 0
+                      and not pending):
+                    resolved.append((order, 'CLOSED_EXTERNALLY',
+                                     'LIVE_FLAT_AFTER_FILL'))
                 else:
                     return False
         except Exception as error:
@@ -883,9 +929,14 @@ class NightExecutor:
         for order, phase, proof in resolved:
             order['phase'] = phase
             order['entry_reconcile_proof'] = proof
-            order['flat_confirmed_at'] = now
+            if phase == 'ENTRY_UNKNOWN':
+                order['warned'] = False
+                order['entry_pending_verified_at'] = now
+            else:
+                order['flat_confirmed_at'] = now
         self.state['halt'] = None
         self.armed_at = now
+        self.preflight_retries.clear()
         while True:
             try:
                 self.queue.get_nowait()
@@ -893,12 +944,14 @@ class NightExecutor:
                 break
         self.save()
         labels = ', '.join(sorted(symbols))
+        waiting = sum(phase == 'ENTRY_UNKNOWN' for _, phase, _ in resolved)
         self.log(f'[CRASH ENTRY HALT CLEARED] {labels}; '
-                 'live flat+no orders+client-ID resolution; auto setting unchanged')
+                 f'pending_verified={waiting}; flat verified; '
+                 'open original BUYs remain tracked; old signals discarded')
         self.alert(f'✅ BELİRSİZ ALIŞ KİLİDİ TEMİZLENDİ | {labels}\n'
-                   'Binance pozisyon ve açık emir sorguları doğrulandı. '
-                   'Eski sinyaller tekrar gönderilmeyecek. '
-                   'Otomatik işlem açık/kapalı ayarı korunuyor.')
+                   f'Binance canlı doğrulaması tamamlandı. Bekleyen orijinal '
+                   f'alış: {waiting}. Hiçbir emir yeniden gönderilmedi veya '
+                   'iptal edilmedi. Yeni sinyal ve güvenlik kontrolleri korunuyor.')
         return True
 
     def deliver_pending(self):
