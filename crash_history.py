@@ -227,7 +227,7 @@ class HistoryCollector:
             ready = [(k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now]
             # Current signal checks precede entry research and expired snapshots.
             ready.sort(key=lambda item: (not (item[1]['phase']=='signal' and
-                0 <= now-item[1]['as_of'] <= 90), item[1]['phase'] != 'warmup', -item[1]['as_of']))
+                0 <= now-item[1]['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS), item[1]['phase'] != 'warmup', -item[1]['as_of']))
             item = ready[0] if ready else None
         if item is None:
             return
@@ -246,9 +246,12 @@ class HistoryCollector:
                     # these repetitive 479/480 jobs for an hour so other
                     # symbols get access to the paced fallback worker.
                     near_complete = COUNT-2 <= event['candle_count'] < COUNT
+                    fresh_signal = (job['phase'] == 'signal' and
+                                    0 <= now-job['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS)
                     self.jobs[key]['retry_after'] = now + (
                         3600 if near_complete else
                         1800 if event['complete'] else
+                        60 if fresh_signal else
                         300 if self.resolver else 1800)
                 self._write(self.path, self.jobs)
             if COUNT-2 <= event['candle_count'] < COUNT:
