@@ -6587,6 +6587,7 @@ def _crash_send_pending(state, now):
         archive_count = d.get('data_sources', {}).get('BINANCE_ARCHIVE', 0)
         bybit_count = d.get('data_sources', {}).get('BYBIT_LINEAR', 0)
         coinbase_count = d.get('data_sources', {}).get('COINBASE_SPOT', 0)
+        okx_count = d.get('data_sources', {}).get('OKX_SWAP', 0)
         source_message = f'Veri: Binance günlük arşivinden {archive_count} mum tamamlandı.\n' if archive_count else ''
         if bybit_count:
             source_message += (f'⚠️ Eksik {bybit_count} mum Bybit USDT Futures ile tamamlandı; '
@@ -6594,6 +6595,9 @@ def _crash_send_pending(state, now):
         if coinbase_count:
             source_message += (f'⚠️ Eksik {coinbase_count} mum Coinbase SPOT USD ile tamamlandı; '
                                'vadeli işlem fiyatı/hacmi farklıdır.\n')
+        if okx_count:
+            source_message += (f'⚠️ Eksik {okx_count} mum OKX USDT-SWAP ile tamamlandı; '
+                               'borsalar arası fiyat/hacim farkı olabilir.\n')
         message = (f"✅ CRASH BOUNCE V2 | LONG ADAYI | {record['symbol']}\n"
                    f"24h düşüş: %{record['change_24h']:.2f}\n"
                    f"4h dipten toparlanma: %{d['recovery_4h_pct']:.2f}\n"
@@ -6692,8 +6696,8 @@ def _crash_v2_validate_entry(record, now):
         selected = valid_rows(rows, end-480*900000, end)
         for t, candle in valid_rows(ws_rows, end-480*900000, end).items():
             prev = selected.get(t)
-            if (prev is None or len(candle)<=12 or candle[12] not in ('BYBIT_LINEAR','COINBASE_SPOT')
-                    or (len(prev)>12 and prev[12] in ('BYBIT_LINEAR','COINBASE_SPOT'))):
+            if (prev is None or len(candle)<=12 or candle[12] not in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')
+                    or (len(prev)>12 and prev[12] in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP'))):
                 selected[t] = candle
         result['data_sources'] = source_counts(list(selected.values()))
         return result
@@ -6936,6 +6940,56 @@ def _crash_queue_history(record, phase, now):
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'bybit_reference'), log)
             coinbase = CoinbaseReference(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'coinbase_reference'), log)
+            from crash_okx import OKXLastClosed
+            # Strictly budgeted fast lane for a fresh signal's last CLOSED bar.
+            urgent_bybit = BybitReference(
+                os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'urgent_bybit'), log,
+                min_request_gap=5, max_per_hour=36,
+                per_symbol_retry=60, max_price_delta=0.005)
+            urgent_okx = OKXLastClosed(log)
+            urgent_binance_retry = {}
+            urgent_binance_times = []
+
+            def urgent_last(symbol, start, end, cached):
+                from crash_data_sources import valid_rows, tagged
+                latest = end - 900000
+                anchor = end - 1800000
+                known = valid_rows(cached, start, end)
+                edge = known.get(anchor)
+                if (edge is None or
+                        len(edge)>12 and edge[12] in
+                        ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')):
+                    return []  # Never mix venues without a Binance anchor.
+                wall = time.time()
+                urgent_binance_times[:] = [t for t in urgent_binance_times if wall-t < 3600]
+                key = (symbol, latest)
+                # A single Binance mini-request is permitted per symbol/slot,
+                # only when its shared rate limiter confirms enough IP budget.
+                if (os.getenv('CRASH_RESEARCH_REST_ENABLED','1') == '1'
+                        and not blocked() and len(urgent_binance_times) < 18
+                        and wall >= urgent_binance_retry.get(key, 0)):
+                    urgent_binance_retry[key] = wall + 90
+                    urgent_binance_times.append(wall)
+                    try:
+                        response = _crash_public_get('/fapi/v1/klines',
+                            {'symbol':symbol, 'interval':'15m',
+                             'startTime':latest, 'endTime':end-1, 'limit':1})
+                        restored = valid_rows(response, latest, end).get(latest)
+                        if restored is not None:
+                            log(f'[CRASH LAST CLOSED BINANCE] {symbol}; slot={latest}')
+                            return [tagged(restored, 'BINANCE_REST')]
+                    except Exception as error:
+                        log(f'[CRASH LAST CLOSED BINANCE WAIT] {symbol}; '
+                            f'reason={type(error).__name__}')
+                # Bybit linear and OKX swap are public, no key, no Binance IP weight.
+                from crash_data_sources import valid_rows
+                binance_only = [r for r in cached if
+                                len(r) <= 12 or r[12] not in
+                                ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')]
+                recovered = urgent_bybit.fill_missing(
+                    symbol, start, end, [latest], binance_only)
+                return recovered or urgent_okx.fill_last(symbol, start, end, binance_only)
+
             resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
                 _crash_public_get, blocked, _crash_history_log,
                 bybit=bybit, coinbase=coinbase,
@@ -6944,7 +6998,8 @@ def _crash_queue_history(record, phase, now):
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
                 resolver=resolver, ws_rows=_CRASH_WS_CACHE.candles,
-                on_rows=_CRASH_WS_CACHE.merge_candles)
+                on_rows=_CRASH_WS_CACHE.merge_candles,
+                urgent_repair=urgent_last)
         key = phase + "_history_queued"
         if not record.get(key):
             _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
@@ -7346,7 +7401,7 @@ class CrashBounceWebSocketCache:
                         continue
                     old = merged.get(int(row[0]))
                     if (len(row)>12 and row[12]=='BYBIT_LINEAR' and old is not None
-                            and (len(old)<=12 or old[12] not in ('BYBIT_LINEAR','COINBASE_SPOT'))):
+                            and (len(old)<=12 or old[12] not in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP'))):
                         continue  # Never overwrite a Binance candle with a Bybit one.
                     merged[int(row[0])] = list(row)
                 except (ValueError, TypeError, IndexError):
@@ -7721,7 +7776,7 @@ def _crash_get_candles(symbol):
         merged = valid_rows(saved, end-480*900000, end)
         for t, candle in valid_rows(rows, end-480*900000, end).items():
             previous = merged.get(t)
-            if (previous is None or len(candle)<=12 or candle[12] not in ('BYBIT_LINEAR','COINBASE_SPOT')
+            if (previous is None or len(candle)<=12 or candle[12] not in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')
                     or (len(previous)>12 and previous[12]=='BYBIT_LINEAR')):
                 merged[t] = candle
         rows = [merged[t] for t in sorted(merged)][-64:]

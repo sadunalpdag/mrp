@@ -17,11 +17,12 @@ class HistoryPacingWait(Exception):
 from crash_policy import supported_symbol
 
 class HistoryCollector:
-    def __init__(self, directory, fetch, emit, blocked, log, resolver=None, ws_rows=None, on_rows=None, bybit=None):
+    def __init__(self, directory, fetch, emit, blocked, log, resolver=None, ws_rows=None, on_rows=None, bybit=None, urgent_repair=None):
         self.directory, self.fetch, self.emit = directory, fetch, emit
         self.blocked, self.log = blocked, log
         self.resolver, self.ws_rows, self.on_rows = resolver, ws_rows, on_rows
         self.bybit = bybit  # Compatibility for existing caller tests; resolver owns fallback
+        self.urgent_repair = urgent_repair  # Public one-bar recovery, separately budgeted.
         self.lock = threading.RLock()
         self.thread = None
         self.attempts = []
@@ -107,12 +108,35 @@ class HistoryCollector:
             from crash_data_sources import valid_rows
             for t, row in valid_rows(self.ws_rows(job['symbol']), start, end).items():
                 old = cached.get(t)
-                if (old is None or len(row) <= 12 or row[12] not in ('BYBIT_LINEAR','COINBASE_SPOT')
-                        or (len(old) > 12 and old[12] in ('BYBIT_LINEAR','COINBASE_SPOT'))):
+                if (old is None or len(row) <= 12 or row[12] not in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')
+                        or (len(old) > 12 and old[12] in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP'))):
                     cached[t] = row
         expected = list(range(start, end, STEP))
         missing = [t for t in expected if t not in cached]
-        alternate_cached = any(len(r)>12 and r[12] in ('BYBIT_LINEAR','COINBASE_SPOT')
+        # Fresh signals can miss just the last CLOSED 15m slot even when all
+        # 5-day history is ready. Bypass the 180s research-download queue for
+        # this one gap, using separately rate-capped public venue endpoints.
+        # An adjacent Binance candle is compulsory for price parity.
+        if (job['phase'] == 'signal' and callable(self.urgent_repair)
+                and scheduled_at is not None
+                and 0 <= scheduled_at-job['as_of'] <= 90
+                and end-STEP in missing and len(missing) <= 2
+                and end-2*STEP in cached
+                and sum(t in cached for t in range(end-16*STEP,end,STEP)) >= 14):
+            try:
+                found = self.validated(self.urgent_repair(
+                    job['symbol'], start, end, list(cached.values())))
+                recovered = found.get(end-STEP)
+                if recovered is not None:
+                    cached[end-STEP] = recovered
+                    missing = [t for t in expected if t not in cached]
+                    self.log(f"[CRASH HISTORY URGENT LAST] {job['symbol']}; "
+                             f"source={recovered[12] if len(recovered)>12 else 'BINANCE'}; "
+                             "closed_slot_verified=1")
+            except Exception as error:
+                self.log(f"[CRASH HISTORY URGENT WAIT] {job['symbol']}; "
+                         f"reason={type(error).__name__}")
+        alternate_cached = any(len(r)>12 and r[12] in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')
                            for t,r in cached.items() if start <= t < end)
         # A signal with 478-480 genuine closed candles is decision-ready only
         # when the latest closed slot and >=14 of the last 16 slots exist.
@@ -194,7 +218,7 @@ class HistoryCollector:
             if job['phase'] != 'warmup':
                 self.emit(event, time.time())
             with self.lock:
-                if event['complete'] and not any(event['data_sources'].get(src,0) for src in ('BYBIT_LINEAR','COINBASE_SPOT')):
+                if event['complete'] and not any(event['data_sources'].get(src,0) for src in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')):
                     self.jobs.pop(key, None)
                 else:
                     # One or two missing bars no longer block V2 eligibility

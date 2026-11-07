@@ -12,8 +12,16 @@ MIN_REQUEST_GAP_SECONDS = 180
 
 
 class BybitReference:
-    def __init__(self, directory, log, get=None, clock=time.time):
+    def __init__(self, directory, log, get=None, clock=time.time, *,
+                 min_request_gap=MIN_REQUEST_GAP_SECONDS,
+                 max_per_hour=MAX_REQUESTS_PER_HOUR,
+                 per_symbol_retry=PER_SYMBOL_RETRY_SECONDS,
+                 max_price_delta=0.03):
         self.directory, self.log, self.get, self.clock = directory, log, get, clock
+        self.min_request_gap = min_request_gap
+        self.max_per_hour = max_per_hour
+        self.per_symbol_retry = per_symbol_retry
+        self.max_price_delta = max_price_delta
         self.next_symbol = {}
         self.requests = []
         self.next_request = 0
@@ -55,12 +63,12 @@ class BybitReference:
         now = self.clock()
         self.requests = [t for t in self.requests if now - t < 3600]
         if (now < self.next_symbol.get(symbol, 0)
-                or len(self.requests) >= MAX_REQUESTS_PER_HOUR
+                or len(self.requests) >= self.max_per_hour
                 or now < self.next_request or now < self.global_cooldown):
             return []
         self.requests.append(now)
-        self.next_request = now + MIN_REQUEST_GAP_SECONDS
-        self.next_symbol[symbol] = now + PER_SYMBOL_RETRY_SECONDS
+        self.next_request = now + self.min_request_gap
+        self.next_symbol[symbol] = now + self.per_symbol_retry
         get = self.get
         if get is None:
             import requests
@@ -128,10 +136,10 @@ class BybitReference:
             for t in overlap:
                 bc = float(existing[t][4])
                 yc = float(found[t][4])
-                if bc <= 0 or abs(yc/bc - 1) > 0.03:
+                if bc <= 0 or abs(yc/bc - 1) > self.max_price_delta:
                     raise ValueError('CROSS_EXCHANGE_PRICE_MISMATCH')
             output = [found[t] for t in wanted if first <= t < stop and t in found]
-            self.next_symbol[symbol] = now + 60 if output else now + PER_SYMBOL_RETRY_SECONDS
+            self.next_symbol[symbol] = now + 60 if output else now + self.per_symbol_retry
             self.log(f'[CRASH BYBIT FILL] {symbol}; '
                      f'eksik_istendi={len(wanted)}; gelen={len(output)}; '
                      f'kontrol={len(overlap)}; sadece_eksik_mum=1')
@@ -140,6 +148,6 @@ class BybitReference:
             self.log(f'[CRASH BYBIT WAIT] {symbol}; '
                      f'reason={type(error).__name__}; '
                      f'code={str(error)[:48] if isinstance(error, ValueError) else "TRANSPORT"}; '
-                     f'tekrar_deneme_sn={PER_SYMBOL_RETRY_SECONDS}')
+                     f'tekrar_deneme_sn={self.per_symbol_retry}')
             return []
 
