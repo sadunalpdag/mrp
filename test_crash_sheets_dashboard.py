@@ -35,6 +35,8 @@ class SheetDashboardTests(unittest.TestCase):
         status, table, colors, previous = self.data()
         row = table[1]
         self.assertEqual(len(row), len(dash.HEADERS))
+        self.assertEqual(len(dash.HEADERS), 25)
+        self.assertEqual(row[22], "⚪ VERİ YOK")
         self.assertEqual(row[13], 2)
         self.assertIn("%50", row[17])
         self.assertEqual(colors[0], ("yellow", "yellow"))
@@ -100,7 +102,7 @@ class SheetDashboardTests(unittest.TestCase):
         batch = book.values_batch_update.call_args.args[0]
         self.assertEqual(len(batch["data"]), 2)
         self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B26")
-        self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:V61")
+        self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:Y61")
         self.assertEqual(len(batch["data"][1]["values"]), 61)
         self.assertTrue(state_store.called)
         self.assertFalse(book.add_worksheet.called)
