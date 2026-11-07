@@ -63,6 +63,18 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(params['endTime'],end-STEP-1)
         self.assertEqual(params['limit'],170)
 
+    def test_guarded_rest_last_resort_targets_latest_closed_if_479(self):
+        start=self.today-5*STEP
+        cached=rows(start,5)[1:4]  # two missing, including mandatory latest
+        self.s.archive=Mock(return_value=[])
+        self.rest.side_effect=lambda path,params: rows(params['startTime'],params['limit'])
+        out=self.s.resolve('BTCUSDT',start,self.today,cached)
+        params=self.rest.call_args.args[1]
+        self.assertEqual(params['startTime'],self.today-STEP)
+        self.assertEqual(params['limit'],1)
+        self.assertEqual(len(out),4)
+        self.assertEqual(out[-1][12],'BINANCE_REST')
+
     def test_full_archive_never_uses_rest(self):
         end=self.today
         start=end-480*STEP
