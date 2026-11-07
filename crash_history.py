@@ -61,16 +61,34 @@ class HistoryCollector:
         if isinstance(at, bool) or not isinstance(at, (float, int)) or not math.isfinite(at) or at <= 0:
             raise ValueError(f'Invalid history timestamp: {at!r}')
         key = record['signal_id'] + ':' + phase
+        anchor = record.get('created_at', at)
+        if (isinstance(anchor, bool) or not isinstance(anchor, (int, float))
+                or not math.isfinite(anchor) or anchor <= 0):
+            anchor = at
         with self.lock:
             updated = dict(self.jobs)
             if phase == 'warmup' and key in updated:
-                updated[key] = dict(updated[key], as_of=max(at,updated[key]['as_of']))
+                updated[key] = dict(updated[key], as_of=max(at,updated[key]['as_of']), created_at=at)
             else:
                 updated.setdefault(key, dict(signal_id=record['signal_id'], symbol=symbol,
-                                             phase=phase, as_of=at, retry_after=0))
+                                             phase=phase, as_of=at, created_at=anchor, retry_after=0))
             # A failed serialization must not poison the in-memory queue.
             self._write(self.path, updated)
             self.jobs = updated
+
+    def prune_expired(self, now):
+        """Do not consume download budget on jobs for >24h-old candidates."""
+        from crash_policy import TRACKING_SECONDS
+        with self.lock:
+            expired = [key for key, job in self.jobs.items()
+                       if now - job.get('created_at', job.get('as_of', 0)) >= TRACKING_SECONDS]
+            if expired:
+                remaining = {k: v for k, v in self.jobs.items() if k not in expired}
+                self._write(self.path, remaining)
+                self.jobs = remaining
+        if expired:
+            self.log(f'[CRASH HISTORY EXPIRED] removed={len(expired)}; horizon=24h')
+        return len(expired)
 
     def start(self):
         with self.lock:
@@ -200,6 +218,7 @@ class HistoryCollector:
 
     def step(self, now=None):
         now = time.time() if now is None else now
+        self.prune_expired(now)
         if self.blocked() and self.resolver is None:
             return
         self.attempts = [t for t in self.attempts if now-t < 3600]
