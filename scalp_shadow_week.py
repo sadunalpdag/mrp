@@ -51,10 +51,14 @@ def _bars(rows, now):
 
 
 def _ready(bars, now):
-    recent = bars[-52:]
-    return (len(recent) == 52 and
-            0 <= now * 1000 - (recent[-1][0] + STEP_MS - 1) <= 1800000 and
-            all(b[0] - a[0] == STEP_MS for a, b in zip(recent, recent[1:])))
+    # Up to 4 absent true candles in 56 slots; never invent/fill bars.
+    # This is a deliberately labeled proxy, not a strictly uniform SMA sample.
+    if len(bars) < 52:
+        return False
+    newest = bars[-1][0]
+    recent = [b for b in bars if newest - 55 * STEP_MS <= b[0] <= newest]
+    return (len(recent) >= 52 and
+            0 <= now * 1000 - (newest + STEP_MS - 1) <= 1800000)
 
 
 def pullback(bars):
@@ -197,10 +201,22 @@ def _scan(data_dir, tickers, candles_get, now, obj):
     known = {(s["strategy"], s["symbol"], s["ts"])
              for s in obj["signals"] if isinstance(s, dict)}
     by_symbol = {s: b for _, s, b in selected}
-    # Resolve past prospective outcomes only on available future CLOSED candles.
+    # A paper signal might leave the current top 10. Read ONLY the existing
+    # local WS cache for up to 24 such symbols; never add WS subscriptions.
+    pending = sorted((s for s in obj["signals"] if s.get("status") == "OPEN"),
+                     key=lambda item: item.get("ts", 0), reverse=True)
+    pending_symbols = []
+    for item in pending:
+        sym = item.get("symbol")
+        if isinstance(sym, str) and sym not in by_symbol and sym not in pending_symbols:
+            pending_symbols.append(sym)
+        if len(pending_symbols) >= 24:
+            break
+    for sym in pending_symbols:
+        by_symbol[sym] = _bars(candles_get(sym), now)
     for signal in obj["signals"]:
-        if signal.get("symbol") in by_symbol and signal.get("status") == "OPEN":
-            _settle(signal, by_symbol[signal["symbol"]], now)
+        if signal.get("status") == "OPEN":
+            _settle(signal, by_symbol.get(signal.get("symbol"), []), now)
     for _, symbol, bars in selected:
         # Use the same last-closed-bar timestamp as the other V2 indicators.
         entry_ts = bars[-1][0]
@@ -304,7 +320,9 @@ class ShadowWeek:
                 _save(self.path, data)
                 try:
                     if _publish(data):
-                        self.logger("[SCALP SHADOW] Pullback Test / Break Bounce Test updated; no REST")
+                        self.logger("[SCALP SHADOW] Pullback Test / Break Bounce Test updated; "
+                                    "coins=%s; paper_signals=%s; no REST" %
+                                    (len(data["sampled_coins"]), len(data["signals"])))
                     else:
                         self.logger("[SCALP SHADOW] local paper results saved; Sheets credentials missing")
                 except Exception as exc:
