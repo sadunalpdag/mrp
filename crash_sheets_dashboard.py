@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from crash_policy import TRACKING_SECONDS
+from crash_policy import TRACKING_SECONDS, is_active_candidate
 
 INTERVAL = 300
 MAX_ROWS = 60
@@ -150,7 +150,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
     # Add the most recent V2 signals still being observed, even if no longer top 20.
     extra = sorted(
         ((sym, rec) for sym, rec in symbols.items()
-         if isinstance(rec, dict) and now - (_num(rec.get("created_at")) or 0) < TRACKING_SECONDS),
+         if isinstance(rec, dict) and is_active_candidate(rec, now)),
         key=lambda pair: _num(pair[1].get("created_at")) or 0, reverse=True)
     names = (top + [sym for sym, _ in extra if sym not in rank])[:MAX_ROWS]
     previous = {}
@@ -159,8 +159,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
     eligible = 0
     for sym in names:
         rec = symbols.get(sym) or {}
-        if (not isinstance(rec, dict) or
-                now - (_num(rec.get("created_at")) or 0) >= TRACKING_SECONDS):
+        if not is_active_candidate(rec, now):
             rec = {}
         v2 = rec.get("v2_features") or {}
         has_signal = bool(rec.get("signal_id"))
