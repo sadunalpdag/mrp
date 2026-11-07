@@ -88,21 +88,21 @@ class TrackingTests(unittest.TestCase):
     def test_no_signal_time_or_above_entry_fill(self):
         self.sample(0,.9); self.sample(180,1.02)
         self.assertEqual(self.r['tracking_status'],'WAIT_ENTRY')
-        self.sample(150*3600+1,.8)
+        self.sample(24*3600+1,.8)
         self.assertEqual(self.r['tracking_status'],'NO_ENTRY_OBSERVED')
         self.assertIsNone(self.g['_crash_summary']([self.r])['observed_tp_rate_resolved_pct'])
 
     def test_timeout_is_not_retroactive_tp_after_deadline(self):
         self.sample(180,.99)
-        self.sample(180+150*3600+1,1.05)
+        self.sample(24*3600+1,1.05)
         self.assertEqual(self.r['tracking_status'],'TIMEOUT')
         self.assertGreater(self.r['coverage_gaps'],0)
         self.assertEqual(self.r['observed_exit_price'],.99)
 
-    def test_active_record_keeps_tracking_after_72_hours(self):
+    def test_active_record_stops_24_hours_from_candidate(self):
         self.sample(180,.99)
-        self.sample(180+100*3600,1.02)
-        self.assertEqual(self.r['tracking_status'],'TP')
+        self.sample(24*3600+1,1.02)
+        self.assertEqual(self.r['tracking_status'],'TIMEOUT')
 
     def test_unsupported_wait_is_filtered_but_existing_open_is_preserved(self):
         self.r['symbol']='牛来USDT'
@@ -124,7 +124,7 @@ class TrackingTests(unittest.TestCase):
             report=json.loads(z.read('report.json'))
         self.assertTrue(any(x['symbol']=='BUSDT' for x in records))
         self.assertEqual(report['legacy_7d_cohort']['signals'],1)
-        self.assertEqual(report['tracking_hours'],150)
+        self.assertEqual(report['tracking_hours'],24)
 
     def test_stale_missing_prices_and_gap_markers(self):
         self.g['_crash_track_results'](self.state,[{'symbol':'AUSDT','lastPrice':'.99',
