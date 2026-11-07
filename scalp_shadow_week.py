@@ -23,6 +23,8 @@ TABS = {"PULLBACK": "Pullback Test", "BREAK_BOUNCE": "Break Bounce Test"}
 HEADERS = ["Coin", "Yön", "Mum zamanı UTC", "Sanal giriş", "TP %1",
            "Risk -%1", "Sonuç", "Sonuç zamanı UTC", "Model", "Gözlem"]
 MODEL = "15m mum vekili / gerçek 5m teyidi YOK"
+DIAG_HEADERS = ["Coin", "Veri", "15m mum", "MA50 trend", "Yön",
+                "Durum", "Koşullar", "Eksik / beklenen", "Sanal sinyal", "Son mum UTC"]
 
 
 def gainer_groups(tickers, allowed_market=None):
@@ -177,6 +179,92 @@ def break_bounce(bars, daily_range):
     return None
 
 
+
+def _diagnostic(strategy, symbol, bars, data_ready, daily_range=None):
+    """Explain every sampled coin, including those without enough 15m data.
+
+    Read-only: diagnostics do not relax or alter paper-trade entry conditions.
+    """
+    last_time = _dt(bars[-1][0]) if bars else "—"
+    observed = (sum(b[0] >= bars[-1][0] - 55 * STEP_MS for b in bars)
+                if bars else 0)
+    coverage = "%s/56" % observed
+    if not data_ready:
+        return [symbol, "EKSİK", coverage, "—", "—", "VERİ BEKLENİYOR",
+                "0/0", "52/56 gerçek 15m mum ve güncel kapanış gerekli",
+                "YOK", last_time]
+
+    old, prev, last = bars[-3:]
+    ma = sum(r[4] for r in bars[-50:]) / 50
+    prior_ma = sum(r[4] for r in bars[-51:-1]) / 50
+    trend = "YUKARI" if ma > prior_ma else "AŞAĞI" if ma < prior_ma else "YATAY"
+
+    if strategy == "PULLBACK":
+        if trend == "YATAY":
+            return [symbol, "HAZIR", coverage, trend, "—",
+                    "TREND BEKLENİYOR", "0/7", "MA50 eğimi yatay",
+                    "YOK", last_time]
+        if trend == "YUKARI":
+            direction = "LONG"
+            checks = [
+                ("MA50 yükselişi", True),
+                ("Fiyat MA50 üstünde", last[4] > ma),
+                ("Önceki mum düşüş", prev[4] < prev[1]),
+                ("Son mum yükseliş", last[4] > last[1]),
+                ("Bullish engulfing", last[1] <= prev[4] and last[4] >= prev[1]),
+                ("MA50 yakınında dönüş", min(prev[3], last[3]) <= ma * 1.005),
+                ("Önceki yapı MA50 üstü", old[4] > ma * 0.995),
+            ]
+        else:
+            direction = "SHORT"
+            checks = [
+                ("MA50 düşüşü", True),
+                ("Fiyat MA50 altında", last[4] < ma),
+                ("Önceki mum yükseliş", prev[4] > prev[1]),
+                ("Son mum düşüş", last[4] < last[1]),
+                ("Bearish engulfing", last[1] >= prev[4] and last[4] <= prev[1]),
+                ("MA50 yakınında dönüş", max(prev[2], last[2]) >= ma * 0.995),
+                ("Önceki yapı MA50 altı", old[4] < ma * 1.005),
+            ]
+        missing = [name for name, ok in checks if not ok]
+        confirmed = pullback(bars) is not None
+        return [symbol, "HAZIR", coverage, trend, direction,
+                "SİNYAL" if confirmed else "ONAY BEKLENİYOR",
+                "%s/%s" % (len(checks) - len(missing), len(checks)),
+                "; ".join(missing) if missing else "Tüm koşullar tamam",
+                "VAR" if confirmed else "YOK", last_time]
+
+    if daily_range is None:
+        return [symbol, "HAZIR", coverage, trend, "—", "GÜNLÜK VERİ EKSİK",
+                "0/4", "Dünün 96 gerçek 15m mumu gerekli",
+                "YOK", last_time]
+    high, low = daily_range
+    prev2 = bars[-3]
+    body = abs(prev[4] - prev[1]) / max(prev[2] - prev[3], 1e-15)
+    body_ok = body >= 0.45
+    up = prev2[4] <= high and prev[1] <= high and prev[4] > high
+    down = prev2[4] >= low and prev[1] >= low and prev[4] < low
+    direction = "YUKARI" if up else "AŞAĞI" if down else "—"
+    retest = (last[3] <= high * 1.003 and last[4] > high
+              and last[4] > last[1]) if up else (
+                  last[2] >= low * 0.997 and last[4] < low
+                  and last[4] < last[1]) if down else False
+    checks = [
+        ("Dünün aralığı", True),
+        ("Kırılım mumu gövdesi", body_ok),
+        ("15m aralık dışı kapanış", up or down),
+        ("15m geri test ve dönüş", retest),
+    ]
+    missing = [name for name, ok in checks if not ok]
+    confirmed = break_bounce(bars, daily_range) is not None
+    status = ("SİNYAL" if confirmed else "KIRILIM BEKLENİYOR" if not (up or down)
+              else "MUM ONAYI BEKLENİYOR" if not body_ok else "RETEST BEKLENİYOR")
+    return [symbol, "HAZIR", coverage, trend, direction, status,
+            "%s/%s" % (len(checks) - len(missing), len(checks)),
+            "; ".join(missing) if missing else "Tüm koşullar tamam",
+            "VAR" if confirmed else "YOK", last_time]
+
+
 def _load(path):
     try:
         with open(path, encoding="utf-8") as fd:
@@ -261,16 +349,14 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
             recent[sym] = _bars(candles_get(sym), now)
         _settle(r, recent.get(sym, []), now)
 
-    for strategy, symbols in ready.items():
+    diagnostics = {k: [] for k in RANK_BOUNDS}
+    for strategy, symbols in groups.items():
         for symbol in symbols:
             bars = recent[symbol]
-            entry_ts = bars[-1][0]
-            result = None
-            if strategy == "PULLBACK":
-                result = pullback(bars)
-            else:
-                # The 192-bar WS research cache can hold yesterday's 96 real
-                # candles. Combine with any already stored local history only.
+            data_ready = _ready(bars, now)
+            daily_range = None
+            if strategy == "BREAK_BOUNCE" and data_ready:
+                # Existing on-disk cache + existing WS; never add REST calls.
                 history_path = os.path.join(data_dir, "crash_research", "history_cache",
                                             symbol + ".json")
                 try:
@@ -281,7 +367,13 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
                 daily_range = previous_utc_range(
                     (history_rows if isinstance(history_rows, list) else [])
                     + (full_candles.get(symbol) or []), now)
-                result = break_bounce(bars, daily_range)
+            diagnostics[strategy].append(
+                _diagnostic(strategy, symbol, bars, data_ready, daily_range))
+            if not data_ready:
+                continue
+            entry_ts = bars[-1][0]
+            result = (pullback(bars) if strategy == "PULLBACK"
+                      else break_bounce(bars, daily_range))
             if result is None or (strategy, symbol, entry_ts) in known:
                 continue
             side, note = result
@@ -304,6 +396,7 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
     obj["ready_groups"] = ready
     obj["sampled_coins"] = {k: list(v) for k, v in ready.items()}
     obj["available_count"] = {k: len(v) for k, v in ready.items()}
+    obj["diagnostics"] = diagnostics
     return obj
 
 def _tab_values(obj, strategy):
@@ -338,7 +431,13 @@ def _tab_values(obj, strategy):
             _dt(s["resolved_at"]) if s.get("resolved_at") else "—",
             "15m PROXY", s.get("note", ""),
         ])
-    return rows + [[""] * len(HEADERS) for _ in range(max(0, 9 + MAX_SHEET_SIGNALS - len(rows)))]
+    rows += [[""] * len(HEADERS) for _ in range(max(0, 9 + MAX_SHEET_SIGNALS - len(rows)))]
+    # Keep original paper-result rows A1:J57 untouched; monitor below them.
+    rows.extend([[""] * 10,
+                 ["Takip edilen coinler / sinyal çıkmama nedenleri", TABS[strategy]],
+                 DIAG_HEADERS])
+    rows.extend(obj.get("diagnostics", {}).get(strategy, [])[:MAX_SYMBOLS])
+    return rows + [[""] * 10 for _ in range(max(0, 80 - len(rows)))]
 
 
 def _publish(obj):
@@ -357,7 +456,7 @@ def _publish(obj):
             tabs[key] = book.add_worksheet(title=title, rows=80, cols=12)
         targets[strategy] = tabs[key]
     # Writes only own tabs, overwrites fixed ranges (never appends indefinitely).
-    data = [{"range": "'" + ws.title.replace("'", "''") + "'!A1:J57",
+    data = [{"range": "'" + ws.title.replace("'", "''") + "'!A1:J80",
              "values": _tab_values(obj, strategy)}
             for strategy, ws in targets.items()]
     book.values_batch_update({"valueInputOption": "RAW", "data": data})
