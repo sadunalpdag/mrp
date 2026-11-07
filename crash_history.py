@@ -8,6 +8,11 @@ import time
 STEP = 900000
 COUNT = 480
 DOWNLOAD_INTERVAL = 180
+# Reserve six of the 18 hourly fallbacks for genuinely live signal candidates.
+LIVE_SIGNAL_RESERVE = 6
+# Within the same hourly ceiling, an active candidate may be tried 30 s after
+# the previous research download; normal/background jobs retain 180 s spacing.
+LIVE_SIGNAL_MIN_GAP = 30
 
 
 class HistoryPacingWait(Exception):
@@ -116,7 +121,16 @@ class HistoryCollector:
                            for t,r in cached.items() if start <= t < end)
         if missing or (alternate_cached and self.resolver is not None):
             if scheduled_at is not None:
-                if scheduled_at < self.next_download:
+                live_signal = (job['phase'] == 'signal' and
+                               0 <= scheduled_at-job['as_of'] <= 90)
+                # The regular three-minute spacing can exceed the 90-second
+                # signal TTL. A live candidate may use reserved capacity once
+                # at least 30 s have elapsed since the preceding download.
+                # This never increases the existing 18-requests/hour ceiling;
+                # source-specific API cooldowns remain enforced by resolver.
+                live_earliest = self.next_download - DOWNLOAD_INTERVAL + LIVE_SIGNAL_MIN_GAP
+                if scheduled_at < self.next_download and not (
+                        live_signal and scheduled_at >= live_earliest):
                     raise HistoryPacingWait()
                 self.next_download = scheduled_at + DOWNLOAD_INTERVAL
                 self._write(self.pacing_path, {'next_download': self.next_download})
@@ -173,6 +187,12 @@ class HistoryCollector:
         if item is None:
             return
         key, job = item
+        live_signal = (job['phase'] == 'signal' and
+                       0 <= now-job['as_of'] <= 90)
+        # Do not exhaust the hourly network budget on up to hundreds of
+        # stale/warmup jobs before a new candidate arrives.
+        if len(self.attempts) >= 18-LIVE_SIGNAL_RESERVE and not live_signal:
+            return
         try:
             event = self.collect(job, scheduled_at=now)
             # Use fetch day so the upcoming ZIP includes late/retried downloads.
@@ -187,7 +207,15 @@ class HistoryCollector:
                     # these repetitive 479/480 jobs for an hour so other
                     # symbols get access to the paced fallback worker.
                     near_complete = COUNT-2 <= event['candle_count'] < COUNT
+                    end_ms = int(job['as_of'] * 1000) // STEP * STEP
+                    latest_closed_present = any(
+                        int(row[0]) == end_ms-STEP
+                        for row in event['closed_15m_ohlcv'])
+                    # 479/480 is usable only if the LAST closed candle exists.
+                    # Never apply the hour-long near-complete delay when that
+                    # required fresh candle is precisely the missing one.
                     self.jobs[key]['retry_after'] = now + (
+                        60 if near_complete and not latest_closed_present else
                         3600 if near_complete else
                         1800 if event['complete'] else
                         300 if self.resolver else 1800)
@@ -195,7 +223,8 @@ class HistoryCollector:
             if COUNT-2 <= event['candle_count'] < COUNT:
                 self.log(f"[CRASH HISTORY NEAR_COMPLETE] {job['symbol']}; "
                          f"real_candles={event['candle_count']}/480; "
-                         "1-2 eksik; sonraki tamamlamayi bir saat ertele")
+                         f"latest_closed_present={int(latest_closed_present)}; "
+                         f"retry_seconds={60 if not latest_closed_present else 3600}")
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
         except HistoryPacingWait:
             with self.lock:
