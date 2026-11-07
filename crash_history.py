@@ -227,11 +227,18 @@ class HistoryCollector:
                          f"retry_seconds={60 if not latest_closed_present else 3600}")
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
         except HistoryPacingWait:
+            # A live candidate has a separate 30-second earliest retry under
+            # the *same* rolling hourly budget. Never defer it for 180 seconds
+            # merely because the initial attempt hit regular pacing.
+            live_signal = (job['phase'] == 'signal' and
+                           0 <= now-job['as_of'] <= 90)
+            retry_at = (max(now+1, self.next_download-DOWNLOAD_INTERVAL+LIVE_SIGNAL_MIN_GAP)
+                        if live_signal else self.next_download)
             with self.lock:
-                self.jobs[key]['retry_after'] = self.next_download
+                self.jobs[key]['retry_after'] = retry_at
                 self._write(self.path, self.jobs)
             self.log(f"[CRASH HISTORY SCHEDULE] {job['symbol']}; "
-                     f"queue={len(self.jobs)}; wait_seconds={max(0,int(self.next_download-now))}")
+                     f"queue={len(self.jobs)}; wait_seconds={max(0,int(retry_at-now))}")
         except Exception as error:
             with self.lock:
                 self.jobs[key]['retry_after'] = now + (300 if self.resolver else 1800)
