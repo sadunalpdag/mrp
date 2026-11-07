@@ -20,7 +20,7 @@ class RateTests(unittest.TestCase):
         def sleep(seconds):
             self.now += seconds
         tree = ast.parse(Path(__file__).with_name('ema.py').read_text())
-        names = {'main', '_crash_public_get', '_crash_public_get_locked', '_crash_set_cooldown', '_crash_wait_until'}
+        names = {'main', '_crash_public_get', '_crash_history_rest_get', '_crash_public_get_locked', '_crash_set_cooldown', '_crash_wait_until'}
         subset = ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names], type_ignores=[])
         self.g = dict(time=SimpleNamespace(time=lambda:self.now, sleep=sleep), math=math,
                       json=json, os=os, re=re, SAVE_LOCK=threading.Lock(), log=Mock(),
@@ -90,6 +90,53 @@ class RateTests(unittest.TestCase):
             self.assertEqual(self.g['requests'].get.call_count, 1)
             self.assertIn('/fapi/v1/exchangeInfo',
                           self.g['requests'].get.call_args.args[0])
+
+    def test_scoped_last_resort_works_while_general_research_disabled(self):
+        self.response(status=200, data=[])
+        params = {'symbol':'ONUSDT', 'interval':'15m', 'limit':2,
+                  'startTime':1800000000000, 'endTime':1800001800000-1}
+        with patch.dict(os.environ, {'CRASH_RESEARCH_REST_ENABLED':'0',
+                                      'CRASH_HISTORY_REST_LAST_RESORT_ENABLED':'1'}):
+            with self.assertRaisesRegex(RuntimeError,'RESEARCH_BINANCE_REST_DISABLED'):
+                self.g['_crash_public_get']('/fapi/v1/klines', params)
+            self.g['_crash_history_rest_get']('/fapi/v1/klines', params)
+        self.assertEqual(self.g['requests'].get.call_count, 1)
+        self.assertTrue(self.g['requests'].get.call_args.args[0].endswith('/fapi/v1/klines'))
+        self.g['_CRASH_IP_BUDGET'].reserve.assert_called_once()
+
+    def test_scoped_history_rejects_non_history_calls_and_can_be_disabled(self):
+        self.response(status=200, data=[])
+        params = {'symbol':'ONUSDT', 'interval':'15m', 'limit':1,
+                  'startTime':1800000000000, 'endTime':1800000900000-1}
+        with patch.dict(os.environ, {'CRASH_RESEARCH_REST_ENABLED':'0',
+                                      'CRASH_HISTORY_REST_LAST_RESORT_ENABLED':'1'}):
+            for endpoint in ('/api/v3/klines','/fapi/v1/fundingRate',
+                             '/futures/data/openInterestHist','/fapi/v1/exchangeInfo'):
+                with self.assertRaises(ValueError):
+                    self.g['_crash_history_rest_get'](endpoint, params)
+            for bad in (dict(params, interval='1h'), dict(params,limit=480),
+                        dict(params, symbol='../USDT'),
+                        dict(params, endTime=params['endTime']+900000)):
+                with self.assertRaises(ValueError):
+                    self.g['_crash_history_rest_get']('/fapi/v1/klines', bad)
+        with patch.dict(os.environ, {'CRASH_HISTORY_REST_LAST_RESORT_ENABLED':'0'}):
+            with self.assertRaisesRegex(RuntimeError,'HISTORY_BINANCE_REST_DISABLED'):
+                self.g['_crash_history_rest_get']('/fapi/v1/klines', params)
+        self.g['requests'].get.assert_not_called()
+
+    def test_scoped_history_obeys_existing_ban_and_budget(self):
+        self.response(status=200, data=[])
+        params = {'symbol':'ONUSDT', 'interval':'15m', 'limit':1,
+                  'startTime':1800000000000, 'endTime':1800000900000-1}
+        with patch.dict(os.environ, {'CRASH_RESEARCH_REST_ENABLED':'0'}):
+            self.g['_crash_cooldown_until'] = self.now + 120
+            with self.assertRaisesRegex(RuntimeError, 'cooldown'):
+                self.g['_crash_history_rest_get']('/fapi/v1/klines', params)
+            self.g['_crash_cooldown_until'] = 0
+            self.g['_CRASH_IP_BUDGET'].reserve.side_effect = RuntimeError('budget')
+            with self.assertRaisesRegex(RuntimeError,'budget'):
+                self.g['_crash_history_rest_get']('/fapi/v1/klines', params)
+        self.g['requests'].get.assert_not_called()
 
     def test_endpoint_allowlist_and_cooldown_corruption_fail_closed(self):
         with self.assertRaises(ValueError): self.g['_crash_public_get']('/fapi/v1/ticker/price')
