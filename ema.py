@@ -8245,6 +8245,16 @@ def _crash_bounce_worker():
         sheets_publisher = DashboardPublisher(DATA_DIR, log, _crash_v2_validate_entry)
     except Exception as error:
         log(f'[CRASH SHEETS SETUP SKIPPED] {type(error).__name__}')
+    # Prospective 7-day scalp research: existing CLOSED WS candles only,
+    # independent paper outcomes, no REST/orders/new WS subscriptions.
+    scalp_shadow = None
+    if os.getenv("SCALP_SHADOW_ENABLED", "1") == "1":
+        try:
+            from scalp_shadow_week import ShadowWeek
+            scalp_shadow = ShadowWeek(DATA_DIR, log)
+            log("[SCALP SHADOW] paper monitor ready; no REST, no trades")
+        except Exception as error:
+            log(f"[SCALP SHADOW SETUP] skipped: {type(error).__name__}")
     try:
         _crash_start_shadow()
     except Exception as error:
@@ -8339,6 +8349,13 @@ def _crash_bounce_worker():
                                           _CRASH_NIGHT, _CRASH_WS_CACHE.health(time.time()))
             except Exception as error:
                 log(f'[CRASH SHEETS SCHEDULE SKIPPED] {type(error).__name__}')
+        # Never hold the trading lock or stall the 3-minute V2 scan.
+        if scalp_shadow is not None:
+            try:
+                scalp_shadow.tick(_CRASH_WS_CACHE.snapshot(time.time()),
+                                  _CRASH_WS_CACHE.candles)
+            except Exception as error:
+                log(f"[SCALP SHADOW SCHEDULE] skipped: {type(error).__name__}")
         time.sleep(max(1,min(15,next_scan-time.time())))
 
 
