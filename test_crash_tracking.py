@@ -94,15 +94,15 @@ class TrackingTests(unittest.TestCase):
 
     def test_timeout_is_not_retroactive_tp_after_deadline(self):
         self.sample(180,.99)
-        self.sample(24*3600+1,1.05)
+        self.sample(180+150*3600+1,1.05)
         self.assertEqual(self.r['tracking_status'],'TIMEOUT')
         self.assertGreater(self.r['coverage_gaps'],0)
         self.assertEqual(self.r['observed_exit_price'],.99)
 
-    def test_active_record_stops_24_hours_from_candidate(self):
+    def test_active_open_record_can_hit_tp_after_24_hours(self):
         self.sample(180,.99)
         self.sample(24*3600+1,1.02)
-        self.assertEqual(self.r['tracking_status'],'TIMEOUT')
+        self.assertEqual(self.r['tracking_status'],'TP')
 
     def test_unsupported_wait_is_filtered_but_existing_open_is_preserved(self):
         self.r['symbol']='牛来USDT'
@@ -125,6 +125,7 @@ class TrackingTests(unittest.TestCase):
         self.assertTrue(any(x['symbol']=='BUSDT' for x in records))
         self.assertEqual(report['legacy_7d_cohort']['signals'],1)
         self.assertEqual(report['tracking_hours'],24)
+        self.assertEqual(report['post_entry_tracking_hours'],150)
 
     def test_stale_missing_prices_and_gap_markers(self):
         self.g['_crash_track_results'](self.state,[{'symbol':'AUSDT','lastPrice':'.99',
