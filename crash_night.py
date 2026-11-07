@@ -1067,6 +1067,7 @@ class NightExecutor:
             'DAILY_LIMIT': 'Günlük giriş sınırı doldu.',
             'EXISTING_ORDER': 'Aynı coin için mevcut giriş/pozisyon kaydı var.',
             'SIGNAL_EXPIRED': 'Girişin 120 saniyelik geçerlilik süresi doldu.',
+            'SIGNAL_CANDIDATE_EXPIRED': 'Sinyal adayı oluşturulalı 120 saniyeyi geçti.',
             'SIGNAL_EXPIRED_AFTER_PREFLIGHT': 'Ön kontrol sırasında sinyalin süresi doldu.',
             'QUEUE_FULL': 'Otomatik giriş kuyruğu dolu.',
             'SYMBOL_QUARANTINED': 'Coin karantinada; kalan emirler kontrol ediliyor.',
@@ -1110,6 +1111,8 @@ class NightExecutor:
             'SYMBOL_QUARANTINED' if symbol in self.state['symbol_quarantine'] else
             'ALERT_PENDING' if self.state['outbox'] else
             'SIGNAL_EXPIRED' if not 0 <= now-observed_at <= 120 or observed_at < self.started else
+            'SIGNAL_CANDIDATE_EXPIRED' if isinstance(record.get('created_at'), (int, float))
+                and not 0 <= now-record['created_at'] <= 120 else
             'V2_NOT_APPROVED' if record.get('v2_status') != 'STRONG_V2'
                 or record.get('v2_sent') is not True else
             'TRACKING_INACTIVE' if record.get('tracking_status') not in ('WAIT_ENTRY', 'OPEN') else
@@ -1170,6 +1173,8 @@ class NightExecutor:
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
         if (not self.enabled.is_set() or not 0 <= now-observed_at <= 120
+                or (isinstance(record.get('created_at'), (int, float))
+                    and not 0 <= now-record['created_at'] <= 120)
                 or entry_block_reason(record) is not None
                 or position_fraction(record) != fraction):
             self.entry_skip(symbol, 'SIGNAL_EXPIRED_AFTER_PREFLIGHT'
