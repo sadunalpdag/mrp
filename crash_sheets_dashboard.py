@@ -24,7 +24,10 @@ HEADERS = [
     "Giriş", "TP", "Giriş uzaklık %", "Risk /3", "Zayıf hacim",
     "RSI/EMA düşüyor", "Tekrar düşük sinyal", "Pozisyon kuralı",
     "Uygunluk", "Sinyal takibi", "Güncelleme", "Sinyal zamanı",
-    "Trend kırılımı (15m)", "Üst çizgi uzaklık %", "Kırılım onay zamanı",
+    "Trend kırılımı (5g / 15m)", "Üst çizgi uzaklık %", "Kırılım onay zamanı",
+    "Kırılım yönü", "5g veri (15m)", "Destek 1 (5g)", "Direnç 1 (5g)",
+    "Fibo 0 dip", "Fibo 23,6", "Fibo 38,2", "Fibo 50",
+    "Fibo 61,8", "Fibo 78,6", "Fibo 100 tepe", "Fibo bandı",
 ]
 FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
 PARIS = ZoneInfo("Europe/Paris")
@@ -82,7 +85,7 @@ def _status(rec, risk):
         return "🟡 VERİ BEKLENİYOR", "yellow"
     return "🔴 V2 UYGUN DEĞİL", "red"
 
-def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None, candle_get=None):
+def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None, candle_get=None, directory=None):
     """Pure data preparation; unknown measurements remain blank, never invented."""
     score_cache = score_cache or {}
     symbols = state.get("symbols") or {}
@@ -140,12 +143,15 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         tp = _num(rec.get("tp")) if has_signal else None
         dist = round((price / entry - 1) * 100, 2) if price and entry and entry > 0 else "—"
         status, color = _status(rec if has_signal else None, risk)
-        trend = {"status": "VERİ YOK", "distance_pct": None, "confirmed_at": None}
+        trend = {"status": "VERİ YOK", "direction": "—", "coverage": "0/480",
+                 "distance_pct": None, "confirmed_at": None,
+                 "support": None, "resistance": None, "fib": {}, "fib_band": "—"}
         if callable(candle_get):
             try:
-                from crash_trend_channel import analyze
-                # Cached CLOSED candles only; never request history or market data.
-                trend = analyze(candle_get(sym), now)
+                from crash_levels_5d import analyze, load_cached
+                # Cached five-day local research + existing closed WS bars ONLY.
+                # No archive requests, no Binance calls, and no entry impact.
+                trend = analyze(load_cached(directory or "", sym, candle_get(sym), now), now)
             except Exception:
                 pass
         trend_status = trend["status"]
@@ -171,6 +177,12 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
             _time(now), _time(rec.get("created_at")) if has_signal else "—",
             trend_label, trend["distance_pct"] if trend["distance_pct"] is not None else "—",
             _time(trend["confirmed_at"]),
+            trend["direction"], trend["coverage"],
+            trend["support"] if trend["support"] is not None else "—",
+            trend["resistance"] if trend["resistance"] is not None else "—",
+            *[(trend["fib"].get(k) if trend["fib"].get(k) is not None else "—")
+              for k in ("0", "23.6", "38.2", "50", "61.8", "78.6", "100")],
+            trend["fib_band"],
         ])
         colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk == 2 else 'red'))
     history = state.get("history") or []
@@ -267,6 +279,9 @@ def _format(sheet, status, signal, colors, signal_rows):
                       "yellow" if trend_status.startswith("🟡") else
                       "red" if trend_status.startswith("🔴") else "grey")
         extra.append((22, trend_tone))
+        direction_tone = ("green" if data[25] == "YUKARI" else
+                          "red" if data[25] == "AŞAĞI" else "grey")
+        extra.append((25, direction_tone))
         distance_to_upper = _num(data[23])
         if distance_to_upper is not None:
             extra.append((23, "green" if trend_tone == "green" else
@@ -302,7 +317,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
         return False
     sheet = client.open_by_key(sheet_id)
     status, signal = _tabs(sheet)
-    # Previously the dashboard owned A:V; expand only if fewer than 25 columns.
+    # Expand only the existing Sinyal tab; never create or delete worksheets.
     if getattr(signal, "col_count", len(HEADERS)) < len(HEADERS):
         sheet.batch_update({"requests": [{"updateSheetProperties": {
             "properties": {"sheetId": signal.id,
@@ -311,13 +326,19 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     os.makedirs(directory, exist_ok=True)
     prev_path = os.path.join(directory, "crash_sheets_score_previous.json")
     status_rows, signal_rows, colors, previous = build_rows(
-        state, tickers, trading, ws, now, _read_previous(prev_path), rescore, candle_get)
+        state, tickers, trading, ws, now, _read_previous(prev_path), rescore, candle_get, directory)
     # Update only panel-owned rectangular ranges. Old worksheets and other data untouched.
     status_rows = status_rows + [["", ""]] * max(0, 26 - len(status_rows))
     signal_rows = signal_rows + [[""] * len(HEADERS)] * max(0, MAX_ROWS + 1 - len(signal_rows))
+    def column_letter(n):
+        letters = ""
+        while n:
+            n, rem = divmod(n - 1, 26)
+            letters = chr(65 + rem) + letters
+        return letters
     sheet.values_batch_update({"valueInputOption": "RAW", "data": [
         {"range": "'" + status.title.replace("'", "''") + "'!A1:B26", "values": status_rows},
-        {"range": "'" + signal.title.replace("'", "''") + "'!A1:Y61", "values": signal_rows},
+        {"range": "'" + signal.title.replace("'", "''") + "'!A1:" + column_letter(len(HEADERS)) + str(MAX_ROWS + 1), "values": signal_rows},
     ]})
     _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
