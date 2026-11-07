@@ -61,12 +61,26 @@ def _name(title):
     return re.sub(r"[^a-z0-9]", "", str(title).lower())
 
 def _risk(rec):
-    item = rec.get("failure_shadow") or {}
-    flags = item.get("flags") if isinstance(item, dict) else None
-    if not isinstance(flags, dict) or any(type(flags.get(k)) is not bool for k in FLAGS):
-        return None, ["?"] * 3, "EKSİK: otomatik alış yok"
-    count = sum(flags[k] for k in FLAGS)
-    marks = ["🔴 VAR" if flags[k] else "🟢 YOK" for k in FLAGS]
+    original = rec.get("failure_shadow")
+    live = original.get("flags") if isinstance(original, dict) else None
+    live = live if isinstance(live, dict) else {}
+    late = rec.get("late_failure_shadow")
+    from crash_failure_shadow import VERSION
+    late_flags = (late.get("flags") if isinstance(late, dict)
+                  and late.get("version") == VERSION else None)
+    late_flags = late_flags if isinstance(late_flags, dict) else {}
+    # Preserve every known live label. Late signal-time research may fill
+    # unknown DISPLAY labels, but never makes an unknown live BUY admissible.
+    flags = {k: (live[k] if type(live.get(k)) is bool else
+                 late_flags.get(k) if type(late_flags.get(k)) is bool else None)
+             for k in FLAGS}
+    marks = ["🔴 VAR" if flags[k] is True else
+             "🟢 YOK" if flags[k] is False else "?" for k in FLAGS]
+    if any(type(flags[k]) is not bool for k in FLAGS):
+        return None, marks, "EKSİK: otomatik alış yok"
+    count = sum(flags.values())
+    if any(type(live.get(k)) is not bool for k in FLAGS):
+        return count, marks, "📋 SONRADAN ANALİZ; OTOMATİK ALIŞ YOK"
     rule = ("⛔ İŞLEM YOK" if count == 3 else
             "⚖️ %50 / TP %0,5" if count == 2 else "✅ %100 / TP %1")
     return count, marks, rule
@@ -81,14 +95,20 @@ def _status(rec, risk):
     if not rec:
         return "⚪ SİNYAL YOK", "grey"
     v2 = rec.get("v2_status")
-    if risk == 3 or risk is None and v2 == "STRONG_V2":
-        return "🔴 ALIŞ YOK (RİSK)", "red"
-    if v2 == "STRONG_V2" and risk is not None:
-        return ("🟢 V2 ONAYLI" if risk <= 1 else "🟡 V2 / YARIM"), ("green" if risk <= 1 else "yellow")
     if v2 == "PENDING_5D_HISTORY":
         return "🟡 VERİ BEKLENİYOR", "yellow"
     if v2 == "MISSING_5D_HISTORY":
         return "🟡 VERİ EKSİK – DEĞERLENDİRİLEMEDİ", "yellow"
+    if v2 == "STRONG_V2":
+        original = rec.get("failure_shadow")
+        live = original.get("flags") if isinstance(original, dict) else None
+        if (not isinstance(live, dict)
+                or any(type(live.get(k)) is not bool for k in FLAGS)):
+            return "🔴 ALIŞ YOK (RİSK EKSİK)", "red"
+        if risk == 3:
+            return "🔴 ALIŞ YOK (RİSK)", "red"
+        if risk is not None:
+            return ("🟢 V2 ONAYLI" if risk <= 1 else "🟡 V2 / YARIM"), ("green" if risk <= 1 else "yellow")
     return "🔴 V2 UYGUN DEĞİL", "red"
 
 
