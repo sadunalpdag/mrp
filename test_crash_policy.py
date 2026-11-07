@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
-from crash_policy import TRACKING_SECONDS, supported_symbol, prune_active_state
+from crash_policy import TRACKING_SECONDS, POST_ENTRY_TRACKING_SECONDS, supported_symbol, prune_active_state
 from crash_live_v2 import advance_trade, MODEL
 from crash_history import HistoryCollector
 
@@ -15,28 +15,37 @@ class PolicyTests(unittest.TestCase):
                     created_at=100.,entry='1',tp='1.01',reference_low='.95',
                     previous_watch_price=.99)
 
-    def test_late_entry_does_not_restart_24h_timer(self):
+    def test_unresolved_open_trade_tracks_tp_after_24h(self):
         r=self.record(); t=100+23*3600
         r.update(ws_last_event_at=t-1,ws_last_trade_id=1)
         self.assertEqual(advance_trade(r,1,t,2),'OPEN')
-        self.assertIsNone(advance_trade(r,1.02,100+24*3600,3))
-        self.assertEqual(r['tracking_status'],'OPEN')
+        self.assertEqual(advance_trade(r,1.02,100+24*3600+2,3),'TP')
+        self.assertEqual(r['tracking_status'],'TP')
+
+    def test_open_trade_closes_virtual_window_after_150h_from_entry(self):
+        r=self.record();t=100+23*3600
+        r.update(ws_last_event_at=t-1,ws_last_trade_id=1)
+        self.assertEqual(advance_trade(r,1,t,2),'OPEN')
+        self.assertIsNone(advance_trade(r,1.02,t+POST_ENTRY_TRACKING_SECONDS,3))
+        self.assertEqual(r['tracking_status'],'OPEN') # timer loop owns TIMEOUT
 
     def test_prune_after_24h_preserves_recent_signal(self):
         old=self.record()
         new=dict(old,signal_id='recent',created_at=101.,tracking_status='WAIT_ENTRY')
-        state={'history':[old,new], 'symbols':{'OLDUSDT':old,'NEWUSDT':new}}
+        old_open=dict(old,signal_id='open',tracking_status='OPEN',entered_at=100+3600)
+        state={'history':[old,new,old_open], 'symbols':{
+            'OLDUSDT':old,'NEWUSDT':new,'OPENUSDT':old_open}}
         removed=prune_active_state(state,100+TRACKING_SECONDS)
         self.assertEqual(removed,2)
-        self.assertEqual(state['history'],[new])
-        self.assertEqual(list(state['symbols']),['NEWUSDT'])
+        self.assertEqual(state['history'],[new,old_open])
+        self.assertEqual(list(state['symbols']),['NEWUSDT','OPENUSDT'])
 
     def test_wait_and_open_deadlines(self):
         r=self.record()
         self.assertIsNone(advance_trade(r,1,101+TRACKING_SECONDS,1))
         self.assertNotIn('entered_at',r)
         self.assertEqual(advance_trade(r,1,101,1),'OPEN')
-        self.assertIsNone(advance_trade(r,1.02,102+TRACKING_SECONDS,2))
+        self.assertIsNone(advance_trade(r,1.02,101+POST_ENTRY_TRACKING_SECONDS,2))
         self.assertEqual(r['tracking_status'],'OPEN') # timer loop owns TIMEOUT
 
     def test_old_terminal_result_not_reopened(self):
