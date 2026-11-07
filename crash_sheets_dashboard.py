@@ -24,6 +24,7 @@ HEADERS = [
     "Giriş", "TP", "Giriş uzaklık %", "Risk /3", "Zayıf hacim",
     "RSI/EMA düşüyor", "Tekrar düşük sinyal", "Pozisyon kuralı",
     "Uygunluk", "Sinyal takibi", "Güncelleme", "Sinyal zamanı",
+    "Trend kırılımı (15m)", "Üst çizgi uzaklık %", "Kırılım onay zamanı",
 ]
 FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
 PARIS = ZoneInfo("Europe/Paris")
@@ -81,7 +82,7 @@ def _status(rec, risk):
         return "🟡 VERİ BEKLENİYOR", "yellow"
     return "🔴 V2 UYGUN DEĞİL", "red"
 
-def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None):
+def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None, candle_get=None):
     """Pure data preparation; unknown measurements remain blank, never invented."""
     score_cache = score_cache or {}
     symbols = state.get("symbols") or {}
@@ -139,6 +140,21 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None)
         tp = _num(rec.get("tp")) if has_signal else None
         dist = round((price / entry - 1) * 100, 2) if price and entry and entry > 0 else "—"
         status, color = _status(rec if has_signal else None, risk)
+        trend = {"status": "VERİ YOK", "distance_pct": None, "confirmed_at": None}
+        if callable(candle_get):
+            try:
+                from crash_trend_channel import analyze
+                # Cached CLOSED candles only; never request history or market data.
+                trend = analyze(candle_get(sym), now)
+            except Exception:
+                pass
+        trend_status = trend["status"]
+        trend_label = {
+            "KIRDI": "🟢 KIRDI", "YAKLAŞIYOR": "🟡 YAKLAŞIYOR",
+            "KIRMADI": "🔴 KIRMADI", "SAHTE KIRILIM": "🔴 SAHTE KIRILIM",
+            "KIRILIM BEKLEME": "🟡 KIRILIM BEKLEME",
+            "KANAL YOK": "⚪ KANAL YOK", "VERİ YOK": "⚪ VERİ YOK",
+        }.get(trend_status, "⚪ VERİ YOK")
         if color == "green":
             eligible += 1
         if has_signal:
@@ -153,6 +169,8 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None)
             risk if risk is not None else "—", *flags, rule, status,
             rec.get("tracking_status", "—") if has_signal else "—",
             _time(now), _time(rec.get("created_at")) if has_signal else "—",
+            trend_label, trend["distance_pct"] if trend["distance_pct"] is not None else "—",
+            _time(trend["confirmed_at"]),
         ])
         colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk == 2 else 'red'))
     history = state.get("history") or []
@@ -244,6 +262,15 @@ def _format(sheet, status, signal, colors, signal_rows):
         for j in (14, 15, 16):
             if data[j] in ("🟢 YOK", "🔴 VAR"):
                 extra.append((j, "green" if data[j] == "🟢 YOK" else "red"))
+        trend_status = str(data[22])
+        trend_tone = ("green" if trend_status.startswith("🟢") else
+                      "yellow" if trend_status.startswith("🟡") else
+                      "red" if trend_status.startswith("🔴") else "grey")
+        extra.append((22, trend_tone))
+        distance_to_upper = _num(data[23])
+        if distance_to_upper is not None:
+            extra.append((23, "green" if trend_tone == "green" else
+                          "yellow" if abs(distance_to_upper) <= 0.5 else "grey"))
         for column, tone in [(18, kind), (13, risk_kind)] + extra:
             requests.append({"repeatCell": {"range": {"sheetId": signal.id,
                 "startRowIndex": i, "endRowIndex": i + 1,
@@ -269,30 +296,37 @@ def _write_previous(path, data):
         os.fsync(fh.fileno())
     os.replace(tmp, path)
 
-def publish(state, tickers, trading, ws, now, directory, rescore=None):
+def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_get=None):
     client, sheet_id = _credentials()
     if not client:
         return False
     sheet = client.open_by_key(sheet_id)
     status, signal = _tabs(sheet)
+    # Previously the dashboard owned A:V; expand only if fewer than 25 columns.
+    if getattr(signal, "col_count", len(HEADERS)) < len(HEADERS):
+        sheet.batch_update({"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": signal.id,
+                           "gridProperties": {"columnCount": len(HEADERS)}},
+            "fields": "gridProperties.columnCount"}}]})
     os.makedirs(directory, exist_ok=True)
     prev_path = os.path.join(directory, "crash_sheets_score_previous.json")
     status_rows, signal_rows, colors, previous = build_rows(
-        state, tickers, trading, ws, now, _read_previous(prev_path), rescore)
+        state, tickers, trading, ws, now, _read_previous(prev_path), rescore, candle_get)
     # Update only panel-owned rectangular ranges. Old worksheets and other data untouched.
     status_rows = status_rows + [["", ""]] * max(0, 26 - len(status_rows))
     signal_rows = signal_rows + [[""] * len(HEADERS)] * max(0, MAX_ROWS + 1 - len(signal_rows))
     sheet.values_batch_update({"valueInputOption": "RAW", "data": [
         {"range": "'" + status.title.replace("'", "''") + "'!A1:B26", "values": status_rows},
-        {"range": "'" + signal.title.replace("'", "''") + "'!A1:V61", "values": signal_rows},
+        {"range": "'" + signal.title.replace("'", "''") + "'!A1:Y61", "values": signal_rows},
     ]})
     _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
     return True
 
 class DashboardPublisher:
-    def __init__(self, directory, logger, rescore=None):
+    def __init__(self, directory, logger, rescore=None, candle_get=None):
         self.directory, self.logger, self.rescore = directory, logger, rescore
+        self.candle_get = candle_get
         self.lock = threading.Lock()
         self.next_due = 0.0
 
@@ -326,7 +360,7 @@ class DashboardPublisher:
         def writer():
             try:
                 if publish({"symbols": symbols, "history": recent}, copied_tickers,
-                           trading, copied_ws, now, self.directory, self.rescore):
+                           trading, copied_ws, now, self.directory, self.rescore, self.candle_get):
                     self.logger("[CRASH SHEETS] Bot Status / Sinyal updated")
             except Exception as exc:
                 # Never log service-account JSON or raw Google error response.

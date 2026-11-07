@@ -8270,7 +8270,9 @@ def _crash_bounce_worker():
     sheets_publisher = None
     try:
         from crash_sheets_dashboard import DashboardPublisher
-        sheets_publisher = DashboardPublisher(DATA_DIR, log, _crash_v2_validate_entry)
+        # Existing in-memory, closed 15m WS candles. No REST, no new subscriptions.
+        sheets_publisher = DashboardPublisher(DATA_DIR, log, _crash_v2_validate_entry,
+                                               _CRASH_WS_CACHE.candles)
     except Exception as error:
         log(f'[CRASH SHEETS SETUP SKIPPED] {type(error).__name__}')
     # Prospective 7-day scalp research: existing CLOSED WS candles only,
