@@ -8355,6 +8355,7 @@ def _crash_bounce_worker():
     market, refreshed = _crash_load_market_cache()
     next_metadata = refreshed + 86400 if market else 0
     next_scan = 0
+    next_late_risk = 0
     threading.Thread(target=_crash_trade_consumer,
                      name="crash-trade-consumer",daemon=True).start()
     _CRASH_WS_CACHE.start()
@@ -8468,6 +8469,18 @@ def _crash_bounce_worker():
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")
             next_scan = max(next_scan, time.time()+60)
+        # Retrospective-only label recovery. Never changes failure_shadow,
+        # V2 delivery status, the safety gate, or an exchange order.
+        risk_now = time.time()
+        if state is not None and risk_now >= next_late_risk:
+            next_late_risk = risk_now + 60
+            try:
+                from crash_late_risk import refresh_late_risk
+                with _CRASH_STATE_LOCK:
+                    refresh_late_risk(state, risk_now, _crash_v2_validate_entry,
+                                      _crash_save_state, log)
+            except Exception as error:
+                log(f'[CRASH LATE RISK SKIPPED] {type(error).__name__}')
         # Sheets publishing is read-only, asynchronous, 5-minute and fail-open.
         # It never requests Binance data or modifies execution/trading state.
         if sheets_publisher is not None and state is not None:
