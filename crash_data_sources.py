@@ -173,6 +173,12 @@ class DataSources:
         gaps=missing()
         recheck=bool(old_alternates and self.clock()>=self.binance_recheck.get(symbol,0))
         work=gaps if gaps else (old_alternates if recheck else [])
+        # The last CLOSED candle is mandatory for V2. If only one or two
+        # timestamps remain absent after WS/archive/Bybit/Coinbase, use any
+        # permitted Binance REST last-resort allowance for that precise bar
+        # before spending it on an older gap. Never synthesize a candle.
+        if gaps and len(gaps) <= 2 and end-STEP in gaps:
+            work=[end-STEP]
         if work and not self.allow_binance_rest:
             self.log(f'[CRASH DATA REST SKIPPED] {symbol}; research Binance REST disabled; '
                      'WS/cache/archive/Bybit/Coinbase only; account+TP preserved')
