@@ -114,6 +114,28 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(event['closed_15m_ohlcv'][-1][0], end-STEP)
         self.fetch.assert_not_called()
 
+    def test_signal_priority_lasts_full_280_second_grace(self):
+        from crash_history import SIGNAL_URGENT_REPAIR_WINDOW_SECONDS
+        self.assertEqual(SIGNAL_URGENT_REPAIR_WINDOW_SECONDS, 280)
+        t = self.job['as_of'] + 200
+        self.worker.submit({'symbol': 'TESTUSDT', 'signal_id': 'signal-new'},
+                           'signal', self.job['as_of'])
+        self.worker.submit({'symbol': 'OTHERUSDT', 'signal_id': 'warmup:other'},
+                           'warmup', self.job['as_of']+1)
+        self.worker.collect = Mock(return_value={
+            'complete': True, 'candle_count': 480, 'data_sources': {}})
+        self.worker.step(now=t)
+        self.assertEqual(self.worker.collect.call_args.args[0]['phase'], 'signal')
+
+    def test_incomplete_fresh_signal_retries_before_grace_expires(self):
+        from types import SimpleNamespace
+        self.worker.resolver = SimpleNamespace(resolve=lambda *args: [])
+        self.worker.submit({'symbol': 'TESTUSDT', 'signal_id': 'signal-new'},
+                           'signal', self.job['as_of'])
+        now = self.job['as_of'] + 10
+        self.worker.step(now=now)
+        self.assertEqual(self.worker.jobs['signal-new:signal']['retry_after'], now+60)
+
     def test_download_budget_still_blocks_missing_history(self):
         self.worker.attempts = [100] * 18
         self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
