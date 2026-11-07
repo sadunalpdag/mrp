@@ -100,6 +100,20 @@ class HistoryTests(unittest.TestCase):
         self.emit.assert_not_called()
         self.assertEqual(self.worker.jobs['test:signal']['retry_after'], 1000)
 
+    def test_urgent_last_candle_repair_still_runs_after_200_seconds(self):
+        end = int(self.job['as_of']*1000)//STEP*STEP
+        self.worker._write(self.tmp.name+'/TESTUSDT.json',
+                           rows(end-480*STEP, 479))
+        self.worker.next_download = self.job['as_of'] + 500
+        repair = Mock(return_value=rows(end-STEP, 1))
+        self.worker.urgent_repair = repair
+        event = self.worker.collect(self.job,
+                                    scheduled_at=self.job['as_of'] + 200)
+        repair.assert_called_once()
+        self.assertEqual(event['candle_count'], 480)
+        self.assertEqual(event['closed_15m_ohlcv'][-1][0], end-STEP)
+        self.fetch.assert_not_called()
+
     def test_download_budget_still_blocks_missing_history(self):
         self.worker.attempts = [100] * 18
         self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
