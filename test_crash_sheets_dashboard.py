@@ -93,7 +93,7 @@ class SheetDashboardTests(unittest.TestCase):
         rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
                    v2_features={"candles": 455,
                                 "missing_reason": "TOO_FEW_5D_CANDLES"})
-        with patch("crash_levels_5d.load_cached", return_value=[]), \\
+        with patch("crash_levels_5d.load_cached", return_value=[]), patch(
                 patch("crash_levels_5d.analyze", return_value={
                     "status": "VERİ YOK", "direction": "—", "coverage": "479/480",
                     "distance_pct": None, "confirmed_at": None, "support": None,
