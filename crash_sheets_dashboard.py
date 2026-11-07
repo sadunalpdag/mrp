@@ -15,6 +15,9 @@ from zoneinfo import ZoneInfo
 
 INTERVAL = 300
 MAX_ROWS = 60
+# User-confirmed EMA Filter workbook link; independent of legacy GOOGLE_SHEETS_ID.
+# Only this dashboard uses this key. Optional override is deliberate and explicit.
+DEFAULT_EMA_FILTER_ID = "1qJ1rcmmAdhhELmdzUovYq1n1UIF5lxdCb1lT3CDPF58"
 HEADERS = [
     "Coin", "24s değişim %", "Düşüş sırası", "Son fiyat", "V2 durumu",
     "RSI14", "4s toparlanma %", "Güç /100", "Önceki güç", "Puan farkı",
@@ -187,7 +190,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None)
 
 def _credentials():
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    sheet_id = os.environ.get("GOOGLE_SHEETS_ID", os.environ.get("GOOGLE_SHEET_ID", "")).strip()
+    sheet_id = (os.environ.get("CRASH_SHEETS_TARGET_ID") or DEFAULT_EMA_FILTER_ID).strip()
     if not raw or not sheet_id:
         return None, None
     from google.oauth2.service_account import Credentials
@@ -294,8 +297,7 @@ class DashboardPublisher:
         self.next_due = 0.0
 
     def tick(self, state, tickers, executor, ws):
-        if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or not (
-            os.environ.get("GOOGLE_SHEETS_ID") or os.environ.get("GOOGLE_SHEET_ID")):
+        if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
             return
         now = time.time()
         if now < self.next_due or not self.lock.acquire(blocking=False):
