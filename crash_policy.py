@@ -2,8 +2,25 @@
 import re
 import math
 
-# A candidate is followed for no more than 24h from its ORIGINAL creation.
+# Unfilled candidates expire 24h after creation; virtual OPEN trades retain
+# the pre-existing 150h post-entry TP/drawdown observation window.
 TRACKING_SECONDS = 24 * 3600
+POST_ENTRY_TRACKING_SECONDS = 150 * 3600
+
+
+def is_active_candidate(record, now):
+    """Still waiting for entry (<24h), or entered and still awaiting TP."""
+    if not isinstance(record, dict):
+        return False
+    created = record.get("created_at")
+    if (not isinstance(created, (int, float)) or isinstance(created, bool)
+            or not math.isfinite(created) or created > now):
+        return False
+    if record.get("tracking_status") == "OPEN":
+        # Keep even older OPEN records until the tracking loop confirms their
+        # post-entry timeout, never pruning them before timeout assessment.
+        return True
+    return 0 <= now-created < TRACKING_SECONDS
 
 def prune_active_state(state, now):
     """Discard expired Crash V2 candidates, not real exchange order state.
@@ -11,17 +28,10 @@ def prune_active_state(state, now):
     The executor owns actual open orders separately. Shared five-day OHLCV
     caches are intentionally retained to avoid repeatedly downloading bars.
     """
-    def fresh(record):
-        if not isinstance(record, dict):
-            return False
-        at = record.get("created_at")
-        return (isinstance(at, (int, float)) and not isinstance(at, bool)
-                and math.isfinite(at) and 0 <= now-at < TRACKING_SECONDS)
-
     old_history = state.get("history") or []
     old_symbols = state.get("symbols") or {}
-    state["history"] = [rec for rec in old_history if fresh(rec)]
-    state["symbols"] = {s: rec for s, rec in old_symbols.items() if fresh(rec)}
+    state["history"] = [rec for rec in old_history if is_active_candidate(rec, now)]
+    state["symbols"] = {s: rec for s, rec in old_symbols.items() if is_active_candidate(rec, now)}
     return (len(old_history)-len(state["history"]) +
             len(old_symbols)-len(state["symbols"]))
 
