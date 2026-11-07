@@ -25,6 +25,8 @@ class CrashV2Tests(unittest.TestCase):
         result = crash_v2.assess_entry(rows[:-1], [], 2000000000)
         self.assertFalse(result["qualified"])
         self.assertEqual(result["candles"], 479)
+        self.assertEqual(result["missing_reason"], "LAST_CLOSED_CANDLE_MISSING")
+        self.assertFalse(result["latest_closed_present"])
 
     def test_one_or_two_missing_old_candles_are_tolerated_without_imputation(self):
         rows = self.rows(2000000000)
