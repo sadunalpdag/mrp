@@ -72,6 +72,43 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(self.worker._read(
             self.tmp.name+'/TESTUSDT.json', [])),479)
 
+    def test_recent_signal_479_cache_ready_bypasses_download_pacing_and_budget(self):
+        end = int(self.job['as_of']*1000)//STEP*STEP
+        saved = rows(end-480*STEP, 480)
+        self.worker._write(self.tmp.name+'/TESTUSDT.json',
+                           [r for i,r in enumerate(saved) if i != 100])
+        self.worker.next_download = 9999
+        self.worker.attempts = [100] * 18
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=100)
+        self.fetch.assert_not_called()
+        event = self.emit.call_args.args[0]
+        self.assertEqual(event['candle_count'], 479)
+        self.assertFalse(event['complete'])
+        self.assertEqual(event['closed_15m_ohlcv'][-1][0], end-STEP)
+
+    def test_recent_signal_479_without_last_closed_never_bypasses_pacing(self):
+        end = int(self.job['as_of']*1000)//STEP*STEP
+        saved = rows(end-480*STEP, 480)
+        self.worker._write(self.tmp.name+'/TESTUSDT.json', saved[:-1])
+        self.worker.next_download = 1000
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=100)
+        self.fetch.assert_not_called()
+        self.emit.assert_not_called()
+        self.assertEqual(self.worker.jobs['test:signal']['retry_after'], 1000)
+
+    def test_download_budget_still_blocks_missing_history(self):
+        self.worker.attempts = [100] * 18
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=100)
+        self.fetch.assert_not_called()
+        self.emit.assert_not_called()
+        self.assertEqual(self.worker.jobs['test:signal']['retry_after'], 3700)
+
     def test_emit_and_remove_job(self):
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),'signal',self.job['as_of'])
         self.worker.step(now=100)
@@ -92,6 +129,9 @@ class ScheduledHistoryTests(HistoryTests):
         self.assertEqual(self.fetch.call_count,2)
 
     def test_gap_request_does_not_redownload_cached_tail(self):
+        # The paced repair still fetches optional old gaps for background
+        # research; only fresh signal decisions bypass that optional download.
+        self.job['phase'] = 'warmup'
         self.worker.collect(self.job)
         path=self.tmp.name+'/TESTUSDT.json'
         cached=self.worker._read(path,[])

@@ -114,8 +114,25 @@ class HistoryCollector:
         missing = [t for t in expected if t not in cached]
         alternate_cached = any(len(r)>12 and r[12] in ('BYBIT_LINEAR','COINBASE_SPOT')
                            for t,r in cached.items() if start <= t < end)
-        if missing or (alternate_cached and self.resolver is not None):
+        # A signal with 478-480 genuine closed candles is decision-ready only
+        # when the latest closed slot and >=14 of the last 16 slots exist.
+        # Do not delay that signal behind a paced *research* download to fill
+        # optional old gaps or replace reference-venue candles.
+        signal_cache_ready = (job['phase'] == 'signal' and len(missing) <= 2
+            and end-STEP in cached
+            and sum(t in cached for t in range(end-16*STEP, end, STEP)) >= 14)
+        if signal_cache_ready and (missing or alternate_cached):
+            self.log(f"[CRASH HISTORY CACHE READY] {job['symbol']}; "
+                     f"real_candles={COUNT-len(missing)}/480; latest_closed=1; "
+                     "paced_download_bypassed=1")
+        if (missing or (alternate_cached and self.resolver is not None)) and not signal_cache_ready:
             if scheduled_at is not None:
+                # Hourly limit applies ONLY to network work. Cache-only signal
+                # snapshots must remain available even when this budget is full.
+                if len(self.attempts) >= 18:
+                    self.next_download = max(self.next_download,
+                                             min(self.attempts) + 3600)
+                    raise HistoryPacingWait()
                 if scheduled_at < self.next_download:
                     raise HistoryPacingWait()
                 self.next_download = scheduled_at + DOWNLOAD_INTERVAL
@@ -162,8 +179,6 @@ class HistoryCollector:
         if self.blocked() and self.resolver is None:
             return
         self.attempts = [t for t in self.attempts if now-t < 3600]
-        if len(self.attempts) >= 18:
-            return
         with self.lock:
             ready = [(k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now]
             # Current signal checks precede entry research and expired snapshots.
