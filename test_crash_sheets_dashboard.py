@@ -35,7 +35,7 @@ class SheetDashboardTests(unittest.TestCase):
         status, table, colors, previous = self.data()
         row = table[1]
         self.assertEqual(len(row), len(dash.HEADERS))
-        self.assertEqual(len(dash.HEADERS), 37)
+        self.assertEqual(len(dash.HEADERS), 40)
         self.assertEqual(row[22], "⚪ VERİ YOK")
         self.assertEqual(row[26], "0/480")
         self.assertEqual(row[13], 2)
@@ -68,6 +68,41 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(table[1][8], 55)
         self.assertEqual(table[1][9], 3.5)
         self.assertEqual(cache["TESTUSDT"]["score"], 58.5)
+
+    def test_479_latest_missing_is_not_mislabeled_as_failed_v2(self):
+        rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
+                   v2_reason="HISTORY_NOT_READY_IN_TIME",
+                   v2_features={"candles": 479,
+                                "missing_reason": "LAST_CLOSED_CANDLE_MISSING"})
+        rescore = Mock(return_value={"status": "STRONG_V2", "qualified": True,
+                                      "candles": 479})
+        _, table, colors, _ = dash.build_rows(
+            {"symbols": {"TESTUSDT": rec}, "history": [rec]}, self.tickers,
+            {}, {}, self.now, rescore=rescore)
+        row = table[1]
+        self.assertIn("VERİ EKSİK", row[18])
+        self.assertEqual(colors[0][0], "yellow")
+        self.assertEqual(row[37], "479/480")
+        self.assertIn("90 saniye", row[38])
+        self.assertIn("son kapanmış", row[38])
+        self.assertIn("SONRADAN V2 ONAYLI", row[39])
+        self.assertIn("canlı emir yok", row[39])
+        rescore.assert_called_once_with(rec, rec["created_at"])
+
+    def test_479_current_history_is_not_confused_with_signal_time(self):
+        rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
+                   v2_features={"candles": 455,
+                                "missing_reason": "TOO_FEW_5D_CANDLES"})
+        with patch("crash_levels_5d.load_cached", return_value=[]), \
+                patch("crash_levels_5d.analyze", return_value={
+                    "status": "VERİ YOK", "direction": "—", "coverage": "479/480",
+                    "distance_pct": None, "confirmed_at": None, "support": None,
+                    "resistance": None, "fib": {}, "fib_band": "—"}):
+            _, table, _, _ = dash.build_rows(
+                {"symbols": {"TESTUSDT": rec}, "history": [rec]}, self.tickers,
+                {}, {}, self.now, candle_get=lambda _: [], directory="/tmp")
+        self.assertEqual(table[1][26], "479/480")  # current trend window
+        self.assertEqual(table[1][37], "455/480")  # original candidate
 
     def test_no_sheet_deletion_or_creation_on_missing_tab(self):
         book = Mock()
@@ -103,7 +138,7 @@ class SheetDashboardTests(unittest.TestCase):
         batch = book.values_batch_update.call_args.args[0]
         self.assertEqual(len(batch["data"]), 2)
         self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B26")
-        self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:AK61")
+        self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:AN61")
         self.assertEqual(len(batch["data"][1]["values"]), 61)
         self.assertTrue(state_store.called)
         self.assertFalse(book.add_worksheet.called)

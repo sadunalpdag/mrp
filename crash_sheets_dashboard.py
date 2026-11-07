@@ -28,6 +28,8 @@ HEADERS = [
     "Kırılım yönü", "5g veri (15m)", "Destek 1 (5g)", "Direnç 1 (5g)",
     "Fibo 0 dip", "Fibo 23,6", "Fibo 38,2", "Fibo 50",
     "Fibo 61,8", "Fibo 78,6", "Fibo 100 tepe", "Fibo bandı",
+    "Sinyal anı V2 mum", "V2 eksik veri açıklaması",
+    "Sonradan V2 kontrolü (emirsiz)",
 ]
 FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
 PARIS = ZoneInfo("Europe/Paris")
@@ -83,7 +85,45 @@ def _status(rec, risk):
         return ("🟢 V2 ONAYLI" if risk <= 1 else "🟡 V2 / YARIM"), ("green" if risk <= 1 else "yellow")
     if v2 == "PENDING_5D_HISTORY":
         return "🟡 VERİ BEKLENİYOR", "yellow"
+    if v2 == "MISSING_5D_HISTORY":
+        return "🟡 VERİ EKSİK – DEĞERLENDİRİLEMEDİ", "yellow"
     return "🔴 V2 UYGUN DEĞİL", "red"
+
+
+_MISSING_REASONS = {
+    "TOO_FEW_5D_CANDLES": "5 günlük mum sayısı 478 altında",
+    "LAST_CLOSED_CANDLE_MISSING": "Sinyal anındaki son kapanmış 15dk mumu yok",
+    "RECENT_4H_GAPS": "Son 4 saatte 14 mumdan az veri",
+}
+
+
+def _missing_explanation(rec, feat):
+    if rec.get("v2_status") not in ("MISSING_5D_HISTORY", "PENDING_5D_HISTORY"):
+        return "—"
+    cause = _MISSING_REASONS.get(feat.get("missing_reason"), "Veri tamamlanmadı / neden kaydedilmemiş")
+    if rec.get("v2_reason") == "HISTORY_NOT_READY_IN_TIME":
+        return "90 saniye içinde karar verilemedi; " + cause
+    return cause
+
+
+def _retrospective_v2(rec, rescore):
+    """Re-check original event time using cached real candles; NEVER create orders."""
+    if (rec.get("v2_status") != "MISSING_5D_HISTORY" or
+            not callable(rescore) or not _num(rec.get("created_at"))):
+        return "—"
+    try:
+        result = rescore(rec, rec["created_at"])
+        if not isinstance(result, dict):
+            return "—"
+        candles = result.get("candles", "—")
+        if result.get("status") == "STRONG_V2":
+            return f"SONRADAN V2 ONAYLI ({candles}/480); canlı emir yok"
+        if result.get("status") == "FILTERED_V2":
+            return f"SONRADAN FİLTREYİ GEÇMEDİ ({candles}/480); canlı emir yok"
+        reason = _MISSING_REASONS.get(result.get("missing_reason"), "veri hâlâ yetersiz")
+        return f"SONRADAN DA EKSİK ({candles}/480): {reason}"
+    except Exception:
+        return "Tekrar değerlendirme yapılamadı"
 
 def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None, candle_get=None, directory=None):
     """Pure data preparation; unknown measurements remain blank, never invented."""
@@ -143,6 +183,13 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         tp = _num(rec.get("tp")) if has_signal else None
         dist = round((price / entry - 1) * 100, 2) if price and entry and entry > 0 else "—"
         status, color = _status(rec if has_signal else None, risk)
+        # This original-signal snapshot is different from the CURRENT rolling
+        # five-day coverage shown in the trend columns.
+        original_coverage = (f'{v2.get("candles")}/480'
+                             if has_signal and isinstance(v2.get("candles"), int)
+                             else "—")
+        missing_explanation = _missing_explanation(rec, v2) if has_signal else "—"
+        retrospective = _retrospective_v2(rec, rescore) if has_signal else "—"
         trend = {"status": "VERİ YOK", "direction": "—", "coverage": "0/480",
                  "distance_pct": None, "confirmed_at": None,
                  "support": None, "resistance": None, "fib": {}, "fib_band": "—"}
@@ -182,7 +229,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
             trend["resistance"] if trend["resistance"] is not None else "—",
             *[(trend["fib"].get(k) if trend["fib"].get(k) is not None else "—")
               for k in ("0", "23.6", "38.2", "50", "61.8", "78.6", "100")],
-            trend["fib_band"],
+            trend["fib_band"], original_coverage, missing_explanation, retrospective,
         ])
         colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk == 2 else 'red'))
     history = state.get("history") or []
