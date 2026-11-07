@@ -227,7 +227,7 @@ class HistoryCollector:
             ready = [(k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now]
             # Current signal checks precede entry research and expired snapshots.
             ready.sort(key=lambda item: (not (item[1]['phase']=='signal' and
-                0 <= now-item[1]['as_of'] <= 90), item[1]['phase'] != 'warmup', -item[1]['as_of']))
+                0 <= now-item[1]['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS), item[1]['phase'] != 'warmup', -item[1]['as_of']))
             item = ready[0] if ready else None
         if item is None:
             return
