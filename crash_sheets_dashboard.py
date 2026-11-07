@@ -151,7 +151,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None)
             rec.get("tracking_status", "—") if has_signal else "—",
             _time(now), _time(rec.get("created_at")) if has_signal else "—",
         ])
-        colors.append(color)
+        colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk == 2 else 'red'))
     history = state.get("history") or []
     since = now - 86400
     recent = [r for r in history if isinstance(r, dict) and (_num(r.get("created_at")) or 0) > since]
@@ -221,8 +221,8 @@ def _format(sheet, status, signal, colors):
             "cell": {"userEnteredFormat": {"backgroundColor": COLORS["header"],
                 "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
             "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat"}})
-    for i, kind in enumerate(colors, start=1):
-        for column, tone in ((18, kind), (13, "red" if kind == "red" else "yellow" if kind == "yellow" else "green")):
+    for i, (kind, risk_kind) in enumerate(colors, start=1):
+        for column, tone in ((18, kind), (13, risk_kind)):
             requests.append({"repeatCell": {"range": {"sheetId": signal.id,
                 "startRowIndex": i, "endRowIndex": i + 1,
                 "startColumnIndex": column, "endColumnIndex": column + 1},
@@ -292,7 +292,7 @@ class DashboardPublisher:
                 trading = {
                     "auto": "AÇIK" if executor.enabled.is_set() else "KAPALI",
                     "halt": executor.state.get("halt"),
-                    "open": sum(o.get("phase") not in ("TP_FILLED", "ENTRY_CANCELLED", "ENTRY_REJECTED")
+                    "open": sum(o.get("phase") not in ("DONE", "NO_FILL", "CLOSED_EXTERNALLY", "ENTRY_NOT_FOUND_FLAT")
                         for o in list(executor.state.get("orders", {}).values())),
                     "daily": executor.daily_count(), "max_daily": executor.max_daily,
                     "max_symbols": executor.max_symbols, "amount": str(executor.position_usdt),
