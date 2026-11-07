@@ -52,18 +52,33 @@ class ShadowWeekTests(unittest.TestCase):
         now = 56 * sw.STEP_MS / 1000
         sample = candles(55)
         tickers = [{"symbol": "A" + str(i) + "USDT",
-                    "priceChangePercent": str(-20+i),
-                    "quoteVolume": str(1000-i)} for i in range(25)]
+                    "priceChangePercent": str(50-i),
+                    "quoteVolume": str(1000-i)} for i in range(35)]
         calls = []
         def getter(symbol):
             calls.append(symbol)
             return sample
         with tempfile.TemporaryDirectory() as td:
             obj = sw._scan(td, tickers, getter, now, {"signals": []})
-        self.assertLessEqual(len(obj["sampled_coins"]), sw.MAX_SYMBOLS)
+        self.assertEqual(len(obj["sampled_coins"]["PULLBACK"]), sw.MAX_SYMBOLS)
+        self.assertEqual(len(obj["sampled_coins"]["BREAK_BOUNCE"]), sw.MAX_SYMBOLS)
+        self.assertEqual(set(calls), {"A" + str(i) + "USDT" for i in range(10, 30)})
         self.assertEqual(len(calls), 20)
         self.assertEqual(len(obj["signals"]), 0)
         self.assertEqual(len(sw._tab_values(obj, "PULLBACK")), 57)
+
+    def test_exact_gainer_bands_without_backfill_and_market_filter(self):
+        tickers = [{"symbol": f"A{i:02}USDT", "priceChangePercent": str(40 - i)}
+                   for i in range(34)]
+        self.assertEqual(sw.gainer_groups(tickers)["PULLBACK"],
+                         [f"A{i:02}USDT" for i in range(10, 20)])
+        self.assertEqual(sw.gainer_groups(tickers)["BREAK_BOUNCE"],
+                         [f"A{i:02}USDT" for i in range(20, 30)])
+        allowed = {f"A{i:02}USDT" for i in range(26)}
+        selected = sw.gainer_groups(tickers, allowed)
+        self.assertEqual(selected["BREAK_BOUNCE"],
+                         [f"A{i:02}USDT" for i in range(20, 26)])
+        self.assertNotIn("A30USDT", selected["BREAK_BOUNCE"])
 
     def test_four_missing_true_candles_allowed_but_five_rejected(self):
         now = 57 * sw.STEP_MS / 1000
