@@ -6985,7 +6985,7 @@ def _crash_initialize_tracking(record):
 
 
 def _crash_track_results(state, tickers, now):
-    from crash_policy import TRACKING_SECONDS, supported_symbol
+    from crash_policy import TRACKING_SECONDS, POST_ENTRY_TRACKING_SECONDS, supported_symbol
     prices = {}
     for ticker in tickers:
         try:
@@ -7008,13 +7008,15 @@ def _crash_track_results(state, tickers, now):
         if status not in ("WAIT_ENTRY", "OPEN"):
             # Continue research trajectories after TP, for alternate TP/SL tests.
             price = prices.get(record["symbol"])
-            if status != "LEGACY_UNKNOWN" and price is not None and now-record["created_at"] <= 14*86400:
+            if status != "LEGACY_UNKNOWN" and price is not None and now-record["created_at"] < TRACKING_SECONDS:
                 active_samples.append({"signal_id":record["signal_id"], "symbol":record["symbol"],
                                        "price":price, "status":status, "after_result":True})
             continue
+        # Entry wait is 24h; an OPEN virtual trade keeps its original 150h TP window.
         since = record.get("entered_at", record["created_at"])
-        deadline = since + TRACKING_SECONDS
-        if now > deadline:
+        deadline = (since + POST_ENTRY_TRACKING_SECONDS if status == "OPEN"
+                    else record["created_at"] + TRACKING_SECONDS)
+        if now >= deadline:
             record["tracking_status"] = "NO_ENTRY_OBSERVED" if status == "WAIT_ENTRY" else "TIMEOUT"
             record["finished_at"] = deadline
             record["observed_exit_price"] = record.get("last_observed_price")
@@ -7178,7 +7180,7 @@ def _crash_daily_report(state, now):
                  "Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
                  "giriş öncesi dip kırılırsa INVALIDATED_BEFORE_ENTRY. Eski sampled_limit_touch_v1 kayıtları "
                  "değiştirilmez: fiyat <= giriş sanal giriş sayılır. Modelleri ayrı karşılaştırın. "
-                 "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme ve giriş sonrası takip ayrı ayrı 150h. ZIP son 14 günü içerir; özet son 7 gündür. Eski TIMEOUT sonuçları yeniden açılmaz. "
+                 "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme 24h; giriş yapan sanal TP/düşüş takibi ayrıca 150h. Gerçek borsa pozisyonları bağımsız korunur. Eski TIMEOUT sonuçları yeniden açılmaz. "
                  "Gerçek emir, komisyon, kayma, funding ve kaldıraç modellenmez. "
                  "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
                  "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
@@ -7197,7 +7199,7 @@ def _crash_daily_report(state, now):
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("report.json", json.dumps({"schema_version":5,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
-                "tracking_hours":150, "export_days":14,
+                "tracking_hours":24, "post_entry_tracking_hours":150, "export_days":14,
                 "rolling_7d_cohort":rolling,
                 "five_day_context_daily":summarize_context(daily),
                 "five_day_context_rolling":summarize_context(filtered),
@@ -7222,7 +7224,7 @@ def _crash_daily_report(state, now):
                 archive.write(ai_market_path, 'ai_market/top_gainers_state.json')
             archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
-            # Cover 150h entry wait plus 150h after entry (12.5 days).
+            # Archived observation files remain available for audit/research.
             for offset in range(15):
                 day = datetime.fromtimestamp(now-offset*86400, tz=timezone.utc).strftime("%Y-%m-%d")
                 source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
@@ -7775,8 +7777,12 @@ def _crash_load_market_cache():
 
 def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
     import os  # self-contained for isolated Crash V2 regression harness
-    from crash_policy import supported_symbol, TRACKING_SECONDS
+    from crash_policy import supported_symbol, TRACKING_SECONDS, prune_active_state
     now = time.time() if now is None else now
+    # Expire both paper signals and their active symbol pointers. Real exchange
+    # orders are owned by the independent NightExecutor state and untouched.
+    if prune_active_state(state, now):
+        _crash_save_state(state)
     tickers = _CRASH_WS_CACHE.snapshot(now) if tickers is None else tickers
     candles_get = _crash_get_candles if candles_get is None else candles_get
     if not isinstance(tickers, list):
@@ -7805,10 +7811,11 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             ranked.append((change, ticker["symbol"], ticker))
     ranked.sort(key=lambda item: (item[0], item[1]))
     top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
-    # Keep previously alerted coins under observation for 150h, including after TP
+    # Keep entry candidates <24h and unresolved virtual OPEN trades through TP/timeout
     # and after they leave the top 20 / recover above the -12% threshold.
+    from crash_policy import is_active_candidate
     watching = {sym for sym, rec in state["symbols"].items()
-                if now - rec.get("created_at", 0) < TRACKING_SECONDS and sym in market
+                if is_active_candidate(rec, now) and sym in market
                 and supported_symbol(sym)}
     selected = list(top)
     selected_symbols = {sym for _, sym, _ in top}
@@ -7897,7 +7904,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             state["symbols"][symbol] = record
             state["history"].append(dict(record))
             state["history"] = [r for r in state["history"]
-                                if now - r["created_at"] <= 180 * 86400]
+                                if now - r["created_at"] < 24 * 3600]
             _crash_save_state(state)
             _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
             scan_metrics["candidates"] += 1
@@ -8250,7 +8257,7 @@ def _crash_start_services():
 
 def _crash_bounce_worker():
     global _CRASH_ACTIVE_STATE, _CRASH_RISK_RESEARCH
-    from crash_policy import supported_symbol
+    from crash_policy import supported_symbol, prune_active_state, TRACKING_SECONDS
     try:
         from crash_risk_research import RiskResearch
         import websocket
@@ -8306,6 +8313,13 @@ def _crash_bounce_worker():
                 _crash_apply_filter_migration(state, time.time())
                 state.setdefault("report", {"last_success_at":time.time()-86400})
                 _crash_save_state(state)
+            # Old candidates must not keep appearing in snapshots or spawn
+            # download work after restarts; this is distinct from real orders.
+            with _CRASH_STATE_LOCK:
+                expired = prune_active_state(state, time.time())
+                if expired:
+                    _crash_save_state(state)
+                    log(f"[CRASH RETENTION] expired={expired}; horizon=24h; exchange_orders_untouched")
             try:
                 _crash_drain_shadow(state)
                 try:
@@ -8327,7 +8341,7 @@ def _crash_bounce_worker():
                         log(f'[CRASH DERIVATIVES QUEUE ERR] {type(error).__name__}')
                 if historical.get('v2_status') == 'STRONG_V2' and historical.get('tracking_status') == 'WAIT_ENTRY':
                     _crash_risk_observe('watch', historical)
-                if now - historical['created_at'] <= 14*86400:
+                if 0 <= now - historical['created_at'] < TRACKING_SECONDS:
                     _crash_queue_history(historical, 'signal', historical['created_at'])
                     if historical.get('entered_at'):
                         _crash_queue_history(historical, 'entry', historical['entered_at'])
