@@ -63,13 +63,18 @@ def _name(title):
 def _risk(rec):
     item = rec.get("failure_shadow") or {}
     flags = item.get("flags") if isinstance(item, dict) else None
-    if not isinstance(flags, dict) or any(type(flags.get(k)) is not bool for k in FLAGS):
+    if not isinstance(flags, dict):
         return None, ["?"] * 3, "EKSİK: otomatik alış yok"
+    # Show each known criterion independently; unknown is never interpreted as safe.
+    marks = [("🔴 VAR" if flags[k] else "🟢 YOK")
+             if type(flags.get(k)) is bool else "?" for k in FLAGS]
+    if any(type(flags.get(k)) is not bool for k in FLAGS):
+        return None, marks, "EKSİK: otomatik alış yok"
     count = sum(flags[k] for k in FLAGS)
-    marks = ["🔴 VAR" if flags[k] else "🟢 YOK" for k in FLAGS]
     rule = ("⛔ İŞLEM YOK" if count == 3 else
             "⚖️ %50 / TP %0,5" if count == 2 else "✅ %100 / TP %1")
     return count, marks, rule
+
 
 def _score(rec):
     feat = rec.get("v2_features") or {}
