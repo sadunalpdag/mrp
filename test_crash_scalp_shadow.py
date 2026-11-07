@@ -25,7 +25,7 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertEqual(len(valid), 2)
 
     def test_daily_range_requires_all_real_candles(self):
-        now = 3 * 86400 + 3600
+        now = 2 * 86400 + 3600
         rows = candles(96, close=100, first=86400 * 1000)
         self.assertEqual(sw.previous_utc_range(rows, now), (100.2, 99.8))
         self.assertIsNone(sw.previous_utc_range(rows[:-1], now))
