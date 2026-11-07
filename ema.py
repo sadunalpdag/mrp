@@ -7774,6 +7774,7 @@ def _crash_load_market_cache():
 
 
 def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
+    import os  # self-contained for isolated Crash V2 regression harness
     from crash_policy import supported_symbol, TRACKING_SECONDS
     now = time.time() if now is None else now
     tickers = _CRASH_WS_CACHE.snapshot(now) if tickers is None else tickers
