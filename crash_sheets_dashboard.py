@@ -1,0 +1,315 @@
+"""Read-only Crash Bounce V2 -> existing EMA Filter 'Bot Status' / 'Sinyal' tabs.
+
+Never deletes worksheets, never creates new tabs, never calls Binance. All failures
+remain in this daemon exporter and cannot gate real orders or WS scanning.
+"""
+import copy
+import json
+import math
+import os
+import re
+import threading
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+INTERVAL = 300
+MAX_ROWS = 60
+HEADERS = [
+    "Coin", "24s değişim %", "Düşüş sırası", "Son fiyat", "V2 durumu",
+    "RSI14", "4s toparlanma %", "Güç /100", "Önceki güç", "Puan farkı",
+    "Giriş", "TP", "Giriş uzaklık %", "Risk /3", "Zayıf hacim",
+    "RSI/EMA düşüyor", "Tekrar düşük sinyal", "Pozisyon kuralı",
+    "Uygunluk", "Sinyal takibi", "Güncelleme", "Sinyal zamanı",
+]
+FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
+PARIS = ZoneInfo("Europe/Paris")
+COLORS = {
+    "green": {"red": 0.79, "green": 0.91, "blue": 0.82},
+    "yellow": {"red": 1.0, "green": 0.94, "blue": 0.72},
+    "red": {"red": 0.98, "green": 0.82, "blue": 0.82},
+    "grey": {"red": 0.91, "green": 0.93, "blue": 0.95},
+    "header": {"red": 0.13, "green": 0.26, "blue": 0.42},
+}
+
+def _num(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        out = float(value)
+        return out if math.isfinite(out) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+def _time(ts):
+    val = _num(ts)
+    return (datetime.fromtimestamp(val, PARIS).strftime("%d.%m.%Y %H:%M")
+            if val is not None and val > 0 else "—")
+
+def _name(title):
+    return re.sub(r"[^a-z0-9]", "", str(title).lower())
+
+def _risk(rec):
+    item = rec.get("failure_shadow") or {}
+    flags = item.get("flags") if isinstance(item, dict) else None
+    if not isinstance(flags, dict) or any(type(flags.get(k)) is not bool for k in FLAGS):
+        return None, ["?"] * 3, "EKSİK: otomatik alış yok"
+    count = sum(flags[k] for k in FLAGS)
+    marks = ["🔴 VAR" if flags[k] else "🟢 YOK" for k in FLAGS]
+    rule = ("⛔ İŞLEM YOK" if count == 3 else
+            "⚖️ %50 / TP %0,5" if count == 2 else "✅ %100 / TP %1")
+    return count, marks, rule
+
+def _score(rec):
+    feat = rec.get("v2_features") or {}
+    scored = (feat.get("strength_score") or rec.get("strength_score") or {})
+    val = _num(scored.get("score")) if isinstance(scored, dict) else None
+    return round(val, 1) if val is not None and 0 <= val <= 100 else None
+
+def _status(rec, risk):
+    if not rec:
+        return "⚪ SİNYAL YOK", "grey"
+    v2 = rec.get("v2_status")
+    if risk == 3 or risk is None and v2 == "STRONG_V2":
+        return "🔴 ALIŞ YOK (RİSK)", "red"
+    if v2 == "STRONG_V2" and risk is not None:
+        return ("🟢 V2 ONAYLI" if risk <= 1 else "🟡 V2 / YARIM"), ("green" if risk <= 1 else "yellow")
+    if v2 == "PENDING_5D_HISTORY":
+        return "🟡 VERİ BEKLENİYOR", "yellow"
+    return "🔴 V2 UYGUN DEĞİL", "red"
+
+def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None):
+    """Pure data preparation; unknown measurements remain blank, never invented."""
+    score_cache = score_cache or {}
+    symbols = state.get("symbols") or {}
+    if not isinstance(symbols, dict):
+        symbols = {}
+    ranking = []
+    latest = {}
+    for item in tickers or []:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol", "")
+        change, price = _num(item.get("priceChangePercent")), _num(item.get("lastPrice"))
+        if not re.fullmatch(r"[A-Z0-9]{2,24}USDT", symbol) or change is None or price is None or price <= 0:
+            continue
+        latest[symbol] = (change, price)
+        ranking.append((change, symbol))
+    ranking.sort()
+    top = [sym for _, sym in ranking[:20]]
+    rank = {sym: i + 1 for i, sym in enumerate(top)}
+    # Add the most recent V2 signals still being observed, even if no longer top 20.
+    extra = sorted(
+        ((sym, rec) for sym, rec in symbols.items()
+         if isinstance(rec, dict) and now - (_num(rec.get("created_at")) or 0) < 150 * 3600),
+        key=lambda pair: _num(pair[1].get("created_at")) or 0, reverse=True)
+    names = (top + [sym for sym, _ in extra if sym not in rank])[:MAX_ROWS]
+    previous = {}
+    rows, colors = [], []
+    risk_summary = {0: 0, 1: 0, 2: 0, 3: 0, "unknown": 0}
+    eligible = 0
+    for sym in names:
+        rec = symbols.get(sym) or {}
+        if not isinstance(rec, dict):
+            rec = {}
+        v2 = rec.get("v2_features") or {}
+        has_signal = bool(rec.get("signal_id"))
+        risk, flags, rule = _risk(rec) if has_signal else (None, ["—"] * 3, "—")
+        current = _score(rec)
+        # Reassess only cached closed candles: same local V2 algorithm, NO REST.
+        if has_signal and rec.get("v2_status") == "STRONG_V2" and callable(rescore):
+            try:
+                live = rescore(rec, now)
+                fresh = (live.get("strength_score") or {}).get("score") if isinstance(live, dict) else None
+                fresh = _num(fresh)
+                if fresh is not None and 0 <= fresh <= 100:
+                    current = round(fresh, 1)
+            except Exception:
+                pass
+        old = score_cache.get(sym) or {}
+        old_score = _num(old.get("score")) if old.get("signal_id") == rec.get("signal_id") else None
+        difference = round(current - old_score, 1) if current is not None and old_score is not None else "—"
+        if current is not None and has_signal:
+            previous[sym] = {"signal_id": rec.get("signal_id"), "score": current}
+        change, price = latest.get(sym, (None, None))
+        entry = _num(rec.get("entry")) if has_signal else None
+        tp = _num(rec.get("tp")) if has_signal else None
+        dist = round((price / entry - 1) * 100, 2) if price and entry and entry > 0 else "—"
+        status, color = _status(rec if has_signal else None, risk)
+        if color == "green":
+            eligible += 1
+        if has_signal:
+            risk_summary[risk if risk is not None else "unknown"] += 1
+        rows.append([
+            sym, round(change, 2) if change is not None else "—", rank.get(sym, "—"),
+            price if price is not None else "—", rec.get("v2_status", "SİNYAL YOK") if has_signal else "SİNYAL YOK",
+            v2.get("rsi14", "—"), v2.get("recovery_4h_pct", "—"),
+            current if current is not None else "—",
+            old_score if old_score is not None else "—", difference,
+            entry if entry is not None else "—", tp if tp is not None else "—", dist,
+            risk if risk is not None else "—", *flags, rule, status,
+            rec.get("tracking_status", "—") if has_signal else "—",
+            _time(now), _time(rec.get("created_at")) if has_signal else "—",
+        ])
+        colors.append(color)
+    history = state.get("history") or []
+    since = now - 86400
+    recent = [r for r in history if isinstance(r, dict) and (_num(r.get("created_at")) or 0) > since]
+    scores = [_score(r) for r in recent]
+    scores = [x for x in scores if x is not None]
+    status_rows = [
+        ["Gösterge", "Değer"],
+        ["Son güncelleme (Paris)", _time(now)],
+        ["Bot", "ÇALIŞIYOR (dashboard güncellemesi)"],
+        ["Binance WS", "BAĞLI" if ws.get("connected") else "BAĞLI DEĞİL / VERİ BEKLENİYOR"],
+        ["Otomatik alış", trading.get("auto", "BİLİNMİYOR")],
+        ["Güvenlik kilidi", trading.get("halt") or "YOK"],
+        ["Açık / bekleyen gerçek işlemler (yerel kayıt)", trading.get("open", "BİLİNMİYOR")],
+        ["Günlük giriş", trading.get("daily", "BİLİNMİYOR")],
+        ["Günlük giriş limiti", trading.get("max_daily", "BİLİNMİYOR")],
+        ["Eşzamanlı sembol sınırı", trading.get("max_symbols", "BİLİNMİYOR")],
+        ["Varsayılan pozisyon USDT", trading.get("amount", "BİLİNMİYOR")],
+        ["İzlenen futures fiyatı (WS)", len(latest)],
+        ["İlk 20 düşen coin", len(top)],
+        ["-12% ve üzeri düşüş (ilk 20)", sum(1 for sym in top if latest[sym][0] <= -12)],
+        ["Sinyal listesi satırı", len(rows)],
+        ["V2 onaylı / düşük risk", eligible],
+        ["Son 24 saat V2 adayı", len(recent)],
+        ["Son 24 saat ort. güç puanı", round(sum(scores)/len(scores), 1) if scores else "—"],
+        ["0 risk sinyali", risk_summary[0]],
+        ["1 risk sinyali", risk_summary[1]],
+        ["2 risk sinyali", risk_summary[2]],
+        ["3 risk sinyali", risk_summary[3]],
+        ["Eksik risk verisi", risk_summary["unknown"]],
+        ["Not", "Risk/puan bilgilendirme amaçlıdır; Binance emirlerini değiştirmez."],
+    ]
+    return status_rows, [HEADERS] + rows, colors, previous
+
+def _credentials():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    sheet_id = os.environ.get("GOOGLE_SHEETS_ID", os.environ.get("GOOGLE_SHEET_ID", "")).strip()
+    if not raw or not sheet_id:
+        return None, None
+    from google.oauth2.service_account import Credentials
+    import gspread
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        obj = None
+    creds = (Credentials.from_service_account_info(obj, scopes=scopes) if isinstance(obj, dict)
+             else Credentials.from_service_account_file(raw, scopes=scopes))
+    return gspread.authorize(creds), sheet_id
+
+def _tabs(sheet):
+    # Fail closed if Render points to the wrong file. Never add/delete worksheets.
+    if "emafilter" not in _name(sheet.title):
+        raise ValueError("SHEETS_TITLE_NOT_EMA_FILTER")
+    tabs = sheet.worksheets()
+    by_name = {_name(w.title): w for w in tabs}
+    status = by_name.get("botstatus")
+    signal = by_name.get("sinyal") or by_name.get("signal") or by_name.get("signals")
+    if not status or not signal:
+        raise ValueError("BOT_STATUS_OR_SINYAL_TAB_MISSING")
+    return status, signal
+
+def _format(sheet, status, signal, colors):
+    requests = []
+    for tab, end_col in ((status, 2), (signal, len(HEADERS))):
+        requests.append({"repeatCell": {"range": {"sheetId": tab.id, "startRowIndex": 0,
+            "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": end_col},
+            "cell": {"userEnteredFormat": {"backgroundColor": COLORS["header"],
+                "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
+            "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat"}})
+    for i, kind in enumerate(colors, start=1):
+        for column, tone in ((18, kind), (13, "red" if kind == "red" else "yellow" if kind == "yellow" else "green")):
+            requests.append({"repeatCell": {"range": {"sheetId": signal.id,
+                "startRowIndex": i, "endRowIndex": i + 1,
+                "startColumnIndex": column, "endColumnIndex": column + 1},
+                "cell": {"userEnteredFormat": {"backgroundColor": COLORS[tone]}},
+                "fields": "userEnteredFormat.backgroundColor"}})
+    if requests:
+        sheet.batch_update({"requests": requests})
+
+def _read_previous(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+def _write_previous(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, allow_nan=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+def publish(state, tickers, trading, ws, now, directory, rescore=None):
+    client, sheet_id = _credentials()
+    if not client:
+        return False
+    sheet = client.open_by_key(sheet_id)
+    status, signal = _tabs(sheet)
+    os.makedirs(directory, exist_ok=True)
+    prev_path = os.path.join(directory, "crash_sheets_score_previous.json")
+    status_rows, signal_rows, colors, previous = build_rows(
+        state, tickers, trading, ws, now, _read_previous(prev_path), rescore)
+    # Update only panel-owned rectangular ranges. Old worksheets and other data untouched.
+    status_rows = status_rows + [["", ""]] * max(0, 26 - len(status_rows))
+    signal_rows = signal_rows + [[""] * len(HEADERS)] * max(0, MAX_ROWS + 1 - len(signal_rows))
+    sheet.values_batch_update({"valueInputOption": "RAW", "data": [
+        {"range": "'" + status.title.replace("'", "''") + "'!A1:B26", "values": status_rows},
+        {"range": "'" + signal.title.replace("'", "''") + "'!A1:V61", "values": signal_rows},
+    ]})
+    _format(sheet, status, signal, colors)
+    _write_previous(prev_path, previous)
+    return True
+
+class DashboardPublisher:
+    def __init__(self, directory, logger, rescore=None):
+        self.directory, self.logger, self.rescore = directory, logger, rescore
+        self.lock = threading.Lock()
+        self.next_due = 0.0
+
+    def tick(self, state, tickers, executor, ws):
+        if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or not (
+            os.environ.get("GOOGLE_SHEETS_ID") or os.environ.get("GOOGLE_SHEET_ID")):
+            return
+        now = time.time()
+        if now < self.next_due or not self.lock.acquire(blocking=False):
+            return
+        self.next_due = now + INTERVAL
+        try:
+            # Small immutable snapshot; never send state files or API keys to Sheets.
+            symbols = copy.deepcopy(state.get("symbols", {}))
+            recent = copy.deepcopy([r for r in state.get("history", [])
+                if isinstance(r, dict) and (_num(r.get("created_at")) or 0) > now - 86400])
+            trading = {}
+            if executor is not None:
+                trading = {
+                    "auto": "AÇIK" if executor.enabled.is_set() else "KAPALI",
+                    "halt": executor.state.get("halt"),
+                    "open": sum(o.get("phase") not in ("TP_FILLED", "ENTRY_CANCELLED", "ENTRY_REJECTED")
+                        for o in list(executor.state.get("orders", {}).values())),
+                    "daily": executor.daily_count(), "max_daily": executor.max_daily,
+                    "max_symbols": executor.max_symbols, "amount": str(executor.position_usdt),
+                }
+            copied_ws = dict(ws or {})
+            copied_tickers = [dict(t) for t in tickers or []]
+        except Exception:
+            self.lock.release()
+            return
+        def writer():
+            try:
+                if publish({"symbols": symbols, "history": recent}, copied_tickers,
+                           trading, copied_ws, now, self.directory, self.rescore):
+                    self.logger("[CRASH SHEETS] Bot Status / Sinyal updated")
+            except Exception as exc:
+                # Never log service-account JSON or raw Google error response.
+                self.logger("[CRASH SHEETS] update skipped: " + type(exc).__name__)
+            finally:
+                self.lock.release()
+        threading.Thread(target=writer, daemon=True, name="crash-sheets-dashboard").start()
