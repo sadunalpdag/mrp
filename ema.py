@@ -8239,6 +8239,12 @@ def _crash_bounce_worker():
     threading.Thread(target=_crash_trade_consumer,
                      name="crash-trade-consumer",daemon=True).start()
     _CRASH_WS_CACHE.start()
+    sheets_publisher = None
+    try:
+        from crash_sheets_dashboard import DashboardPublisher
+        sheets_publisher = DashboardPublisher(DATA_DIR, log, _crash_v2_validate_entry)
+    except Exception as error:
+        log(f'[CRASH SHEETS SETUP SKIPPED] {type(error).__name__}')
     try:
         _crash_start_shadow()
     except Exception as error:
@@ -8324,6 +8330,15 @@ def _crash_bounce_worker():
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")
             next_scan = max(next_scan, time.time()+60)
+        # Sheets publishing is read-only, asynchronous, 5-minute and fail-open.
+        # It never requests Binance data or modifies execution/trading state.
+        if sheets_publisher is not None and state is not None:
+            try:
+                with _CRASH_STATE_LOCK:
+                    sheets_publisher.tick(state, _CRASH_WS_CACHE.snapshot(time.time()),
+                                          _CRASH_NIGHT, _CRASH_WS_CACHE.health(time.time()))
+            except Exception as error:
+                log(f'[CRASH SHEETS SCHEDULE SKIPPED] {type(error).__name__}')
         time.sleep(max(1,min(15,next_scan-time.time())))
 
 
