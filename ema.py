@@ -6316,7 +6316,7 @@ CRASH_DATA_FALLBACK_ENABLED = 1  # WS/cache -> REST -> Binance daily archive
 CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
 CRASH_BOUNCE_FILTER_VERSION = "five_day_entry_v2_only"
-CRASH_V2_SIGNAL_TTL_SECONDS = 90
+CRASH_V2_SIGNAL_TTL_SECONDS = 280
 CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
@@ -6661,7 +6661,14 @@ def _crash_send_pending(state, now):
             if executor is not None:
                 from crash_failure_shadow import entry_block_reason
                 if entry_block_reason(record) is None:
-                    executor.submit(record, receipt['accepted_at'])
+                    # The Telegram delivery is fresh, but the underlying market
+                    # candidate may not be. Never auto-buy an old snapshot.
+                    candidate_age = max(now, receipt['accepted_at']) - record['created_at']
+                    if 0 <= candidate_age <= 120:
+                        executor.submit(record, receipt['accepted_at'])
+                    else:
+                        log(f"[CRASH AUTO ENTRY SKIP] {record['symbol']}; "
+                            f"candidate_age_s={candidate_age:.1f}; Telegram only")
                 # Three true risk flags or incomplete labels: Telegram + virtual tracking only.
                 # NightExecutor.enter independently rechecks sizing and safety before real BUY.
         else:
