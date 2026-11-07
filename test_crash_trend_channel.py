@@ -21,6 +21,8 @@ class TrendChannelTests(unittest.TestCase):
             elif variant == "fake" and i in (62, 63):
                 close = upper - 2
             elif variant == "near" and i == 63:
+                close = upper - 0.75
+            elif variant == "pending" and i == 63:
                 close = upper - 0.15
             hi, low = close + 0.8, close - 0.8
             opened = start + i * STEP_MS
@@ -41,6 +43,11 @@ class TrendChannelTests(unittest.TestCase):
     def test_near_upper_trendline_is_yellow(self):
         outcome = analyze(self.rows("near"), self.now)
         self.assertEqual(outcome["status"], "YAKLAŞIYOR", outcome)
+
+    def test_unconfirmed_above_channel_is_pending(self):
+        outcome = analyze(self.rows("pending"), self.now)
+        self.assertEqual(outcome["status"], "KIRILIM BEKLEME", outcome)
+        self.assertIsNone(outcome["confirmed_at"])
 
     def test_missing_and_stale_candles_are_unknown(self):
         self.assertEqual(analyze([], self.now)["status"], "VERİ YOK")
