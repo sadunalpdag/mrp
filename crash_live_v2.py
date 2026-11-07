@@ -4,7 +4,7 @@ Trade prints are observations, not proof a limit order could have filled.
 An ordered entry must precede an ordered TP; this module never places orders.
 """
 import math
-from crash_policy import TRACKING_SECONDS
+from crash_policy import TRACKING_SECONDS, POST_ENTRY_TRACKING_SECONDS
 
 MODEL = 'ws_aggtrade_upcross_v3'
 TERMINAL = {'TP', 'TIMEOUT', 'NO_ENTRY_OBSERVED', 'INVALIDATED_BEFORE_ENTRY',
@@ -23,11 +23,12 @@ def advance_trade(record, price, observed_at, trade_id):
         target = float(record['tp'])
         bottom = float(record['reference_low'])
         created = float(record['created_at'])
-        since = float(record.get('entered_at', created)) if record.get('tracking_status') == 'OPEN' else created
+        status = record.get('tracking_status', 'WAIT_ENTRY')
+        entered = float(record.get('entered_at', created)) if status == 'OPEN' else created
     except (TypeError, ValueError, KeyError, OverflowError):
         return None
-    if (not all(math.isfinite(x) for x in (price, observed_at, entry, target, bottom, created, since))
-            or price <= 0 or observed_at <= created or observed_at > since + TRACKING_SECONDS):
+    if (not all(math.isfinite(x) for x in (price, observed_at, entry, target, bottom, created, entered))
+            or price <= 0 or observed_at <= created or observed_at >= (entered + POST_ENTRY_TRACKING_SECONDS if status == 'OPEN' else created + TRACKING_SECONDS)):
         return None
     previous_id = record.get('ws_last_trade_id')
     if previous_id is not None and trade_id <= previous_id:
@@ -46,7 +47,6 @@ def advance_trade(record, price, observed_at, trade_id):
     record['max_gap_seconds'] = max(float(record.get('max_gap_seconds', 0)), gap)
     if gap > 30:
         record['coverage_gaps'] = record.get('coverage_gaps', 0) + 1
-    status = record.get('tracking_status', 'WAIT_ENTRY')
     if record.get('derivatives_shadow') is not None:
         record['shadow_new_low_observed'] = record.get('shadow_new_low_observed', False) or price < bottom
         if status == 'OPEN':
