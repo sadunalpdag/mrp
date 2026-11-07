@@ -6985,7 +6985,7 @@ def _crash_initialize_tracking(record):
 
 
 def _crash_track_results(state, tickers, now):
-    from crash_policy import TRACKING_SECONDS, supported_symbol
+    from crash_policy import TRACKING_SECONDS, POST_ENTRY_TRACKING_SECONDS, supported_symbol
     prices = {}
     for ticker in tickers:
         try:
@@ -7012,9 +7012,10 @@ def _crash_track_results(state, tickers, now):
                 active_samples.append({"signal_id":record["signal_id"], "symbol":record["symbol"],
                                        "price":price, "status":status, "after_result":True})
             continue
-        # Never restart the 24h clock when a virtual entry occurs.
+        # Entry wait is 24h; an OPEN virtual trade keeps its original 150h TP window.
         since = record.get("entered_at", record["created_at"])
-        deadline = record["created_at"] + TRACKING_SECONDS
+        deadline = (since + POST_ENTRY_TRACKING_SECONDS if status == "OPEN"
+                    else record["created_at"] + TRACKING_SECONDS)
         if now >= deadline:
             record["tracking_status"] = "NO_ENTRY_OBSERVED" if status == "WAIT_ENTRY" else "TIMEOUT"
             record["finished_at"] = deadline
@@ -7179,7 +7180,7 @@ def _crash_daily_report(state, now):
                  "Yeni sampled_upward_cross_v2: önceki örnek < giriş ve yeni örnek >= giriş ise sanal giriş; "
                  "giriş öncesi dip kırılırsa INVALIDATED_BEFORE_ENTRY. Eski sampled_limit_touch_v1 kayıtları "
                  "değiştirilmez: fiyat <= giriş sanal giriş sayılır. Modelleri ayrı karşılaştırın. "
-                 "daha sonraki örnek fiyat >= TP ise TP. Aday başlangıcından itibaren toplam 24h sanal takip. Aktif durum yalnız son 24 saati içerir. Eski TIMEOUT sonuçları yeniden açılmaz. "
+                 "daha sonraki örnek fiyat >= TP ise TP. Giriş bekleme 24h; giriş yapan sanal TP/düşüş takibi ayrıca 150h. Gerçek borsa pozisyonları bağımsız korunur. Eski TIMEOUT sonuçları yeniden açılmaz. "
                  "Gerçek emir, komisyon, kayma, funding ve kaldıraç modellenmez. "
                  "3 dakikalık örnekler arası hareketler kaçabilir; TIMEOUT TP hiç olmadı demek değildir. "
                  "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
@@ -7198,7 +7199,7 @@ def _crash_daily_report(state, now):
         with zipfile.ZipFile(path+".tmp", "w", compression=zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("report.json", json.dumps({"schema_version":5,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
-                "tracking_hours":150, "export_days":14,
+                "tracking_hours":24, "post_entry_tracking_hours":150, "export_days":14,
                 "rolling_7d_cohort":rolling,
                 "five_day_context_daily":summarize_context(daily),
                 "five_day_context_rolling":summarize_context(filtered),
@@ -7223,7 +7224,7 @@ def _crash_daily_report(state, now):
                 archive.write(ai_market_path, 'ai_market/top_gainers_state.json')
             archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
-            # Cover 150h entry wait plus 150h after entry (12.5 days).
+            # Archived observation files remain available for audit/research.
             for offset in range(15):
                 day = datetime.fromtimestamp(now-offset*86400, tz=timezone.utc).strftime("%Y-%m-%d")
                 source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
@@ -7810,10 +7811,11 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             ranked.append((change, ticker["symbol"], ticker))
     ranked.sort(key=lambda item: (item[0], item[1]))
     top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
-    # Keep only last-24h coins under observation, including after TP
+    # Keep entry candidates <24h and unresolved virtual OPEN trades through TP/timeout
     # and after they leave the top 20 / recover above the -12% threshold.
+    from crash_policy import is_active_candidate
     watching = {sym for sym, rec in state["symbols"].items()
-                if now - rec.get("created_at", 0) < TRACKING_SECONDS and sym in market
+                if is_active_candidate(rec, now) and sym in market
                 and supported_symbol(sym)}
     selected = list(top)
     selected_symbols = {sym for _, sym, _ in top}
