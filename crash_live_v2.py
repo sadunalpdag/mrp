@@ -23,11 +23,10 @@ def advance_trade(record, price, observed_at, trade_id):
         target = float(record['tp'])
         bottom = float(record['reference_low'])
         created = float(record['created_at'])
-        since = float(record.get('entered_at', created)) if record.get('tracking_status') == 'OPEN' else created
     except (TypeError, ValueError, KeyError, OverflowError):
         return None
-    if (not all(math.isfinite(x) for x in (price, observed_at, entry, target, bottom, created, since))
-            or price <= 0 or observed_at <= created or observed_at > since + TRACKING_SECONDS):
+    if (not all(math.isfinite(x) for x in (price, observed_at, entry, target, bottom, created))
+            or price <= 0 or observed_at <= created or observed_at >= created + TRACKING_SECONDS):
         return None
     previous_id = record.get('ws_last_trade_id')
     if previous_id is not None and trade_id <= previous_id:
