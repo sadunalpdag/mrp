@@ -6401,20 +6401,40 @@ _CRASH_PUBLIC_LOCK = threading.RLock()
 
 
 def _crash_public_get(path, params=None):
-    # All research workers share one REST pacing/cooldown budget.
+    # General research remains disabled by CRASH_RESEARCH_REST_ENABLED=0.
     with _CRASH_PUBLIC_LOCK:
         return _crash_public_get_locked(path, params)
 
 
-def _crash_public_get_locked(path, params=None):
+def _crash_history_rest_get(path, params=None):
+    """Isolated last-resort history gaps, not a general research REST switch."""
+    if os.getenv("CRASH_HISTORY_REST_LAST_RESORT_ENABLED", "1") != "1":
+        raise RuntimeError("HISTORY_BINANCE_REST_DISABLED")
+    # Share account-order IP budget, public cooldown, and request pacing.
+    with _CRASH_PUBLIC_LOCK:
+        return _crash_public_get_locked(path, params, history_only=True)
+
+
+def _crash_public_get_locked(path, params=None, history_only=False):
     global _crash_next_request, _crash_weight_window, _crash_weight_used, _crash_backoff
     if path not in ("/fapi/v1/exchangeInfo", "/fapi/v1/klines", "/api/v3/klines",
                     "/futures/data/openInterestHist", "/fapi/v1/fundingRate"):
         raise ValueError("Crash-only endpoint not allowed")
+    if history_only:
+        from crash_policy import supported_symbol
+        p = params if isinstance(params, dict) else {}
+        count, first, last = p.get("limit"), p.get("startTime"), p.get("endTime")
+        if (path != "/fapi/v1/klines" or p.get("interval") != "15m"
+                or not supported_symbol(p.get("symbol"))
+                or type(count) is not int or not 1 <= count <= 192
+                or type(first) is not int or type(last) is not int
+                or first <= 0 or first % 900000 or (last + 1) % 900000
+                or last - first + 1 != count * 900000):
+            raise ValueError("History fallback requires bounded closed 15m gap")
     # Research can never consume the Binance IP budget intended for account
     # positions, BUY reconciliation or TP. Exchange metadata remains available
     # once a day, to keep the live V2 futures symbol universe validated.
-    if (path != "/fapi/v1/exchangeInfo"
+    if (path != "/fapi/v1/exchangeInfo" and not history_only
             and os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1"):
         raise RuntimeError("RESEARCH_BINANCE_REST_DISABLED")
     if time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned():
@@ -6970,15 +6990,24 @@ def _crash_queue_history(record, phase, now):
                 wall = time.time()
                 urgent_binance_times[:] = [t for t in urgent_binance_times if wall-t < 3600]
                 key = (symbol, latest)
-                # A single Binance mini-request is permitted per symbol/slot,
-                # only when its shared rate limiter confirms enough IP budget.
-                if (os.getenv('CRASH_RESEARCH_REST_ENABLED','1') == '1'
+                # Prefer keyless futures venues; use Binance REST only if
+                # neither can provide a price-anchored last CLOSED candle.
+                binance_only = [r for r in cached if
+                                len(r) <= 12 or r[12] not in
+                                ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')]
+                recovered = urgent_bybit.fill_missing(
+                    symbol, start, end, [latest], binance_only)
+                recovered = recovered or urgent_okx.fill_last(symbol, start, end, binance_only)
+                if recovered:
+                    return recovered
+                # One bounded fallback attempt per slot; separate hourly limit.
+                if (os.getenv('CRASH_HISTORY_REST_LAST_RESORT_ENABLED','1') == '1'
                         and not blocked() and len(urgent_binance_times) < 18
                         and wall >= urgent_binance_retry.get(key, 0)):
                     urgent_binance_retry[key] = wall + 90
                     urgent_binance_times.append(wall)
                     try:
-                        response = _crash_public_get('/fapi/v1/klines',
+                        response = _crash_history_rest_get('/fapi/v1/klines',
                             {'symbol':symbol, 'interval':'15m',
                              'startTime':latest, 'endTime':end-1, 'limit':1})
                         restored = valid_rows(response, latest, end).get(latest)
@@ -6988,19 +7017,12 @@ def _crash_queue_history(record, phase, now):
                     except Exception as error:
                         log(f'[CRASH LAST CLOSED BINANCE WAIT] {symbol}; '
                             f'reason={type(error).__name__}')
-                # Bybit linear and OKX swap are public, no key, no Binance IP weight.
-                from crash_data_sources import valid_rows
-                binance_only = [r for r in cached if
-                                len(r) <= 12 or r[12] not in
-                                ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')]
-                recovered = urgent_bybit.fill_missing(
-                    symbol, start, end, [latest], binance_only)
-                return recovered or urgent_okx.fill_last(symbol, start, end, binance_only)
+                return []
 
             resolver = DataSources(os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'fallback_cache'),
-                _crash_public_get, blocked, _crash_history_log,
+                _crash_history_rest_get, blocked, _crash_history_log,
                 bybit=bybit, coinbase=coinbase,
-                allow_binance_rest=os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") == "1")
+                allow_binance_rest=os.getenv("CRASH_HISTORY_REST_LAST_RESORT_ENABLED", "1") == "1")
             _CRASH_HISTORY_COLLECTOR = HistoryCollector(
                 os.path.join(CRASH_BOUNCE_RESEARCH_DIR, "history_cache"),
                 _crash_public_get, _crash_append_data, blocked, log,
@@ -7793,7 +7815,7 @@ def _crash_get_candles(symbol):
             _CRASH_WS_CACHE.merge_candles(symbol, rows)
             return rows
         _crash_queue_history({'symbol':symbol, 'signal_id':'warmup:'+symbol}, 'warmup', now)
-        log(f'[CRASH DATA QUEUED] {symbol}; WS/cache eksik; REST -> GUNLUK_ARSIV sirasi')
+        log(f'[CRASH DATA QUEUED] {symbol}; WS/cache eksik; arsiv -> Bybit/Coinbase -> Binance REST son care')
         return rows
     if now<_crash_cooldown_until or BinanceRateLimiter.is_banned():
         return rows
@@ -15460,8 +15482,9 @@ def main():
         _crash_cooldown_until = until
     _crash_start_services()
     if os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1":
-        log("[CRASH REST PRIORITY] research Binance klines/spot/OI/funding disabled; "
-            "WS + saved cache + daily archive + Bybit/Coinbase retained; "
+        log("[CRASH REST PRIORITY] non-history research Binance REST disabled; "
+            "WS/cache/archive -> Bybit/Coinbase -> scoped 15m Binance REST last resort="
+            + os.getenv("CRASH_HISTORY_REST_LAST_RESORT_ENABLED", "1") + "; "
             "account, orders and TP REST UNCHANGED")
     global _CRASH_DAY_TRADER_WS_FEED
     # A single existing Binance Futures WS socket feeds both V2 and the
