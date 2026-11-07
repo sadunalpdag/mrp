@@ -101,7 +101,7 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertIn("VERİ EKSİK", row[18])
         self.assertEqual(colors[0][0], "yellow")
         self.assertEqual(row[37], "479/480")
-        self.assertIn("90 saniye", row[38])
+        self.assertIn("Aday süresi içinde karar verilemedi", row[38])
         self.assertIn("son kapanmış", row[38])
         self.assertIn("SONRADAN V2 ONAYLI", row[39])
         self.assertIn("canlı emir yok", row[39])

@@ -73,7 +73,7 @@ class CrashV2Tests(unittest.TestCase):
                   and n.name == "_crash_send_pending")
         receipt = Mock(return_value={"ok":True, "attempt_at":100, "accepted_at":101,
                                      "message_id":42})
-        env = dict(CRASH_V2_SIGNAL_TTL_SECONDS=90,
+        env = dict(CRASH_V2_SIGNAL_TTL_SECONDS=280,
                    _crash_save_state=Mock(), _crash_append_data=Mock(),
                    _crash_telegram_receipt=receipt, time=time)
         exec(compile(ast.Module(body=[fn], type_ignores=[]), "ema.py", "exec"), env)
@@ -177,9 +177,43 @@ class CrashV2Tests(unittest.TestCase):
     def test_stale_signal_never_sent_late(self):
         env, receipt = self._delivery_context()
         state, record = self._candidate()
-        env["_crash_send_pending"](state, 191)
+        env["_crash_send_pending"](state, 381)
         self.assertEqual(record["v2_delivery_status"],"EXPIRED_NOT_SENT")
         receipt.assert_not_called()
+
+    def test_delayed_telegram_allowed_but_old_candidate_never_autobought(self):
+        env, receipt = self._delivery_context()
+        executor = Mock()
+        env['_CRASH_NIGHT'] = executor
+        env['log'] = Mock()
+        state, record = self._candidate()
+        receipt.return_value = {"ok": True, "attempt_at": 379,
+                                "accepted_at": 379, "message_id": 43}
+        env["_crash_send_pending"](state, 379)  # Candidate age: 279s.
+        self.assertEqual(record["v2_delivery_status"], "SENT")
+        executor.submit.assert_not_called()
+
+    def test_pending_history_survives_90s_but_expires_after_280s(self):
+        tree = ast.parse(Path(__file__).with_name("ema.py").read_text())
+        fn = next(node for node in tree.body
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name == "_crash_review_candidate")
+        assess = Mock(return_value={"status": "MISSING_5D_HISTORY",
+                                    "qualified": False, "candles": 479})
+        env = dict(CRASH_V2_SIGNAL_TTL_SECONDS=280,
+                   _crash_v2_assess_candidate=assess,
+                   _crash_save_state=Mock(), _crash_append_data=Mock())
+        exec(compile(ast.Module(body=[fn], type_ignores=[]),
+                     "ema.py", "exec"), env)
+        record = dict(symbol="TESTUSDT", signal_id="TEST-100", created_at=100,
+                      v2_status="PENDING_5D_HISTORY", v2_delivery_status="WAIT_V2")
+        state = {"history": [record], "symbols": {"TESTUSDT": dict(record)}}
+        env["_crash_review_candidate"](state, record, 379)
+        self.assertEqual(record["v2_status"], "PENDING_5D_HISTORY")
+        assess.assert_called_once()
+        env["_crash_review_candidate"](state, record, 381)
+        self.assertEqual(record["v2_reason"], "HISTORY_NOT_READY_IN_TIME")
+        self.assertEqual(record["v2_delivery_status"], "EXPIRED_NOT_SENT")
 
     def test_timeout_marks_unknown_delivery_no_blind_retry(self):
         env, receipt = self._delivery_context()

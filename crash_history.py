@@ -8,6 +8,7 @@ import time
 STEP = 900000
 COUNT = 480
 DOWNLOAD_INTERVAL = 180
+SIGNAL_URGENT_REPAIR_WINDOW_SECONDS = 280
 
 
 class HistoryPacingWait(Exception):
@@ -137,7 +138,7 @@ class HistoryCollector:
         # An adjacent Binance candle is compulsory for price parity.
         if (job['phase'] == 'signal' and callable(self.urgent_repair)
                 and scheduled_at is not None
-                and 0 <= scheduled_at-job['as_of'] <= 90
+                and 0 <= scheduled_at-job['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS
                 and end-STEP in missing and len(missing) <= 2
                 and end-2*STEP in cached
                 and sum(t in cached for t in range(end-16*STEP,end,STEP)) >= 14):
