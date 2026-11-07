@@ -63,7 +63,7 @@ class HistoryTests(unittest.TestCase):
     def test_one_missing_bar_has_hour_backoff_not_queue_starvation(self):
         from types import SimpleNamespace
         self.worker.resolver = SimpleNamespace(
-            resolve=lambda symbol,start,end,cached: rows(start,479))
+            resolve=lambda symbol,start,end,cached: rows(start,480)[:100] + rows(start,480)[101:])
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),
                            'warmup',self.job['as_of'])
         self.worker.step(now=100)
@@ -71,6 +71,41 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(item['retry_after'],3700)
         self.assertEqual(len(self.worker._read(
             self.tmp.name+'/TESTUSDT.json', [])),479)
+
+    def test_latest_closed_missing_retries_soon_not_after_one_hour(self):
+        from types import SimpleNamespace
+        self.worker.resolver = SimpleNamespace(
+            resolve=lambda symbol,start,end,cached: rows(start,479))
+        self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),
+                           'signal',self.job['as_of'])
+        now = self.job['as_of']+10
+        self.worker.step(now=now)
+        self.assertEqual(self.worker.jobs['test:signal']['retry_after'],now+60)
+
+    def test_live_signal_may_use_reserved_30_second_pacing(self):
+        now = self.job['as_of']+10
+        self.worker.submit({'symbol':'AAAUSDT','signal_id':'one'},
+                           'signal',self.job['as_of'])
+        self.worker.submit({'symbol':'BBBUSDT','signal_id':'two'},
+                           'signal',self.job['as_of'])
+        self.worker.step(now=now)
+        self.worker.step(now=now+20)
+        self.assertEqual(self.fetch.call_count,1)
+        self.worker.step(now=now+31)
+        self.assertEqual(self.fetch.call_count,2)
+
+    def test_background_jobs_leave_six_requests_for_live_signals(self):
+        now = self.job['as_of']+10
+        self.worker.attempts=[now-100]*12
+        self.worker.submit({'symbol':'AAAUSDT','signal_id':'background'},
+                           'warmup',now-100)
+        self.worker.step(now=now)
+        self.fetch.assert_not_called()
+        self.worker.submit({'symbol':'BBBUSDT','signal_id':'live'},
+                           'signal',self.job['as_of'])
+        self.worker.step(now=now)
+        self.assertEqual(self.fetch.call_count,1)
+        self.assertEqual(self.emit.call_args.args[0]['symbol'],'BBBUSDT')
 
     def test_emit_and_remove_job(self):
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),'signal',self.job['as_of'])
