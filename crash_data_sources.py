@@ -141,9 +141,9 @@ class DataSources:
             added=0
             for t,row in valid_rows(rows,start,end).items():
                 if (t not in found or
-                        (source(found[t]) in ('BYBIT_LINEAR','COINBASE_SPOT') and
+                        (source(found[t]) in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP') and
                          (src == 'BINANCE_REST' or source(row) not in
-                          ('BYBIT_LINEAR','COINBASE_SPOT')))):
+                          ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')))):
                     found[t]=tagged(row,src) if src else row
                     added+=1
             return added
@@ -152,18 +152,18 @@ class DataSources:
         # Binance daily archives. The archive host has a separate request
         # budget and cached ZIPs are not downloaded again.
         today=int(self.clock()*1000)//DAY*DAY
-        needed_days=missing()+[t for t in expected if t in found and source(found[t]) in ("BYBIT_LINEAR","COINBASE_SPOT")]
+        needed_days=missing()+[t for t in expected if t in found and source(found[t]) in ("BYBIT_LINEAR","COINBASE_SPOT","OKX_SWAP")]
         for day in sorted({t//DAY*DAY for t in needed_days if t//DAY*DAY<today}):
             add(self.archive(symbol,day))
 
         # Public-data fallback priority:
-        # Binance WS/cache/archive -> Bybit linear -> Coinbase spot -> Binance REST.
+        # Binance WS/cache/archive -> Bybit linear -> OKX swap (urgent last bar) / Coinbase spot -> Binance REST.
         # The two external venues are rate-paced independently. Binance REST
         # is the last resort, not the first request that triggers an IP ban.
         # Keep the existing 30-minute Binance recheck for non-Binance rows.
         gaps=missing()
         blocked=self.blocked()
-        alternate_tags=("BYBIT_LINEAR","COINBASE_SPOT")
+        alternate_tags=("BYBIT_LINEAR","COINBASE_SPOT","OKX_SWAP")
         old_alternates=[t for t in expected if t in found
                         and source(found[t]) in alternate_tags]
         if gaps and self.bybit is not None:
