@@ -99,6 +99,15 @@ class UrgentOKXTests(unittest.TestCase):
             self.assertEqual(assess_entry(event["closed_15m_ohlcv"],[],
                                           self.end/1000+10)["status"],"STRONG_V2")
 
+    def test_rate_limit_blocks_repeated_urgent_requests(self):
+        refused = Mock(status_code=429, headers={"Retry-After":"300"})
+        self.get.side_effect=[refused]
+        self.assertEqual(self.okx.fill_last("BTCUSDT",self.start,self.end,self.cache),[])
+        self.now+=70
+        self.assertEqual(self.okx.fill_last("BTCUSDT",self.start,self.end,self.cache),[])
+        self.get.assert_called_once()
+        self.assertEqual(self.get.call_args.kwargs["headers"],{})
+
     def test_old_signal_does_not_use_fast_lane(self):
         with tempfile.TemporaryDirectory() as directory:
             emit, repair=Mock(),Mock()
