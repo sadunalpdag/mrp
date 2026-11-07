@@ -105,8 +105,8 @@ class FiveDayLevelsTests(unittest.TestCase):
             _, rows, _, _ = build_rows(state, tickers, {}, {}, self.now,
                                        candle_get=lambda _: self.candles("up")[-64:],
                                        directory=td)
-            self.assertEqual(len(HEADERS), 37)
-            self.assertEqual(len(rows[1]), 37)
+            self.assertEqual(len(HEADERS), 40)
+            self.assertEqual(len(rows[1]), 40)
             self.assertEqual(rows[1][22], "🟢 KIRDI")
             self.assertEqual(rows[1][25], "YUKARI")
             self.assertEqual(rows[1][26], "480/480")
