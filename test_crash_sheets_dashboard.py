@@ -78,6 +78,15 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(table[1][4],"SİNYAL YOK")
         self.assertEqual(table[1][21],"—")
 
+    def test_open_virtual_trade_stays_visible_after_24h(self):
+        old=dict(self.record,created_at=self.now-24*3600-1,
+                 tracking_status="OPEN",entered_at=self.now-3600)
+        _, table, _, _=dash.build_rows(
+            {"symbols":{"TESTUSDT":old},"history":[old]},self.tickers,
+            {},{},self.now)
+        self.assertEqual(table[1][4],"STRONG_V2")
+        self.assertEqual(table[1][19],"OPEN")
+
     def test_479_latest_missing_is_not_mislabeled_as_failed_v2(self):
         rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
                    v2_reason="HISTORY_NOT_READY_IN_TIME",
