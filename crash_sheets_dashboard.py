@@ -62,7 +62,7 @@ def _risk(rec):
     item = rec.get("failure_shadow") or {}
     flags = item.get("flags") if isinstance(item, dict) else None
     if not isinstance(flags, dict) or any(type(flags.get(k)) is not bool for k in FLAGS):
-        return None, ["?"] * 3, "EKSİK: otomatik alış yok"
+        return None, ["VERİ YOK"] * 3, "EKSİK RİSK VERİSİ: otomatik alış yok"
     count = sum(flags[k] for k in FLAGS)
     marks = ["🔴 VAR" if flags[k] else "🟢 YOK" for k in FLAGS]
     rule = ("⛔ İŞLEM YOK" if count == 3 else
