@@ -213,7 +213,7 @@ def _tabs(sheet):
         raise ValueError("BOT_STATUS_OR_SINYAL_TAB_MISSING")
     return status, signal
 
-def _format(sheet, status, signal, colors):
+def _format(sheet, status, signal, colors, signal_rows):
     requests = []
     for tab, end_col in ((status, 2), (signal, len(HEADERS))):
         requests.append({"repeatCell": {"range": {"sheetId": tab.id, "startRowIndex": 0,
@@ -221,8 +221,27 @@ def _format(sheet, status, signal, colors):
             "cell": {"userEnteredFormat": {"backgroundColor": COLORS["header"],
                 "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}}},
             "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat"}})
+        requests.append({"updateSheetProperties": {
+            "properties": {"sheetId": tab.id, "gridProperties": {"frozenRowCount": 1}},
+            "fields": "gridProperties.frozenRowCount"}})
     for i, (kind, risk_kind) in enumerate(colors, start=1):
-        for column, tone in ((18, kind), (13, risk_kind)):
+        data = signal_rows[i]
+        extra = []
+        rsi, recovery, score, distance = (_num(data[j]) for j in (5, 6, 7, 12))
+        if rsi is not None:
+            extra.append((5, "green" if rsi >= 20 else "yellow" if rsi >= 18 else "red"))
+        if recovery is not None:
+            extra.append((6, "green" if recovery >= 1 else "yellow" if recovery >= 0.7 else "red"))
+        if score is not None:
+            # Display-only quality score, NOT an entry filter.
+            extra.append((7, "green" if score >= 70 else "yellow" if score >= 45 else "red"))
+        if distance is not None:
+            extra.append((12, "green" if abs(distance) <= 0.3 else
+                          "yellow" if abs(distance) <= 1 else "red"))
+        for j in (14, 15, 16):
+            if data[j] in ("🟢 YOK", "🔴 VAR"):
+                extra.append((j, "green" if data[j] == "🟢 YOK" else "red"))
+        for column, tone in [(18, kind), (13, risk_kind)] + extra:
             requests.append({"repeatCell": {"range": {"sheetId": signal.id,
                 "startRowIndex": i, "endRowIndex": i + 1,
                 "startColumnIndex": column, "endColumnIndex": column + 1},
@@ -264,7 +283,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None):
         {"range": "'" + status.title.replace("'", "''") + "'!A1:B26", "values": status_rows},
         {"range": "'" + signal.title.replace("'", "''") + "'!A1:V61", "values": signal_rows},
     ]})
-    _format(sheet, status, signal, colors)
+    _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
     return True
 
