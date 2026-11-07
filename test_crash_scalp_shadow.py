@@ -65,6 +65,19 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertEqual(len(obj["signals"]), 0)
         self.assertEqual(len(sw._tab_values(obj, "PULLBACK")), 57)
 
+    def test_four_missing_true_candles_allowed_but_five_rejected(self):
+        now = 57 * sw.STEP_MS / 1000
+        rows = candles(56)
+        four_gaps = [r for i, r in enumerate(rows) if i not in (4, 12, 20, 28)]
+        self.assertTrue(sw._ready(sw._bars(four_gaps, now), now))
+        five_gaps = [r for i, r in enumerate(rows) if i not in (4, 12, 20, 28, 36)]
+        self.assertFalse(sw._ready(sw._bars(five_gaps, now), now))
+
+    def test_no_future_candles_produce_data_gap_not_win(self):
+        signal = {"status": "OPEN", "ts": 0, "side": "LONG", "tp": 101, "risk": 99}
+        sw._settle(signal, [], sw.HORIZON_S + 1)
+        self.assertEqual(signal["status"], "DATA_GAP")
+
     def test_wrong_workbook_fail_closed(self):
         class Book:
             title = "Other spreadsheet"
