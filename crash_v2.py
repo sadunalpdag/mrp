@@ -62,12 +62,19 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
     present = sum(start+i*STEP_MS in candles for i in range(HISTORY_CANDLES))
     recent_times = range(end-16*STEP_MS, end, STEP_MS)
     recent = [candles[t] for t in recent_times if t in candles]
-    if (present < HISTORY_CANDLES-2 or end-STEP_MS not in candles
-            or len(recent) < 14):
+    # Coverage alone is insufficient: the latest CLOSED candle is compulsory.
+    latest_closed_present = end-STEP_MS in candles
+    missing_reason = ("TOO_FEW_5D_CANDLES" if present < HISTORY_CANDLES-2 else
+                      "LAST_CLOSED_CANDLE_MISSING" if not latest_closed_present else
+                      "RECENT_4H_GAPS" if len(recent) < 14 else None)
+    if missing_reason is not None:
         return {"status":"MISSING_5D_HISTORY", "qualified":False,
                 "candles":present, "expected_candles":HISTORY_CANDLES,
                 "missing_candles":HISTORY_CANDLES-present,
-                "recent_4h_observed":len(recent)}
+                "recent_4h_observed":len(recent),
+                "latest_closed_present":latest_closed_present,
+                "missing_reason":missing_reason,
+                "signal_last_closed_open_ms":end-STEP_MS}
     ordered = [candles[start+i*STEP_MS] for i in range(HISTORY_CANDLES)
                if start+i*STEP_MS in candles]
     closes = [c[3] for c in ordered]
@@ -94,6 +101,9 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
             "expected_candles":HISTORY_CANDLES,
             "missing_candles":HISTORY_CANDLES-present,
             "recent_4h_observed":len(recent),
+            "latest_closed_present":True,
+            "missing_reason":None,
+            "signal_last_closed_open_ms":end-STEP_MS,
             "candle_tolerance_version":"missing_up_to_2_real_closed_v1",
             "rsi14":round(rsi,4),
             "recovery_4h_pct":round(recovery,4),
