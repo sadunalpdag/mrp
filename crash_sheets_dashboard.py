@@ -104,7 +104,7 @@ def _missing_explanation(rec, feat):
         return "—"
     cause = _MISSING_REASONS.get(feat.get("missing_reason"), "Veri tamamlanmadı / neden kaydedilmemiş")
     if rec.get("v2_reason") == "HISTORY_NOT_READY_IN_TIME":
-        return "90 saniye içinde karar verilemedi; " + cause
+        return "Aday süresi içinde karar verilemedi; " + cause
     return cause
 
 
