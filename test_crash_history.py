@@ -109,6 +109,16 @@ class HistoryTests(unittest.TestCase):
         self.emit.assert_not_called()
         self.assertEqual(self.worker.jobs['test:signal']['retry_after'], 3700)
 
+    def test_expired_candidate_jobs_removed_without_download(self):
+        old=dict(symbol='TESTUSDT',signal_id='expired',created_at=100)
+        fresh=dict(symbol='TESTUSDT',signal_id='fresh',created_at=100+23*3600)
+        self.worker.submit(old,'signal',self.job['as_of'])
+        self.worker.submit(fresh,'signal',self.job['as_of'])
+        self.worker.prune_expired(100+24*3600)
+        self.assertNotIn('expired:signal',self.worker.jobs)
+        self.assertIn('fresh:signal',self.worker.jobs)
+        self.fetch.assert_not_called()
+
     def test_emit_and_remove_job(self):
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),'signal',self.job['as_of'])
         self.worker.step(now=100)
