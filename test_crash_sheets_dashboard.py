@@ -69,6 +69,15 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(table[1][9], 3.5)
         self.assertEqual(cache["TESTUSDT"]["score"], 58.5)
 
+    def test_expired_signal_is_not_shown_as_active_even_in_top20(self):
+        old=dict(self.record,created_at=self.now - 24*3600 - 1)
+        _, table, _, _=dash.build_rows(
+            {"symbols":{"TESTUSDT":old},"history":[]},self.tickers,
+            {},{},self.now)
+        self.assertEqual(table[1][0],"TESTUSDT")
+        self.assertEqual(table[1][4],"SİNYAL YOK")
+        self.assertEqual(table[1][21],"—")
+
     def test_479_latest_missing_is_not_mislabeled_as_failed_v2(self):
         rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
                    v2_reason="HISTORY_NOT_READY_IN_TIME",
