@@ -7296,7 +7296,9 @@ class CrashBounceWebSocketCache:
         self.tickers = {}
         self.rows = {}
         self.wanted = set()
+        self.shadow_wanted = set()  # bounded research-only kline streams
         self.trade_wanted = set()
+        self._loading = False
         self.connected = False
         self.opened_at = 0.
         self.ws = None
@@ -7316,9 +7318,13 @@ class CrashBounceWebSocketCache:
                 saved = json.load(handle)
             if not isinstance(saved, dict):
                 raise ValueError("Invalid candle cache")
-            for symbol, rows in saved.items():
-                if isinstance(rows, list):
-                    self.merge_candles(symbol, rows)
+            self._loading = True
+            try:
+                for symbol, rows in saved.items():
+                    if isinstance(rows, list):
+                        self.merge_candles(symbol, rows)
+            finally:
+                self._loading = False
             self.dirty = False
         except Exception as error:
             log(f"[CRASH WS CACHE] rebuilding invalid cache: {type(error).__name__}")
@@ -7345,7 +7351,10 @@ class CrashBounceWebSocketCache:
                     merged[int(row[0])] = list(row)
                 except (ValueError, TypeError, IndexError):
                     continue
-            self.rows[symbol] = [merged[t] for t in sorted(merged)][-64:]
+            # Two days of genuine closed 15m bars for paper research only.
+            # The existing V2 symbols retain their original 64-bar limit.
+            limit = 192 if symbol in self.shadow_wanted or (self._loading and len(rows) > 64) else 64
+            self.rows[symbol] = [merged[t] for t in sorted(merged)][-limit:]
             self.dirty = True
 
     def candles(self, symbol):
@@ -7453,15 +7462,22 @@ class CrashBounceWebSocketCache:
             except Exception:
                 ws.close()
 
-    def reconcile(self, symbols, trade_symbols=None):
+    def reconcile(self, symbols, trade_symbols=None, research_symbols=None):
         from crash_policy import supported_symbol
-        wanted = {s for s in symbols if supported_symbol(s)}
+        base = {s for s in symbols if supported_symbol(s)}
         trades = set(trade_symbols or ())
-        if len(wanted)>100 or len(trades)>100:
+        if len(base)>100 or len(trades)>100:
             raise ValueError("Too many crash websocket subscriptions")
         with self.lock:
+            if research_symbols is not None:
+                research = {s for s in research_symbols if supported_symbol(s)}
+                if len(research) > 36:
+                    raise ValueError("Too many shadow research subscriptions")
+                self.shadow_wanted = research
+            wanted = base | self.shadow_wanted
             old, self.wanted = self.wanted, wanted
             old_trades, self.trade_wanted = self.trade_wanted, trades
+        # Existing single WebSocket: NO REST, no extra socket or real orders.
         self._send("UNSUBSCRIBE", old-wanted)
         self._send("SUBSCRIBE", wanted-old)
         self._send("UNSUBSCRIBE", old_trades-trades, "@aggTrade")
@@ -7758,6 +7774,7 @@ def _crash_load_market_cache():
 
 
 def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
+    import os  # self-contained for isolated Crash V2 regression harness
     from crash_policy import supported_symbol, TRACKING_SECONDS
     now = time.time() if now is None else now
     tickers = _CRASH_WS_CACHE.snapshot(now) if tickers is None else tickers
@@ -7801,8 +7818,19 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                       r.get("tracking_model")=="ws_aggtrade_upcross_v3"
                       and r.get("v2_status")=="STRONG_V2"
                       and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
+    # Shadow uses different 24h top-GAINER rank bands, leaving the V2 loser
+    # selection and order-watching streams completely unchanged.
+    research_symbols = set()
+    if os.getenv("SCALP_SHADOW_ENABLED", "1") == "1":
+        try:
+            from scalp_shadow_week import gainer_groups, open_shadow_symbols
+            groups = gainer_groups(tickers, market)
+            research_symbols = set(groups["PULLBACK"] + groups["BREAK_BOUNCE"])
+            research_symbols.update(open_shadow_symbols(DATA_DIR, now, max_extra=16))
+        except Exception as error:
+            log(f"[SCALP SHADOW SUBS] skipped: {type(error).__name__}")
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
-                              trade_watching)
+                              trade_watching, research_symbols=research_symbols)
     _crash_append_data({"type":"scan", "observed_at":now,
         "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":150,"tracking_model":"ws_aggtrade_upcross_v3",
                          "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480,
@@ -8353,7 +8381,7 @@ def _crash_bounce_worker():
         if scalp_shadow is not None:
             try:
                 scalp_shadow.tick(_CRASH_WS_CACHE.snapshot(time.time()),
-                                  _CRASH_WS_CACHE.candles)
+                                  _CRASH_WS_CACHE.candles, market)
             except Exception as error:
                 log(f"[SCALP SHADOW SCHEDULE] skipped: {type(error).__name__}")
         time.sleep(max(1,min(15,next_scan-time.time())))

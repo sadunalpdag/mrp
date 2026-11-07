@@ -1,8 +1,8 @@
-"""Seven-day PAPER scalp probes. Never places orders, opens WS feeds, or requests REST.
+"""Seven-day PAPER scalp probes; uses already connected futures WS, never REST/orders.
 
-Both signals are 15m proxies from existing CLOSED WS candles. Break & Bounce
-requires yesterday's UTC day range already saved locally; 5m entry confirmation
-is unavailable and is never represented as confirmed.
+Pullback observes 24h top-gainer ranks 11-20; Break & Bounce observes 21-30.
+Closed 15m WS candles only, with separate bounded subscriptions supplied by
+CrashBounceWebSocketCache. Actual 5m entry confirmation remains unavailable.
 """
 import json
 import math
@@ -14,13 +14,59 @@ from datetime import datetime, timezone
 STEP_MS = 900_000
 INTERVAL_S = 300
 HORIZON_S = 12 * 3600
-MAX_SYMBOLS = 10
+MAX_SYMBOLS = 10  # per strategy, 20 combined
 MAX_SHEET_SIGNALS = 48
+SELECTION_VERSION = "positive_gainers_11_20_vs_21_30_v1"
+RANK_BOUNDS = {"PULLBACK": (10, 20), "BREAK_BOUNCE": (20, 30)}
 RETENTION_S = 8 * 86400
 TABS = {"PULLBACK": "Pullback Test", "BREAK_BOUNCE": "Break Bounce Test"}
 HEADERS = ["Coin", "Yön", "Mum zamanı UTC", "Sanal giriş", "TP %1",
            "Risk -%1", "Sonuç", "Sonuç zamanı UTC", "Model", "Gözlem"]
 MODEL = "15m mum vekili / gerçek 5m teyidi YOK"
+
+
+def gainer_groups(tickers, allowed_market=None):
+    """Exact 11-20 and 21-30 ranks from current, positive 24h USDT-M gainers.
+
+    Filter to existing verified USDT perpetual market metadata when provided.
+    A missing 15m history never promotes rank 31 into an earlier bucket.
+    """
+    allowed = set(allowed_market) if allowed_market is not None else None
+    by_symbol = {}
+    for item in tickers if isinstance(tickers, list) else ():
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol")
+        if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+            continue
+        if len(symbol) > 28 or not symbol[:-4].isascii() or not symbol[:-4].isalnum():
+            continue
+        if allowed is not None and symbol not in allowed:
+            continue
+        change = _number(item.get("priceChangePercent"))
+        if change is None or change <= 0:
+            continue
+        by_symbol[symbol] = change
+    ranked = [s for s, change in sorted(by_symbol.items(), key=lambda x: (-x[1], x[0]))]
+    return {k: ranked[start:end] for k, (start, end) in RANK_BOUNDS.items()}
+
+
+def open_shadow_symbols(directory, now, max_extra=16):
+    """Keep active paper trades subscribed after they leave their gainer rank."""
+    state = _load(os.path.join(directory, "scalp_shadow_week.json"))
+    live = sorted((r for r in state.get("signals", []) if isinstance(r, dict)
+                   and r.get("selection_version") == SELECTION_VERSION
+                   and r.get("status") == "OPEN"
+                   and isinstance(r.get("ts"), (int, float))
+                   and 0 <= now - r["ts"] / 1000 <= HORIZON_S),
+                  key=lambda r: r["ts"], reverse=True)
+    result = []
+    for r in live:
+        if r.get("symbol") not in result and isinstance(r.get("symbol"), str):
+            result.append(r["symbol"])
+        if len(result) >= max_extra:
+            break
+    return result
 
 
 def _number(value):
@@ -171,85 +217,98 @@ def _settle(signal, bars, now):
             signal["resolved_at"] = r[0] + STEP_MS
             return
     if now * 1000 >= expiry_ms:
-        # Do not call an unobserved move a timeout.
-        current = bars[-1][0] + STEP_MS if bars else 0
-        signal["status"] = "TIMEOUT" if current >= expiry_ms else "DATA_GAP"
+        # A complete candle-by-candle path is required to claim TIMEOUT.
+        required = {signal["ts"] + i * STEP_MS
+                    for i in range(1, HORIZON_S * 1000 // STEP_MS + 1)}
+        observed = {bar[0] for bar in later}
+        signal["status"] = "TIMEOUT" if required.issubset(observed) else "DATA_GAP"
         signal["resolved_at"] = int(now * 1000)
 
 
-def _scan(data_dir, tickers, candles_get, now, obj):
-    # Never start additional WS subscriptions or request any REST data.
-    ranked = []
-    for t in tickers if isinstance(tickers, list) else ():
-        if not isinstance(t, dict):
-            continue
-        symbol = t.get("symbol", "")
-        change = _number(t.get("priceChangePercent"))
-        volume = _number(t.get("quoteVolume"))
-        if (not symbol.endswith("USDT") or not symbol[:-4].isalnum() or
-                change is None or volume is None or volume < 0):
-            continue
-        ranked.append((change, -volume, symbol))
-    ranked.sort()
-    available = []
-    for _, neg_volume, symbol in ranked[:20]:  # same existing Crash candidates
-        bars = _bars(candles_get(symbol), now)
-        if _ready(bars, now):
-            available.append((-neg_volume, symbol, bars))
-    available.sort(reverse=True)
-    selected = available[:MAX_SYMBOLS]
-    known = {(s["strategy"], s["symbol"], s["ts"])
-             for s in obj["signals"] if isinstance(s, dict)}
-    by_symbol = {s: b for _, s, b in selected}
-    # A paper signal might leave the current top 10. Read ONLY the existing
-    # local WS cache for up to 24 such symbols; never add WS subscriptions.
-    pending = sorted((s for s in obj["signals"] if s.get("status") == "OPEN"),
-                     key=lambda item: item.get("ts", 0), reverse=True)
-    pending_symbols = []
-    for item in pending:
-        sym = item.get("symbol")
-        if isinstance(sym, str) and sym not in by_symbol and sym not in pending_symbols:
-            pending_symbols.append(sym)
-        if len(pending_symbols) >= 24:
-            break
-    for sym in pending_symbols:
-        by_symbol[sym] = _bars(candles_get(sym), now)
-    for signal in obj["signals"]:
-        if signal.get("status") == "OPEN":
-            _settle(signal, by_symbol.get(signal.get("symbol"), []), now)
-    for _, symbol, bars in selected:
-        # Use the same last-closed-bar timestamp as the other V2 indicators.
-        entry_ts = bars[-1][0]
-        proposals = [("PULLBACK", pullback(bars))]
-        yesterday_path = os.path.join(data_dir, "crash_research", "history_cache", symbol + ".json")
-        try:
-            with open(yesterday_path, encoding="utf-8") as fd:
-                daily_rows = json.load(fd)
-        except (OSError, ValueError, TypeError):
-            daily_rows = []
-        proposals.append(("BREAK_BOUNCE", break_bounce(bars, previous_utc_range(daily_rows, now))))
-        for strategy, result in proposals:
+def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
+    """Bounded 15m-only prospective scan. Pure research; nothing signed/REST."""
+    groups = gainer_groups(tickers, allowed_market)
+    ready = {k: [] for k in RANK_BOUNDS}
+    recent = {}
+    full_candles = {}
+    # Read each exact ranked gainer cache once, reuse for yesterday's range.
+    for symbol in set(groups["PULLBACK"] + groups["BREAK_BOUNCE"]):
+        full_candles[symbol] = candles_get(symbol)
+        recent[symbol] = _bars(full_candles[symbol], now)
+    for strategy, symbols in groups.items():
+        for symbol in symbols:
+            bars = recent[symbol]
+            if _ready(bars, now):
+                ready[strategy].append(symbol)
+
+    # Preserve legacy records locally but NEVER include those trials in
+    # the new gainer-universe results/denominators.
+    obj["selection_version"] = SELECTION_VERSION
+    obj.setdefault("signals", [])
+    if not obj.get("gainer_test_started"):
+        obj["gainer_test_started"] = int(now)
+    known = {(r["strategy"], r["symbol"], r["ts"]) for r in obj["signals"]
+             if isinstance(r, dict) and r.get("selection_version") == SELECTION_VERSION
+             and all(k in r for k in ("strategy", "symbol", "ts"))}
+    # Update pending outcomes even if their symbol rotated off the rank list.
+    pending = sorted((r for r in obj["signals"] if isinstance(r, dict)
+                      and r.get("selection_version") == SELECTION_VERSION
+                      and r.get("status") == "OPEN"),
+                     key=lambda r: r.get("ts", 0), reverse=True)
+    for r in pending[:200]:
+        sym = r.get("symbol")
+        if isinstance(sym, str) and sym not in recent:
+            recent[sym] = _bars(candles_get(sym), now)
+        _settle(r, recent.get(sym, []), now)
+
+    for strategy, symbols in ready.items():
+        for symbol in symbols:
+            bars = recent[symbol]
+            entry_ts = bars[-1][0]
+            result = None
+            if strategy == "PULLBACK":
+                result = pullback(bars)
+            else:
+                # The 192-bar WS research cache can hold yesterday's 96 real
+                # candles. Combine with any already stored local history only.
+                history_path = os.path.join(data_dir, "crash_research", "history_cache",
+                                            symbol + ".json")
+                try:
+                    with open(history_path, encoding="utf-8") as fd:
+                        history_rows = json.load(fd)
+                except (OSError, ValueError, TypeError):
+                    history_rows = []
+                daily_range = previous_utc_range(
+                    (history_rows if isinstance(history_rows, list) else [])
+                    + (full_candles.get(symbol) or []), now)
+                result = break_bounce(bars, daily_range)
             if result is None or (strategy, symbol, entry_ts) in known:
                 continue
             side, note = result
             entry = bars[-1][4]
             obj["signals"].append({
+                "selection_version": SELECTION_VERSION,
                 "strategy": strategy, "symbol": symbol, "side": side,
-                "ts": entry_ts, "entry": entry, "tp": entry * (1.01 if side == "LONG" else 0.99),
+                "ts": entry_ts, "entry": entry,
+                "tp": entry * (1.01 if side == "LONG" else 0.99),
                 "risk": entry * (0.99 if side == "LONG" else 1.01),
                 "status": "OPEN", "resolved_at": None, "note": note,
             })
             known.add((strategy, symbol, entry_ts))
-    obj["signals"] = [s for s in obj["signals"]
-                      if isinstance(s, dict) and now - s.get("ts", 0) / 1000 < RETENTION_S][-2000:]
+    # The 8-day local retention cap also applies to legacy experiments.
+    obj["signals"] = [r for r in obj["signals"] if isinstance(r, dict)
+                      and isinstance(r.get("ts"), (int, float))
+                      and now - r["ts"] / 1000 < RETENTION_S][-2000:]
     obj["last_scan"] = int(now)
-    obj["sampled_coins"] = [s for _, s, _ in selected]
-    obj["available_count"] = len(available)
+    obj["ranked_groups"] = groups
+    obj["ready_groups"] = ready
+    obj["sampled_coins"] = {k: list(v) for k, v in ready.items()}
+    obj["available_count"] = {k: len(v) for k, v in ready.items()}
     return obj
-
 
 def _tab_values(obj, strategy):
     signals = [s for s in obj["signals"] if s.get("strategy") == strategy
+               and s.get("selection_version") == SELECTION_VERSION
                and obj["last_scan"] - s["ts"] / 1000 <= 7 * 86400]
     statuses = {k: sum(s.get("status") == k for s in signals)
                 for k in ("OPEN", "TP", "RISK", "TIMEOUT", "AMBIGUOUS", "DATA_GAP")}
@@ -259,7 +318,11 @@ def _tab_values(obj, strategy):
         ["Yedi günlük sanal test", TABS[strategy]],
         ["Model", MODEL],
         ["Son tarama UTC", _dt(obj["last_scan"] * 1000)],
-        ["Takip edilen coin", ", ".join(obj.get("sampled_coins", [])) or "VERİ YETERSİZ"],
+        ["24s en çok yükselen %s-%s. sıralar / veri hazır %s/%s" %
+         (RANK_BOUNDS[strategy][0] + 1, RANK_BOUNDS[strategy][1],
+          len(obj.get("ready_groups", {}).get(strategy, [])),
+          len(obj.get("ranked_groups", {}).get(strategy, []))),
+         ", ".join(obj.get("ranked_groups", {}).get(strategy, [])) or "YETERLİ YÜKSELEN YOK"],
         ["Sinyal / açık / TP / risk", "%s / %s / %s / %s" %
          (len(signals), statuses["OPEN"], statuses["TP"], statuses["RISK"])],
         ["Sadece TP ve risk arasında TP oranı", rate],
@@ -308,21 +371,28 @@ class ShadowWeek:
         self.lock = threading.Lock()
         self.path = os.path.join(directory, "scalp_shadow_week.json")
 
-    def tick(self, tickers, candles_get):
+    def tick(self, tickers, candles_get, allowed_market=None):
         now = self.clock()
         if now < self.next_due or not self.lock.acquire(False):
             return
         self.next_due = now + INTERVAL_S
         snapshot = [dict(t) for t in tickers if isinstance(t, dict)]
+        market_symbols = set(allowed_market) if allowed_market is not None else None
         def work():
             try:
-                data = _scan(self.directory, snapshot, candles_get, now, _load(self.path))
+                data = _scan(self.directory, snapshot, candles_get, now, _load(self.path),
+                             market_symbols)
                 _save(self.path, data)
                 try:
                     if _publish(data):
                         self.logger("[SCALP SHADOW] Pullback Test / Break Bounce Test updated; "
-                                    "coins=%s; paper_signals=%s; no REST" %
-                                    (len(data["sampled_coins"]), len(data["signals"])))
+                                    "Pullback_ready=%s/%s; Break_ready=%s/%s; paper_signals=%s; no REST" %
+                                    (len(data["ready_groups"]["PULLBACK"]),
+                                     len(data["ranked_groups"]["PULLBACK"]),
+                                     len(data["ready_groups"]["BREAK_BOUNCE"]),
+                                     len(data["ranked_groups"]["BREAK_BOUNCE"]),
+                                     sum(r.get("selection_version") == SELECTION_VERSION
+                                         for r in data["signals"])))
                     else:
                         self.logger("[SCALP SHADOW] local paper results saved; Sheets credentials missing")
                 except Exception as exc:
