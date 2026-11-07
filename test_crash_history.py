@@ -129,6 +129,9 @@ class ScheduledHistoryTests(HistoryTests):
         self.assertEqual(self.fetch.call_count,2)
 
     def test_gap_request_does_not_redownload_cached_tail(self):
+        # The paced repair still fetches optional old gaps for background
+        # research; only fresh signal decisions bypass that optional download.
+        self.job['phase'] = 'warmup'
         self.worker.collect(self.job)
         path=self.tmp.name+'/TESTUSDT.json'
         cached=self.worker._read(path,[])
