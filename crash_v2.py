@@ -47,9 +47,10 @@ def assess_entry(history_rows, ws_rows, at, btc_change_24h=None):
                         l > min(o,c) or h < max(o,c) or l > h):
                     continue
                 new_source = row[12] if len(row)>12 else 'BINANCE_CACHE_WS'
-                if (opened in candles and provenance[opened] != 'BYBIT_LINEAR'
-                        and new_source == 'BYBIT_LINEAR'):
-                    continue  # Binance data always outranks a cached Bybit gap.
+                if (opened in candles and provenance[opened] not in
+                        ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')
+                        and new_source in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')):
+                    continue  # Binance data outranks a cached external-venue gap.
                 provenance[opened] = new_source
                 candles[opened] = (o,h,l,c,v)
                 try:
