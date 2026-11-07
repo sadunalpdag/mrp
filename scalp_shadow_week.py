@@ -230,9 +230,11 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
     groups = gainer_groups(tickers, allowed_market)
     ready = {k: [] for k in RANK_BOUNDS}
     recent = {}
-    # Read OHLC only for exact ranked gainers; never substitute a lower rank.
+    full_candles = {}
+    # Read each exact ranked gainer cache once, reuse for yesterday's range.
     for symbol in set(groups["PULLBACK"] + groups["BREAK_BOUNCE"]):
-        recent[symbol] = _bars(candles_get(symbol), now)
+        full_candles[symbol] = candles_get(symbol)
+        recent[symbol] = _bars(full_candles[symbol], now)
     for strategy, symbols in groups.items():
         for symbol in symbols:
             bars = recent[symbol]
@@ -278,7 +280,7 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
                     history_rows = []
                 daily_range = previous_utc_range(
                     (history_rows if isinstance(history_rows, list) else [])
-                    + (candles_get(symbol) or []), now)
+                    + (full_candles.get(symbol) or []), now)
                 result = break_bounce(bars, daily_range)
             if result is None or (strategy, symbol, entry_ts) in known:
                 continue
