@@ -274,6 +274,17 @@ class HistoryCollector:
                 self.step()
             except Exception as error:
                 self.log(f'[CRASH HISTORY ERR] {type(error).__name__}: {str(error)[:200]}')
-            time.sleep(15)
+            # A 24-job signal burst would otherwise wait 24 x 15 = 360s,
+            # outlasting the 280s candidate deadline. Drain eligible urgent
+            # cache checks promptly; all actual network work remains protected
+            # by the unchanged 180s pacing and per-venue API budgets.
+            now = time.time()
+            with self.lock:
+                urgent_ready = any(
+                    job.get('phase') == 'signal'
+                    and job.get('retry_after', 0) <= now
+                    and 0 <= now-job.get('as_of', 0) <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS
+                    for job in self.jobs.values())
+            time.sleep(2 if urgent_ready else 15)
 
 
