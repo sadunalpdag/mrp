@@ -7408,6 +7408,7 @@ class CrashBounceWebSocketCache:
         self.send_lock = threading.Lock()
         self.tickers = {}
         self.rows = {}
+        self.last_ws_closed = {}  # Direct x=true events during THIS connection only.
         self.wanted = set()
         self.shadow_wanted = set()  # bounded research-only kline streams
         self.trade_wanted = set()
@@ -7474,6 +7475,11 @@ class CrashBounceWebSocketCache:
         with self.lock:
             return [list(r) for r in self.rows.get(symbol, [])]
 
+    def last_ws_observation(self, symbol):
+        with self.lock:
+            found = self.last_ws_closed.get(symbol)
+            return dict(found) if found else None
+
     def flush(self):
         with self.lock:
             if not self.dirty:
@@ -7536,6 +7542,8 @@ class CrashBounceWebSocketCache:
                 row = [k["t"],k["o"],k["h"],k["l"],k["c"],k["v"],k["T"],
                        k.get("q"),k.get("n",0),k.get("V"),k.get("Q"),"0"]
                 self.merge_candles(symbol, [row])
+                with self.lock:
+                    self.last_ws_closed[symbol] = {'open_ms': int(k['t']), 'received_at': time.time()}
                 # Read-only shadow feed. Pass ONLY this actual closed WS event;
                 # never forward REST, archive, or alternate-venue cache rows.
                 feed = globals().get("_CRASH_DAY_TRADER_WS_FEED")
@@ -7604,6 +7612,7 @@ class CrashBounceWebSocketCache:
             self.last_ticker_at=0.
             self.reconnect_requested=False
             self.tickers={}  # Never carry pre-disconnect prices into a new session.
+            self.last_ws_closed={}  # Old cache rows are NOT proof of a new WS event.
             wanted=set(self.wanted)
             trade_wanted=set(self.trade_wanted)
         self._send("SUBSCRIBE", wanted)
@@ -8394,6 +8403,12 @@ def _crash_bounce_worker():
                                                _CRASH_WS_CACHE.candles)
     except Exception as error:
         log(f'[CRASH SHEETS SETUP SKIPPED] {type(error).__name__}')
+    candle_audit = None
+    try:
+        from crash_candle_trace import CandleAudit
+        candle_audit = CandleAudit(CRASH_BOUNCE_RESEARCH_DIR, log)
+    except Exception as error:
+        log(f'[CRASH 15M AUDIT SETUP SKIPPED] {type(error).__name__}')
     # Prospective 7-day scalp research: existing CLOSED WS candles only,
     # independent paper outcomes, no REST/orders/new WS subscriptions.
     scalp_shadow = None
@@ -8506,6 +8521,12 @@ def _crash_bounce_worker():
                                           _CRASH_NIGHT, _CRASH_WS_CACHE.health(time.time()))
             except Exception as error:
                 log(f'[CRASH SHEETS SCHEDULE SKIPPED] {type(error).__name__}')
+        # Read-only five-minute candle audit; disk I/O runs on its own thread.
+        if candle_audit is not None:
+            try:
+                candle_audit.tick(_CRASH_WS_CACHE.snapshot(time.time()), _CRASH_WS_CACHE)
+            except Exception as error:
+                log(f'[CRASH 15M AUDIT SCHEDULE ERROR] {type(error).__name__}')
         # Never hold the trading lock or stall the 3-minute V2 scan.
         if scalp_shadow is not None:
             try:
