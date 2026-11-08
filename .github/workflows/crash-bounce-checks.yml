@@ -14,6 +14,8 @@ on:
       - 'crash_score_v3.py'
       - 'crash_context.py'
       - 'test_crash*.py'
+      - 'structure_agent_monitor.py'
+      - 'test_structure_agent_monitor.py'
       - 'day_trader_ws_feed.py'
       - 'test_day_trader_ws_feed.py'
       - '.github/workflows/crash-bounce-checks.yml'
@@ -31,6 +33,8 @@ on:
       - 'crash_score_v3.py'
       - 'crash_context.py'
       - 'test_crash*.py'
+      - 'structure_agent_monitor.py'
+      - 'test_structure_agent_monitor.py'
       - 'day_trader_ws_feed.py'
       - 'test_day_trader_ws_feed.py'
       - '.github/workflows/crash-bounce-checks.yml'
@@ -48,9 +52,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Check Python syntax
-        run: python -m py_compile day_trader_ws_feed.py ai_top_gainers.py ai_market_agents.py ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py crash_context.py
+        run: python -m py_compile structure_agent_monitor.py day_trader_ws_feed.py ai_top_gainers.py ai_market_agents.py ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py crash_context.py
       - name: Run offline Crash Bounce tests
-        run: python -m unittest discover -p 'test_crash*.py' -v && python -m unittest test_day_trader_ws_feed -v
+        run: python -m unittest discover -p 'test_crash*.py' -v && python -m unittest test_day_trader_ws_feed test_structure_agent_monitor -v
 
       - name: Run offline AI market research tests
         run: python -m unittest test_ai_top_gainers test_ai_market_agents -v
