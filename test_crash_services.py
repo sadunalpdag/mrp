@@ -647,7 +647,13 @@ class NightTests(unittest.TestCase):
         self.b.closing_orders = Mock(return_value=[])
         self.e.reconcile(order)
         self.assertEqual(order['phase'], 'PROTECTED')
-        self.assertTrue(self.e.state['halt'])
+        # A TP failure alone cannot classify a BUY as uncertain. The BUY's
+        # own reconciliation owns that decision; meanwhile do not drop the
+        # unresolved BUY or release this symbol.
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertEqual(self.e.state['orders']['uncertain']['phase'],
+                         'ENTRY_UNKNOWN')
         self.b.positions.assert_not_called()
 
     def test_persisted_warned_manual_close_can_release_prior_tp_halt(self):
