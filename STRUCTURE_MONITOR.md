@@ -6,9 +6,12 @@ change Crash candidate eligibility, or submit orders. `0` disables the observer
 and its extra kline subscriptions.
 
 The existing EMA Filter workbook receives one new worksheet, **Structure Agent
-Test**. Other worksheets are not edited or deleted. Rows show the current top
-50 active USDT perpetual contracts by 24-hour USDT quote turnover; unavailable
-age or price data is not interpreted as eligibility. Contract age must be at
+Test**. Other worksheets are not edited or deleted. The observer ranks the top
+50 active USDT perpetual contracts by 24-hour USDT quote turnover in the
+background, but the sheet displays ONLY up to 5 active **DÖNÜŞ** and 5 active
+**DEVAM** candidates (up to 10 rows). No noncandidate or missing-data coin is
+shown as an active watchlist item. Unavailable age or price data is not
+interpreted as eligibility. Contract age must be at
 least 30 days. Only five days of candles are required, not 30 days of candles.
 BTC/ETH changes are shown as context, not imposed as a trading filter.
 
@@ -28,7 +31,14 @@ Two independent LONG research hypotheses are monitored:
   holding the impulse low, then a bullish close above the pullback highs.
 
 At most five current candidates per hypothesis are selected, prioritizing
-fresh confirmations then turnover rank. Indicative entry is the observed
+fresh confirmations then turnover rank. The scan reassesses the same 50-coin
+universe every five minutes; when a selected candidate expires, loses its
+setup, becomes ineligible, or is rejected, the next eligible candidate of
+that method takes its place without a separate API query. A bare upward/downward
+4h trend is **YAPI YOK**, not **İZLE**. **İZLE** requires an actual in-progress
+reversal breakout/retest or continuation impulse/pullback; a failed first
+reversal touch does not occupy a slot indefinitely. If fewer than five
+candidates meet the conditions in either method, those slots stay empty. Indicative entry is the observed
 ticker price, never a claimed historical fill. Stop is below the relevant
 pullback low by 0.20 ATR. The illustrative target is 1.5 times price risk.
 Known overhead pivot resistance must leave room for that target. Spread and
@@ -36,11 +46,15 @@ order-book depth are explicitly **unmeasured**, so confirmations are never
 marked execution-eligible. There is no paper-fill/P&L simulator in this version.
 
 Confirmed observations are deduplicated by symbol/method/candle timestamp and
-retained locally for 30 days (maximum 2,000 records); the latest 100 are shown
-below the diagnostic table. Restarting does not backdate a missed first touch.
+retained locally for 30 days (maximum 2,000 records); historical confirmations
+and all 50 diagnostic rows remain in the local JSON but do not clutter the
+active Google Sheets table. The existing single fixed-range Sheets write clears
+old 50-coin rows and the older event list. Restarting does not backdate a missed first touch.
 State is `DATA_DIR/structure_agent_monitor.json`.
 
-Missing bars propose one warmup every five minutes, with a rotating cursor and
+The observer uses the existing cached/WS candles for all 50; the display
+change adds no new market-data REST calls. Missing bars still propose only one
+warmup every five minutes, with a rotating cursor and
 at most three structure warmups outstanding in the existing history worker.
 Due Crash jobs take precedence at submission. The existing archive checksum,
 alternate-venue price validation, request pacing, IP cooldown and last-resort
