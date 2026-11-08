@@ -190,9 +190,11 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
     risk_summary = {0: 0, 1: 0, 2: 0, 3: 0, "unknown": 0}
     eligible = 0
     for sym in names:
-        rec = symbols.get(sym) or {}
-        if not is_active_candidate(rec, now):
-            rec = {}
+        stored_rec = symbols.get(sym)
+        active = is_active_candidate(stored_rec, now)
+        expired_signal = (not active and isinstance(stored_rec, dict)
+                          and bool(stored_rec.get("signal_id")))
+        rec = stored_rec if active else {}
         v2 = rec.get("v2_features") or {}
         has_signal = bool(rec.get("signal_id"))
         risk, flags, rule = _risk(rec) if has_signal else (None, ["—"] * 3, "—")
@@ -264,7 +266,8 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         rows.append([
             sym, round(change, 2) if change is not None else "—", rank.get(sym, "—"),
             price if price is not None else "—", (rec.get("v2_status") or "V2 DURUMU KAYITLI DEĞİL") if has_signal
-            else _no_candidate_status(change, live),
+            else ("ÖNCEKİ ADAY SÜRESİ DOLDU" if expired_signal
+                  else _no_candidate_status(change, live)),
             visible_v2.get("rsi14", "—"), visible_v2.get("recovery_4h_pct", "—"),
             (current if current is not None else
              "VERİ EKSİK" if has_signal and rec.get("v2_status") in (
