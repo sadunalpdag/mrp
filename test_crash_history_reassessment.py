@@ -60,6 +60,26 @@ class ReassessmentTests(unittest.TestCase):
         self.assertEqual(self.old["v2_status"], "MISSING_5D_HISTORY")
         self.assertFalse(self.old["v2_sent"])
 
+    def test_filtered_decision_with_real_strength_metrics_gets_var_yok_labels(self):
+        result = dict(self.valid, status="FILTERED_V2", qualified=False)
+        validator = Mock(return_value=result)
+        self.assertEqual(reassess_expired(self.state, self.now, validator, self.log), 1)
+        self.assertEqual(self.old["retrospective_v2"]["status"], "FILTERED_V2")
+        self.assertEqual(self.old["retrospective_v2"]["known_risk_flags"], 3)
+        self.assertEqual(self.old["failure_shadow"]["known_flags"], 3)
+        self.assertEqual(self.old["v2_status"], "MISSING_5D_HISTORY")
+        self.assertFalse(self.old["v2_sent"])
+
+    def test_previous_filtered_record_without_risk_is_backfilled(self):
+        self.old["retrospective_v2"] = {
+            "status": "FILTERED_V2", "checked_at": self.now - 600,
+            "research_only": True}
+        result = dict(self.valid, status="FILTERED_V2", qualified=False)
+        self.assertEqual(reassess_expired(
+            self.state, self.now, Mock(return_value=result), self.log), 1)
+        self.assertEqual(self.old["failure_shadow"]["known_flags"], 3)
+        self.assertEqual(self.old["v2_delivery_status"], "EXPIRED_NOT_SENT")
+
     def test_nonexpired_or_nonhistorical_candidates_are_not_modified(self):
         self.old["v2_status"] = "STRONG_V2"
         check = Mock(return_value=self.valid)

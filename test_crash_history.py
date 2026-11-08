@@ -114,6 +114,33 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(event['closed_15m_ohlcv'][-1][0], end-STEP)
         self.fetch.assert_not_called()
 
+    def test_three_missing_including_last_can_repair_to_valid_478(self):
+        end = int(self.job['as_of']*1000)//STEP*STEP
+        original = rows(end-480*STEP, 480)
+        self.worker._write(self.tmp.name+'/TESTUSDT.json',
+                           [r for i,r in enumerate(original) if i not in (100,200,479)])
+        self.worker.next_download = self.job['as_of'] + 500
+        repair = Mock(return_value=original[-1:])
+        self.worker.urgent_repair = repair
+        event = self.worker.collect(self.job,
+                                    scheduled_at=self.job['as_of'] + 20)
+        repair.assert_called_once()
+        self.assertEqual(event['candle_count'], 478)
+        self.assertEqual(event['closed_15m_ohlcv'][-1][0], end-STEP)
+        self.fetch.assert_not_called()
+
+    def test_fresh_signal_missing_last_closed_retries_before_expiry(self):
+        from types import SimpleNamespace
+        end = int(self.job['as_of']*1000)//STEP*STEP
+        self.worker.resolver = SimpleNamespace(
+            resolve=lambda symbol,start,end,cached: rows(start,479))
+        # One missing last closed after first download.
+        self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),
+                           'signal',self.job['as_of'])
+        self.worker.step(now=self.job['as_of'] + 10)
+        job = self.worker.jobs['test:signal']
+        self.assertEqual(job['retry_after'], self.job['as_of'] + 40)
+
     def test_download_budget_still_blocks_missing_history(self):
         self.worker.attempts = [100] * 18
         self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),

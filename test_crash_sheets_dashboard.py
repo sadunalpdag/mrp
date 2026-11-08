@@ -58,6 +58,7 @@ class SheetDashboardTests(unittest.TestCase):
         _, table, colors, _ = self.data({"weak_volume": True})
         self.assertEqual(table[1][13], "—")
         self.assertEqual(colors[0], ("red", "grey"))
+        self.assertEqual(table[1][15], "VERİ YOK")
 
     def test_partial_risk_visibility_is_independent(self):
         _, table, _, _ = self.data({"weak_volume": True,
@@ -65,7 +66,7 @@ class SheetDashboardTests(unittest.TestCase):
                                     "repeat_lower_entry": False})
         row = table[1]
         self.assertEqual(row[14], "🔴 VAR")
-        self.assertEqual(row[15], "?")
+        self.assertEqual(row[15], "VERİ YOK")
         self.assertEqual(row[16], "🟢 YOK")
         self.assertIn("EKSİK", row[17])
 

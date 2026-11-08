@@ -64,10 +64,11 @@ def _risk(rec):
     item = rec.get("failure_shadow") or {}
     flags = item.get("flags") if isinstance(item, dict) else None
     if not isinstance(flags, dict):
-        return None, ["?"] * 3, "EKSİK: otomatik alış yok"
-    # Show each known criterion independently; unknown is never interpreted as safe.
+        return None, ["VERİ YOK"] * 3, "EKSİK: otomatik alış yok"
+    # Known booleans are VAR/YOK; unmeasured risk is explicitly VERİ YOK,
+    # never a misleading YOK and never a question mark.
     marks = [("🔴 VAR" if flags[k] else "🟢 YOK")
-             if type(flags.get(k)) is bool else "?" for k in FLAGS]
+             if type(flags.get(k)) is bool else "VERİ YOK" for k in FLAGS]
     if any(type(flags.get(k)) is not bool for k in FLAGS):
         return None, marks, "EKSİK: otomatik alış yok"
     count = sum(flags[k] for k in FLAGS)

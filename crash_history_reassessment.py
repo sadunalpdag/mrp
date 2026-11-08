@@ -31,7 +31,11 @@ def reassess_expired(state, now, validate, log):
                 or not math.isfinite(created) or not 0 <= now-created < HISTORY_HORIZON_SECONDS):
             continue
         previous = record.get("retrospective_v2") or {}
-        if previous.get("status") in ("STRONG_V2", "FILTERED_V2"):
+        # A pre-fix filtered historical decision may have no risk labels.
+        # Re-evaluate from original-time cached data once risk is missing.
+        if previous.get("status") in ("STRONG_V2", "FILTERED_V2") and (
+                isinstance(record.get("failure_shadow"), dict)
+                or previous.get("status") == "STRONG_V2"):
             continue
         if now < previous.get("checked_at", 0) + RETRY_SECONDS:
             continue
@@ -49,10 +53,13 @@ def reassess_expired(state, now, validate, log):
                 "checked_at": now,
                 "research_only": True,
             }
-            if status == "STRONG_V2" and result.get("qualified") is True:
-                # No look-ahead: same signal-time strength metrics; never use
-                # current prices, outcome labels or future candles.
-                research_record = dict(record, v2_status="STRONG_V2",
+            score = result.get("strength_score") or {}
+            if (status in ("STRONG_V2", "FILTERED_V2")
+                    and isinstance(score, dict)
+                    and isinstance(score.get("metrics"), dict)):
+                # Risk is descriptive even for filtered candidates. Use
+                # genuine original-time closed candle metrics only; no orders.
+                research_record = dict(record, v2_status=status,
                                        v2_features=result)
                 risk = assess(research_record, history)
                 record["failure_shadow"] = risk
