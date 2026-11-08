@@ -49,10 +49,14 @@ def reassess_expired(state, now, validate, log):
                 "checked_at": now,
                 "research_only": True,
             }
-            if status == "STRONG_V2" and result.get("qualified") is True:
-                # No look-ahead: same signal-time strength metrics; never use
-                # current prices, outcome labels or future candles.
-                research_record = dict(record, v2_status="STRONG_V2",
+            if (status in ("STRONG_V2", "FILTERED_V2")
+                    and isinstance(result.get("strength_score"), dict)):
+                # Risk columns and power score are historical observations,
+                # also valid for FILTERED candidates. They never change the
+                # original signal status, delivery, or real BUY eligibility.
+                # All calculations use the ORIGINAL candidate time, not now.
+                retrospective["strength_score"] = result["strength_score"]
+                research_record = dict(record, v2_status=status,
                                        v2_features=result)
                 risk = assess(research_record, history)
                 record["failure_shadow"] = risk
