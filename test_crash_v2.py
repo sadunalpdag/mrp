@@ -74,6 +74,7 @@ class CrashV2Tests(unittest.TestCase):
         receipt = Mock(return_value={"ok":True, "attempt_at":100, "accepted_at":101,
                                      "message_id":42})
         env = dict(CRASH_V2_SIGNAL_TTL_SECONDS=280,
+                   CRASH_LIVE_ENTRY_TTL_SECONDS=120,
                    _crash_save_state=Mock(), _crash_append_data=Mock(),
                    _crash_telegram_receipt=receipt, time=time)
         exec(compile(ast.Module(body=[fn], type_ignores=[]), "ema.py", "exec"), env)
