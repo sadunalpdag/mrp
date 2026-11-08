@@ -1,5 +1,6 @@
 """Read-only 15m candle audit: distinguish actual WS closes from cache merges."""
 import json
+import math
 import os
 import threading
 import time
@@ -66,7 +67,7 @@ class CandleAudit:
                         or not symbol.isascii() or not symbol.isalnum()):
                     continue
                 change = float(ticker['priceChangePercent'])
-                if not __import__('math').isfinite(change):
+                if not math.isfinite(change):
                     continue
                 ranked.append((change, symbol))
             except (TypeError, ValueError, KeyError):
