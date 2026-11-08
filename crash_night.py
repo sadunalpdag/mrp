@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 ZONE = ZoneInfo('Europe/Paris')
 D = Decimal
 ENTRY_TTL_SECONDS = 8 * 3600
+SYMBOL_ERROR_QUARANTINE_SECONDS = 8 * 3600
 ORDER_POLL_SECONDS = 5 * 60
 TP_POLL_SECONDS = 5 * 60
 MANUAL_TP_POLL_SECONDS = 5 * 60
@@ -514,13 +515,42 @@ class NightExecutor:
             return '⏳ Komut işlenmeyi bekliyor. /otomatik_durum ile sonucu kontrol edin.'
         return result['message']
 
-    def alert(self, text):
-        self.state['outbox'].append({'text': text, 'retry_at': 0})
+    def alert(self, text, blocks_entries=True):
+        self.state['outbox'].append({'text': text, 'retry_at': 0, 'blocks_entries': bool(blocks_entries)})
         self.save()
 
     def halt(self, reason, symbol):
         self.state['halt'] = reason
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
+
+    def quarantine_symbol(self, symbol, reason, order=None):
+        """Block new entries for at least 8h; keep normal order/TP checks."""
+        now = self.clock()
+        q = self.state['symbol_quarantine']
+        entry = q.get(symbol)
+        created = entry is None
+        if created:
+            entry = {'reason': reason, 'since': now,
+                     'until': now + SYMBOL_ERROR_QUARANTINE_SECONDS}
+            q[symbol] = entry
+        else:
+            if not isinstance(entry, dict):
+                raise ValueError('INVALID_SYMBOL_QUARANTINE')
+            entry.setdefault('until', float(entry.get('since', now))
+                             + SYMBOL_ERROR_QUARANTINE_SECONDS)
+            if reason in ('ENTRY_UNVERIFIED', 'TP_UNVERIFIED'):
+                entry['reason'] = reason
+            else:
+                entry.setdefault('reason', reason)
+        if order:
+            for field in ('entry_id', 'tp_id'):
+                if order.get(field):
+                    entry[field] = order[field]
+        self.save()
+        if created:
+            self.log(f'[CRASH SYMBOL QUARANTINE 8H] {symbol}; '
+                     f'reason={reason}; until={int(entry["until"])}')
+        return created
 
     def quarantine_unverified_tp(self, order, error):
         """Isolate one unsafe TP instead of globally freezing unrelated symbols.
@@ -536,12 +566,7 @@ class NightExecutor:
         # handles genuinely uncertain entry responses and raises a halt when
         # signed exchange evidence is missing. Never clear an existing halt
         # here; simply isolate this TP failure to the affected symbol.
-        quarantine = self.state['symbol_quarantine']
-        if symbol not in quarantine:
-            quarantine[symbol] = {
-                'reason': 'TP_UNVERIFIED', 'since': self.clock(),
-                'tp_id': order.get('tp_id'),
-            }
+        self.quarantine_symbol(symbol, 'TP_UNVERIFIED', order)
         if not order.get('warned'):
             order['warned'] = True
             reason = order.get('tp_submit_error', error_details(error))
@@ -549,9 +574,8 @@ class NightExecutor:
                 f'⚠️ TP DOĞRULANAMADI | {symbol}\n{reason}\n'
                 'Yalnız bu sembolde yeni alış engellendi; diğer sembollerde '
                 'otomatik giriş açık kalır. Mevcut pozisyon kapatılmadı ve '
-                'TP yeniden gönderilmedi. Binance üzerinden pozisyonu/TP’yi kontrol edin.')
-        else:
-            self.save()
+                'TP yeniden gönderilmedi. Binance üzerinden pozisyonu/TP’yi kontrol edin.',
+                blocks_entries=False)
         code = error.code if isinstance(error, BrokerError) else str(error)
         self.log(f'[CRASH TP SYMBOL ISOLATED] {symbol}; code={code}; '
                  f'global_halt={self.state.get("halt") or "none"}; no TP reissue')
@@ -565,15 +589,23 @@ class NightExecutor:
                  and o.get('warned')]
         quarantine = self.state['symbol_quarantine'].get(symbol)
         if (isinstance(quarantine, dict)
-                and quarantine.get('reason') == 'TP_UNVERIFIED'
+                and quarantine.get('reason') in (
+                    'TP_UNVERIFIED', 'ENTRY_UNVERIFIED')
                 and quarantine.get('tp_id') == order.get('tp_id')
                 and not peers):
-            del self.state['symbol_quarantine'][symbol]
-            self.log(f'[CRASH TP SYMBOL RELEASED] {symbol}; '
-                     'exact TP ID verified; other symbols never halted')
-            self.alert(f'✅ TP KORUMASI DOĞRULANDI | {symbol}\n'
-                       'Sembol bazlı alış engeli kaldırıldı. '
-                       'Diğer otomatik ayarlar değişmedi.')
+            until = float(quarantine.get('until',
+                          float(quarantine.get('since', self.clock()))
+                          + SYMBOL_ERROR_QUARANTINE_SECONDS))
+            if self.clock() >= until:
+                del self.state['symbol_quarantine'][symbol]
+                self.log(f'[CRASH TP SYMBOL RELEASED] {symbol}; '
+                         '8h elapsed and exact TP verified')
+                self.alert(f'✅ TP KORUMASI DOĞRULANDI | {symbol}\n'
+                           '8 saatlik karantina kaldırıldı.',
+                           blocks_entries=False)
+            else:
+                quarantine['tp_verified_at'] = self.clock()
+                self.save()
         order.pop('warned', None)
 
     def recover_tp_halt_to_quarantine(self):
@@ -600,10 +632,14 @@ class NightExecutor:
         quarantine = self.state['symbol_quarantine']
         for order in unresolved:
             symbol = order['symbol']
-            quarantine.setdefault(symbol, {
-                'reason': 'TP_UNVERIFIED', 'since': self.clock(),
-                'tp_id': order.get('tp_id'),
-            })
+            self.quarantine_symbol(symbol, 'TP_UNVERIFIED', order)
+        # An old TP halt alert must not silently block unrelated symbols
+        # when Telegram delivery is delayed after the safety stop is scoped.
+        for item in self.state['outbox']:
+            msg = item.get('text', '')
+            if (msg.startswith('⚠️ OTOMATİK İŞLEM | ')
+                    and 'TP DOĞRULANAMADI' in msg):
+                item['blocks_entries'] = False
         self.state['halt'] = None
         self.armed_at = self.clock()
         self.preflight_retries.clear()
@@ -616,7 +652,8 @@ class NightExecutor:
         self.alert(f'✅ TP KAYNAKLI GENEL KİLİT KALDIRILDI\n'
                    f'İlgili semboller: {names}. Bu semboller TP doğrulanana '
                    'veya pozisyon kapanana kadar alışa kapalı; diğer coinlerde '
-                   'otomatik giriş devam edebilir. Eski sinyaller kullanılmayacak.')
+                   'otomatik giriş devam edebilir. Eski sinyaller kullanılmayacak.',
+                   blocks_entries=False)
         self.log(f'[CRASH TP GLOBAL TO SYMBOL] {names}; no BUY replay; '
                  'entry_unknown=0; manual off preserved')
         return True
@@ -830,29 +867,50 @@ class NightExecutor:
             return None
 
     def review_quarantined_symbols(self):
-        """Migrate old quarantine records to normal exchange preflight rules."""
-        for symbol in list(self.state['symbol_quarantine']):
+        """Release after 8h only if live position and bot order risk is gone.
+
+        Never retire an unresolved BUY merely because the timer expired.
+        Existing TP/entry reconciliation continues during quarantine.
+        """
+        for symbol, q in list(self.state['symbol_quarantine'].items()):
+            if not isinstance(q, dict):
+                raise ValueError('INVALID_SYMBOL_QUARANTINE')
+            since = float(q.get('since', self.clock()))
+            until = float(q.get('until',
+                               since + SYMBOL_ERROR_QUARANTINE_SECONDS))
+            if self.clock() < until:
+                continue
+            if any(o.get('symbol') == symbol and
+                   o.get('phase') == 'ENTRY_UNKNOWN'
+                   for o in self.state['orders'].values()):
+                continue
             remaining = self._finish_flat_symbol(symbol)
             if remaining is None:
                 continue
-            del self.state['symbol_quarantine'][symbol]
             for order in self.state['orders'].values():
-                if (order.get('symbol') == symbol
-                        and order.get('phase') == 'CLOSED_EXTERNALLY'
-                        and order.get('close_verification') == 'LIVE_POSITION_ZERO_QUARANTINED'):
+                if order.get('symbol') != symbol:
+                    continue
+                if order.get('phase') in ('TP_UNKNOWN', 'PROTECTED'):
+                    # Exchange proved flat, not that TP definitely filled.
+                    order['phase'] = 'CLOSED_EXTERNALLY'
+                    order['flat_confirmed_at'] = self.clock()
                     order['close_verification'] = (
                         'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT'
                         if remaining else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
+                elif (order.get('phase') == 'CLOSED_EXTERNALLY'
+                      and order.get('close_verification') ==
+                      'LIVE_POSITION_ZERO_QUARANTINED'):
+                    order['close_verification'] = (
+                        'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT'
+                        if remaining else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
+            del self.state['symbol_quarantine'][symbol]
             self.save()
-            self.log(f'[CRASH LEGACY QUARANTINE CLEARED] {symbol}; '
-                     f'flat confirmed; manual_open_orders={remaining}; no new quarantine')
-            message = (f'✅ ESKİ COIN KARANTİNASI KALDIRILDI | {symbol}\n'
-                       'Pozisyon kapalı doğrulandı. Botun eski TP emri varsa '
-                       'yalnız kendi emri temizlendi. Manuel emirler korundu; '
-                       'aynı coinde yeni alış Binance ön kontrolüne tabidir.')
-            threading.Thread(target=self._deliver_skip_notice,
-                             args=(message,), name='crash-legacy-quarantine-clear',
-                             daemon=True).start()
+            self.log(f'[CRASH SYMBOL QUARANTINE RELEASED] {symbol}; '
+                     f'8h elapsed; verified flat; manual_orders={remaining}')
+            self.alert(f'✅ 8 SAATLİK KARANTİNA BİTTİ | {symbol}\n'
+                       'Canlı Binance pozisyonu ve bot emirleri kontrol edildi. '
+                       'Yeni sinyaller normal ön kontrolden geçer.',
+                       blocks_entries=False)
 
     def recover_closed_tp_halt(self):
         """Resolve a stale TP-only global halt without creating quarantines.
@@ -1025,6 +1083,54 @@ class NightExecutor:
                  f'auto_enabled={self.enabled.is_set()}; '
                  'live checks continue via existing reconciliation; '
                  'no blind unlock, no extra REST')
+
+    def migrate_legacy_entry_halt_to_quarantine(self):
+        """Replace old persisted BUY halt by per-symbol isolation, no BUY replay.
+
+        Do not migrate unrelated EXECUTOR_ERROR or account state errors.
+        Uncertain entries remain in their original phase until reconciliation.
+        """
+        reason = self.state.get('halt')
+        if not isinstance(reason, str) or not reason.startswith(
+                'GİRİŞ SONUCU BELİRSİZ'):
+            return False
+        pending = [o for o in self.state['orders'].values()
+                   if o.get('phase') in ('ENTRY_UNKNOWN', 'TP_UNKNOWN')]
+        if any(not o.get('symbol') for o in pending):
+            return False
+        if not pending and not self.state['symbol_quarantine']:
+            return False
+        for order in pending:
+            self.quarantine_symbol(
+                order['symbol'],
+                'ENTRY_UNVERIFIED' if order['phase'] == 'ENTRY_UNKNOWN'
+                else 'TP_UNVERIFIED', order)
+            order['warned'] = True
+        # Previously queued error notification must not remain a hidden lock.
+        for item in self.state['outbox']:
+            msg = item.get('text', '')
+            if (msg.startswith('⚠️ OTOMATİK İŞLEM | ')
+                    and 'GİRİŞ SONUCU BELİRSİZ' in msg):
+                item['blocks_entries'] = False
+        self.state['halt'] = None
+        self.armed_at = self.clock()
+        self.preflight_retries.clear()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.save()
+        symbols = ','.join(sorted(set(o['symbol'] for o in pending)
+                                  | set(self.state['symbol_quarantine'])))
+        self.log(f'[CRASH LEGACY ENTRY HALT ISOLATED] {symbols}; '
+                 'no BUY replay, 8h quarantine')
+        self.alert(f'✅ GENEL GİRİŞ KİLİDİ SEMBOL KARANTİNASINA ÇEVRİLDİ\n'
+                   f'Karantina: {symbols}. En az 8 saat; belirsiz alış ve '
+                   'TP doğrulanmadan ilgili coinde yeni alış olmaz. '
+                   'Diğer coinlerin yeni sinyalleri devam eder.',
+                   blocks_entries=False)
+        return True
 
     def recover_unknown_entry_halt(self):
         """Clear stale global BUY halt when every unknown symbol is safely verified.
@@ -1208,7 +1314,8 @@ class NightExecutor:
             'INVALID_SIGNAL' if not sid or not supported_symbol(symbol) else
             'HALTED' if self.state['halt'] else
             'SYMBOL_QUARANTINED' if symbol in self.state['symbol_quarantine'] else
-            'ALERT_PENDING' if self.state['outbox'] else
+            'ALERT_PENDING' if any(item.get('blocks_entries', True)
+                                   for item in self.state['outbox']) else
             'SIGNAL_EXPIRED' if not 0 <= now-observed_at <= 120 or observed_at < self.started else
             'SIGNAL_CANDIDATE_EXPIRED' if isinstance(record.get('created_at'), (int, float))
                 and not 0 <= now-record['created_at'] <= 120 else
@@ -1266,8 +1373,20 @@ class NightExecutor:
                       and error.not_sent and error.deferred_reason == 'IP_WEIGHT_SOFT_CEILING'
                       else (str(error)[:240] if isinstance(error, (ValueError, BrokerError))
                             else 'CHECK_FAILED'))
+            # No BUY was sent. A symbol-specific failure quarantines only
+            # that symbol; exchange-wide throttling remains a normal deferral.
+            throttle = (isinstance(error, BrokerError)
+                        and error.code in ('-1003', '-1015'))
+            isolated = not throttle and reason != 'LOCAL_IP_BUDGET'
+            if isolated:
+                self.quarantine_symbol(symbol, 'ENTRY_PRECHECK_FAILED')
             self.alert(f'⚠️ OTOMATİK GİRİŞ YAPILMADI | {symbol}\n'
-                       f'TP/giriş ön kontrolü başarısız: {type(error).__name__}: {reason}')
+                       f'TP/giriş ön kontrolü başarısız: {type(error).__name__}: '
+                       f'{reason}\n'
+                       + ('8 saat coin karantinası; diğer alışlar açık.'
+                          if isolated else
+                          'API/REST koruması; diğer coinler kapatılmadı.'),
+                       blocks_entries=False)
             return
         # Network preflight can take seconds. Recheck window and freshness.
         now = self.clock()
@@ -1347,7 +1466,7 @@ class NightExecutor:
             'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT'
             if remaining else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
         order['external_close_reason'] = 'TP_NOT_ACTIVE_POSITION_FLAT'
-        self.state['symbol_quarantine'].pop(symbol, None)
+        # Manual close never shortens the eight-hour cooldown.
         self.save()
         self.log(f'[CRASH EXTERNAL CLOSE CONFIRMED] {symbol}; '
                  f'flat, remaining_manual_orders={remaining}; '
@@ -1546,14 +1665,22 @@ class NightExecutor:
                 # Scope a missing/uncertain TP to its symbol. Preserve any
                 # existing global ENTRY_UNKNOWN or executor failure halt.
                 self.quarantine_unverified_tp(order, error)
+            elif order['phase'] == 'ENTRY_UNKNOWN':
+                # Never resend a possibly-filled BUY. No global halt.
+                self.quarantine_symbol(symbol, 'ENTRY_UNVERIFIED', order)
+                if not order.get('warned'):
+                    order['warned'] = True
+                    self.alert(f'⚠️ GİRİŞ SONUCU BELİRSİZ | {symbol}\n'
+                               + error_details(error)
+                               + '\n8 saat sembol karantinası. Orijinal alış '
+                                 've TP kontrolü sürer; diğer coinlerin '
+                                 'alışları devam eder.',
+                               blocks_entries=False)
             else:
-                reason = 'GİRİŞ SONUCU BELİRSİZ'
+                # Only malformed executor phases remain a global safety fault.
                 if not self.state.get('halt'):
-                    order['warned'] = True
-                    self.halt(reason+'\n'+error_details(error), symbol)
-                elif not order.get('warned'):
-                    order['warned'] = True
-                    self.save()
+                    self.halt('BEKLENMEYEN İŞLEM DURUMU\n'
+                              + error_details(error), symbol)
             code = error.code if isinstance(error, BrokerError) else type(error).__name__
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]}; '
                      f'code={code}; deferred={getattr(error, "deferred_reason", None)}')
@@ -1700,7 +1827,9 @@ class NightExecutor:
             self.safety_housekeeping()
         if self.state.get('halt') and self.clock() >= self.next_halt_recheck:
             self.next_halt_recheck = self.clock() + MANUAL_TP_POLL_SECONDS
-            self.recover_tp_halt_to_quarantine()
+            self.migrate_legacy_entry_halt_to_quarantine()
+            if self.state.get('halt'):
+                self.recover_tp_halt_to_quarantine()
             if self.state.get('halt'):
                 self.recover_mixed_halt()
             if self.state.get('halt'):
