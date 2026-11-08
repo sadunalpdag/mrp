@@ -589,7 +589,8 @@ class NightExecutor:
                  and o.get('warned')]
         quarantine = self.state['symbol_quarantine'].get(symbol)
         if (isinstance(quarantine, dict)
-                and quarantine.get('reason') == 'TP_UNVERIFIED'
+                and quarantine.get('reason') in (
+                    'TP_UNVERIFIED', 'ENTRY_UNVERIFIED')
                 and quarantine.get('tp_id') == order.get('tp_id')
                 and not peers):
             until = float(quarantine.get('until',
@@ -632,6 +633,13 @@ class NightExecutor:
         for order in unresolved:
             symbol = order['symbol']
             self.quarantine_symbol(symbol, 'TP_UNVERIFIED', order)
+        # An old TP halt alert must not silently block unrelated symbols
+        # when Telegram delivery is delayed after the safety stop is scoped.
+        for item in self.state['outbox']:
+            msg = item.get('text', '')
+            if (msg.startswith('⚠️ OTOMATİK İŞLEM | ')
+                    and 'TP DOĞRULANAMADI' in msg):
+                item['blocks_entries'] = False
         self.state['halt'] = None
         self.armed_at = self.clock()
         self.preflight_retries.clear()
