@@ -6757,6 +6757,12 @@ def _crash_review_candidate(state, record, now, allow_rest=False):
                       v2_reason="NON_ASCII_OR_INVALID_SYMBOL", tracking_status="V2_FILTERED",
                       finished_at=now)
     elif now-record["created_at"] > CRASH_V2_SIGNAL_TTL_SECONDS:
+        last_features = record.get("v2_features") or {}
+        log(f"[CRASH V2 EXPIRED] {record['symbol']}; "
+            f"age_s={now-record['created_at']:.0f}; "
+            f"candles={last_features.get('candles', 'unknown')}/480; "
+            f"missing_reason={last_features.get('missing_reason', 'unknown')}; "
+            "no Telegram; no BUY")
         record.update(v2_status="MISSING_5D_HISTORY",v2_delivery_status="EXPIRED_NOT_SENT",
                       v2_reason="HISTORY_NOT_READY_IN_TIME",tracking_status="V2_FILTERED",
                       finished_at=now)
@@ -6768,17 +6774,24 @@ def _crash_review_candidate(state, record, now, allow_rest=False):
         if result["status"] == "MISSING_5D_HISTORY":
             return
         record["v2_status"] = result["status"]
-        if result["qualified"]:
-            # Prospective research only: original as-of candles + earlier signal
-            # history, never outcomes or future snapshots. No entry gate.
+        # The risk columns are observational for ALL evaluated candidates.
+        # Previously FILTERED_V2 skipped this calculation entirely, leaving
+        # three '?' in Sheets even with sufficient real closed 15m history.
+        # This does not make a filtered candidate tradeable or send Telegram.
+        if isinstance(result.get("strength_score"), dict):
             try:
                 from crash_failure_shadow import assess
                 record["failure_shadow"] = assess(record, state["history"])
             except Exception as error:
                 log(f"[CRASH FAILURE SHADOW ERR] {record['symbol']}: {type(error).__name__}")
-        else:
+        if not result["qualified"]:
             record.update(tracking_status="V2_FILTERED", finished_at=now,
                           v2_reason=result["status"], v2_delivery_status="FILTERED_NOT_SENT")
+            log(f"[CRASH V2 FILTERED] {record['symbol']}; "
+                f"candles={result.get('candles')}/480; "
+                f"rsi={result.get('rsi14')}; "
+                f"recovery={result.get('recovery_4h_pct')}; "
+                "risk_research_only=1; no Telegram; no BUY")
     latest = state["symbols"].get(record["symbol"])
     if latest and latest.get("signal_id") == record.get("signal_id"):
         latest.update(record)
