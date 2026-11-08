@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 ZONE = ZoneInfo('Europe/Paris')
 D = Decimal
 ENTRY_TTL_SECONDS = 8 * 3600
+SYMBOL_ERROR_QUARANTINE_SECONDS = 8 * 3600
 ORDER_POLL_SECONDS = 5 * 60
 TP_POLL_SECONDS = 5 * 60
 MANUAL_TP_POLL_SECONDS = 5 * 60
@@ -514,13 +515,42 @@ class NightExecutor:
             return '⏳ Komut işlenmeyi bekliyor. /otomatik_durum ile sonucu kontrol edin.'
         return result['message']
 
-    def alert(self, text):
-        self.state['outbox'].append({'text': text, 'retry_at': 0})
+    def alert(self, text, blocks_entries=True):
+        self.state['outbox'].append({'text': text, 'retry_at': 0, 'blocks_entries': bool(blocks_entries)})
         self.save()
 
     def halt(self, reason, symbol):
         self.state['halt'] = reason
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
+
+    def quarantine_symbol(self, symbol, reason, order=None):
+        """Block new entries for at least 8h; keep normal order/TP checks."""
+        now = self.clock()
+        q = self.state['symbol_quarantine']
+        entry = q.get(symbol)
+        created = entry is None
+        if created:
+            entry = {'reason': reason, 'since': now,
+                     'until': now + SYMBOL_ERROR_QUARANTINE_SECONDS}
+            q[symbol] = entry
+        else:
+            if not isinstance(entry, dict):
+                raise ValueError('INVALID_SYMBOL_QUARANTINE')
+            entry.setdefault('until', float(entry.get('since', now))
+                             + SYMBOL_ERROR_QUARANTINE_SECONDS)
+            if reason in ('ENTRY_UNVERIFIED', 'TP_UNVERIFIED'):
+                entry['reason'] = reason
+            else:
+                entry.setdefault('reason', reason)
+        if order:
+            for field in ('entry_id', 'tp_id'):
+                if order.get(field):
+                    entry[field] = order[field]
+        self.save()
+        if created:
+            self.log(f'[CRASH SYMBOL QUARANTINE 8H] {symbol}; '
+                     f'reason={reason}; until={int(entry["until"])}')
+        return created
 
     def quarantine_unverified_tp(self, order, error):
         """Isolate one unsafe TP instead of globally freezing unrelated symbols.
@@ -536,12 +566,7 @@ class NightExecutor:
         # handles genuinely uncertain entry responses and raises a halt when
         # signed exchange evidence is missing. Never clear an existing halt
         # here; simply isolate this TP failure to the affected symbol.
-        quarantine = self.state['symbol_quarantine']
-        if symbol not in quarantine:
-            quarantine[symbol] = {
-                'reason': 'TP_UNVERIFIED', 'since': self.clock(),
-                'tp_id': order.get('tp_id'),
-            }
+        self.quarantine_symbol(symbol, 'TP_UNVERIFIED', order)
         if not order.get('warned'):
             order['warned'] = True
             reason = order.get('tp_submit_error', error_details(error))
@@ -549,9 +574,8 @@ class NightExecutor:
                 f'⚠️ TP DOĞRULANAMADI | {symbol}\n{reason}\n'
                 'Yalnız bu sembolde yeni alış engellendi; diğer sembollerde '
                 'otomatik giriş açık kalır. Mevcut pozisyon kapatılmadı ve '
-                'TP yeniden gönderilmedi. Binance üzerinden pozisyonu/TP’yi kontrol edin.')
-        else:
-            self.save()
+                'TP yeniden gönderilmedi. Binance üzerinden pozisyonu/TP’yi kontrol edin.',
+                blocks_entries=False)
         code = error.code if isinstance(error, BrokerError) else str(error)
         self.log(f'[CRASH TP SYMBOL ISOLATED] {symbol}; code={code}; '
                  f'global_halt={self.state.get("halt") or "none"}; no TP reissue')
@@ -568,12 +592,19 @@ class NightExecutor:
                 and quarantine.get('reason') == 'TP_UNVERIFIED'
                 and quarantine.get('tp_id') == order.get('tp_id')
                 and not peers):
-            del self.state['symbol_quarantine'][symbol]
-            self.log(f'[CRASH TP SYMBOL RELEASED] {symbol}; '
-                     'exact TP ID verified; other symbols never halted')
-            self.alert(f'✅ TP KORUMASI DOĞRULANDI | {symbol}\n'
-                       'Sembol bazlı alış engeli kaldırıldı. '
-                       'Diğer otomatik ayarlar değişmedi.')
+            until = float(quarantine.get('until',
+                          float(quarantine.get('since', self.clock()))
+                          + SYMBOL_ERROR_QUARANTINE_SECONDS))
+            if self.clock() >= until:
+                del self.state['symbol_quarantine'][symbol]
+                self.log(f'[CRASH TP SYMBOL RELEASED] {symbol}; '
+                         '8h elapsed and exact TP verified')
+                self.alert(f'✅ TP KORUMASI DOĞRULANDI | {symbol}\n'
+                           '8 saatlik karantina kaldırıldı.',
+                           blocks_entries=False)
+            else:
+                quarantine['tp_verified_at'] = self.clock()
+                self.save()
         order.pop('warned', None)
 
     def recover_tp_halt_to_quarantine(self):
@@ -600,10 +631,7 @@ class NightExecutor:
         quarantine = self.state['symbol_quarantine']
         for order in unresolved:
             symbol = order['symbol']
-            quarantine.setdefault(symbol, {
-                'reason': 'TP_UNVERIFIED', 'since': self.clock(),
-                'tp_id': order.get('tp_id'),
-            })
+            self.quarantine_symbol(symbol, 'TP_UNVERIFIED', order)
         self.state['halt'] = None
         self.armed_at = self.clock()
         self.preflight_retries.clear()
@@ -1347,7 +1375,7 @@ class NightExecutor:
             'LIVE_POSITION_ZERO_MANUAL_ORDERS_KEPT'
             if remaining else 'LIVE_POSITION_ZERO_NO_OPEN_ORDERS')
         order['external_close_reason'] = 'TP_NOT_ACTIVE_POSITION_FLAT'
-        self.state['symbol_quarantine'].pop(symbol, None)
+        # Manual close never shortens the eight-hour cooldown.
         self.save()
         self.log(f'[CRASH EXTERNAL CLOSE CONFIRMED] {symbol}; '
                  f'flat, remaining_manual_orders={remaining}; '
