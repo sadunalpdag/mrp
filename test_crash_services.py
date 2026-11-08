@@ -390,6 +390,71 @@ class NightTests(unittest.TestCase):
         self.assertIn('Mevcut pozisyon kapatılmadı',
                       '\n'.join(c.args[0] for c in self.deliver.call_args_list))
 
+    def test_pending_buy_does_not_rehalt_after_other_symbols_tp_failure(self):
+        # Reproduces YBUSDT's verified GTC BUY plus UAIUSDT's cancelled TP.
+        self.enter()
+        self.e.deliver_pending()
+        protected = self.e.state['orders']['signal-1']
+        self.b.orders[protected['tp_id']]['status'] = 'CANCELED'
+        pending_id = 'cbn' + 'b' * 24 + 'e'
+        pending = dict(day=day(self.now), symbol='BUSDT',
+                       phase='ENTRY_UNKNOWN', entry_id=pending_id,
+                       quantity='5', price='10', tp='10.1',
+                       warned=True, position_side='BOTH')
+        self.e.state['orders']['verified-pending'] = pending
+        self.e.state['halt'] = (
+            'GİRİŞ SONUCU BELİRSİZ\\nAçık alış sonucu doğrulanamadı.')
+        pending_live = dict(symbol='BUSDT', clientOrderId=pending_id,
+                            side='BUY', type='LIMIT', status='NEW',
+                            executedQty='0', origQty='5', price='10',
+                            positionSide='BOTH')
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5', positionSide='BOTH')])
+        self.b.closing_orders = Mock(side_effect=lambda symbol:
+                                    [pending_live] if symbol == 'BUSDT' else [])
+        original_order = self.b.order
+        self.b.order = Mock(side_effect=lambda symbol, client_id:
+                            pending_live if client_id == pending_id
+                            else original_order(symbol, client_id))
+        self.assertTrue(self.e.recover_unknown_entry_halt())
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(pending['phase'], 'ENTRY_UNKNOWN')
+        self.assertFalse(pending['warned'])
+        self.e.deliver_pending()
+        alerts_before = self.deliver.call_count
+        for _ in range(3):
+            self.e.reconcile(protected)
+            self.assertIsNone(self.e.state['halt'])
+            self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+            self.assertNotIn('BUSDT', self.e.state['symbol_quarantine'])
+            self.e.deliver_pending()
+            self.now += 300
+        self.assertFalse(any(
+            'GİRİŞ SONUCU BELİRSİZ' in c.args[0]
+            for c in self.deliver.call_args_list[alerts_before:]))
+        self.assertEqual(len(self.b.buys), 1)
+        self.assertEqual(len(self.b.tps), 1)
+
+    def test_genuine_unknown_buy_still_halts_on_its_own_reconcile(self):
+        self.enter()
+        protected = self.e.state['orders']['signal-1']
+        self.b.orders[protected['tp_id']]['status'] = 'CANCELED'
+        self.e.state['orders']['uncertain'] = dict(
+            day=day(self.now), symbol='BUSDT', phase='ENTRY_UNKNOWN',
+            entry_id='missing-buy', quantity='5', price='10', tp='10.1',
+            submitted_at=self.now - 90)
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5')])
+        self.b.closing_orders = Mock(
+            side_effect=BrokerError('ACCOUNT_UNAVAILABLE'))
+        # TP cancellation is isolated, but a failed BUY verification must
+        # independently stop the account as before.
+        self.e.reconcile(protected)
+        self.assertIsNone(self.e.state['halt'])
+        self.e.reconcile(self.e.state['orders']['uncertain'])
+        self.assertTrue(self.e.state['halt'].startswith(
+            'GİRİŞ SONUCU BELİRSİZ'))
+
     def test_unknown_buy_response_reconciles_without_repeat(self):
         self.b.unknown_buy=True; self.enter()
         self.assertEqual(self.e.state['orders']['signal-1']['phase'],'PROTECTED')
