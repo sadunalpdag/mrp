@@ -250,7 +250,8 @@ class NightTests(unittest.TestCase):
         self.b.orders[order['entry_id']].update(status='PARTIALLY_FILLED',executedQty='2')
         self.b.cancel_entry=Mock(side_effect=BrokerError('UNKNOWN'))
         self.e.reconcile(order)
-        self.assertFalse(self.b.tps);self.assertTrue(self.e.state['halt'])
+        self.assertFalse(self.b.tps);self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'],'ENTRY_UNKNOWN')
 
     def test_candidate_immediate_fill_without_upward_cross(self):
@@ -435,7 +436,7 @@ class NightTests(unittest.TestCase):
         self.assertEqual(len(self.b.buys), 1)
         self.assertEqual(len(self.b.tps), 1)
 
-    def test_genuine_unknown_buy_still_halts_on_its_own_reconcile(self):
+    def test_genuine_unknown_buy_isolates_its_symbol(self):
         self.enter()
         protected = self.e.state['orders']['signal-1']
         self.b.orders[protected['tp_id']]['status'] = 'CANCELED'
@@ -452,8 +453,9 @@ class NightTests(unittest.TestCase):
         self.e.reconcile(protected)
         self.assertIsNone(self.e.state['halt'])
         self.e.reconcile(self.e.state['orders']['uncertain'])
-        self.assertTrue(self.e.state['halt'].startswith(
-            'GİRİŞ SONUCU BELİRSİZ'))
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('BUSDT', self.e.state['symbol_quarantine'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
 
     def test_unknown_buy_response_reconciles_without_repeat(self):
         self.b.unknown_buy=True; self.enter()
@@ -466,7 +468,8 @@ class NightTests(unittest.TestCase):
         self.e.save(); self.e.guard.close()
         self.e=self.make(); self.e.step()
         self.assertFalse(self.b.buys)
-        self.assertTrue(self.e.state['halt'].startswith('GİRİŞ SONUCU BELİRSİZ'))
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
 
     def test_daily_limit_persisted_and_resets_at_midnight(self):
         for i in range(10):
@@ -555,6 +558,9 @@ class NightTests(unittest.TestCase):
         self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(len(self.b.tps), 1)  # No blind replacement.
         self.b.orders[order['tp_id']]['status'] = 'NEW'
+        self.e.reconcile(order)
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])  # min 8h
+        self.now += 8 * 3600
         self.e.reconcile(order)
         self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertIsNone(self.e.state['halt'])
@@ -752,6 +758,10 @@ class NightTests(unittest.TestCase):
         manual = dict(symbol='AUSDT', side='BUY', type='LIMIT',
                       status='NEW', clientOrderId='manual-order')
         self.b.closing_orders = Mock(return_value=[manual])
+        with patch('crash_night.threading.Thread'):
+            self.e.review_quarantined_symbols()
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.now += 8 * 3600
         with patch('crash_night.threading.Thread'):
             self.e.review_quarantined_symbols()
         self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
@@ -1332,7 +1342,8 @@ class NightTests(unittest.TestCase):
             executedQty='1', origQty=order['quantity'], price=order['price'])]
         self.now += 60
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
         self.assertNotIn('entry_missing_first_seen_at', order)
         self.assertEqual(len(self.b.buys), 1)
@@ -1353,8 +1364,8 @@ class NightTests(unittest.TestCase):
         self.b.positions.side_effect = BrokerError('-1003')
         self.now += 60
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'].startswith(
-            'GİRİŞ SONUCU BELİRSİZ'))
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertNotIn('entry_missing_first_seen_at', order)
         self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
         self.assertEqual(len(self.b.buys), 1)
@@ -1432,6 +1443,86 @@ class NightTests(unittest.TestCase):
         self.b.positions.assert_called_once()
         self.b.order.assert_called_once()
         self.assertFalse(self.b.buys)
+
+    def test_symbol_preflight_failure_is_eight_hours_and_other_entries_continue(self):
+        self.b.preflight = Mock(side_effect=lambda sym: (
+            (_ for _ in ()).throw(BrokerError('-4028'))
+            if sym == 'AUSDT' else None))
+        self.deliver.return_value = {'ok': False}  # Telegram outage is not a BUY stop.
+        self.enter()
+        q = self.e.state['symbol_quarantine']['AUSDT']
+        self.assertEqual(q['reason'], 'ENTRY_PRECHECK_FAILED')
+        self.assertEqual(q['until'] - q['since'], 8 * 3600)
+        self.assertIsNone(self.e.state['halt'])
+        self.assertFalse(self.b.buys)
+        self.assertFalse(self.e.state['outbox'][0]['blocks_entries'])
+        self.enter(signal_id='other', symbol='BUSDT')
+        self.assertEqual(len(self.b.buys), 1)
+        self.enter(signal_id='retry-a', symbol='AUSDT')
+        self.assertEqual(len(self.b.buys), 1)
+        self.e.guard.close()
+        self.e = self.make()
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.now += 8 * 3600 - 1
+        self.e.review_quarantined_symbols()
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.now += 1
+        self.e.review_quarantined_symbols()
+        self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
+
+    def test_entry_result_not_final_quarantines_coin_without_stopping_others(self):
+        order = self.pending_entry()
+        self.e.deliver_pending()
+        self.b.orders[order['entry_id']].update(
+            status='PARTIALLY_FILLED', executedQty='2')
+        self.b.cancel_entry = Mock()  # Cancel response did not become final.
+        self.e.reconcile(order)
+        self.assertIsNone(self.e.state['halt'])
+        q = self.e.state['symbol_quarantine']['AUSDT']
+        self.assertEqual(q['reason'], 'ENTRY_UNVERIFIED')
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+        self.assertFalse(self.b.tps)
+        self.assertFalse(any(i.get('blocks_entries', True)
+                             for i in self.e.state['outbox']))
+        deadline = q['until']
+        self.now += 300
+        self.e.reconcile(order)
+        self.assertEqual(q['until'], deadline)  # Polls do not reset 8h.
+        self.enter(signal_id='other', symbol='BUSDT')
+        self.assertEqual(len(self.b.buys), 2)
+        self.b.positions = Mock(return_value=[])
+        self.b.closing_orders = Mock(return_value=[])
+        self.now = deadline + 1
+        self.e.review_quarantined_symbols()
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertEqual(order['phase'], 'ENTRY_UNKNOWN')
+
+    def test_old_global_halt_with_zero_unknown_uses_existing_coin_quarantine(self):
+        self.e.quarantine_symbol('UAIUSDT', 'ENTRY_UNVERIFIED')
+        self.e.state['halt'] = 'GİRİŞ SONUCU BELİRSİZ\nENTRY_RESULT_NOT_FINAL'
+        self.e.state['outbox'].append(dict(
+            text='⚠️ OTOMATİK İŞLEM | UAIUSDT\nGİRİŞ SONUCU BELİRSİZ',
+            retry_at=0))
+        self.e.save()
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('UAIUSDT', self.e.state['symbol_quarantine'])
+        self.assertFalse(any(item.get('blocks_entries', True)
+                             for item in self.e.state['outbox']))
+        self.enter(signal_id='other', symbol='BUSDT')
+        self.assertEqual(len(self.b.buys), 1)
+
+    def test_old_unknown_entry_migrates_without_resending_buy(self):
+        old = self.add_unknown_halt()
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertEqual(old['phase'], 'ENTRY_UNKNOWN')
+        self.assertFalse(self.b.buys)
+        self.enter(signal_id='other', symbol='BUSDT')
+        self.assertEqual(len(self.b.buys), 1)
 
     def test_bad_state_and_multiple_processes_fail_closed(self):
         with self.assertRaises(BlockingIOError): self.make()
