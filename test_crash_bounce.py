@@ -28,7 +28,8 @@ class CrashBounceTests(unittest.TestCase):
                     BOT_TOKEN="test",CHAT_ID="test",requests=Mock(),log=Mock(),
                     _crash_save_state=Mock(),_crash_append_data=Mock(),
                     _crash_queue_history=Mock(),_crash_track_results=Mock(),
-                    _crash_review_pending_v2=Mock(),_crash_apply_filter_migration=Mock(),
+                    _crash_review_pending_v2=Mock(),_crash_reassess_expired_history=Mock(),
+                    _crash_apply_filter_migration=Mock(),
                     _crash_features=Mock(return_value={"rsi14_wilder":24,"ema25_slope_pct":-.1}),
                     BinanceRateLimiter=SimpleNamespace(is_banned=lambda:False))
         exec(compile(subset,"ema.py","exec"),self.g)
