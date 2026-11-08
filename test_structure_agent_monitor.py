@@ -111,6 +111,111 @@ class StructureTests(unittest.TestCase):
             self.assertEqual(ticker, original)
             self.assertEqual(obj['mode'], 'MONITOR_ONLY')
 
+    def test_only_active_formations_are_izle(self):
+        # Bare 4h trend / market structure is not a working setup.
+        self.assertEqual(mon.analyse(self.rows, self.now, 2)["decision"], "YAPI YOK")
+        with patch.object(mon, "structure", return_value=("YÜKSELİŞ", [], [])):
+            result = mon.analyse(self.rows, self.now, 2)
+            self.assertEqual(result["decision"], "YAPI YOK")
+            self.assertEqual(result["method"], "—")
+
+            forming = copy.deepcopy(self.rows)
+            impulse_ts, pull_ts, last_ts = [r[0] for r in forming[-3:]]
+            forming[-3] = row(impulse_ts, 100, 106, 99, 105, 100)
+            forming[-2] = row(pull_ts, 104, 105, 102, 103, 10)
+            forming[-1] = row(last_ts, 103, 104.5, 102.5, 104, 12)
+            pending = mon.analyse(forming, self.now, 2)
+            self.assertEqual(pending["method"], "DEVAM")
+            self.assertEqual(pending["decision"], "İZLE")
+            self.assertEqual(pending["level"], 105)
+
+            forming[-1] = row(last_ts, 104, 107, 103, 106, 12)
+            confirmed = mon.analyse(forming, self.now, 2)
+            self.assertEqual(confirmed["decision"], "TEYİT VAR")
+
+            forming[-1] = row(last_ts, 101, 103, 98, 99, 12)
+            invalid = mon.analyse(forming, self.now, 2)
+            self.assertEqual(invalid["decision"], "YAPI YOK")
+
+    def test_top_five_per_method_replaced_within_same_fifty_coins(self):
+        # Scan all 50 locally; show only 5+5 valid formations. If one leaves
+        # the top five, the next valid already-scanned coin takes its place.
+        tickers = []
+        symbols = [f"D{i}USDT" for i in range(7)] + [
+            f"C{i}USDT" for i in range(7)] + [f"OTHER{i}USDT" for i in range(36)]
+        for rank, symbol in enumerate(symbols):
+            tickers.append(dict(symbol=symbol, quoteVolume=1000-rank,
+                                lastPrice=100,
+                                priceChangePercent=-5 if symbol.startswith("D") else 5))
+        market = {s: ".01" for s in symbols}
+        onboard = {s: 1 for s in symbols}
+        decisions = {"D0USDT": "TEYİT VAR", "C0USDT": "TEYİT VAR"}
+
+        def analyse_symbol(rows, now, change):
+            symbol = rows[0]
+            method = ("DÖNÜŞ" if symbol.startswith("D") else
+                      "DEVAM" if symbol.startswith("C") else "—")
+            decision = decisions.get(symbol, "İZLE" if method != "—" else "YAPI YOK")
+            return dict(count=480, four_count=29, sources={}, reason="test",
+                        trend="YÜKSELİŞ", method=method, decision=decision,
+                        stop=98, confirmed=1234, resistances=[])
+
+        with tempfile.TemporaryDirectory() as directory:
+            candles = Mock(return_value=[])
+            with patch.object(mon, "cached_rows",
+                              side_effect=lambda d, sym, ws, now: [sym]), \
+                 patch.object(mon, "analyse", side_effect=analyse_symbol):
+                first = mon.scan(directory, tickers, market, onboard,
+                                 candles, self.now, {})
+                self.assertEqual(len(first["rows"]), 50)
+                self.assertEqual(len(first["selected"]), 10)
+                self.assertEqual(first["selected"][:5],
+                                 [f"D{i}USDT" for i in range(5)])
+                self.assertEqual(first["selected"][5:],
+                                 [f"C{i}USDT" for i in range(5)])
+                sheet = mon.sheet_values(first)
+                self.assertEqual([r[0] for r in sheet[6:16]], first["selected"])
+                self.assertTrue(all(not any(s in r for s in symbols[14:])
+                                    for r in sheet[6:16]))
+                self.assertTrue(all(not any(r) for r in sheet[16:]))
+                self.assertEqual(candles.call_count, 50)
+
+                # Invalidate a watched reversal and continuation, preserve
+                # other eight, promote ranks 6 from the same 50-coin pool.
+                decisions.update(D1USDT="SÜRESİ DOLDU", C1USDT="REDDET")
+                candles.reset_mock()
+                second = mon.scan(directory, tickers, market, onboard,
+                                  candles, self.now+300, first)
+                self.assertEqual(len(second["selected"]), 10)
+                self.assertNotIn("D1USDT", second["selected"])
+                self.assertNotIn("C1USDT", second["selected"])
+                self.assertIn("D5USDT", second["selected"])
+                self.assertIn("C5USDT", second["selected"])
+                self.assertEqual([r[0] for r in mon.sheet_values(second)[6:16]],
+                                 second["selected"])
+                self.assertEqual(candles.call_count, 50)
+
+    def test_no_forced_fill_if_less_than_five_per_method(self):
+        tickers = [dict(symbol=f"D{i}USDT", quoteVolume=200-i,
+                        lastPrice=100, priceChangePercent=-5) for i in range(50)]
+        market = {t["symbol"]: ".01" for t in tickers}
+        onboard = {t["symbol"]: 1 for t in tickers}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(mon, "cached_rows", side_effect=lambda d, sym, ws, now: [sym]), \
+                 patch.object(mon, "analyse", side_effect=lambda rows, now, change: dict(
+                     count=480, four_count=29, sources={}, reason="test",
+                     trend="DÜŞÜŞ", method="DÖNÜŞ" if rows[0] in (
+                         "D0USDT", "D1USDT") else "—",
+                     decision="İZLE" if rows[0] in ("D0USDT", "D1USDT")
+                     else "YAPI YOK")):
+                obj = mon.scan(directory, tickers, market, onboard,
+                               lambda sym: [], self.now, {})
+                self.assertEqual(obj["selected"], ["D0USDT", "D1USDT"])
+                view = mon.sheet_values(obj)
+                self.assertEqual([r[0] for r in view[6:8]], obj["selected"])
+                self.assertFalse(any(view[8]))
+                self.assertIn("DÖNÜŞ 2/5 | DEVAM 0/5", view[3])
+
     def test_publish_only_own_tab_and_readback(self):
         with tempfile.TemporaryDirectory() as directory:
             obj = mon.scan(directory, [], {}, {}, lambda s:[], self.now, {})
