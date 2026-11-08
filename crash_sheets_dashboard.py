@@ -180,6 +180,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         has_signal = bool(rec.get("signal_id"))
         risk, flags, rule = _risk(rec) if has_signal else (None, ["—"] * 3, "—")
         current = _score(rec)
+        live = None  # Optional cache-only view of the current CLOSED-candle window.
         # Display-only CURRENT 5-day strength on each ranked coin when cached
         # CLOSED candles allow it; it does not create a V2 signal or BUY.
         # Historical MISSING_5D_HISTORY uses original-time backfill instead.
@@ -201,7 +202,9 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         old = score_cache.get(sym) or {}
         old_score = _num(old.get("score")) if old.get("signal_id") == rec.get("signal_id") else None
         difference = round(current - old_score, 1) if current is not None and old_score is not None else "—"
-        if current is not None and has_signal:
+        if current is not None:
+            # Keep last dashboard score for non-signal coins, too, so the
+            # previous score and delta columns can populate on the next tick.
             previous[sym] = {"signal_id": rec.get("signal_id"), "score": current}
         change, price = latest.get(sym, (None, None))
         entry = _num(rec.get("entry")) if has_signal else None
@@ -237,10 +240,14 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
             eligible += 1
         if has_signal:
             risk_summary[risk if risk is not None else "unknown"] += 1
+        # For a coin with no V2 candidate, use current real CLOSED candles to
+        # display RSI/recovery. Never mistake this dashboard-only calculation
+        # for a V2 signal, Telegram event, or automatic entry approval.
+        visible_v2 = v2 if has_signal else (live if isinstance(live, dict) else {})
         rows.append([
             sym, round(change, 2) if change is not None else "—", rank.get(sym, "—"),
             price if price is not None else "—", rec.get("v2_status", "SİNYAL YOK") if has_signal else "SİNYAL YOK",
-            v2.get("rsi14", "—"), v2.get("recovery_4h_pct", "—"),
+            visible_v2.get("rsi14", "—"), visible_v2.get("recovery_4h_pct", "—"),
             (current if current is not None else
              "VERİ EKSİK" if has_signal and rec.get("v2_status") in (
                  "PENDING_5D_HISTORY", "MISSING_5D_HISTORY") else
@@ -332,6 +339,18 @@ def _format(sheet, status, signal, colors, signal_rows):
         requests.append({"updateSheetProperties": {
             "properties": {"sheetId": tab.id, "gridProperties": {"frozenRowCount": 1}},
             "fields": "gridProperties.frozenRowCount"}})
+    # Values are refreshed over the complete dashboard rectangle, but older
+    # background fills used to survive when a coin moved to a different row.
+    # Clear ONLY panel-owned indicator/risk backgrounds before recoloring the
+    # currently measured cells (no other workbook content or tabs touched).
+    for first_col, last_col in ((5, 8), (13, 17)):
+        requests.append({"repeatCell": {
+            "range": {"sheetId": signal.id, "startRowIndex": 1,
+                      "endRowIndex": MAX_ROWS + 1,
+                      "startColumnIndex": first_col,
+                      "endColumnIndex": last_col},
+            "cell": {"userEnteredFormat": {}},
+            "fields": "userEnteredFormat.backgroundColor"}})
     for i, (kind, risk_kind) in enumerate(colors, start=1):
         data = signal_rows[i]
         extra = []
