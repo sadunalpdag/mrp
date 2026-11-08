@@ -203,7 +203,8 @@ class CrashV2Tests(unittest.TestCase):
                                     "qualified": False, "candles": 479})
         env = dict(CRASH_V2_SIGNAL_TTL_SECONDS=280,
                    _crash_v2_assess_candidate=assess,
-                   _crash_save_state=Mock(), _crash_append_data=Mock())
+                   _crash_save_state=Mock(), _crash_append_data=Mock(),
+                   log=Mock())
         exec(compile(ast.Module(body=[fn], type_ignores=[]),
                      "ema.py", "exec"), env)
         record = dict(symbol="TESTUSDT", signal_id="TEST-100", created_at=100,
@@ -215,6 +216,30 @@ class CrashV2Tests(unittest.TestCase):
         env["_crash_review_candidate"](state, record, 381)
         self.assertEqual(record["v2_reason"], "HISTORY_NOT_READY_IN_TIME")
         self.assertEqual(record["v2_delivery_status"], "EXPIRED_NOT_SENT")
+
+    def test_filtered_v2_records_risk_without_telegram_or_buy(self):
+        at = 2_000_000_000
+        filtered = crash_v2.assess_entry(
+            self.rows(at, "1", "1.005"), [], at)
+        self.assertEqual(filtered["status"], "FILTERED_V2")
+        tree = ast.parse(Path(__file__).with_name("ema.py").read_text())
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "_crash_review_candidate")
+        env = dict(CRASH_V2_SIGNAL_TTL_SECONDS=280,
+                   _crash_v2_assess_candidate=Mock(return_value=filtered),
+                   _crash_save_state=Mock(), _crash_append_data=Mock(),
+                   log=Mock())
+        exec(compile(ast.Module(body=[fn], type_ignores=[]),
+                     "ema.py", "exec"), env)
+        record = dict(symbol="TESTUSDT", signal_id="test-filtered",
+                      created_at=at, entry="1.00",
+                      v2_status="PENDING_5D_HISTORY")
+        state = {"history":[record], "symbols":{"TESTUSDT":dict(record)}}
+        env["_crash_review_candidate"](state, record, at)
+        self.assertEqual(record["v2_status"], "FILTERED_V2")
+        self.assertEqual(record["failure_shadow"]["known_flags"], 3)
+        self.assertEqual(record["v2_delivery_status"], "FILTERED_NOT_SENT")
+        self.assertNotIn("v2_sent", record)
 
     def test_timeout_marks_unknown_delivery_no_blind_retry(self):
         env, receipt = self._delivery_context()
