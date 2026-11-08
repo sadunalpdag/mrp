@@ -31,7 +31,11 @@ def reassess_expired(state, now, validate, log):
                 or not math.isfinite(created) or not 0 <= now-created < HISTORY_HORIZON_SECONDS):
             continue
         previous = record.get("retrospective_v2") or {}
-        if previous.get("status") in ("STRONG_V2", "FILTERED_V2"):
+        # A pre-fix filtered historical decision may have no risk labels.
+        # Re-evaluate from original-time cached data once risk is missing.
+        if previous.get("status") in ("STRONG_V2", "FILTERED_V2") and (
+                isinstance(record.get("failure_shadow"), dict)
+                or previous.get("status") == "STRONG_V2"):
             continue
         if now < previous.get("checked_at", 0) + RETRY_SECONDS:
             continue
