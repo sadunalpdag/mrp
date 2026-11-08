@@ -530,13 +530,12 @@ class NightExecutor:
         conceal an existing closing order. The next poll verifies the exact ID.
         """
         symbol = order['symbol']
-        # An unresolved BUY can introduce additional, untracked exposure.
-        # This is NOT a TP-only incident and must retain account-wide safety.
-        if any(o.get('phase') == 'ENTRY_UNKNOWN'
-               for o in self.state['orders'].values()):
-            if not self.state.get('halt'):
-                self.halt('GİRİŞ SONUCU BELİRSİZ\nAçık alış sonucu doğrulanamadı.', symbol)
-            return
+        # ENTRY_UNKNOWN is also the normal phase of a verified, unfilled GTC
+        # LIMIT BUY. A TP fault on ANOTHER symbol must not turn that pending
+        # BUY into a global halt every five minutes. The BUY's own reconcile()
+        # handles genuinely uncertain entry responses and raises a halt when
+        # signed exchange evidence is missing. Never clear an existing halt
+        # here; simply isolate this TP failure to the affected symbol.
         quarantine = self.state['symbol_quarantine']
         if symbol not in quarantine:
             quarantine[symbol] = {
