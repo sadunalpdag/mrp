@@ -6700,6 +6700,10 @@ def _crash_send_pending(state, now):
         if latest and latest.get("signal_id") == record.get("signal_id"):
             latest.update(record)
         _crash_save_state(state)
+        log(f"[CRASH TELEGRAM DELIVERY] {record['symbol']}; "
+            f"status={record['v2_delivery_status']}; "
+            f"candidate_age_s={max(0, now-record['created_at']):.1f}; "
+            f"attempt={record['v2_telegram_attempts']}")
         _crash_append_data({"type":"telegram_delivery", "observed_at":time.time(),
                             "signal_id":record["signal_id"],"symbol":record["symbol"],
                             "status":record["v2_delivery_status"],
@@ -6766,23 +6770,39 @@ def _crash_review_candidate(state, record, now, allow_rest=False):
         if result.get("strength_score") is not None:
             record["strength_score"] = result["strength_score"]
         if result["status"] == "MISSING_5D_HISTORY":
+            marker = (result.get("candles"), result.get("missing_reason"))
+            if record.get("_v2_missing_log_marker") != marker:
+                log(f"[CRASH V2 DATA WAIT] {record['symbol']}; "
+                    f"candles={result.get('candles')}/480; "
+                    f"last_closed={result.get('latest_closed_present')}; "
+                    f"missing_reason={result.get('missing_reason')}; "
+                    f"candidate_age_s={max(0,now-record['created_at']):.1f}")
+                record["_v2_missing_log_marker"] = marker
             return
         record["v2_status"] = result["status"]
-        if result["qualified"]:
-            # Prospective research only: original as-of candles + earlier signal
-            # history, never outcomes or future snapshots. No entry gate.
+        # Risk labels are descriptive for every V2 decision, including
+        # FILTERED_V2. Do not turn a filtered candidate into a live signal.
+        score = result.get("strength_score") or {}
+        if isinstance(score, dict) and isinstance(score.get("metrics"), dict):
             try:
                 from crash_failure_shadow import assess
                 record["failure_shadow"] = assess(record, state["history"])
             except Exception as error:
                 log(f"[CRASH FAILURE SHADOW ERR] {record['symbol']}: {type(error).__name__}")
-        else:
+        if not result["qualified"]:
             record.update(tracking_status="V2_FILTERED", finished_at=now,
                           v2_reason=result["status"], v2_delivery_status="FILTERED_NOT_SENT")
     latest = state["symbols"].get(record["symbol"])
     if latest and latest.get("signal_id") == record.get("signal_id"):
         latest.update(record)
     _crash_save_state(state)
+    log(f"[CRASH V2 DECISION] {record['symbol']}; "
+        f"status={record.get('v2_status')}; "
+        f"candles={(record.get('v2_features') or {}).get('candles')}/480; "
+        f"rsi={(record.get('v2_features') or {}).get('rsi14')}; "
+        f"recovery_4h_pct={(record.get('v2_features') or {}).get('recovery_4h_pct')}; "
+        f"risk_known={(record.get('failure_shadow') or {}).get('known_flags',0)}/3; "
+        f"delivery={record.get('v2_delivery_status')}")
     _crash_append_data({"type":"v2_candidate_decision","observed_at":now,
                         "signal_id":record["signal_id"],"symbol":record["symbol"],
                         "v2_status":record["v2_status"],
