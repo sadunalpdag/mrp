@@ -547,7 +547,8 @@ class NightTests(unittest.TestCase):
         self.b.positions = Mock(side_effect=BrokerError('-1003'))
         self.b.closing_orders = Mock(return_value=[])
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertIn('VERIFY_FAILED=-1003',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
@@ -565,7 +566,8 @@ class NightTests(unittest.TestCase):
             [dict(symbol='AUSDT', positionAmt='2')]])
         self.b.closing_orders = Mock(return_value=[])
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertIn('POSITION_CHANGED',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
@@ -771,7 +773,8 @@ class NightTests(unittest.TestCase):
         self.b.cancel_owned_tp = Mock(side_effect=BrokerError('UNKNOWN', uncertain=True))
         self.e.reconcile(order)
         self.assertEqual(order['phase'], 'PROTECTED')
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.b.cancel_owned_tp.assert_called_once()
 
     def test_owned_tp_mismatch_is_never_cancelled(self):
@@ -786,7 +789,8 @@ class NightTests(unittest.TestCase):
         self.b.closing_orders = Mock(return_value=[mismatched])
         self.b.cancel_owned_tp = Mock()
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.b.cancel_owned_tp.assert_not_called()
 
