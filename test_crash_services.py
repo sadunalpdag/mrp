@@ -1439,7 +1439,10 @@ class NightTests(unittest.TestCase):
         self.b.order=Mock(side_effect=BrokerError('-2013'))
         self.e.step()
         self.assertIsNone(self.e.state['halt'])
-        self.assertEqual(old['phase'], 'NO_FILL')
+        # -2013 alone does not prove NO_FILL. Keep the original BUY pending
+        # reconciliation while other symbols are allowed to trade.
+        self.assertEqual(old['phase'], 'ENTRY_UNKNOWN')
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.b.positions.assert_called_once()
         self.b.order.assert_called_once()
         self.assertFalse(self.b.buys)
