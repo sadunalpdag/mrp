@@ -530,6 +530,13 @@ class NightExecutor:
         conceal an existing closing order. The next poll verifies the exact ID.
         """
         symbol = order['symbol']
+        # An unresolved BUY can introduce additional, untracked exposure.
+        # This is NOT a TP-only incident and must retain account-wide safety.
+        if any(o.get('phase') == 'ENTRY_UNKNOWN'
+               for o in self.state['orders'].values()):
+            if not self.state.get('halt'):
+                self.halt('GİRİŞ SONUCU BELİRSİZ\nAçık alış sonucu doğrulanamadı.', symbol)
+            return
         quarantine = self.state['symbol_quarantine']
         if symbol not in quarantine:
             quarantine[symbol] = {
