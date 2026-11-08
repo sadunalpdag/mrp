@@ -89,6 +89,63 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(table[1][14:17], ["—"] * 3)
         self.assertEqual(score.call_args.args[0]["symbol"], "TESTUSDT")
 
+    def test_non_signal_rsi_and_recovery_use_only_validated_cached_values(self):
+        view = Mock(return_value={
+            "status": "FILTERED_V2", "qualified": False,
+            "rsi14": 31.25, "recovery_4h_pct": 0.75,
+            "strength_score": {"score": 43.5}})
+        _, table, _, cache = dash.build_rows(
+            {"symbols": {}, "history": []}, self.tickers, {}, {},
+            self.now, rescore=view)
+        row = table[1]
+        self.assertEqual(row[4], "SİNYAL YOK")
+        self.assertEqual(row[5:8], [31.25, 0.75, 43.5])
+        self.assertEqual(cache["TESTUSDT"]["score"], 43.5)
+        self.assertNotIn("TESTUSDT", dash.build_rows(
+            {"symbols": {}, "history": []}, [], {}, {}, self.now)[3])
+
+    def test_non_signal_previous_power_and_delta_on_next_tick(self):
+        view = Mock(return_value={"status": "FILTERED_V2",
+                                  "rsi14": 23, "recovery_4h_pct": 0.44,
+                                  "strength_score": {"score": 47.0}})
+        _, table, _, cache = dash.build_rows(
+            {"symbols": {}, "history": []}, self.tickers, {}, {},
+            self.now, rescore=view)
+        view.return_value["strength_score"]["score"] = 49.0
+        _, updated, _, _ = dash.build_rows(
+            {"symbols": {}, "history": []}, self.tickers, {}, {},
+            self.now + 300, score_cache=cache, rescore=view)
+        self.assertEqual(updated[1][8:10], [47, 2])
+
+    def test_unknown_current_data_not_invented(self):
+        view = Mock(return_value={"status": "MISSING_5D_HISTORY",
+                                  "candles": 477})
+        _, table, _, cache = dash.build_rows(
+            {"symbols": {}, "history": []}, self.tickers, {}, {},
+            self.now, rescore=view)
+        self.assertEqual(table[1][5:7], ["—", "—"])
+        self.assertEqual(table[1][7], "HESAPLANAMADI")
+        self.assertEqual(cache, {})
+
+    def test_format_resets_old_indicator_fills_before_current_colors(self):
+        book = Mock()
+        status = SimpleNamespace(title="Bot Status", id=123)
+        signal = SimpleNamespace(title="Sinyal", id=456)
+        rows = [dash.HEADERS, [""] * len(dash.HEADERS)]
+        rows[1][5:8] = [30, 1.2, 55]
+        dash._format(book, status, signal, [("green", "grey")], rows)
+        ops = book.batch_update.call_args.args[0]["requests"]
+        clears = [op["repeatCell"] for op in ops
+                  if (op.get("repeatCell", {}).get("cell") ==
+                      {"userEnteredFormat": {}})]
+        self.assertEqual({(op["range"]["startColumnIndex"],
+                           op["range"]["endColumnIndex"])
+                          for op in clears}, {(5, 8), (13, 17)})
+        self.assertTrue(all(op["range"]["endRowIndex"] ==
+                            dash.MAX_ROWS + 1 for op in clears))
+        self.assertTrue(all(op["fields"] ==
+                            "userEnteredFormat.backgroundColor" for op in clears))
+
     def test_retrospective_power_uses_original_closed_candles(self):
         rec = dict(self.record,
                    v2_status="MISSING_5D_HISTORY",
