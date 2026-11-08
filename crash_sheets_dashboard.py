@@ -87,7 +87,7 @@ def _score(rec):
 
 def _status(rec, risk):
     if not rec:
-        return "⚪ SİNYAL YOK", "grey"
+        return "⚪ AKTİF ADAY KAYDI YOK", "grey"
     v2 = rec.get("v2_status")
     if risk == 3 or risk is None and v2 == "STRONG_V2":
         return "🔴 ALIŞ YOK (RİSK)", "red"
@@ -98,6 +98,23 @@ def _status(rec, risk):
     if v2 == "MISSING_5D_HISTORY":
         return "🟡 VERİ EKSİK – DEĞERLENDİRİLEMEDİ", "yellow"
     return "🔴 V2 UYGUN DEĞİL", "red"
+
+
+
+def _no_candidate_status(change, live):
+    """Dashboard-only description: a missing candidate is not a negative V2 verdict.
+
+    The scanner does not currently persist per-symbol skip reasons. Never
+    translate missing history, an entry-level gate or pruned state to
+    "SİNYAL YOK" or a passing/failing V2 assessment.
+    """
+    if change is None:
+        return "ADAY KAYDI YOK — 24s VERİSİ BELİRSİZ"
+    if change > -12:
+        return "EŞİK DIŞI — 24s düşüş %12 altında"
+    if isinstance(live, dict) and live.get("status") == "MISSING_5D_HISTORY":
+        return "ADAY KAYDI YOK — GÖSTERGE VERİSİ EKSİK"
+    return "ADAY KAYDI YOK — NEDEN KAYDEDİLMEMİŞ"
 
 
 _MISSING_REASONS = {
@@ -246,7 +263,8 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         visible_v2 = v2 if has_signal else (live if isinstance(live, dict) else {})
         rows.append([
             sym, round(change, 2) if change is not None else "—", rank.get(sym, "—"),
-            price if price is not None else "—", rec.get("v2_status", "SİNYAL YOK") if has_signal else "SİNYAL YOK",
+            price if price is not None else "—", (rec.get("v2_status") or "V2 DURUMU KAYITLI DEĞİL") if has_signal
+            else _no_candidate_status(change, live),
             visible_v2.get("rsi14", "—"), visible_v2.get("recovery_4h_pct", "—"),
             (current if current is not None else
              "VERİ EKSİK" if has_signal and rec.get("v2_status") in (
