@@ -84,7 +84,7 @@ class SheetDashboardTests(unittest.TestCase):
         _, table, _, _ = dash.build_rows(
             {"symbols":{}, "history":[]}, self.tickers, {}, {}, self.now,
             rescore=score)
-        self.assertEqual(table[1][4], "SİNYAL YOK")
+        self.assertEqual(table[1][4], "ADAY KAYDI YOK — NEDEN KAYDEDİLMEMİŞ")
         self.assertEqual(table[1][7], 64.5)
         self.assertEqual(table[1][14:17], ["—"] * 3)
         self.assertEqual(score.call_args.args[0]["symbol"], "TESTUSDT")
@@ -98,11 +98,32 @@ class SheetDashboardTests(unittest.TestCase):
             {"symbols": {}, "history": []}, self.tickers, {}, {},
             self.now, rescore=view)
         row = table[1]
-        self.assertEqual(row[4], "SİNYAL YOK")
+        self.assertEqual(row[4], "ADAY KAYDI YOK — NEDEN KAYDEDİLMEMİŞ")
         self.assertEqual(row[5:8], [31.25, 0.75, 43.5])
         self.assertEqual(cache["TESTUSDT"]["score"], 43.5)
         self.assertNotIn("TESTUSDT", dash.build_rows(
             {"symbols": {}, "history": []}, [], {}, {}, self.now)[3])
+
+
+    def test_no_candidate_below_drop_threshold_is_not_a_v2_verdict(self):
+        tickers = [{"symbol": "TESTUSDT", "priceChangePercent": "-8",
+                    "lastPrice": "1.002"}]
+        _, table, colors, _ = dash.build_rows(
+            {"symbols": {}, "history": []}, tickers, {}, {}, self.now)
+        self.assertEqual(table[1][4], "EŞİK DIŞI — 24s düşüş %12 altında")
+        self.assertEqual(table[1][18], "⚪ AKTİF ADAY KAYDI YOK")
+        self.assertEqual(table[1][14:17], ["—"] * 3)
+        self.assertEqual(colors[0][0], "grey")
+
+    def test_no_candidate_with_missing_candles_is_not_called_no_signal(self):
+        view = Mock(return_value={"status": "MISSING_5D_HISTORY",
+                                  "candles": 479})
+        _, table, _, _ = dash.build_rows(
+            {"symbols": {}, "history": []}, self.tickers, {}, {},
+            self.now, rescore=view)
+        self.assertEqual(table[1][4], "ADAY KAYDI YOK — GÖSTERGE VERİSİ EKSİK")
+        self.assertEqual(table[1][7], "HESAPLANAMADI")
+        self.assertEqual(table[1][14:17], ["—"] * 3)
 
     def test_non_signal_previous_power_and_delta_on_next_tick(self):
         view = Mock(return_value={"status": "FILTERED_V2",
