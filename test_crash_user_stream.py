@@ -83,7 +83,8 @@ class EventTests(unittest.TestCase):
         self.e.on_account_event(self.event());self.e.step()
         self.now+=1
         self.e.on_account_event(self.event(cid='tp',status='CANCELED',qty='0'));self.e.step()
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(len(self.b.tps),1)
 
     def test_overflow_requests_resync(self):
