@@ -7592,7 +7592,8 @@ class CrashBounceWebSocketCache:
         with self.lock:
             if research_symbols is not None:
                 research = {s for s in research_symbols if supported_symbol(s)}
-                if len(research) > 36:
+                # 36 existing scalp slots + 50 structure monitor slots.
+                if len(research) > 86:
                     raise ValueError("Too many shadow research subscriptions")
                 self.shadow_wanted = research
             wanted = base | self.shadow_wanted
@@ -7895,6 +7896,30 @@ def _crash_load_market_cache():
 
 
 
+def _crash_structure_onboard():
+    """Metadata only; no network, unknown ages stay unknown in the monitor."""
+    try:
+        with open(CRASH_BOUNCE_MARKET_FILE, encoding='utf-8') as handle:
+            return json.load(handle).get('onboard_dates', {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _crash_structure_queue(symbol, now):
+    """At most one low-priority warmup; existing Crash work always goes first."""
+    with _CRASH_STATE_LOCK:
+        collector = globals().get('_CRASH_HISTORY_COLLECTOR')
+        if collector is not None:
+            with collector.lock:
+                jobs = list(collector.jobs.values())
+                if (sum(str(j.get('signal_id', '')).startswith('structure-warmup:') for j in jobs) >= 3
+                        or any(not str(j.get('signal_id', '')).startswith('structure-warmup:')
+                               and j.get('retry_after', 0) <= now for j in jobs)):
+                    return
+        _crash_queue_history({'symbol':symbol, 'signal_id':'structure-warmup:'+symbol},
+                             'warmup', now)
+
+
 def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
     import os  # self-contained for isolated Crash V2 regression harness
     from crash_policy import supported_symbol, TRACKING_SECONDS, prune_active_state
@@ -7957,6 +7982,13 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             research_symbols.update(open_shadow_symbols(DATA_DIR, now, max_extra=16))
         except Exception as error:
             log(f"[SCALP SHADOW SUBS] skipped: {type(error).__name__}")
+    if os.getenv("STRUCTURE_MONITOR_ENABLED", "1") == "1":
+        try:
+            from structure_agent_monitor import universe
+            research_symbols.update(t['symbol'] for t in universe(
+                tickers, market, _crash_structure_onboard(), now))
+        except Exception as error:
+            log(f"[STRUCTURE MONITOR SUBS] skipped: {type(error).__name__}")
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
                               trade_watching, research_symbols=research_symbols)
     _crash_append_data({"type":"scan", "observed_at":now,
@@ -8419,6 +8451,18 @@ def _crash_bounce_worker():
             log("[SCALP SHADOW] paper monitor ready; no REST, no trades")
         except Exception as error:
             log(f"[SCALP SHADOW SETUP] skipped: {type(error).__name__}")
+    structure_monitor = None
+    if os.getenv("STRUCTURE_MONITOR_ENABLED", "1") == "1":
+        try:
+            from structure_agent_monitor import StructureMonitor
+            structure_monitor = StructureMonitor(DATA_DIR, log, _crash_structure_queue)
+            # Refresh old metadata once to learn contract ages. The existing
+            # metadata gate, cooldown and IP budget remain in force.
+            if market and not _crash_structure_onboard():
+                next_metadata = 0
+            log('[STRUCTURE MONITOR] ready; mode=MONITOR_ONLY; execution=OFF')
+        except Exception as error:
+            log(f'[STRUCTURE MONITOR SETUP] skipped: {type(error).__name__}')
     try:
         _crash_start_shadow()
     except Exception as error:
@@ -8488,7 +8532,10 @@ def _crash_bounce_worker():
                         }
                         if not updated:
                             raise ValueError("Empty futures metadata")
-                        _crash_write_json(CRASH_BOUNCE_MARKET_FILE, {"market":updated,"updated_at":now})
+                        onboard_dates = {s['symbol']:s.get('onboardDate')
+                                         for s in info['symbols'] if s.get('symbol') in updated}
+                        _crash_write_json(CRASH_BOUNCE_MARKET_FILE, {
+                            "market":updated,"updated_at":now,"onboard_dates":onboard_dates})
                         market, refreshed = updated, now
                         next_metadata = now + 86400
                     except Exception as error:
@@ -8534,6 +8581,13 @@ def _crash_bounce_worker():
                                   _CRASH_WS_CACHE.candles, market)
             except Exception as error:
                 log(f"[SCALP SHADOW SCHEDULE] skipped: {type(error).__name__}")
+        if structure_monitor is not None:
+            try:
+                structure_monitor.tick(_CRASH_WS_CACHE.snapshot(time.time()),
+                                       _CRASH_WS_CACHE.candles, dict(market),
+                                       _crash_structure_onboard())
+            except Exception as error:
+                log(f'[STRUCTURE MONITOR SCHEDULE] skipped: {type(error).__name__}')
         time.sleep(max(1,min(15,next_scan-time.time())))
 
 
