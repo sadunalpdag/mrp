@@ -79,6 +79,37 @@ def _number(value):
         return None
 
 
+def _history_rows(directory, symbol, ws_rows, now):
+    """Merge already-stored Crash candles and closed WS; NEVER fetch via REST.
+
+    Prefer exchange-native candles over alternate venue references. Reject
+    invalid, unclosed or future timestamps before either shadow strategy can
+    consume them. The same 5-day history is later reused for yesterday's range.
+    """
+    from crash_data_sources import valid_rows
+    from crash_policy import supported_symbol
+    if not supported_symbol(symbol):
+        return []
+    end = int(now * 1000) // STEP_MS * STEP_MS
+    start = end - 480 * STEP_MS
+    path = os.path.join(directory, "crash_research", "history_cache",
+                        symbol + ".json")
+    try:
+        with open(path, encoding="utf-8") as fd:
+            stored = json.load(fd)
+    except (OSError, ValueError, TypeError):
+        stored = []
+    merged = valid_rows(stored, start, end)
+    alternate = ("BYBIT_LINEAR", "COINBASE_SPOT", "OKX_SWAP")
+    for ts, row in valid_rows(ws_rows, start, end).items():
+        old = merged.get(ts)
+        old_alt = old is not None and len(old) > 12 and old[12] in alternate
+        new_alt = len(row) > 12 and row[12] in alternate
+        if old is None or old_alt or not new_alt:
+            merged[ts] = row
+    return [merged[ts] for ts in sorted(merged)]
+
+
 def _bars(rows, now):
     """Only genuine, correctly timed, already closed 15m OHLCV; no gap filling."""
     by_ts = {}
@@ -98,15 +129,20 @@ def _bars(rows, now):
     return [by_ts[ts] for ts in sorted(by_ts)[-64:]]
 
 
+def _coverage(bars, now):
+    """Observed real closes in the CURRENT 56 slots, not 56 before stale data."""
+    end = int(now * 1000) // STEP_MS * STEP_MS
+    start = end - 56 * STEP_MS
+    return sum(start <= b[0] < end for b in bars)
+
+
 def _ready(bars, now):
-    # Up to 4 absent true candles in 56 slots; never invent/fill bars.
-    # This is a deliberately labeled proxy, not a strictly uniform SMA sample.
-    if len(bars) < 52:
+    # Up to 4 absent true candles in the current 56 slots; never synthesize.
+    # This remains a labeled 15m proxy, not a guaranteed uniform SMA sample.
+    if not bars or _coverage(bars, now) < 52:
         return False
     newest = bars[-1][0]
-    recent = [b for b in bars if newest - 55 * STEP_MS <= b[0] <= newest]
-    return (len(recent) >= 52 and
-            0 <= now * 1000 - (newest + STEP_MS - 1) <= 1800000)
+    return 0 <= now * 1000 - (newest + STEP_MS - 1) <= 1800000
 
 
 def pullback(bars):
@@ -180,18 +216,23 @@ def break_bounce(bars, daily_range):
 
 
 
-def _diagnostic(strategy, symbol, bars, data_ready, daily_range=None):
+def _diagnostic(strategy, symbol, bars, data_ready, daily_range=None, now=None):
     """Explain every sampled coin, including those without enough 15m data.
 
     Read-only: diagnostics do not relax or alter paper-trade entry conditions.
     """
     last_time = _dt(bars[-1][0]) if bars else "—"
-    observed = (sum(b[0] >= bars[-1][0] - 55 * STEP_MS for b in bars)
-                if bars else 0)
-    coverage = "%s/56" % observed
+    observed = (_coverage(bars, now) if now is not None else
+                sum(b[0] >= bars[-1][0] - 55 * STEP_MS for b in bars) if bars
+                else 0)
+    coverage = f"{observed}/56"
     if not data_ready:
+        age_min = (max(0, int((now * 1000 - (bars[-1][0] + STEP_MS - 1)) / 60000))
+                   if now is not None and bars else None)
+        freshness = (f"son kapanış {age_min} dk önce (en fazla 30 dk)" if age_min is not None
+                     else "son kapanış yok")
         return [symbol, "EKSİK", coverage, "—", "—", "VERİ BEKLENİYOR",
-                "0/0", "52/56 gerçek 15m mum ve güncel kapanış gerekli",
+                "0/0", f"Gerçek kapanmış mum {observed}/56; en az 52/56 gerekli; {freshness}",
                 "YOK", last_time]
 
     old, prev, last = bars[-3:]
@@ -319,9 +360,10 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
     ready = {k: [] for k in RANK_BOUNDS}
     recent = {}
     full_candles = {}
-    # Read each exact ranked gainer cache once, reuse for yesterday's range.
+    # Read each ranked gainer's existing 5-day file once and merge with
+    # CLOSED WS rows. No direct REST requests, new subscriptions or fake bars.
     for symbol in set(groups["PULLBACK"] + groups["BREAK_BOUNCE"]):
-        full_candles[symbol] = candles_get(symbol)
+        full_candles[symbol] = _history_rows(data_dir, symbol, candles_get(symbol), now)
         recent[symbol] = _bars(full_candles[symbol], now)
     for strategy, symbols in groups.items():
         for symbol in symbols:
@@ -346,7 +388,7 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
     for r in pending[:200]:
         sym = r.get("symbol")
         if isinstance(sym, str) and sym not in recent:
-            recent[sym] = _bars(candles_get(sym), now)
+            recent[sym] = _bars(_history_rows(data_dir, sym, candles_get(sym), now), now)
         _settle(r, recent.get(sym, []), now)
 
     diagnostics = {k: [] for k in RANK_BOUNDS}
@@ -356,19 +398,11 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
             data_ready = _ready(bars, now)
             daily_range = None
             if strategy == "BREAK_BOUNCE" and data_ready:
-                # Existing on-disk cache + existing WS; never add REST calls.
-                history_path = os.path.join(data_dir, "crash_research", "history_cache",
-                                            symbol + ".json")
-                try:
-                    with open(history_path, encoding="utf-8") as fd:
-                        history_rows = json.load(fd)
-                except (OSError, ValueError, TypeError):
-                    history_rows = []
-                daily_range = previous_utc_range(
-                    (history_rows if isinstance(history_rows, list) else [])
-                    + (full_candles.get(symbol) or []), now)
+                # The already-merged validated 5-day cache includes yesterday
+                # when it is really complete; never invent the 96 daily bars.
+                daily_range = previous_utc_range(full_candles[symbol], now)
             diagnostics[strategy].append(
-                _diagnostic(strategy, symbol, bars, data_ready, daily_range))
+                _diagnostic(strategy, symbol, bars, data_ready, daily_range, now))
             if not data_ready:
                 continue
             entry_ts = bars[-1][0]
@@ -464,11 +498,40 @@ def _publish(obj):
 
 
 class ShadowWeek:
-    def __init__(self, directory, logger, clock=time.time):
+    def __init__(self, directory, logger, clock=time.time, queue_history=None):
         self.directory, self.logger, self.clock = directory, logger, clock
+        self.queue_history = queue_history
         self.next_due = 0
         self.lock = threading.Lock()
         self.path = os.path.join(directory, "scalp_shadow_week.json")
+        self.cursor_path = os.path.join(directory, "scalp_shadow_warmup_cursor.json")
+
+    def request_missing_history(self, data, now):
+        """One low-priority proposal per 5m; caller enforces shared queue cap.
+
+        Queue only real gaps, including Break Bounce's missing prior-day
+        range; never overwrite existing data or block a live Crash trade.
+        """
+        if not callable(self.queue_history):
+            return
+        candidates = []
+        for strategy in ("PULLBACK", "BREAK_BOUNCE"):
+            for row in data.get("diagnostics", {}).get(strategy, []):
+                if row[5] in ("VERİ BEKLENİYOR", "GÜNLÜK VERİ EKSİK"):
+                    if row[0] not in candidates:
+                        candidates.append(row[0])
+        if not candidates:
+            return
+        try:
+            with open(self.cursor_path, encoding="utf-8") as fd:
+                cursor = max(0, int(json.load(fd).get("cursor", 0)))
+        except (OSError, ValueError, TypeError, AttributeError):
+            cursor = 0
+        symbol = candidates[cursor % len(candidates)]
+        self.queue_history(symbol, now)
+        _save(self.cursor_path, {"cursor": cursor + 1})
+        self.logger(f"[SCALP SHADOW WARMUP] requested={symbol}; "
+                    f"missing_symbols={len(candidates)}; max_one_per_5min=1")
 
     def tick(self, tickers, candles_get, allowed_market=None):
         now = self.clock()
@@ -482,6 +545,10 @@ class ShadowWeek:
                 data = _scan(self.directory, snapshot, candles_get, now, _load(self.path),
                              market_symbols)
                 _save(self.path, data)
+                try:
+                    self.request_missing_history(data, now)
+                except Exception as exc:
+                    self.logger("[SCALP SHADOW WARMUP ERROR] " + type(exc).__name__)
                 try:
                     if _publish(data):
                         self.logger("[SCALP SHADOW] Pullback Test / Break Bounce Test updated; "

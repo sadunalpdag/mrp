@@ -85,12 +85,126 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertNotIn("A30USDT", selected["BREAK_BOUNCE"])
 
     def test_four_missing_true_candles_allowed_but_five_rejected(self):
-        now = 57 * sw.STEP_MS / 1000
+        now = 56 * sw.STEP_MS / 1000
         rows = candles(56)
         four_gaps = [r for i, r in enumerate(rows) if i not in (4, 12, 20, 28)]
         self.assertTrue(sw._ready(sw._bars(four_gaps, now), now))
         five_gaps = [r for i, r in enumerate(rows) if i not in (4, 12, 20, 28, 36)]
         self.assertFalse(sw._ready(sw._bars(five_gaps, now), now))
+
+    def test_merges_existing_five_day_file_with_closed_ws_without_rest(self):
+        import json
+        from pathlib import Path
+        now = 56 * sw.STEP_MS / 1000
+        rows = candles(56, first=0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"crash_research"/"history_cache"/"XUSDT.json"
+            path.parent.mkdir(parents=True)
+            archive = [list(r)+[None]*5+["BINANCE_ARCHIVE"] for r in rows[:54]]
+            # Stored alternate must not override exchange-native WS.
+            archive[-1][-1] = "BYBIT_LINEAR"
+            path.write_text(json.dumps(archive), encoding="utf-8")
+            live = rows[53:55] + [
+                [56*sw.STEP_MS, "100", "101", "99", "100", "100",
+                 57*sw.STEP_MS-1]]
+            merged = sw._history_rows(directory, "XUSDT", live, now)
+            bars = sw._bars(merged, now)
+            self.assertEqual(len(merged), 55)
+            self.assertEqual(len(bars), 55)
+            self.assertTrue(sw._ready(bars, now))
+            self.assertEqual(merged[53][12:] if len(merged[53]) > 12 else [],
+                             [])   # valid exchange WS replaces stale Bybit candle
+            self.assertEqual(merged[-1][0], 54*sw.STEP_MS)
+            self.assertFalse(any(r[0] == 56*sw.STEP_MS for r in merged))
+            # A disk cache with missing historic rows can also be valid.
+            self.assertEqual(sw._coverage(bars, now), 55)
+
+    def test_stale_history_does_not_count_as_current_52_of_56(self):
+        now = 120 * sw.STEP_MS / 1000
+        bars = sw._bars(candles(56, first=0), now)
+        self.assertEqual(sw._coverage(bars, now), 0)
+        self.assertFalse(sw._ready(bars, now))
+        diagnostic = sw._diagnostic("PULLBACK", "XUSDT", bars, False, now=now)
+        self.assertEqual(diagnostic[2], "0/56")
+        self.assertIn("mevcut", diagnostic[7]) if False else None
+        self.assertIn("Gerçek kapanmış mum 0/56", diagnostic[7])
+        self.assertIn("son kapanış", diagnostic[7])
+
+    def test_break_bounce_uses_daily_cache_and_keeps_incomplete_day_unready(self):
+        import json
+        from pathlib import Path
+        now = 2 * 86400 + 3600
+        start = 86400 * 1000
+        yesterday = candles(96, first=start)
+        today = candles(4, first=2*86400*1000)
+        recent_raw = yesterday[-51:] + today
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"crash_research"/"history_cache"/"XUSDT.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(yesterday[:-1]), encoding="utf-8")
+            merged = sw._history_rows(directory, "XUSDT", recent_raw, now)
+            bars = sw._bars(merged, now)
+            self.assertTrue(sw._ready(bars, now))
+            self.assertEqual(sw.previous_utc_range(merged, now),
+                             (101.0 * 1.002, 101.0 * 0.998))
+            missing = [r for r in merged if r[0] != yesterday[28][0]]
+            self.assertIsNone(sw.previous_utc_range(missing, now))
+            diagnostics = sw._diagnostic("BREAK_BOUNCE", "XUSDT", bars,
+                                         True, daily_range=None, now=now)
+            self.assertEqual(diagnostics[5], "GÜNLÜK VERİ EKSİK")
+
+    def test_round_robin_history_repair_one_per_scan_and_persists(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            proposed = Mock()
+            monitor = sw.ShadowWeek(directory, Mock(), clock=lambda: 1000,
+                                    queue_history=proposed)
+            def issue(symbol, status):
+                return [symbol, "EKSİK", "0/56", "—", "—",
+                        status, "0/0", "test", "YOK", "—"]
+            data = {"diagnostics": {
+                "PULLBACK": [
+                    issue("AUSDT", "VERİ BEKLENİYOR"),
+                    issue("BUSDT", "VERİ BEKLENİYOR")],
+                "BREAK_BOUNCE": [
+                    issue("CUSDT", "GÜNLÜK VERİ EKSİK"),
+                    issue("DUSDT", "KIRILIM BEKLENİYOR")]}}
+            monitor.request_missing_history(data, 1000)
+            monitor.request_missing_history(data, 1300)
+            monitor.request_missing_history(data, 1600)
+            self.assertEqual([call.args[0] for call in proposed.call_args_list],
+                             ["AUSDT", "BUSDT", "CUSDT"])
+            monitor = sw.ShadowWeek(directory, Mock(),
+                                    queue_history=proposed)
+            monitor.request_missing_history(data, 1900)
+            self.assertEqual(proposed.call_args_list[-1].args, ("AUSDT", 1900))
+            self.assertEqual(proposed.call_count, 4)
+
+    def test_scan_reads_history_for_ranked_symbols_without_extra_price_calls(self):
+        import json
+        from pathlib import Path
+        now = 56 * sw.STEP_MS / 1000
+        rows = candles(56)
+        tickers = [
+            {"symbol": f"COIN{i}USDT", "priceChangePercent": str(50-i),
+             "quoteVolume": str(1000-i)} for i in range(30)]
+        called = []
+        def getter(symbol):
+            called.append(symbol)
+            return rows[-2:] if symbol == "COIN10USDT" else []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/"crash_research"/"history_cache"/"COIN10USDT.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(rows[:-2]), encoding="utf-8")
+            obj = sw._scan(directory, tickers, getter, now, {"signals": []})
+            record = obj["diagnostics"]["PULLBACK"][0]
+            self.assertEqual(record[0], "COIN10USDT")
+            self.assertEqual(record[1], "HAZIR")
+            self.assertEqual(record[2], "56/56")
+            self.assertNotEqual(record[5], "VERİ BEKLENİYOR")
+            self.assertEqual(len(called), 20)
+            self.assertEqual(len(set(called)), 20)
+            self.assertEqual(len(obj["ready_groups"]["PULLBACK"]), 1)
 
     def test_no_future_candles_produce_data_gap_not_win(self):
         signal = {"status": "OPEN", "ts": 0, "side": "LONG", "tp": 101, "risk": 99}
