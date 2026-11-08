@@ -65,9 +65,43 @@ class SheetDashboardTests(unittest.TestCase):
                                     "repeat_lower_entry": False})
         row = table[1]
         self.assertEqual(row[14], "🔴 VAR")
-        self.assertEqual(row[15], "?")
+        self.assertEqual(row[15], "VERİ EKSİK")
         self.assertEqual(row[16], "🟢 YOK")
         self.assertIn("EKSİK", row[17])
+
+    def test_missing_risk_never_claims_safe_or_displays_question_marks(self):
+        rec = dict(self.record)
+        rec.pop("failure_shadow")
+        _, table, colors, _ = dash.build_rows(
+            {"symbols":{"TESTUSDT":rec}, "history":[rec]},
+            self.tickers, {}, {}, self.now)
+        self.assertEqual(table[1][14:17], ["VERİ EKSİK"] * 3)
+        self.assertIn("EKSİK", table[1][17])
+        self.assertEqual(colors[0], ("red", "grey"))
+
+    def test_top_loser_without_v2_candidate_uses_only_cached_live_score(self):
+        score = Mock(return_value={"strength_score": {"score": 64.5}})
+        _, table, _, _ = dash.build_rows(
+            {"symbols":{}, "history":[]}, self.tickers, {}, {}, self.now,
+            rescore=score)
+        self.assertEqual(table[1][4], "SİNYAL YOK")
+        self.assertEqual(table[1][7], 64.5)
+        self.assertEqual(table[1][14:17], ["—"] * 3)
+        self.assertEqual(score.call_args.args[0]["symbol"], "TESTUSDT")
+
+    def test_retrospective_power_uses_original_closed_candles(self):
+        rec = dict(self.record,
+                   v2_status="MISSING_5D_HISTORY",
+                   v2_features={"candles": 477},
+                   retrospective_v2={"status":"STRONG_V2",
+                                     "candles":480, "research_only":True,
+                                     "strength_score":{"score":49.5}})
+        _, table, _, _ = dash.build_rows(
+            {"symbols":{"TESTUSDT":rec}, "history":[rec]},
+            self.tickers, {}, {}, self.now)
+        self.assertEqual(table[1][7], 49.5)
+        self.assertEqual(table[1][4], "MISSING_5D_HISTORY")
+        self.assertIn("canlı emir yok", table[1][39])
 
     def test_stored_late_research_never_shows_live_order(self):
         rec = dict(self.record, v2_status="MISSING_5D_HISTORY",

@@ -60,6 +60,18 @@ class ReassessmentTests(unittest.TestCase):
         self.assertEqual(self.old["v2_status"], "MISSING_5D_HISTORY")
         self.assertFalse(self.old["v2_sent"])
 
+    def test_filtered_backfill_recovers_measurable_risk_without_delivery(self):
+        result = dict(self.valid, status="FILTERED_V2", qualified=False)
+        check = Mock(return_value=result)
+        self.assertEqual(reassess_expired(self.state, self.now, check, self.log), 1)
+        self.assertEqual(self.old["retrospective_v2"]["status"], "FILTERED_V2")
+        self.assertEqual(self.old["failure_shadow"]["known_flags"], 3)
+        self.assertEqual(self.old["retrospective_v2"]["strength_score"],
+                         result["strength_score"])
+        self.assertEqual(self.old["v2_status"], "MISSING_5D_HISTORY")
+        self.assertEqual(self.old["v2_delivery_status"], "EXPIRED_NOT_SENT")
+        self.assertFalse(self.old["v2_sent"])
+
     def test_nonexpired_or_nonhistorical_candidates_are_not_modified(self):
         self.old["v2_status"] = "STRONG_V2"
         check = Mock(return_value=self.valid)
