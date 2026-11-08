@@ -133,7 +133,7 @@ class HistoryTests(unittest.TestCase):
         from types import SimpleNamespace
         end = int(self.job['as_of']*1000)//STEP*STEP
         self.worker.resolver = SimpleNamespace(
-            resolve=lambda symbol,start,end,cached: rows(end-479*STEP,479))
+            resolve=lambda symbol,start,end,cached: rows(start,479))
         # One missing last closed after first download.
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),
                            'signal',self.job['as_of'])
