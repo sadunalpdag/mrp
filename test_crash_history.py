@@ -72,6 +72,31 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(len(self.worker._read(
             self.tmp.name+'/TESTUSDT.json', [])),479)
 
+    def test_477_live_candidate_retries_ws_cache_without_extra_rest(self):
+        from types import SimpleNamespace
+        end = int(self.job['as_of']*1000)//STEP*STEP
+        full = rows(end-480*STEP, 480)
+        partial = [bar for i,bar in enumerate(full) if i not in (100,101,102)]
+        ws_tail = []
+        self.worker.ws_rows = lambda symbol: ws_tail
+        self.worker.resolver = SimpleNamespace(
+            resolve=lambda symbol,start,end,cached: partial)
+        self.worker.submit(dict(symbol="TESTUSDT",signal_id="test"),
+                           "signal", self.job["as_of"])
+        now = self.job["as_of"] + 5
+        self.worker.step(now=now)
+        self.assertEqual(self.emit.call_args.args[0]["candle_count"], 477)
+        self.assertEqual(self.worker.jobs["test:signal"]["retry_after"], now+15)
+        self.worker.step(now=now+16)
+        # REST budget still waits; the worker must keep looking at WS cache.
+        self.assertEqual(self.worker.jobs["test:signal"]["retry_after"], now+31)
+        ws_tail.append(full[100])
+        self.worker.step(now=now+32)
+        event = self.emit.call_args.args[0]
+        self.assertEqual(event["candle_count"], 478)
+        self.assertEqual(event["closed_15m_ohlcv"][-1][0], end-STEP)
+        self.fetch.assert_not_called()
+
     def test_recent_signal_479_cache_ready_bypasses_download_pacing_and_budget(self):
         end = int(self.job['as_of']*1000)//STEP*STEP
         saved = rows(end-480*STEP, 480)
