@@ -246,10 +246,29 @@ class HistoryCollector:
                     # these repetitive 479/480 jobs for an hour so other
                     # symbols get access to the paced fallback worker.
                     near_complete = COUNT-2 <= event['candle_count'] < COUNT
+                    # A fresh candidate may be one WS close or one gap away
+                    # from V2 eligibility. Never sleep an hour while its
+                    # original 280-second delivery window is still open.
+                    # This is a CACHE-ONLY retry: network pacing is unchanged.
+                    as_of = job['as_of']
+                    fresh_signal = (job['phase'] == 'signal' and
+                                    0 <= now-as_of <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS)
+                    last_slot = int(as_of*1000)//STEP*STEP - STEP
+                    latest_present = any(
+                        int(row[0]) == last_slot
+                        for row in event['closed_15m_ohlcv'])
+                    urgent_cache_retry = fresh_signal and (
+                        event['candle_count'] < COUNT-2 or not latest_present)
                     self.jobs[key]['retry_after'] = now + (
+                        15 if urgent_cache_retry else
                         3600 if near_complete else
                         1800 if event['complete'] else
                         300 if self.resolver else 1800)
+                    if urgent_cache_retry:
+                        self.log(f"[CRASH HISTORY CACHE RETRY] {job['symbol']}; "
+                                 f"candles={event['candle_count']}/480; "
+                                 f"latest_closed={int(latest_present)}; "
+                                 "retry_in=15s; network_pacing_unchanged=1")
                 self._write(self.path, self.jobs)
             if COUNT-2 <= event['candle_count'] < COUNT:
                 self.log(f"[CRASH HISTORY NEAR_COMPLETE] {job['symbol']}; "
@@ -258,10 +277,16 @@ class HistoryCollector:
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
         except HistoryPacingWait:
             with self.lock:
-                self.jobs[key]['retry_after'] = self.next_download
+                # REST remains paced at next_download, but closed WS/cache
+                # updates must be rechecked inside a LIVE signal window.
+                fresh_signal = (job['phase'] == 'signal' and
+                                0 <= now-job['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS)
+                retry_at = min(self.next_download, now+15) if fresh_signal else self.next_download
+                self.jobs[key]['retry_after'] = retry_at
                 self._write(self.path, self.jobs)
             self.log(f"[CRASH HISTORY SCHEDULE] {job['symbol']}; "
-                     f"queue={len(self.jobs)}; wait_seconds={max(0,int(self.next_download-now))}")
+                     f"queue={len(self.jobs)}; wait_seconds={max(0,int(retry_at-now))}; "
+                     f"network_wait_seconds={max(0,int(self.next_download-now))}")
         except Exception as error:
             with self.lock:
                 self.jobs[key]['retry_after'] = now + (300 if self.resolver else 1800)
