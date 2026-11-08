@@ -139,7 +139,9 @@ class HistoryCollector:
         if (job['phase'] == 'signal' and callable(self.urgent_repair)
                 and scheduled_at is not None
                 and 0 <= scheduled_at-job['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS
-                and end-STEP in missing and len(missing) <= 2
+                # Repair the final closed slot even if two other historical
+                # slots are missing: 477/480 can become valid 478/480.
+                and end-STEP in missing and len(missing) <= 3
                 and end-2*STEP in cached
                 and sum(t in cached for t in range(end-16*STEP,end,STEP)) >= 14):
             try:
@@ -241,20 +243,30 @@ class HistoryCollector:
                 if event['complete'] and not any(event['data_sources'].get(src,0) for src in ('BYBIT_LINEAR','COINBASE_SPOT','OKX_SWAP')):
                     self.jobs.pop(key, None)
                 else:
-                    # One or two missing bars no longer block V2 eligibility
-                    # (validated independently at candidate time). Back off
-                    # these repetitive 479/480 jobs for an hour so other
-                    # symbols get access to the paced fallback worker.
+                    # Incomplete OLD history may wait an hour, but a fresh
+                    # signal missing the *last closed bar* must not be delayed
+                    # beyond its 280s decision window. REST pacing/budgets
+                    # remain enforced by collect() on the next attempt.
                     near_complete = COUNT-2 <= event['candle_count'] < COUNT
+                    end = int(job['as_of'] * 1000) // STEP * STEP
+                    last_closed_present = any(
+                        int(row[0]) == end-STEP
+                        for row in event['closed_15m_ohlcv'])
+                    urgent_last_gap = (near_complete and job['phase'] == 'signal'
+                        and 0 <= now-job['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS
+                        and not last_closed_present)
                     self.jobs[key]['retry_after'] = now + (
+                        30 if urgent_last_gap else
                         3600 if near_complete else
                         1800 if event['complete'] else
                         300 if self.resolver else 1800)
                 self._write(self.path, self.jobs)
             if COUNT-2 <= event['candle_count'] < COUNT:
+                with self.lock:
+                    retry_after = self.jobs.get(key, {}).get('retry_after', now)
                 self.log(f"[CRASH HISTORY NEAR_COMPLETE] {job['symbol']}; "
                          f"real_candles={event['candle_count']}/480; "
-                         "1-2 eksik; sonraki tamamlamayi bir saat ertele")
+                         f"next_retry_s={max(0, int(retry_after-now))}")
             self.log(f"[CRASH HISTORY] {job['symbol']} {job['phase']}: {event['candle_count']}/480")
         except HistoryPacingWait:
             with self.lock:
