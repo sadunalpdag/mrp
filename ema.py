@@ -7905,19 +7905,34 @@ def _crash_structure_onboard():
         return {}
 
 
-def _crash_structure_queue(symbol, now):
-    """At most one low-priority warmup; existing Crash work always goes first."""
+def _crash_structure_queue(symbol, now, source='structure'):
+    """Shared low-priority research warmup, capped at three queued symbols.
+
+    Both StructureAgent and paper-scalp observers may propose missing history.
+    Real Crash signal/entry jobs always go first; the existing collector owns
+    all archive/REST pacing, cooldown and fallback decisions.
+    """
+    if source not in ('structure', 'scalp'):
+        raise ValueError('INVALID_RESEARCH_WARMUP_SOURCE')
+    prefixes = ('structure-warmup:', 'scalp-warmup:')
     with _CRASH_STATE_LOCK:
         collector = globals().get('_CRASH_HISTORY_COLLECTOR')
         if collector is not None:
             with collector.lock:
                 jobs = list(collector.jobs.values())
-                if (sum(str(j.get('signal_id', '')).startswith('structure-warmup:') for j in jobs) >= 3
-                        or any(not str(j.get('signal_id', '')).startswith('structure-warmup:')
-                               and j.get('retry_after', 0) <= now for j in jobs)):
-                    return
-        _crash_queue_history({'symbol':symbol, 'signal_id':'structure-warmup:'+symbol},
+                def research(job):
+                    return (job.get('phase') == 'warmup' and
+                            str(job.get('signal_id', '')).startswith(prefixes))
+                if (sum(research(j) for j in jobs) >= 3
+                        or any(j.get('symbol') == symbol and
+                               j.get('phase') == 'warmup' for j in jobs)
+                        or any(not research(j) and j.get('retry_after', 0) <= now
+                               for j in jobs)):
+                    return False
+        _crash_queue_history({'symbol':symbol,
+                              'signal_id':source+'-warmup:'+symbol},
                              'warmup', now)
+        return True
 
 
 def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=None):
@@ -8447,7 +8462,10 @@ def _crash_bounce_worker():
     if os.getenv("SCALP_SHADOW_ENABLED", "1") == "1":
         try:
             from scalp_shadow_week import ShadowWeek
-            scalp_shadow = ShadowWeek(DATA_DIR, log)
+            scalp_shadow = ShadowWeek(
+                DATA_DIR, log,
+                queue_history=lambda symbol, at: _crash_structure_queue(
+                    symbol, at, source='scalp'))
             log("[SCALP SHADOW] paper monitor ready; no REST, no trades")
         except Exception as error:
             log(f"[SCALP SHADOW SETUP] skipped: {type(error).__name__}")
