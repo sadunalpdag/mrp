@@ -209,7 +209,7 @@ class SheetDashboardTests(unittest.TestCase):
             {"symbols":{"TESTUSDT":old},"history":[]},self.tickers,
             {},{},self.now)
         self.assertEqual(table[1][0],"TESTUSDT")
-        self.assertEqual(table[1][4],"SİNYAL YOK")
+        self.assertEqual(table[1][4],"ÖNCEKİ ADAY SÜRESİ DOLDU")
         self.assertEqual(table[1][21],"—")
 
     def test_open_virtual_trade_stays_visible_after_24h(self):
