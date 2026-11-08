@@ -522,6 +522,106 @@ class NightExecutor:
         self.state['halt'] = reason
         self.alert(f'⚠️ OTOMATİK İŞLEM | {symbol}\n{reason}\nYeni girişler durdu. Mevcut pozisyon otomatik kapatılmadı; Binance üzerinden kontrol edin.')
 
+    def quarantine_unverified_tp(self, order, error):
+        """Isolate one unsafe TP instead of globally freezing unrelated symbols.
+
+        A failed read is NEVER proof that a position is flat or protected.
+        Do not submit/cancel/replace a TP here: an uncertain response may
+        conceal an existing closing order. The next poll verifies the exact ID.
+        """
+        symbol = order['symbol']
+        # An unresolved BUY can introduce additional, untracked exposure.
+        # This is NOT a TP-only incident and must retain account-wide safety.
+        if any(o.get('phase') == 'ENTRY_UNKNOWN'
+               for o in self.state['orders'].values()):
+            if not self.state.get('halt'):
+                self.halt('GİRİŞ SONUCU BELİRSİZ\nAçık alış sonucu doğrulanamadı.', symbol)
+            return
+        quarantine = self.state['symbol_quarantine']
+        if symbol not in quarantine:
+            quarantine[symbol] = {
+                'reason': 'TP_UNVERIFIED', 'since': self.clock(),
+                'tp_id': order.get('tp_id'),
+            }
+        if not order.get('warned'):
+            order['warned'] = True
+            reason = order.get('tp_submit_error', error_details(error))
+            self.alert(
+                f'⚠️ TP DOĞRULANAMADI | {symbol}\n{reason}\n'
+                'Yalnız bu sembolde yeni alış engellendi; diğer sembollerde '
+                'otomatik giriş açık kalır. Mevcut pozisyon kapatılmadı ve '
+                'TP yeniden gönderilmedi. Binance üzerinden pozisyonu/TP’yi kontrol edin.')
+        else:
+            self.save()
+        code = error.code if isinstance(error, BrokerError) else str(error)
+        self.log(f'[CRASH TP SYMBOL ISOLATED] {symbol}; code={code}; '
+                 f'global_halt={self.state.get("halt") or "none"}; no TP reissue')
+
+    def release_verified_tp(self, order):
+        """Release only our matching TP quarantine after authoritative ID proof."""
+        symbol = order['symbol']
+        peers = [o for o in self.state['orders'].values()
+                 if o is not order and o.get('symbol') == symbol
+                 and o.get('phase') in ('TP_UNKNOWN', 'PROTECTED')
+                 and o.get('warned')]
+        quarantine = self.state['symbol_quarantine'].get(symbol)
+        if (isinstance(quarantine, dict)
+                and quarantine.get('reason') == 'TP_UNVERIFIED'
+                and quarantine.get('tp_id') == order.get('tp_id')
+                and not peers):
+            del self.state['symbol_quarantine'][symbol]
+            self.log(f'[CRASH TP SYMBOL RELEASED] {symbol}; '
+                     'exact TP ID verified; other symbols never halted')
+            self.alert(f'✅ TP KORUMASI DOĞRULANDI | {symbol}\n'
+                       'Sembol bazlı alış engeli kaldırıldı. '
+                       'Diğer otomatik ayarlar değişmedi.')
+        order.pop('warned', None)
+
+    def recover_tp_halt_to_quarantine(self):
+        """Migrate a persisted TP-only halt to per-symbol protection next cycle.
+
+        An uncertain BUY, unknown affected record or different halt cause
+        remains a global stop. Stale queued signals are discarded, never replayed.
+        """
+        reason = self.state.get('halt')
+        if not isinstance(reason, str) or not reason.startswith('TP DOĞRULANAMADI'):
+            return False
+        records = list(self.state['orders'].values())
+        if any(o.get('phase') == 'ENTRY_UNKNOWN' for o in records):
+            return False
+        unresolved = [o for o in records
+                      if o.get('phase') in ('TP_UNKNOWN', 'PROTECTED')
+                      and o.get('warned')]
+        if (not unresolved or any(
+                o.get('phase') == 'TP_UNKNOWN' and not o.get('warned')
+                for o in records)
+                or any(not o.get('symbol') or not o.get('tp_id')
+                       for o in unresolved)):
+            return False
+        quarantine = self.state['symbol_quarantine']
+        for order in unresolved:
+            symbol = order['symbol']
+            quarantine.setdefault(symbol, {
+                'reason': 'TP_UNVERIFIED', 'since': self.clock(),
+                'tp_id': order.get('tp_id'),
+            })
+        self.state['halt'] = None
+        self.armed_at = self.clock()
+        self.preflight_retries.clear()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        names = ','.join(sorted({o['symbol'] for o in unresolved}))
+        self.alert(f'✅ TP KAYNAKLI GENEL KİLİT KALDIRILDI\n'
+                   f'İlgili semboller: {names}. Bu semboller TP doğrulanana '
+                   'veya pozisyon kapanana kadar alışa kapalı; diğer coinlerde '
+                   'otomatik giriş devam edebilir. Eski sinyaller kullanılmayacak.')
+        self.log(f'[CRASH TP GLOBAL TO SYMBOL] {names}; no BUY replay; '
+                 'entry_unknown=0; manual off preserved')
+        return True
+
     def recover_mixed_halt(self):
         """Resolve simultaneous TP and BUY uncertainty only from live Binance proof.
 
@@ -1372,11 +1472,13 @@ class NightExecutor:
                     raise ValueError('TP_PROPERTIES_NOT_CONFIRMED')
                 if tp.get('status') == 'FILLED':
                     order['phase'] = 'DONE'
+                    self.release_verified_tp(order)
                     self.save()
                     self.alert(f'✅ OTOMATİK TP DOLDU | {symbol}\nTP: {order["tp"]}')
                 elif tp.get('status') in ('NEW', 'PARTIALLY_FILLED'):
                     first = order['phase'] != 'PROTECTED'
                     order['phase'] = 'PROTECTED'
+                    self.release_verified_tp(order)
                     self.save()
                     if first:
                         self.alert(f'✅ OTOMATİK GİRİŞ + TP DOĞRULANDI | {symbol}\nMiktar: {order["filled_qty"]} | Giriş limit: {order["price"]}\nTP: {order["tp"]} | 10x | SL yok')
@@ -1441,16 +1543,18 @@ class NightExecutor:
             if missing_tp and order['phase'] in ('TP_UNKNOWN', 'PROTECTED'):
                 if self._confirm_external_close(order):
                     return
-            reason = ('GİRİŞ SONUCU BELİRSİZ' if order['phase'] == 'ENTRY_UNKNOWN' else 'TP DOĞRULANAMADI')
-            if not self.state.get('halt'):
-                # Legacy records may have warned=True from an earlier halt.
-                # They must not bypass a newly detected unsafe condition.
-                order['warned'] = True
-                self.halt(reason+'\n'+order.get('tp_submit_error', error_details(error)), symbol)
-            elif not order.get('warned'):
-                order['warned'] = True
-                # Never replace an earlier safety cause (e.g. TP failure).
-                self.save()
+            if order['phase'] in ('TP_UNKNOWN', 'PROTECTED'):
+                # Scope a missing/uncertain TP to its symbol. Preserve any
+                # existing global ENTRY_UNKNOWN or executor failure halt.
+                self.quarantine_unverified_tp(order, error)
+            else:
+                reason = 'GİRİŞ SONUCU BELİRSİZ'
+                if not self.state.get('halt'):
+                    order['warned'] = True
+                    self.halt(reason+'\n'+error_details(error), symbol)
+                elif not order.get('warned'):
+                    order['warned'] = True
+                    self.save()
             code = error.code if isinstance(error, BrokerError) else type(error).__name__
             self.log(f'[CRASH NIGHT RECONCILE] {symbol} {order["phase"]}; '
                      f'code={code}; deferred={getattr(error, "deferred_reason", None)}')
@@ -1597,7 +1701,9 @@ class NightExecutor:
             self.safety_housekeeping()
         if self.state.get('halt') and self.clock() >= self.next_halt_recheck:
             self.next_halt_recheck = self.clock() + MANUAL_TP_POLL_SECONDS
-            self.recover_mixed_halt()
+            self.recover_tp_halt_to_quarantine()
+            if self.state.get('halt'):
+                self.recover_mixed_halt()
             if self.state.get('halt'):
                 self.recover_closed_tp_halt()
             if self.state.get('halt'):

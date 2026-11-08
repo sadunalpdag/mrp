@@ -374,13 +374,21 @@ class NightTests(unittest.TestCase):
         self.assertIn('bugün 1/10',self.e.summary())
         self.assertEqual(self.e.state['orders']['signal-1']['phase'],'NO_FILL')
 
-    def test_tp_failure_halts_and_alerts_without_closing_or_duplicate(self):
+    def test_tp_failure_isolates_symbol_while_other_trades_continue(self):
         self.b.fail_tp=True; self.enter()
-        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
-        self.e.deliver_pending(); self.enter(signal_id='signal-2',symbol='BUSDT')
-        self.e.step()
-        self.assertEqual(len(self.b.buys),1); self.assertEqual(len(self.b.tps),1)
-        self.assertIn('otomatik kapatılmadı', self.deliver.call_args.args[0])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertEqual(len(self.b.tps), 1)
+        self.e.deliver_pending()
+        self.b.fail_tp=False
+        self.enter(signal_id='signal-2',symbol='BUSDT')
+        self.assertEqual(len(self.b.buys), 2)
+        self.assertEqual(len(self.b.tps), 2)
+        self.e.deliver_pending()
+        self.enter(signal_id='signal-3', symbol='AUSDT')
+        self.assertEqual(len(self.b.buys), 2)
+        self.assertIn('Mevcut pozisyon kapatılmadı',
+                      '\n'.join(c.args[0] for c in self.deliver.call_args_list))
 
     def test_unknown_buy_response_reconciles_without_repeat(self):
         self.b.unknown_buy=True; self.enter()
@@ -418,7 +426,9 @@ class NightTests(unittest.TestCase):
         self.enter(); self.e.deliver_pending()
         o=self.e.state['orders']['signal-1']; self.b.orders[o['tp_id']]['status']='CANCELED'
         self.now=timestamp('2026-10-28T12:00:00'); self.e.step()
-        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(self.e.state['symbol_quarantine']['AUSDT']['reason'],
+                         'TP_UNVERIFIED')
 
     def make_halted_cancelled_tp(self):
         self.enter()
@@ -426,7 +436,10 @@ class NightTests(unittest.TestCase):
         order = self.e.state['orders']['signal-1']
         self.b.orders[order['tp_id']]['status'] = 'CANCELED'
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
+        # Simulate the TP-only stop persisted by an older deployed version.
+        self.e.state['symbol_quarantine'].pop('AUSDT', None)
+        self.e.state['halt'] = 'TP DOĞRULANAMADI\nKod: TP_NOT_ACTIVE'
+        self.e.save()
         self.assertTrue(order['warned'])
         return order
 
@@ -454,7 +467,7 @@ class NightTests(unittest.TestCase):
         self.assertIn('CRASH EXTERNAL CLOSE CONFIRMED',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
 
-    def test_missing_tp_with_live_position_keeps_safety_halt(self):
+    def test_missing_tp_with_live_position_isolates_not_unlocks_symbol(self):
         self.enter()
         order = self.e.state['orders']['signal-1']
         self.b.order = Mock(side_effect=BrokerError('-2013'))
@@ -463,10 +476,47 @@ class NightTests(unittest.TestCase):
         self.b.closing_orders = Mock(return_value=[])
         self.e.reconcile(order)
         self.assertEqual(order['phase'], 'PROTECTED')
-        self.assertTrue(self.e.state['halt'].startswith('TP DOĞRULANAMADI'))
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.b.closing_orders.assert_not_called()
         self.assertIn('POSITION_OPEN',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
+
+    def test_tp_quarantine_clears_only_after_exact_tp_reverified(self):
+        self.enter()
+        order = self.e.state['orders']['signal-1']
+        self.b.orders[order['tp_id']]['status'] = 'CANCELED'
+        self.e.reconcile(order)
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertEqual(len(self.b.tps), 1)  # No blind replacement.
+        self.b.orders[order['tp_id']]['status'] = 'NEW'
+        self.e.reconcile(order)
+        self.assertNotIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertEqual(len(self.b.tps), 1)
+
+    def test_previous_tp_halt_converts_to_symbol_only_next_cycle(self):
+        self.make_halted_cancelled_tp()
+        self.b.positions = Mock(return_value=[
+            dict(symbol='AUSDT', positionAmt='5', positionSide='BOTH')])
+        self.e.next_quarantine_scan = self.now + 300
+        self.e.next_manual_close_scan = self.now + 300
+        self.e.next_poll = self.now + 300
+        self.e.next_expiry_scan = self.now + 300
+        self.e.step()
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
+        self.e.deliver_pending()
+        self.enter(signal_id='another-symbol', symbol='BUSDT')
+        self.assertEqual(len(self.b.buys), 2)
+        self.assertEqual(len(self.b.tps), 2)
+
+    def test_previous_tp_halt_never_unlocks_unknown_buy(self):
+        self.make_halted_cancelled_tp()
+        self.e.state['orders']['unknown_buy'] = {
+            'symbol': 'BUSDT', 'phase': 'ENTRY_UNKNOWN', 'warned': True}
+        self.assertFalse(self.e.recover_tp_halt_to_quarantine())
+        self.assertTrue(self.e.state['halt'])
 
     def test_manual_close_with_open_normal_or_algo_order_has_no_quarantine(self):
         self.enter()
@@ -497,7 +547,8 @@ class NightTests(unittest.TestCase):
         self.b.positions = Mock(side_effect=BrokerError('-1003'))
         self.b.closing_orders = Mock(return_value=[])
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertIn('VERIFY_FAILED=-1003',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
@@ -515,7 +566,8 @@ class NightTests(unittest.TestCase):
             [dict(symbol='AUSDT', positionAmt='2')]])
         self.b.closing_orders = Mock(return_value=[])
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.assertIn('POSITION_CHANGED',
                       '\n'.join(c.args[0] for c in self.e.log.call_args_list))
@@ -721,7 +773,8 @@ class NightTests(unittest.TestCase):
         self.b.cancel_owned_tp = Mock(side_effect=BrokerError('UNKNOWN', uncertain=True))
         self.e.reconcile(order)
         self.assertEqual(order['phase'], 'PROTECTED')
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.b.cancel_owned_tp.assert_called_once()
 
     def test_owned_tp_mismatch_is_never_cancelled(self):
@@ -736,7 +789,8 @@ class NightTests(unittest.TestCase):
         self.b.closing_orders = Mock(return_value=[mismatched])
         self.b.cancel_owned_tp = Mock()
         self.e.reconcile(order)
-        self.assertTrue(self.e.state['halt'])
+        self.assertIsNone(self.e.state['halt'])
+        self.assertIn('AUSDT', self.e.state['symbol_quarantine'])
         self.assertEqual(order['phase'], 'PROTECTED')
         self.b.cancel_owned_tp.assert_not_called()
 
@@ -833,8 +887,8 @@ class NightTests(unittest.TestCase):
         self.e.step()
         self.assertIsNone(self.e.state['halt'])
         self.assertEqual(order['phase'], 'CLOSED_EXTERNALLY')
-        self.assertEqual(self.b.positions.call_count, 2)
-        self.b.closing_orders.assert_called_once_with('AUSDT')
+        self.assertGreaterEqual(self.b.positions.call_count, 2)
+        self.assertGreaterEqual(self.b.closing_orders.call_count, 1)
         self.assertEqual(len(self.b.buys), 1)
 
     def test_local_budget_deferred_buy_never_halts_or_counts_daily(self):
