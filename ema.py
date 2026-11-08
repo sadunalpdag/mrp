@@ -6317,6 +6317,8 @@ CRASH_BOUNCE_TOP_LOSERS = 20
 CRASH_BOUNCE_DROP_PCT = 12.0
 CRASH_BOUNCE_FILTER_VERSION = "five_day_entry_v2_only"
 CRASH_V2_SIGNAL_TTL_SECONDS = 280
+# Real BUY orders are intentionally stricter than delayed V2/Telegram research.
+CRASH_LIVE_ENTRY_TTL_SECONDS = 120
 CRASH_BOUNCE_COOLDOWN_SECONDS = 24 * 3600
 CRASH_BOUNCE_TP_PCT = Decimal("0.01")
 CRASH_BOUNCE_ENTRY_BUFFER = Decimal("0.003")
@@ -6684,7 +6686,7 @@ def _crash_send_pending(state, now):
                     # The Telegram delivery is fresh, but the underlying market
                     # candidate may not be. Never auto-buy an old snapshot.
                     candidate_age = max(now, receipt['accepted_at']) - record['created_at']
-                    if 0 <= candidate_age <= 120:
+                    if 0 <= candidate_age <= CRASH_LIVE_ENTRY_TTL_SECONDS:
                         executor.submit(record, receipt['accepted_at'])
                     else:
                         log(f"[CRASH AUTO ENTRY SKIP] {record['symbol']}; "
@@ -6793,6 +6795,18 @@ def _crash_review_pending_v2(state, now):
         if (record.get("v2_delivery_phase") == "CANDIDATE"
                 and record.get("v2_status") == "PENDING_5D_HISTORY"):
             _crash_review_candidate(state, record, now)
+
+
+def _crash_reassess_expired_history(state, now):
+    """Recover only historical V2/risk labels after the candidate has expired.
+
+    No status or delivery transition to STRONG_V2 and no executor calls.
+    Strictly original-time cached closed candles, independently of live BUY.
+    """
+    from crash_history_reassessment import reassess_expired
+    changed = reassess_expired(state, now, _crash_v2_validate_entry, log)
+    if changed:
+        _crash_save_state(state)
 
 
 def _crash_signal_score(features):
@@ -7874,6 +7888,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     _crash_apply_filter_migration(state, now)
     _crash_track_results(state, tickers, now)
     _crash_review_pending_v2(state, now)
+    _crash_reassess_expired_history(state, now)
     _crash_send_pending(state, now)
     if not tickers:
         log(f"[CRASH WS WAIT] disconnected/warming/no fresh futures ticker data; {_CRASH_WS_CACHE.health(now)}")
@@ -8464,6 +8479,7 @@ def _crash_bounce_worker():
             else:
                 with _CRASH_STATE_LOCK:
                     _crash_review_pending_v2(state, now)
+                    _crash_reassess_expired_history(state, now)
                     _crash_send_pending(state, now)
         except Exception as error:
             log(f"[CRASH BOUNCE LOOP ERR] {error}")

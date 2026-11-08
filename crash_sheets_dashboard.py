@@ -63,13 +63,18 @@ def _name(title):
 def _risk(rec):
     item = rec.get("failure_shadow") or {}
     flags = item.get("flags") if isinstance(item, dict) else None
-    if not isinstance(flags, dict) or any(type(flags.get(k)) is not bool for k in FLAGS):
+    if not isinstance(flags, dict):
         return None, ["?"] * 3, "EKSİK: otomatik alış yok"
+    # Show each known criterion independently; unknown is never interpreted as safe.
+    marks = [("🔴 VAR" if flags[k] else "🟢 YOK")
+             if type(flags.get(k)) is bool else "?" for k in FLAGS]
+    if any(type(flags.get(k)) is not bool for k in FLAGS):
+        return None, marks, "EKSİK: otomatik alış yok"
     count = sum(flags[k] for k in FLAGS)
-    marks = ["🔴 VAR" if flags[k] else "🟢 YOK" for k in FLAGS]
     rule = ("⛔ İŞLEM YOK" if count == 3 else
             "⚖️ %50 / TP %0,5" if count == 2 else "✅ %100 / TP %1")
     return count, marks, rule
+
 
 def _score(rec):
     feat = rec.get("v2_features") or {}
@@ -110,8 +115,15 @@ def _missing_explanation(rec, feat):
 
 def _retrospective_v2(rec, rescore):
     """Re-check original event time using cached real candles; NEVER create orders."""
-    if (rec.get("v2_status") != "MISSING_5D_HISTORY" or
-            not callable(rescore) or not _num(rec.get("created_at"))):
+    if rec.get("v2_status") != "MISSING_5D_HISTORY":
+        return "—"
+    stored = rec.get("retrospective_v2") or {}
+    if isinstance(stored, dict) and stored.get("status") in ("STRONG_V2", "FILTERED_V2"):
+        candles = stored.get("candles", "—")
+        if stored["status"] == "STRONG_V2":
+            return f"SONRADAN V2 ONAYLI ({candles}/480); canlı emir yok"
+        return f"SONRADAN FİLTREYİ GEÇMEDİ ({candles}/480); canlı emir yok"
+    if not callable(rescore) or not _num(rec.get("created_at")):
         return "—"
     try:
         result = rescore(rec, rec["created_at"])

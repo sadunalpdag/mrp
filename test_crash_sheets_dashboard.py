@@ -59,6 +59,28 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(table[1][13], "—")
         self.assertEqual(colors[0], ("red", "grey"))
 
+    def test_partial_risk_visibility_is_independent(self):
+        _, table, _, _ = self.data({"weak_volume": True,
+                                    "falling_rsi_ema": None,
+                                    "repeat_lower_entry": False})
+        row = table[1]
+        self.assertEqual(row[14], "🔴 VAR")
+        self.assertEqual(row[15], "?")
+        self.assertEqual(row[16], "🟢 YOK")
+        self.assertIn("EKSİK", row[17])
+
+    def test_stored_late_research_never_shows_live_order(self):
+        rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
+                   v2_reason="HISTORY_NOT_READY_IN_TIME",
+                   retrospective_v2={"status":"STRONG_V2",
+                                     "candles":479,"research_only":True})
+        _, table, _, _ = dash.build_rows(
+            {"symbols":{"TESTUSDT":rec}, "history":[rec]},
+            self.tickers, {}, {}, self.now)
+        self.assertIn("SONRADAN V2 ONAYLI (479/480)", table[1][39])
+        self.assertIn("canlı emir yok", table[1][39])
+        self.assertEqual(table[1][4], "MISSING_5D_HISTORY")
+
     def test_previous_score_delta_and_current_rescore(self):
         prior = {"TESTUSDT": {"signal_id": "s-1", "score": 55.0}}
         state = {"symbols": {"TESTUSDT": self.record}, "history": [self.record]}
