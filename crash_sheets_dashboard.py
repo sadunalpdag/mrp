@@ -64,10 +64,11 @@ def _risk(rec):
     item = rec.get("failure_shadow") or {}
     flags = item.get("flags") if isinstance(item, dict) else None
     if not isinstance(flags, dict):
-        return None, ["?"] * 3, "EKSİK: otomatik alış yok"
+        # Never claim YOK when the underlying signal-time measure is unknown.
+        return None, ["VERİ EKSİK"] * 3, "EKSİK: otomatik alış yok"
     # Show each known criterion independently; unknown is never interpreted as safe.
     marks = [("🔴 VAR" if flags[k] else "🟢 YOK")
-             if type(flags.get(k)) is bool else "?" for k in FLAGS]
+             if type(flags.get(k)) is bool else "VERİ EKSİK" for k in FLAGS]
     if any(type(flags.get(k)) is not bool for k in FLAGS):
         return None, marks, "EKSİK: otomatik alış yok"
     count = sum(flags[k] for k in FLAGS)
@@ -78,7 +79,9 @@ def _risk(rec):
 
 def _score(rec):
     feat = rec.get("v2_features") or {}
-    scored = (feat.get("strength_score") or rec.get("strength_score") or {})
+    retrospective = rec.get("retrospective_v2") or {}
+    scored = (feat.get("strength_score") or rec.get("strength_score") or
+              retrospective.get("strength_score") or {})
     val = _num(scored.get("score")) if isinstance(scored, dict) else None
     return round(val, 1) if val is not None and 0 <= val <= 100 else None
 
@@ -177,10 +180,18 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         has_signal = bool(rec.get("signal_id"))
         risk, flags, rule = _risk(rec) if has_signal else (None, ["—"] * 3, "—")
         current = _score(rec)
-        # Reassess only cached closed candles: same local V2 algorithm, NO REST.
-        if has_signal and rec.get("v2_status") == "STRONG_V2" and callable(rescore):
+        # Display-only CURRENT 5-day strength on each ranked coin when cached
+        # CLOSED candles allow it; it does not create a V2 signal or BUY.
+        # Historical MISSING_5D_HISTORY uses original-time backfill instead.
+        if callable(rescore) and (not has_signal or rec.get("v2_status") == "STRONG_V2"):
             try:
-                live = rescore(rec, now)
+                sample = rec if has_signal else {
+                    "symbol": sym,
+                    "btc_change_24h": next(
+                        (t.get("priceChangePercent") for t in tickers or []
+                         if isinstance(t, dict) and t.get("symbol") == "BTCUSDT"), None),
+                }
+                live = rescore(sample, now)
                 fresh = (live.get("strength_score") or {}).get("score") if isinstance(live, dict) else None
                 fresh = _num(fresh)
                 if fresh is not None and 0 <= fresh <= 100:
@@ -230,7 +241,10 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
             sym, round(change, 2) if change is not None else "—", rank.get(sym, "—"),
             price if price is not None else "—", rec.get("v2_status", "SİNYAL YOK") if has_signal else "SİNYAL YOK",
             v2.get("rsi14", "—"), v2.get("recovery_4h_pct", "—"),
-            current if current is not None else "—",
+            (current if current is not None else
+             "VERİ EKSİK" if has_signal and rec.get("v2_status") in (
+                 "PENDING_5D_HISTORY", "MISSING_5D_HISTORY") else
+             "HESAPLANAMADI"),
             old_score if old_score is not None else "—", difference,
             entry if entry is not None else "—", tp if tp is not None else "—", dist,
             risk if risk is not None else "—", *flags, rule, status,
