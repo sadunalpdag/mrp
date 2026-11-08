@@ -193,6 +193,7 @@ class TrackingTests(unittest.TestCase):
             CRASH_BOUNCE_TOP_LOSERS=20,CRASH_BOUNCE_DROP_PCT=12,
             CRASH_BOUNCE_COOLDOWN_SECONDS=86400,
             _crash_send_pending=Mock(),_crash_review_pending_v2=Mock(),
+            _crash_reassess_expired_history=Mock(),
             _crash_apply_filter_migration=Mock(),_crash_queue_history=Mock(),
             _crash_review_candidate=Mock(),
             _crash_initialize_tracking=self.g['_crash_initialize_tracking'],
