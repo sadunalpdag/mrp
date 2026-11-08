@@ -16,7 +16,7 @@ from crash_data_sources import valid_rows, source_counts
 STEP = 900000
 FOUR_H = 16 * STEP
 TAB = "Structure Agent Test"
-VERSION = "structure_monitor_v1"
+VERSION = "structure_monitor_v2"
 HEADERS = ["Coin", "Hacim sırası", "24s hacim USDT", "24s değişim %",
            "15m veri", "Tam 4s mum", "4s yapı", "Yöntem", "Karar",
            "Seviye", "Gösterge giriş", "Sanal stop", "Sanal TP 1,5R",
@@ -145,7 +145,7 @@ def analyse(rows, now, change):
         base["reason"] = "En az 20 ardışık tam 4s mum gerekli"
         return base
     trend, highs, lows = structure(bars)
-    base.update(trend=trend, decision="İZLE", reason="Uygun yapı / ilk geri test bekleniyor",
+    base.update(trend=trend, decision="YAPI YOK", reason="Etkin dönüş veya devam formasyonu yok",
                 resistances=[value for _,value in highs])
     volatility = atr(rows)
     if volatility <= 0:
@@ -162,30 +162,34 @@ def analyse(rows, now, change):
             continue
         break_end = int(bars[i][0]) + FOUR_H
         after = [r for r in rows if break_end <= int(r[0]) < break_end+16*STEP]
-        base.update(method="DÖNÜŞ", level=level, reason="İlk geri test bekleniyor")
+        base.update(method="DÖNÜŞ", decision="İZLE", level=level, reason="İlk geri test bekleniyor")
         zone = .20 * volatility
         for pos, row in enumerate(after):
             if float(row[3]) <= level+zone and float(row[2]) >= level-zone:
                 # Freeze first contact: later bounces are not relabeled first.
                 if pos != len(after)-1 or int(row[0]) != end-STEP:
-                    base["reason"] = "İlk temas geçmişte; yeni sinyal üretilmedi"
+                    base.update(decision="SÜRESİ DOLDU",
+                                reason="İlk temas geçmişte; yeni sinyal üretilmedi")
                     return base
                 if float(row[4]) > level and float(row[4]) > float(row[1]):
                     stop = min(float(r[3]) for r in after[:pos+1]) - zone
                     base.update(decision="TEYİT VAR", stop=stop, confirmed=int(row[6]),
                                 reason="İlk geri testte 15m alıcı teyidi; yalnız gözlem")
                 else:
-                    base["reason"] = "İlk temas var; kapanış teyidi yok"
+                    base.update(decision="REDDET",
+                                reason="İlk temasta 15m alıcı kapanış teyidi yok")
                 return base
         if end >= break_end+16*STEP:
             base.update(decision="SÜRESİ DOLDU", reason="16 mum içinde ilk geri test gelmedi")
         return base
-    # Independent momentum experiment: high-timeframe uptrend, a >=1 ATR
-    # impulse, 1-4 bearish pullback bars, latest close breaks pullback high.
+    # Independent continuation: an actual volume impulse and 1-4 pullback
+    # candles are required even to mark a coin İZLE. A bare uptrend is not
+    # an actionable watch candidate.
     if trend == "YÜKSELİŞ" and change > 0:
-        base.update(method="DEVAM", reason="Hacimli itki ve ilk geri çekilme bekleniyor")
         last = rows[-1]
         for size in range(1, 5):
+            # First candle AFTER a qualifying bearish pullback. The latest
+            # close may confirm the break, or may still be waiting.
             pull = rows[-size-1:-1]
             impulse = rows[-size-2]
             volume_mean = sum(float(r[5]) for r in rows[-size-22:-size-2])/20
@@ -193,13 +197,29 @@ def analyse(rows, now, change):
                     and float(impulse[5]) >= 1.5*volume_mean
                     and all(float(r[4]) < float(r[1]) for r in pull)
                     and min(float(r[3]) for r in pull) > float(impulse[3])
-                    and float(last[4]) > max(float(r[2]) for r in pull)
-                    and float(last[4]) > float(last[1])):
-                base.update(decision="TEYİT VAR", level=max(float(r[2]) for r in pull),
-                            stop=min(float(r[3]) for r in pull)-.20*volatility,
-                            confirmed=int(last[6]), reason="İlk geri çekilme sonrası kapanış kırılımı; yalnız gözlem")
-                break
-    base["resistances"] = [value for _,value in highs]
+                    and float(last[3]) > float(impulse[3])):
+                level = max(float(r[2]) for r in pull)
+                base.update(method="DEVAM", decision="İZLE", level=level,
+                            reason="İlk geri çekilme tamam; 15m kapanış kırılımı bekleniyor")
+                if float(last[4]) > level and float(last[4]) > float(last[1]):
+                    base.update(decision="TEYİT VAR",
+                                stop=min(float(r[3]) for r in pull)-.20*volatility,
+                                confirmed=int(last[6]),
+                                reason="İlk geri çekilme sonrası kapanış kırılımı; yalnız gözlem")
+                return base
+        for size in range(1, 5):
+            # Pullback still in progress, without an invented entry signal.
+            pull = rows[-size:]
+            impulse = rows[-size-1]
+            volume_mean = sum(float(r[5]) for r in rows[-size-21:-size-1])/20
+            if (float(impulse[4])-float(impulse[1]) >= volatility
+                    and float(impulse[5]) >= 1.5*volume_mean
+                    and all(float(r[4]) < float(r[1]) for r in pull)
+                    and min(float(r[3]) for r in pull) > float(impulse[3])):
+                base.update(method="DEVAM", decision="İZLE",
+                            level=max(float(r[2]) for r in pull),
+                            reason=f"{size} kapanmış geri çekilme mumu; ilk kırılım bekleniyor")
+                return base
     return base
 
 
@@ -252,27 +272,34 @@ def paris(ms):
 
 
 def sheet_values(obj):
+    # All top-50 diagnostics remain in the local JSON for replacement
+    # selection and missing-candle repairs. Only the active top five per
+    # method are published; historical events remain in local research state.
+    lookup = {r["symbol"]: r for r in obj["rows"]}
+    visible = [lookup[symbol] for symbol in obj["selected"]
+               if symbol in lookup and lookup[symbol].get("age_ready")
+               and lookup[symbol].get("method") in ("DÖNÜŞ", "DEVAM")
+               and lookup[symbol].get("decision") in ("İZLE", "TEYİT VAR")]
+    reversal = sum(r["method"] == "DÖNÜŞ" for r in visible)
+    continuation = sum(r["method"] == "DEVAM" for r in visible)
+    waiting = sum(r["decision"] == "VERİ BEKLENİYOR" for r in obj["rows"])
     values = [[TAB, "YALNIZ İZLEME — GERÇEK EMİR YOK", paris(obj["observed_at"]*1000)],
               ["Model", VERSION, "4s yapı / 15m teyit", "Giriş, stop ve TP gösterge seviyeleridir"],
               ["BTC / ETH", json.dumps(obj.get("references", []), ensure_ascii=False)],
-              ["Seçilenler", ", ".join(obj["selected"]) or "Henüz uygun aday yok"],
-              ["Eksik veri", "Mevcut Crash history kuyruğu; kaynaklar işaretli; yapay mum yok"],
+              ["Aktif takip", f"DÖNÜŞ {reversal}/5 | DEVAM {continuation}/5",
+               f"Arka planda {len(obj['rows'])}/50 coin taranıyor; aday kaybolursa yedek otomatik seçilir"],
+              ["Veri bekleyen (arka plan)", waiting,
+               "Eksikler mevcut Crash history kuyruğunda tamamlanır; yapay mum yok"],
               HEADERS]
-    for r in obj["rows"]:
+    for r in visible:
         values.append([r["symbol"], r["rank"], r["volume"], r["change"], f'{r["count"]}/480',
                        r["four_count"], r["trend"], r["method"], r["decision"],
                        r.get("level", ""), r.get("entry", ""), r.get("stop", ""),
                        r.get("target", ""), paris(r.get("confirmed")), r["reason"],
                        json.dumps(r["sources"], ensure_ascii=False),
                        "ÖLÇÜLMEDİ — işlem uygunluğu onayı yok", "YALNIZ İZLEME"])
-    values += [[""]*18 for _ in range(60-len(values))]
-    values += [["Son teyit kayıtları (gerçek işlem değil)"], HEADERS]
-    for r in reversed(obj.get("events", [])[-100:]):
-        values.append([r["symbol"], r["rank"], r["volume"], r["change"], f'{r["count"]}/480',
-                       r["four_count"], r["trend"], r["method"], "TEYİT KAYDI",
-                       r.get("level", ""), r.get("entry", ""), r.get("stop", ""),
-                       r.get("target", ""), paris(r.get("confirmed")), r["reason"],
-                       json.dumps(r["sources"]), "ÖLÇÜLMEDİ", "YALNIZ İZLEME"])
+    # Clear old 50-coin diagnostic rows and old event-table rows in the same
+    # pre-existing single Sheets write, without increasing request volume.
     return values + [[""]*18 for _ in range(162-len(values))]
 
 
