@@ -252,6 +252,80 @@ class ScheduledHistoryTests(HistoryTests):
 
 if __name__=='__main__':unittest.main()
 
+class DeliveryAgeTests(unittest.TestCase):
+    """No live sockets/orders: execute the isolated ema.py delivery function."""
+    def run_delivery(self, age):
+        import ast
+        import sys
+        from pathlib import Path
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import patch
+        now = 200000.0
+        source = ast.parse(Path(__file__).with_name('ema.py').read_text())
+        method = next(n for n in source.body
+                      if isinstance(n, ast.FunctionDef)
+                      and n.name == '_crash_send_pending')
+        record = dict(signal_id='test-age', symbol='TESTUSDT',
+                      created_at=now-age, v2_status='STRONG_V2',
+                      v2_delivery_phase='CANDIDATE', v2_sent=False,
+                      tracking_status='WAIT_ENTRY',
+                      entry='1.0', tp='1.01', change_24h=-15,
+                      last_price='1.00', derivatives_shadow={},
+                      v2_features=dict(recovery_4h_pct=1.5,
+                          rsi14=32.0, candles=480, return_5d_pct=-14,
+                          data_sources={}, strength_score={}))
+        executor = SimpleNamespace(
+            enabled=SimpleNamespace(is_set=lambda: True),
+            submit=Mock(), entry_skip=Mock())
+        delivered = []
+        def receipt(message):
+            delivered.append(message)
+            return {'ok': True, 'accepted_at': now + 1, 'message_id': 123}
+        fake = {}
+        def module(name, **functions):
+            m = ModuleType(name)
+            for key, val in functions.items():
+                setattr(m, key, val)
+            fake[name] = m
+        module('crash_policy', supported_symbol=lambda symbol: True)
+        module('crash_derivatives', empty_snapshot=lambda r: {},
+               format_shadow=lambda shadow: '')
+        module('crash_context', format_context=lambda ctx: '')
+        module('crash_failure_shadow', format_warning=lambda shadow: '',
+               entry_block_reason=lambda r: None,
+               position_fraction=lambda r: 1)
+        namespace = dict(
+            CRASH_V2_SIGNAL_TTL_SECONDS=280,
+            CRASH_LIVE_ENTRY_TTL_SECONDS=120,
+            _CRASH_NIGHT=executor, _CRASH_HEALTH=None, _CRASH_SHADOW=None,
+            _CRASH_AI=None, _crash_telegram_receipt=receipt,
+            _crash_save_state=Mock(), _crash_append_data=Mock(),
+            log=Mock(), time=SimpleNamespace(time=lambda: now))
+        with patch.dict(sys.modules, fake):
+            exec(compile(ast.Module(body=[method], type_ignores=[]),
+                         'ema.py', 'exec'), namespace)
+            namespace['_crash_send_pending'](
+                {'history': [record], 'symbols': {'TESTUSDT': record}}, now)
+        return record, executor, delivered[0], namespace
+
+    def test_late_telegram_approved_signal_never_queues_buy(self):
+        rec, exe, msg, ns = self.run_delivery(200)
+        self.assertTrue(rec['v2_sent'])
+        exe.submit.assert_not_called()
+        exe.entry_skip.assert_called_once_with(
+            'TESTUSDT', 'SIGNAL_CANDIDATE_EXPIRED')
+        self.assertIn('120 saniyelik güvenli alış süresi doldu', msg)
+        self.assertIn('GÖNDERİLMEYECEK', msg)
+
+    def test_fresh_telegram_signal_uses_original_deadline_not_new_one(self):
+        rec, exe, msg, ns = self.run_delivery(30)
+        self.assertTrue(rec['v2_sent'])
+        exe.entry_skip.assert_not_called()
+        exe.submit.assert_called_once()
+        self.assertEqual(exe.submit.call_args.args[0]['signal_id'],
+                         'test-age')
+        self.assertIn('120 saniyeden genç kalır', msg)
+
 class EntrySnapshotTests(unittest.TestCase):
     def test_tracking_captures_entry_once(self):
         import ast, math
