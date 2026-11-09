@@ -6651,9 +6651,15 @@ def _crash_send_pending(state, now):
             else:
                 fraction = position_fraction(record)
                 size_label = '%50' if fraction == 0.5 else '%100'
-                message = message.replace('Gerçek emir yok.',
-                    f'Otomatik GTC limit için risk bazlı tutar: {size_label}. '
-                    'Gerçek emir sonucu ayrı mesajla bildirilir; bekleyen alış düşerken de dolabilir.')
+                if age > CRASH_LIVE_ENTRY_TTL_SECONDS:
+                    message = message.replace('Gerçek emir yok.',
+                        '⚠️ Adayın 120 saniyelik güvenli alış süresi doldu. '
+                        'Bu sinyal için otomatik emir GÖNDERİLMEYECEK; yalnız sanal takip.')
+                else:
+                    message = message.replace('Gerçek emir yok.',
+                        f'Otomatik GTC limit için risk bazlı tutar: {size_label}. '
+                        'Yalnız aday 120 saniyeden genç kalır ve Binance güvenlik '
+                        'kontrolleri geçerse alış DENENİR; sonuç ayrı mesajla bildirilir.')
         receipt = _crash_telegram_receipt(message)
         monitor = globals().get('_CRASH_HEALTH')
         if monitor:
@@ -6690,7 +6696,12 @@ def _crash_send_pending(state, now):
                         executor.submit(record, receipt['accepted_at'])
                     else:
                         log(f"[CRASH AUTO ENTRY SKIP] {record['symbol']}; "
+                            f"reason=SIGNAL_CANDIDATE_EXPIRED; "
                             f"candidate_age_s={candidate_age:.1f}; Telegram only")
+                        # Signal was delivered, but BUY was never enqueued.
+                        # Tell the operator why without blocking other coins.
+                        executor.entry_skip(record['symbol'],
+                                            'SIGNAL_CANDIDATE_EXPIRED')
                 # Three true risk flags or incomplete labels: Telegram + virtual tracking only.
                 # NightExecutor.enter independently rechecks sizing and safety before real BUY.
         else:
@@ -6941,6 +6952,17 @@ _CRASH_HISTORY_ERRORS = {}
 _CRASH_RISK_RESEARCH = None
 
 
+def _crash_live_entry_priority_active():
+    """Pause optional research, not Binance BUY/TP or account WS protection.
+
+    This is an in-process read-only guard. A queued fresh candidate retains
+    its original 120-second window and is never replayed after expiration.
+    """
+    executor = globals().get('_CRASH_NIGHT')
+    return bool(executor is not None and
+                executor.live_entry_priority_active())
+
+
 def _crash_risk_observe(kind, record):
     """Best-effort paper observer; never change the live transition or send orders."""
     try:
@@ -6974,7 +6996,8 @@ def _crash_queue_history(record, phase, now):
         if _CRASH_HISTORY_COLLECTOR is None:
             from crash_history import HistoryCollector
             from crash_data_sources import DataSources
-            blocked = lambda: (time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
+            blocked = lambda: (_crash_live_entry_priority_active()
+                or time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
                 or time.time() < getattr(getattr(globals().get('_CRASH_NIGHT'), 'broker', None), 'cooldown_until', 0))
             # Only annotate the existing REST-wait log; do not change API pacing.
             def _crash_history_log(message):
@@ -7055,7 +7078,8 @@ def _crash_queue_history(record, phase, now):
                 _crash_public_get, _crash_append_data, blocked, log,
                 resolver=resolver, ws_rows=_CRASH_WS_CACHE.candles,
                 on_rows=_CRASH_WS_CACHE.merge_candles,
-                urgent_repair=urgent_last)
+                urgent_repair=urgent_last,
+                live_entry_pending=_crash_live_entry_priority_active)
         key = phase + "_history_queued"
         if not record.get(key):
             _CRASH_HISTORY_COLLECTOR.submit(record, phase, now)
