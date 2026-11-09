@@ -403,6 +403,7 @@ class NightExecutor:
         self.next_lock_audit = 0
         self.next_safety_housekeeping = 0
         self.skip_notice_after = {}
+        self.entry_priority_until = 0  # Never longer than original 120s BUY window.
         self.protected_poll = {}
         self.enabled = threading.Event()
         self.armed_at = clock()
@@ -1269,26 +1270,48 @@ class NightExecutor:
                  f'daily={self.daily_count()}/{self.max_daily}; '
                  f'halt={bool(self.state.get("halt"))}; outbox={len(self.state["outbox"])}')
         notices = {
+            'AUTO_OFF': 'Otomatik alım kapalı.',
+            'SIGNAL_BEFORE_ARM': 'Sinyal otomatik alım açılmadan önce oluşturuldu.',
             'DAILY_LIMIT': 'Günlük giriş sınırı doldu.',
-            'EXISTING_ORDER': 'Aynı coin için mevcut giriş/pozisyon kaydı var.',
-            'SIGNAL_EXPIRED': 'Girişin 120 saniyelik geçerlilik süresi doldu.',
-            'SIGNAL_CANDIDATE_EXPIRED': 'Sinyal adayı oluşturulalı 120 saniyeyi geçti.',
-            'SIGNAL_EXPIRED_AFTER_PREFLIGHT': 'Ön kontrol sırasında sinyalin süresi doldu.',
+            'EXISTING_ORDER': 'Aynı coinde açık/sonuçlanmamış giriş veya pozisyon kaydı var. Çift alış engellendi.',
+            'SIGNAL_EXPIRED': 'Sinyalin 120 saniyelik güvenli giriş süresi doldu.',
+            'SIGNAL_CANDIDATE_EXPIRED': 'Adayın oluşturulmasının üzerinden 120 saniye geçti.',
+            'SIGNAL_EXPIRED_AFTER_PREFLIGHT': 'Binance ön kontrolü sürerken 120 saniyelik süre doldu.',
             'QUEUE_FULL': 'Otomatik giriş kuyruğu dolu.',
-            'SYMBOL_QUARANTINED': 'Coin karantinada; kalan emirler kontrol ediliyor.',
+            'SYMBOL_QUARANTINED': 'Bu coin 8 saatlik güvenlik karantinasında.',
+            'ALERT_PENDING': 'İşlemi engelleyen güvenlik uyarısı henüz tamamlanmadı.',
+            'TRACKING_INACTIVE': 'Sanal giriş takibi artık aktif değil.',
+            'RISK_BLOCKED': '3 risk kriteri veya eksik risk değerlendirmesi nedeniyle giriş yasak.',
         }
         # A safety halt already has its own durable warning. Do NOT put
         # optional skip notices into the blocking outbox: a failed Telegram
         # delivery must not block tomorrow's otherwise valid new entries.
-        if (reason in notices and not self.state['outbox']
-                and self.clock() >= self.skip_notice_after.get(reason, 0)):
-            self.skip_notice_after[reason] = self.clock() + LOCK_AUDIT_SECONDS
-            message = (f'⏸️ OTOMATİK ALIŞ ENGELLENDİ | {symbol}\n'
-                       f'Neden: {notices[reason]} '
+        key = (symbol, reason)
+        blocking_alert = any(item.get('blocks_entries', True)
+                             for item in self.state['outbox'])
+        if (reason in notices and not blocking_alert
+                and self.clock() >= self.skip_notice_after.get(key, 0)):
+            # Keep at most one reminder per symbol+reason/30m. One blocked
+            # coin must never hide a different coin's missed BUY explanation.
+            self.skip_notice_after[key] = self.clock() + LOCK_AUDIT_SECONDS
+            if len(self.skip_notice_after) > 500:
+                self.skip_notice_after = {
+                    k: until for k, until in self.skip_notice_after.items()
+                    if until > self.clock()}
+            message = (f'⏸️ OTOMATİK ALIŞ YAPILMADI | {symbol}\n'
+                       f'Kod: {reason}\nNeden: {notices[reason]}\n'
+                       'Yeni/tekrar alış emri GÖNDERİLMEDİ. '
                        'Mevcut emirler ve TP koruması değiştirilmedi.')
             threading.Thread(target=self._deliver_skip_notice,
                              args=(message,), name='crash-entry-skip-notice',
                              daemon=True).start()
+
+    def live_entry_priority_active(self):
+        """Read-only signal to pause optional research, not protective checks."""
+        return (self.enabled.is_set() and not self.state.get('halt')
+                and (self.clock() < self.entry_priority_until
+                     or not self.queue.empty()
+                     or bool(self.preflight_retries)))
 
     def submit(self, record, observed_at):
         symbol = record.get('symbol', 'UNKNOWN')
@@ -1300,6 +1323,11 @@ class NightExecutor:
             return
         try:
             self.queue.put_nowait((dict(record), observed_at))
+            # Only the original age-limited candidate pauses optional data
+            # downloads. No retries of stale or uncertain exchange orders.
+            self.entry_priority_until = max(
+                self.entry_priority_until,
+                min(float(observed_at) + 120, self.clock() + 120))
         except queue.Full:
             self.entry_skip(symbol, 'QUEUE_FULL')
 
