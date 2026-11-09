@@ -1160,6 +1160,43 @@ class NightTests(unittest.TestCase):
         # Informational notifications must never block legitimate future BUYs.
         self.assertFalse(self.e.state['outbox'])
 
+    def test_distinct_coins_get_distinct_nonblocking_skip_reasons(self):
+        # A JCT expiry must not hide a Q expiry merely because both carry
+        # SIGNAL_EXPIRED. Nonblocking TP notification in the outbox is fine.
+        self.e.state['outbox'].append(dict(
+            text='Coin check', retry_at=0, blocks_entries=False))
+        before = list(self.e.state['outbox'])
+        with patch('crash_night.threading.Thread') as thread:
+            self.e.entry_skip('JCTUSDT', 'SIGNAL_EXPIRED')
+            self.e.entry_skip('QUSDT', 'SIGNAL_EXPIRED')
+            self.e.entry_skip('JCTUSDT', 'SIGNAL_EXPIRED')
+            self.e.entry_skip('ONUSDT', 'EXISTING_ORDER')
+            self.assertEqual(thread.call_count, 3)
+            messages = [call.kwargs['args'][0] for call in thread.call_args_list]
+            self.assertIn('JCTUSDT', messages[0])
+            self.assertIn('SIGNAL_EXPIRED', messages[0])
+            self.assertIn('QUSDT', messages[1])
+            self.assertIn('ONUSDT', messages[2])
+            self.assertIn('Çift alış engellendi', messages[2])
+        self.assertEqual(self.e.state['outbox'], before)
+
+    def test_live_priority_is_bounded_by_original_signal_ttl(self):
+        # The history collector may yield, but an old/unknown BUY is never
+        # refreshed or replayed. Priority ends without altering the queue.
+        self.assertFalse(self.e.live_entry_priority_active())
+        self.e.submit(self.r, self.now)
+        self.assertTrue(self.e.live_entry_priority_active())
+        self.assertEqual(self.e.entry_priority_until, self.now + 120)
+        self.e.queue.get_nowait()
+        self.now += 119
+        self.assertTrue(self.e.live_entry_priority_active())
+        self.now += 1
+        self.assertFalse(self.e.live_entry_priority_active())
+        self.e.submit(dict(self.r, signal_id='signal-2'), self.now)
+        self.assertTrue(self.e.live_entry_priority_active())
+        self.e.apply_control('off')
+        self.assertFalse(self.e.live_entry_priority_active())
+
     def test_30_min_lock_audit_shows_pending_conditions(self):
         self.e.state['halt'] = 'EXECUTOR_ERROR'
         self.e.state['orders']['unknown'] = dict(phase='ENTRY_UNKNOWN')
