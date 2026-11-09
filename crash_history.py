@@ -18,12 +18,14 @@ class HistoryPacingWait(Exception):
 from crash_policy import supported_symbol
 
 class HistoryCollector:
-    def __init__(self, directory, fetch, emit, blocked, log, resolver=None, ws_rows=None, on_rows=None, bybit=None, urgent_repair=None):
+    def __init__(self, directory, fetch, emit, blocked, log, resolver=None, ws_rows=None, on_rows=None, bybit=None, urgent_repair=None, live_entry_pending=None):
         self.directory, self.fetch, self.emit = directory, fetch, emit
         self.blocked, self.log = blocked, log
         self.resolver, self.ws_rows, self.on_rows = resolver, ws_rows, on_rows
         self.bybit = bybit  # Compatibility for existing caller tests; resolver owns fallback
         self.urgent_repair = urgent_repair  # Public one-bar recovery, separately budgeted.
+        self.live_entry_pending = live_entry_pending  # Trading first, paper downloads later.
+        self.last_live_priority_log = 0
         self.lock = threading.RLock()
         self.thread = None
         self.attempts = []
@@ -220,14 +222,39 @@ class HistoryCollector:
     def step(self, now=None):
         now = time.time() if now is None else now
         self.prune_expired(now)
+        # Research downloads (including urgent candidate history) must not
+        # consume shared exchange resources while an already-qualified BUY is
+        # within its original 120s decision window. This never touches live
+        # entry submission, existing positions, TP or account reconciliation.
+        if callable(self.live_entry_pending):
+            try:
+                pending = bool(self.live_entry_pending())
+            except Exception as error:
+                self.log(f'[CRASH HISTORY LIVE PRIORITY GUARD] {type(error).__name__}; '
+                         'research paused')
+                return
+            if pending:
+                if now - self.last_live_priority_log >= 30:
+                    self.log('[CRASH HISTORY LIVE ENTRY PRIORITY] '
+                             'research deferred; original BUY deadline unchanged')
+                    self.last_live_priority_log = now
+                return
         if self.blocked() and self.resolver is None:
             return
         self.attempts = [t for t in self.attempts if now-t < 3600]
         with self.lock:
             ready = [(k,dict(v)) for k,v in self.jobs.items() if v['retry_after']<=now]
-            # Current signal checks precede entry research and expired snapshots.
-            ready.sort(key=lambda item: (not (item[1]['phase']=='signal' and
-                0 <= now-item[1]['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS), item[1]['phase'] != 'warmup', -item[1]['as_of']))
+            # Priority: CURRENT V2 candidate -> entry / other signal
+            # -> low-priority StructureAgent/Scalp warmup.
+            # Previously warmup overtook old entry and signal records.
+            def priority(item):
+                job = item[1]
+                urgent = (job['phase'] == 'signal' and
+                          0 <= now-job['as_of'] <= SIGNAL_URGENT_REPAIR_WINDOW_SECONDS)
+                rank = (0 if urgent else 1 if job['phase'] == 'entry' else
+                        2 if job['phase'] == 'signal' else 3)
+                return (rank, -job['as_of'])
+            ready.sort(key=priority)
             item = ready[0] if ready else None
         if item is None:
             return

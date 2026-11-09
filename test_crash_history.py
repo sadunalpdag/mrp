@@ -158,6 +158,59 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('fresh:signal',self.worker.jobs)
         self.fetch.assert_not_called()
 
+    def test_fresh_v2_history_priority_over_warmup_even_if_warmup_newer(self):
+        # A current candidate may be <120s old; any avoidable warmup ahead
+        # of that candidate could make a genuine signal expire.
+        from types import SimpleNamespace
+        now = self.job['as_of'] + 10
+        signal = dict(symbol='AAAUSDT', signal_id='fresh')
+        self.worker.submit(dict(symbol='BBBUSDT', signal_id='warm'),
+                           'warmup', now + 20)
+        self.worker.submit(signal, 'signal', self.job['as_of'])
+        self.worker.collect = Mock(return_value=dict(
+            complete=True, candle_count=480, data_sources={},
+            closed_15m_ohlcv=[]))
+        self.worker.step(now=now)
+        self.assertEqual(self.worker.collect.call_args.args[0]['signal_id'], 'fresh')
+        self.assertIn('warm:warmup', self.worker.jobs)
+
+    def test_pending_entry_research_precedes_background_warmup(self):
+        now = self.job['as_of'] + 400
+        self.worker.submit(dict(symbol='BBBUSDT', signal_id='warm'),
+                           'warmup', now)
+        self.worker.submit(dict(symbol='AAAUSDT', signal_id='entry'),
+                           'entry', self.job['as_of'])
+        self.worker.collect = Mock(return_value=dict(
+            complete=True, candle_count=480, data_sources={},
+            closed_15m_ohlcv=[]))
+        self.worker.step(now=now)
+        self.assertEqual(self.worker.collect.call_args.args[0]['phase'], 'entry')
+
+    def test_live_buy_window_pauses_research_without_losing_jobs(self):
+        now = self.job['as_of'] + 10
+        active = Mock(return_value=True)
+        self.worker.live_entry_pending = active
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=now)
+        self.fetch.assert_not_called()
+        self.emit.assert_not_called()
+        self.assertIn('test:signal', self.worker.jobs)
+        self.assertTrue(any('LIVE ENTRY PRIORITY' in c.args[0]
+                            for c in self.worker.log.call_args_list))
+        active.return_value = False
+        self.worker.step(now=now+1)
+        self.assertTrue(self.emit.called)
+        self.assertNotIn('test:signal', self.worker.jobs)
+
+    def test_priority_guard_failure_fails_closed_on_research_not_entries(self):
+        self.worker.live_entry_pending = Mock(side_effect=RuntimeError('offline'))
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=self.job['as_of']+2)
+        self.fetch.assert_not_called()
+        self.assertIn('test:signal', self.worker.jobs)
+
     def test_emit_and_remove_job(self):
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),'signal',self.job['as_of'])
         self.worker.step(now=100)
@@ -198,6 +251,80 @@ class ScheduledHistoryTests(HistoryTests):
         self.assertIn('test:signal',self.worker.jobs)
 
 if __name__=='__main__':unittest.main()
+
+class DeliveryAgeTests(unittest.TestCase):
+    """No live sockets/orders: execute the isolated ema.py delivery function."""
+    def run_delivery(self, age):
+        import ast
+        import sys
+        from pathlib import Path
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import patch
+        now = 200000.0
+        source = ast.parse(Path(__file__).with_name('ema.py').read_text())
+        method = next(n for n in source.body
+                      if isinstance(n, ast.FunctionDef)
+                      and n.name == '_crash_send_pending')
+        record = dict(signal_id='test-age', symbol='TESTUSDT',
+                      created_at=now-age, v2_status='STRONG_V2',
+                      v2_delivery_phase='CANDIDATE', v2_sent=False,
+                      tracking_status='WAIT_ENTRY',
+                      entry='1.0', tp='1.01', change_24h=-15,
+                      last_price='1.00', derivatives_shadow={},
+                      v2_features=dict(recovery_4h_pct=1.5,
+                          rsi14=32.0, candles=480, return_5d_pct=-14,
+                          data_sources={}, strength_score={}))
+        executor = SimpleNamespace(
+            enabled=SimpleNamespace(is_set=lambda: True),
+            submit=Mock(), entry_skip=Mock())
+        delivered = []
+        def receipt(message):
+            delivered.append(message)
+            return {'ok': True, 'accepted_at': now + 1, 'message_id': 123}
+        fake = {}
+        def module(name, **functions):
+            m = ModuleType(name)
+            for key, val in functions.items():
+                setattr(m, key, val)
+            fake[name] = m
+        module('crash_policy', supported_symbol=lambda symbol: True)
+        module('crash_derivatives', empty_snapshot=lambda r: {},
+               format_shadow=lambda shadow: '')
+        module('crash_context', format_context=lambda ctx: '')
+        module('crash_failure_shadow', format_warning=lambda shadow: '',
+               entry_block_reason=lambda r: None,
+               position_fraction=lambda r: 1)
+        namespace = dict(
+            CRASH_V2_SIGNAL_TTL_SECONDS=280,
+            CRASH_LIVE_ENTRY_TTL_SECONDS=120,
+            _CRASH_NIGHT=executor, _CRASH_HEALTH=None, _CRASH_SHADOW=None,
+            _CRASH_AI=None, _crash_telegram_receipt=receipt,
+            _crash_save_state=Mock(), _crash_append_data=Mock(),
+            log=Mock(), time=SimpleNamespace(time=lambda: now))
+        with patch.dict(sys.modules, fake):
+            exec(compile(ast.Module(body=[method], type_ignores=[]),
+                         'ema.py', 'exec'), namespace)
+            namespace['_crash_send_pending'](
+                {'history': [record], 'symbols': {'TESTUSDT': record}}, now)
+        return record, executor, delivered[0], namespace
+
+    def test_late_telegram_approved_signal_never_queues_buy(self):
+        rec, exe, msg, ns = self.run_delivery(200)
+        self.assertTrue(rec['v2_sent'])
+        exe.submit.assert_not_called()
+        exe.entry_skip.assert_called_once_with(
+            'TESTUSDT', 'SIGNAL_CANDIDATE_EXPIRED')
+        self.assertIn('120 saniyelik güvenli alış süresi doldu', msg)
+        self.assertIn('GÖNDERİLMEYECEK', msg)
+
+    def test_fresh_telegram_signal_uses_original_deadline_not_new_one(self):
+        rec, exe, msg, ns = self.run_delivery(30)
+        self.assertTrue(rec['v2_sent'])
+        exe.entry_skip.assert_not_called()
+        exe.submit.assert_called_once()
+        self.assertEqual(exe.submit.call_args.args[0]['signal_id'],
+                         'test-age')
+        self.assertIn('120 saniyeden genç kalır', msg)
 
 class EntrySnapshotTests(unittest.TestCase):
     def test_tracking_captures_entry_once(self):
