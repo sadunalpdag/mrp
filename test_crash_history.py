@@ -158,6 +158,59 @@ class HistoryTests(unittest.TestCase):
         self.assertIn('fresh:signal',self.worker.jobs)
         self.fetch.assert_not_called()
 
+    def test_fresh_v2_history_priority_over_warmup_even_if_warmup_newer(self):
+        # A current candidate may be <120s old; any avoidable warmup ahead
+        # of that candidate could make a genuine signal expire.
+        from types import SimpleNamespace
+        now = self.job['as_of'] + 10
+        signal = dict(symbol='AAAUSDT', signal_id='fresh')
+        self.worker.submit(dict(symbol='BBBUSDT', signal_id='warm'),
+                           'warmup', now + 20)
+        self.worker.submit(signal, 'signal', self.job['as_of'])
+        self.worker.collect = Mock(return_value=dict(
+            complete=True, candle_count=480, data_sources={},
+            closed_15m_ohlcv=[]))
+        self.worker.step(now=now)
+        self.assertEqual(self.worker.collect.call_args.args[0]['signal_id'], 'fresh')
+        self.assertIn('warm:warmup', self.worker.jobs)
+
+    def test_pending_entry_research_precedes_background_warmup(self):
+        now = self.job['as_of'] + 400
+        self.worker.submit(dict(symbol='BBBUSDT', signal_id='warm'),
+                           'warmup', now)
+        self.worker.submit(dict(symbol='AAAUSDT', signal_id='entry'),
+                           'entry', self.job['as_of'])
+        self.worker.collect = Mock(return_value=dict(
+            complete=True, candle_count=480, data_sources={},
+            closed_15m_ohlcv=[]))
+        self.worker.step(now=now)
+        self.assertEqual(self.worker.collect.call_args.args[0]['phase'], 'entry')
+
+    def test_live_buy_window_pauses_research_without_losing_jobs(self):
+        now = self.job['as_of'] + 10
+        active = Mock(return_value=True)
+        self.worker.live_entry_pending = active
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=now)
+        self.fetch.assert_not_called()
+        self.emit.assert_not_called()
+        self.assertIn('test:signal', self.worker.jobs)
+        self.assertTrue(any('LIVE ENTRY PRIORITY' in c.args[0]
+                            for c in self.worker.log.call_args_list))
+        active.return_value = False
+        self.worker.step(now=now+1)
+        self.assertTrue(self.emit.called)
+        self.assertNotIn('test:signal', self.worker.jobs)
+
+    def test_priority_guard_failure_fails_closed_on_research_not_entries(self):
+        self.worker.live_entry_pending = Mock(side_effect=RuntimeError('offline'))
+        self.worker.submit(dict(symbol='TESTUSDT', signal_id='test'),
+                           'signal', self.job['as_of'])
+        self.worker.step(now=self.job['as_of']+2)
+        self.fetch.assert_not_called()
+        self.assertIn('test:signal', self.worker.jobs)
+
     def test_emit_and_remove_job(self):
         self.worker.submit(dict(symbol='TESTUSDT',signal_id='test'),'signal',self.job['as_of'])
         self.worker.step(now=100)
