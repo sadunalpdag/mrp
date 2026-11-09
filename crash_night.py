@@ -1308,10 +1308,11 @@ class NightExecutor:
 
     def live_entry_priority_active(self):
         """Read-only signal to pause optional research, not protective checks."""
+        now = self.clock()
         return (self.enabled.is_set() and not self.state.get('halt')
-                and (self.clock() < self.entry_priority_until
-                     or not self.queue.empty()
-                     or bool(self.preflight_retries)))
+                and (now < self.entry_priority_until
+                     or any(now < float(retry['observed_at']) + 120
+                            for retry in self.preflight_retries.values())))
 
     def submit(self, record, observed_at):
         symbol = record.get('symbol', 'UNKNOWN')
