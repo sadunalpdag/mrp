@@ -7259,6 +7259,57 @@ def _crash_send_report_file(path, caption):
         return False
 
 
+_CRASH_REPORT_TRANSFER = None
+
+
+def _crash_report_background(action, path, period_end=None, caption=None):
+    """Nonblocking daily report transport; keep the live signal scan responsive.
+
+    One report transfer runs at a time. The worker only writes its own result
+    object; the main report loop persists progress after receiving the result.
+    """
+    global _CRASH_REPORT_TRANSFER
+    key = (action, path)
+    current = _CRASH_REPORT_TRANSFER
+    if current is not None:
+        if current["key"] != key:
+            if not current["done"]:
+                return "running", None
+            _CRASH_REPORT_TRANSFER = None
+        elif not current["done"]:
+            return "running", None
+        else:
+            _CRASH_REPORT_TRANSFER = None
+            return (("error", current["error"]) if current["error"]
+                    else ("done", current["value"]))
+
+    job = {"key": key, "done": False, "value": None, "error": None}
+
+    def worker():
+        try:
+            if action == "r2":
+                from crash_report_storage import upload_private_report
+                job["value"] = upload_private_report(path, period_end)
+            elif action == "split":
+                from crash_report_parts import report_zip_parts
+                job["value"] = report_zip_parts(path)
+            elif action == "telegram":
+                job["value"] = _crash_send_report_file(path, caption)
+            else:
+                raise ValueError("UNKNOWN_REPORT_TRANSFER")
+        except Exception as error:
+            # Never log remote error bodies; they can contain signed URLs or
+            # credentials. No live order or protective TP state is affected.
+            job["error"] = type(error).__name__
+        finally:
+            job["done"] = True
+
+    _CRASH_REPORT_TRANSFER = job
+    threading.Thread(target=worker, name="crash-report-transfer",
+                     daemon=True).start()
+    return "running", None
+
+
 def _crash_daily_report(state, now):
     import zipfile
     from crash_context import summarize_context
@@ -7405,19 +7456,128 @@ def _crash_daily_report(state, now):
         pending['summary_sent'] = bool(receipt.get('ok') or receipt.get('ambiguous'))
         log(f"[CRASH REPORT SUMMARY] accepted={receipt.get('ok')} error={receipt.get('error')}")
         _crash_save_state(state)
-    if os.path.getsize(pending["path"]) > 49*1024*1024:
-        log("[CRASH REPORT ERR] export exceeds Telegram document limit; text summary only")
-        if pending.get('summary_sent'):
-            success(report, now)
-            report['last_zip_error'] = 'DOCUMENT_TOO_LARGE_TEXT_ONLY'
+    from crash_report_parts import REPORT_PART_LIMIT_BYTES
+    from crash_report_storage import r2_configured
+
+    # Cloud storage is opt-in. Partial credentials never change trading
+    # behavior and fall back to independent Telegram ZIP parts.
+    try:
+        use_r2 = r2_configured()
+    except ValueError:
+        use_r2 = False
+        log("[CRASH REPORT R2] incomplete configuration; Telegram fallback")
+
+    if use_r2 and not pending.get("r2_failed") and not pending.get("r2_uploaded"):
+        status, result = _crash_report_background(
+            "r2", pending["path"], period_end=pending["period_end"])
+        if status == "running":
+            report["retry_after"] = now + 15
             _crash_save_state(state)
+            return
+        if status == "done" and isinstance(result, dict) and result.get("url"):
+            pending["r2_uploaded"] = True
+            pending["r2_url"] = result["url"]
+            pending["r2_key"] = result["key"]
+            log(f"[CRASH REPORT R2] uploaded; bytes={result['size_bytes']}; "
+                "private=1; signed_url=7d")
+            _crash_save_state(state)
+        else:
+            pending["r2_failed"] = True
+            log(f"[CRASH REPORT R2 WAIT] {str(result)[:60]}; "
+                "fallback=49MB Telegram ZIP parts")
+            _crash_save_state(state)
+
+    if pending.get("r2_uploaded"):
+        # The original entire ZIP, rather than fragmented observations, is
+        # available in a private bucket; never log the signed download URL.
+        announcement = (
+            pending["caption"] +
+            "\n📦 Tam ZIP arşivi buluta kaydedildi.\n"
+            "🔒 Özel indirme bağlantısı (7 gün geçerli):\n" +
+            pending["r2_url"] +
+            "\nArşiv dosyası bulutta saklanmaya devam eder.")
+        receipt = _crash_telegram_receipt(announcement)
+        if receipt.get("ok"):
+            local_zip = pending["path"]
+            success(report, now)
+            report.pop("last_zip_error", None)
+            _crash_save_state(state)
+            # Original research records remain untouched. Remove only the
+            # already-verified packaged ZIP to save scarce Render disk space.
+            try:
+                os.unlink(local_zip)
+            except OSError:
+                pass
+            log("[CRASH REPORT] daily cloud link sent; private R2 ZIP stored")
+        else:
+            report["retry_after"] = now + 1800
+            _crash_save_state(state)
+            log(f"[CRASH REPORT LINK RETRY] code={receipt.get('error', 'UNKNOWN')}")
         return
-    if _crash_send_report_file(pending["path"], pending["caption"]):
-        success(report, now)
-        report.pop("pending",None)
-        report.pop("retry_after",None)
+
+    # No R2 credentials or upload failure: Telegram gets all parts. Small
+    # reports retain their original single-document behavior.
+    if os.path.getsize(pending["path"]) <= REPORT_PART_LIMIT_BYTES:
+        if _crash_send_report_file(pending["path"], pending["caption"]):
+            success(report, now)
+            report.pop("last_zip_error", None)
+            _crash_save_state(state)
+            log("[CRASH REPORT] daily data sent")
+        return
+
+    parts = pending.get("parts")
+    if not parts or not all(os.path.isfile(p) for p in parts):
+        status, result = _crash_report_background("split", pending["path"])
+        if status == "running":
+            report["retry_after"] = now + 15
+            _crash_save_state(state)
+            return
+        if status != "done" or not isinstance(result, list) or not result:
+            report["retry_after"] = now + 1800
+            _crash_save_state(state)
+            log(f"[CRASH REPORT PARTS WAIT] {str(result)[:60]}; retry=30m")
+            return
+        pending["parts"] = parts = result
+        pending.setdefault("part_index", 0)
+        log(f"[CRASH REPORT PARTS READY] count={len(parts)}; "
+            f"limit_bytes={REPORT_PART_LIMIT_BYTES}")
         _crash_save_state(state)
-        log("[CRASH REPORT] daily data sent")
+    index = int(pending.get("part_index", 0))
+    if index < 0 or index >= len(parts):
+        index = 0
+        pending["part_index"] = 0
+    partpath = parts[index]
+    part_caption = (f"📦 CRASH BOUNCE günlük arşiv | Bölüm {index+1}/{len(parts)}\n"
+                    f"Dosya: {os.path.basename(partpath)}\n"
+                    "Tüm parçalar bağımsız ZIP; MULTIPART_README.txt açıklamasına bakın.")
+    status, sent = _crash_report_background(
+        "telegram", partpath, caption=part_caption)
+    if status == "running":
+        report["retry_after"] = now + 15
+        _crash_save_state(state)
+        return
+    if status != "done" or not sent:
+        report["retry_after"] = now + 1800
+        _crash_save_state(state)
+        log(f"[CRASH REPORT PART SEND WAIT] index={index+1}/{len(parts)}; retry=30m")
+        return
+    pending["part_index"] = index + 1
+    if pending["part_index"] < len(parts):
+        report["retry_after"] = now + 15
+        _crash_save_state(state)
+        log(f"[CRASH REPORT PART SENT] index={index+1}/{len(parts)}")
+        return
+    final_parts = list(parts)
+    success(report, now)
+    report.pop("last_zip_error", None)
+    _crash_save_state(state)
+    for partpath in final_parts:
+        if partpath != pending["path"]:
+            try:
+                os.unlink(partpath)
+            except OSError:
+                pass
+    log(f"[CRASH REPORT] all {len(parts)} Telegram ZIP parts sent")
 
 
 

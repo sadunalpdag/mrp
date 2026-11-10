@@ -164,6 +164,100 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(self.state['report']['next_due_at'],slot(due+1800, tomorrow=True))
         self.assertEqual(self.g['_crash_send_report_file'].call_args.args[0],pending['path'])
 
+    def test_private_r2_upload_is_async_and_only_completes_after_link_ack(self):
+        from unittest.mock import patch
+        local = Path(self.tmp.name) / "test-report.zip"
+        with zipfile.ZipFile(local, "w") as z:
+            z.writestr("report.json", '{"test":true}')
+        self.state["report"] = {
+            "last_success_at": self.now - 86400,
+            "schedule_version": 2, "next_due_at": self.now,
+            "pending": {
+                "path": str(local), "caption": "Günlük özet",
+                "period_end": self.now, "summary_sent": True}}
+        uploaded = dict(key="crash-bounce/2026/01/01/report.zip",
+                        size_bytes=local.stat().st_size,
+                        url="https://private.example/signed")
+        worker = Mock(side_effect=[("running", None), ("done", uploaded)])
+        self.g["_crash_report_background"] = worker
+        with patch("crash_report_storage.r2_configured", return_value=True):
+            self.g["_crash_daily_report"](self.state, self.now)
+            self.assertTrue(local.exists())
+            self.assertIn("pending", self.state["report"])
+            self.g["_crash_telegram_receipt"].assert_not_called()
+            self.g["_crash_daily_report"](self.state, self.now + 16)
+        self.assertNotIn("pending", self.state["report"])
+        self.assertFalse(local.exists())
+        self.assertEqual(worker.call_count, 2)
+        self.g["_crash_send_report_file"].assert_not_called()
+        self.assertIn("https://private.example/signed",
+                      self.g["_crash_telegram_receipt"].call_args.args[0])
+        self.assertEqual(self.state["report"]["next_due_at"],
+                         slot(self.now + 16, tomorrow=True))
+
+    def test_r2_link_failure_does_not_finish_report_or_repeat_upload(self):
+        from unittest.mock import patch
+        local = Path(self.tmp.name) / "pending-report.zip"
+        with zipfile.ZipFile(local, "w") as z:
+            z.writestr("report.json", '{"ok":1}')
+        self.state["report"] = dict(
+            schedule_version=2, last_success_at=self.now-86400,
+            next_due_at=self.now,
+            pending=dict(path=str(local), caption="Günlük",
+                         period_end=self.now, summary_sent=True))
+        worker = Mock(return_value=("done", {
+            "key": "archive/test.zip", "size_bytes": local.stat().st_size,
+            "url": "https://private.example/only-once"}))
+        self.g["_crash_report_background"] = worker
+        self.g["_crash_telegram_receipt"].return_value = {
+            "ok": False, "error": "TEMPORARY"}
+        with patch("crash_report_storage.r2_configured", return_value=True):
+            self.g["_crash_daily_report"](self.state, self.now)
+            self.assertEqual(worker.call_count, 1)
+            self.assertIn("pending", self.state["report"])
+            self.assertTrue(local.exists())
+            self.g["_crash_telegram_receipt"].return_value = {"ok": True}
+            self.g["_crash_daily_report"](self.state, self.now+1801)
+        self.assertNotIn("pending", self.state["report"])
+        self.assertEqual(worker.call_count, 1)
+        self.assertFalse(local.exists())
+
+    def test_large_telegram_parts_preserve_progress_and_never_finish_early(self):
+        from unittest.mock import patch
+        local = Path(self.tmp.name) / "original.zip"
+        with zipfile.ZipFile(local, "w") as z:
+            z.writestr("report.json", '{"full":true}')
+        part1 = Path(self.tmp.name) / "original.part001.zip"
+        part2 = Path(self.tmp.name) / "original.part002.zip"
+        for part in (part1, part2):
+            part.write_bytes(b"pretend valid part")
+        self.state["report"] = dict(
+            schedule_version=2, last_success_at=self.now-86400,
+            next_due_at=self.now,
+            pending=dict(path=str(local), caption="Günlük",
+                         period_end=self.now, summary_sent=True,
+                         parts=[str(part1), str(part2)], part_index=0))
+        self.g["_crash_report_background"] = Mock(
+            side_effect=[("running", None), ("done", True),
+                         ("running", None), ("done", True)])
+        # Existing ZIP is mocked >49MB, avoiding the creation of a 49MB
+        # unit fixture while verifying per-part durable send progress.
+        with patch("crash_report_storage.r2_configured", return_value=False), \
+             patch("os.path.getsize", return_value=50_000_000):
+            self.g["_crash_daily_report"](self.state, self.now)
+            self.assertEqual(self.state["report"]["pending"]["part_index"], 0)
+            self.g["_crash_daily_report"](self.state, self.now+16)
+            self.assertEqual(self.state["report"]["pending"]["part_index"], 1)
+            self.g["_crash_daily_report"](self.state, self.now+32)
+            self.assertEqual(self.state["report"]["pending"]["part_index"], 1)
+            self.g["_crash_daily_report"](self.state, self.now+48)
+        self.assertNotIn("pending", self.state["report"])
+        self.assertFalse(part1.exists())
+        self.assertFalse(part2.exists())
+        self.assertTrue(local.exists())  # The original source ZIP was preserved.
+        self.assertEqual(self.g["_crash_report_background"].call_count, 4)
+        self.g["_crash_send_report_file"].assert_not_called()
+
     def test_manual_report_and_missing_pending_zip_rebuild(self):
         self.state['report']={'last_success_at':self.now-86400,'schedule_version':2,
                              'next_due_at':self.now+86400,
