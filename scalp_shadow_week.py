@@ -23,6 +23,10 @@ TABS = {"PULLBACK": "Pullback Test", "BREAK_BOUNCE": "Break Bounce Test"}
 HEADERS = ["Coin", "Yön", "Mum zamanı UTC", "Sanal giriş", "TP %1",
            "Risk -%1", "Sonuç", "Sonuç zamanı UTC", "Model", "Gözlem"]
 MODEL = "15m mum vekili / gerçek 5m teyidi YOK"
+PULLBACK_NO_SL_MODEL = "pullback_tp_only_12h_mfe_mae_v1"
+PULLBACK_HEADERS = HEADERS[:5] + ["SL"] + HEADERS[6:] + [
+    "En düşük fiyat", "En yüksek fiyat", "MAE %", "MFE %",
+    "Son fiyat", "Son getiri %"]
 DIAG_HEADERS = ["Coin", "Veri", "15m mum", "MA50 trend", "Yön",
                 "Durum", "Koşullar", "Eksik / beklenen", "Sanal sinyal", "Son mum UTC"]
 
@@ -331,9 +335,87 @@ def _dt(ms):
     return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%d.%m %H:%M")
 
 
+def _settle_pullback_no_sl(signal, bars, now):
+    """Track an entire 12h prospective PAPER observation without a stop-loss.
+
+    A -1% adverse move is recorded, never treated as an exit. An observed
+    +1% TP ends the paper trade. If no TP, mark a complete 12h path TIMEOUT,
+    otherwise DATA_GAP. No REST, fake candles or live orders.
+    """
+    signal["exit_model"] = PULLBACK_NO_SL_MODEL
+    ts = signal["ts"]
+    entry = _number(signal.get("entry"))
+    tp = _number(signal.get("tp"))
+    if entry is None or entry <= 0 or tp is None or tp <= 0:
+        signal["status"] = "DATA_GAP"
+        signal["resolved_at"] = int(now * 1000)
+        return
+
+    expiry_ms = ts + HORIZON_S * 1000
+    later = sorted((r for r in bars if ts < r[0] <= expiry_ms), key=lambda r: r[0])
+    # The signal is taken at the close of candle ts. Its 48th subsequent
+    # 15m candle only becomes available another 15m after its opening.
+    last_close_ms = expiry_ms + STEP_MS
+
+    if later:
+        low = min(r[3] for r in later)
+        high = max(r[2] for r in later)
+        if signal.get("lowest_price") is not None:
+            low = min(low, float(signal["lowest_price"]))
+        if signal.get("highest_price") is not None:
+            high = max(high, float(signal["highest_price"]))
+        signal["lowest_price"] = low
+        signal["highest_price"] = high
+        if signal["side"] == "LONG":
+            favorable = (high / entry - 1) * 100
+            adverse = (low / entry - 1) * 100
+        else:
+            favorable = (1 - low / entry) * 100
+            adverse = (1 - high / entry) * 100
+        signal["mfe_pct"] = round(max(0.0, favorable), 4)
+        signal["mae_pct"] = round(min(0.0, adverse), 4)
+        # This is a diagnostic, not an SL exit. The -1% level may have been
+        # crossed long before the first subsequently observed TP.
+        signal["minus_one_pct_seen"] = signal["mae_pct"] <= -1.0
+        last = later[-1]
+        if last[0] >= signal.get("last_observed_bar_ts", -1):
+            signal["last_observed_bar_ts"] = last[0]
+            signal["last_price"] = last[4]
+            if signal["side"] == "LONG":
+                pnl = (last[4] / entry - 1) * 100
+            else:
+                pnl = (1 - last[4] / entry) * 100
+            signal["last_return_pct"] = round(pnl, 4)
+
+        # A TP reached after a -1% adverse excursion is still a TP because
+        # Pullback has NO SL. The first observed candle touching TP wins.
+        for r in later:
+            good = (r[2] >= tp if signal["side"] == "LONG"
+                    else r[3] <= tp)
+            if good:
+                signal["status"] = "TP"
+                signal["resolved_at"] = r[0] + STEP_MS
+                return
+
+    if now * 1000 >= last_close_ms:
+        required = {ts + i * STEP_MS
+                    for i in range(1, HORIZON_S * 1000 // STEP_MS + 1)}
+        observed = {r[0] for r in later}
+        signal["observed_bars"] = len(required.intersection(observed))
+        signal["status"] = ("TIMEOUT" if required.issubset(observed)
+                            else "DATA_GAP")
+        signal["resolved_at"] = last_close_ms
+
+
 def _settle(signal, bars, now):
     if signal["status"] != "OPEN":
         return
+    if signal.get("strategy") == "PULLBACK":
+        # Includes already-open legacy Pullback paper signals. Historical
+        # resolved RISK and AMBIGUOUS records remain unaltered for audit.
+        _settle_pullback_no_sl(signal, bars, now)
+        return
+    # Break Bounce retains its existing 1% TP / 1% risk shadow model.
     expiry_ms = signal["ts"] + int(HORIZON_S * 1000)
     later = [r for r in bars if signal["ts"] < r[0] <= expiry_ms]
     for r in later:
@@ -417,7 +499,10 @@ def _scan(data_dir, tickers, candles_get, now, obj, allowed_market=None):
                 "strategy": strategy, "symbol": symbol, "side": side,
                 "ts": entry_ts, "entry": entry,
                 "tp": entry * (1.01 if side == "LONG" else 0.99),
-                "risk": entry * (0.99 if side == "LONG" else 1.01),
+                "risk": (None if strategy == "PULLBACK"
+                         else entry * (0.99 if side == "LONG" else 1.01)),
+                "exit_model": (PULLBACK_NO_SL_MODEL if strategy == "PULLBACK"
+                               else "tp_risk_12h_legacy"),
                 "status": "OPEN", "resolved_at": None, "note": note,
             })
             known.add((strategy, symbol, entry_ts))
@@ -439,8 +524,37 @@ def _tab_values(obj, strategy):
                and obj["last_scan"] - s["ts"] / 1000 <= 7 * 86400]
     statuses = {k: sum(s.get("status") == k for s in signals)
                 for k in ("OPEN", "TP", "RISK", "TIMEOUT", "AMBIGUOUS", "DATA_GAP")}
-    resolved = statuses["TP"] + statuses["RISK"]
-    rate = str(round(100 * statuses["TP"] / resolved, 1)) + "%" if resolved else "—"
+    is_pullback = strategy == "PULLBACK"
+    width = len(PULLBACK_HEADERS) if is_pullback else len(HEADERS)
+    if is_pullback:
+        paper = [s for s in signals
+                 if s.get("exit_model") == PULLBACK_NO_SL_MODEL]
+        paper_tp = sum(s.get("status") == "TP" for s in paper)
+        paper_timeout = sum(s.get("status") == "TIMEOUT" for s in paper)
+        resolved = paper_tp + paper_timeout
+        rate = (str(round(100 * paper_tp / resolved, 1)) + "%"
+                if resolved else "—")
+        breached = sum(s.get("minus_one_pct_seen") is True for s in paper)
+        breached_tp = sum(s.get("minus_one_pct_seen") is True
+                          and s.get("status") == "TP" for s in paper)
+        summary = ["Sinyal / açık / TP / eski SL sonucu",
+                   "%s / %s / %s / %s" %
+                   (len(signals), statuses["OPEN"], statuses["TP"], statuses["RISK"])]
+        rate_row = ["SL'siz sonuçlanan TP / (TP + 12s TIMEOUT)", rate]
+        caveat = ("Pullback'de SL YOK, 12 saat izlenir. -1%% eşiği %s kez görüldü; "
+                  "bunların %s tanesi sonra TP. MFE/MAE gözlenen 15m mumlardan; "
+                  "geçmiş RISK kayıtları eski modeldir." %
+                  (breached, breached_tp))
+        headers = PULLBACK_HEADERS
+    else:
+        resolved = statuses["TP"] + statuses["RISK"]
+        rate = (str(round(100 * statuses["TP"] / resolved, 1)) + "%"
+                if resolved else "—")
+        summary = ["Sinyal / açık / TP / risk", "%s / %s / %s / %s" %
+                   (len(signals), statuses["OPEN"], statuses["TP"], statuses["RISK"])]
+        rate_row = ["Sadece TP ve risk arasında TP oranı", rate]
+        caveat = "5m teyidi YOK; gerçek işlem, komisyon veya kaldıraç dahil değil."
+        headers = HEADERS
     rows = [
         ["Yedi günlük sanal test", TABS[strategy]],
         ["Model", MODEL],
@@ -450,28 +564,48 @@ def _tab_values(obj, strategy):
           len(obj.get("ready_groups", {}).get(strategy, [])),
           len(obj.get("ranked_groups", {}).get(strategy, []))),
          ", ".join(obj.get("ranked_groups", {}).get(strategy, [])) or "YETERLİ YÜKSELEN YOK"],
-        ["Sinyal / açık / TP / risk", "%s / %s / %s / %s" %
-         (len(signals), statuses["OPEN"], statuses["TP"], statuses["RISK"])],
-        ["Sadece TP ve risk arasında TP oranı", rate],
+        summary,
+        rate_row,
         ["Belirsiz / zaman aşımı / veri boşluğu",
          "%s / %s / %s" % (statuses["AMBIGUOUS"], statuses["TIMEOUT"], statuses["DATA_GAP"])],
-        ["DİKKAT", "5m teyidi YOK; gerçek işlem, komisyon veya kaldıraç dahil değil."],
-        HEADERS,
+        ["DİKKAT", caveat],
+        headers,
     ]
     for s in sorted(signals, key=lambda x: x["ts"], reverse=True)[:MAX_SHEET_SIGNALS]:
-        rows.append([
+        new_model = is_pullback and s.get("exit_model") == PULLBACK_NO_SL_MODEL
+        risk_text = ("SL YOK" if new_model else
+                     "—" if s.get("risk") is None else round(s["risk"], 9))
+        row = [
             s["symbol"], s["side"], _dt(s["ts"]), round(s["entry"], 9),
-            round(s["tp"], 9), round(s["risk"], 9), s["status"],
+            round(s["tp"], 9), risk_text, s["status"],
             _dt(s["resolved_at"]) if s.get("resolved_at") else "—",
-            "15m PROXY", s.get("note", ""),
-        ])
-    rows += [[""] * len(HEADERS) for _ in range(max(0, 9 + MAX_SHEET_SIGNALS - len(rows)))]
-    # Keep original paper-result rows A1:J57 untouched; monitor below them.
-    rows.extend([[""] * 10,
+            ("15m TP-only" if new_model else "15m PROXY"),
+            s.get("note", ""),
+        ]
+        if is_pullback:
+            # Legacy finished RISK records intentionally remain without
+            # invented price-path metrics. New/current rows show actual
+            # post-entry highs, lows, adverse and favorable excursions.
+            row.extend([
+                round(s["lowest_price"], 9) if new_model and "lowest_price" in s else "—",
+                round(s["highest_price"], 9) if new_model and "highest_price" in s else "—",
+                s.get("mae_pct", "—") if new_model else "—",
+                s.get("mfe_pct", "—") if new_model else "—",
+                round(s["last_price"], 9) if new_model and "last_price" in s else "—",
+                s.get("last_return_pct", "—") if new_model else "—",
+            ])
+        rows.append(row)
+    rows += [[""] * width for _ in range(max(0, 9 + MAX_SHEET_SIGNALS - len(rows)))]
+    # Keep original paper-result rows A1:J57 and diagnostic row 60 unchanged.
+    # Pullback alone extends rightward to P with actual price excursions.
+    rows.extend([[""] * width,
                  ["Takip edilen coinler / sinyal çıkmama nedenleri", TABS[strategy]],
                  DIAG_HEADERS])
     rows.extend(obj.get("diagnostics", {}).get(strategy, [])[:MAX_SYMBOLS])
-    return rows + [[""] * 10 for _ in range(max(0, 80 - len(rows)))]
+    return [row + [""] * (width - len(row)) for row in
+            rows + [[""] * width for _ in range(max(0, 80 - len(rows)))]]
+
+
 
 
 def _publish(obj):
@@ -487,10 +621,14 @@ def _publish(obj):
     for strategy, title in TABS.items():
         key = _name(title)
         if key not in tabs:
-            tabs[key] = book.add_worksheet(title=title, rows=80, cols=12)
+            tabs[key] = book.add_worksheet(
+                title=title, rows=80, cols=16 if strategy == "PULLBACK" else 12)
         targets[strategy] = tabs[key]
+        if strategy == "PULLBACK" and getattr(tabs[key], "col_count", 16) < 16:
+            tabs[key].resize(cols=16)
     # Writes only own tabs, overwrites fixed ranges (never appends indefinitely).
-    data = [{"range": "'" + ws.title.replace("'", "''") + "'!A1:J80",
+    data = [{"range": "'" + ws.title.replace("'", "''") +
+                       ("'!A1:P80" if strategy == "PULLBACK" else "'!A1:J80"),
              "values": _tab_values(obj, strategy)}
             for strategy, ws in targets.items()]
     book.values_batch_update({"valueInputOption": "RAW", "data": data})
