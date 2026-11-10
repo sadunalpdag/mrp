@@ -159,6 +159,27 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.e.max_symbols,20)
         self.assertEqual(float(self.e.position_usdt),500)
 
+    def test_telegram_limit_and_symbols_50_persist_without_resetting_count(self):
+        # Two independent controls share the owner-only Telegram parser.
+        for text, action in [('/limit 50', 'limit:50'),
+                             ('/sembol 50', 'symbols:50')]:
+            self.assertEqual(self.e.apply_control(action).startswith('✅'), True)
+        self.e.apply_control('counter:7')
+        self.assertEqual(self.e.max_daily, 50)
+        self.assertEqual(self.e.max_symbols, 50)
+        self.assertEqual(self.e.broker.max_symbols, 50)
+        self.assertEqual(self.e.daily_count(), 7)
+        for invalid in ('limit:51', 'symbols:51', 'symbols:1.5'):
+            message = self.e.apply_control(invalid)
+            self.assertIn('1–50', message)
+        self.assertEqual((self.e.max_daily, self.e.max_symbols), (50, 50))
+        self.e.guard.close()
+        restarted = self.make()
+        self.assertEqual((restarted.max_daily, restarted.max_symbols), (50, 50))
+        self.assertEqual(restarted.broker.max_symbols, 50)
+        self.assertEqual(restarted.daily_count(), 7)
+        self.assertIn('bugün 7/50', restarted.summary())
+
     def test_on_discards_buffered_crossings_and_pre_activation_event(self):
         self.e.queue.put((self.r,self.now))
         self.now+=1; self.e.apply_control('on')
