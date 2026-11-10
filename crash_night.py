@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 ZONE = ZoneInfo('Europe/Paris')
 D = Decimal
+MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS = 50  # Telegram /limit and /sembol; defaults remain 20.
 ENTRY_TTL_SECONDS = 8 * 3600
 SYMBOL_ERROR_QUARANTINE_SECONDS = 8 * 3600
 ORDER_POLL_SECONDS = 5 * 60
@@ -382,7 +383,7 @@ class NightExecutor:
         self.max_symbols = int(settings.get('max_symbols', 20))
         self.broker.max_symbols = self.max_symbols
         self.position_usdt = D(str(settings.get('position_usdt', '500')))
-        if not 1 <= self.max_symbols <= 20 or not 1 <= self.max_daily <= 20 or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 1000:
+        if not 1 <= self.max_symbols <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS or not 1 <= self.max_daily <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 1000:
             self.guard.close()
             raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
@@ -447,11 +448,14 @@ class NightExecutor:
             kind, raw = action.split(':', 1)
             try:
                 value = D(raw)
-                ceiling = {'amount':1000, 'symbols':20, 'limit':20}[kind]
+                ceiling = {'amount':1000, 'symbols':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS,
+                           'limit':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS}[kind]
                 if not value.is_finite() or not 1 <= value <= ceiling or (kind != 'amount' and value != value.to_integral_value()):
                     raise ValueError('range')
             except (ValueError, ArithmeticError):
-                return '⚠️ Kullanım: /sembol 1–20, /limit 1–20 veya /tutar 1–1000 (USDT toplam pozisyon, teminat değil).'
+                return (f'⚠️ Kullanım: /sembol 1–{MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS}, '
+                        f'/limit 1–{MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS} veya '
+                        '/tutar 1–1000 (USDT toplam pozisyon, teminat değil).')
             settings = dict(self.state.get('trade_settings', {}))
             key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols'}[kind]
             settings[key] = str(value) if kind == 'amount' else int(value)
