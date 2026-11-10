@@ -223,6 +223,28 @@ def analyse(rows, now, change):
     return base
 
 
+def diagnostic_counts(rows):
+    """Counts of data readiness and setup blockers, without loosening rules."""
+    from collections import Counter
+    decisions = Counter(str(r.get("decision", "UNKNOWN")) for r in rows)
+    reasons = Counter(str(r.get("reason", "UNKNOWN")) for r in rows
+                      if r.get("decision") not in ("TEYİT VAR", "İZLE"))
+    return {
+        "universe": len(rows),
+        "age_ready": sum(r.get("age_ready") is True for r in rows),
+        "exact_480": sum(int(r.get("count", 0)) == 480 for r in rows),
+        "ready_480_and_age": sum(r.get("age_ready") is True
+                                 and int(r.get("count", 0)) == 480 for r in rows),
+        "four_ready": sum(r.get("age_ready") is True and
+                          int(r.get("four_count", 0)) >= 20 and
+                          int(r.get("count", 0)) == 480 for r in rows),
+        "active": sum(r.get("decision") in ("TEYİT VAR", "İZLE")
+                      and r.get("age_ready") is True for r in rows),
+        "decisions": dict(sorted(decisions.items())),
+        "top_reasons": reasons.most_common(5),
+    }
+
+
 def scan(directory, tickers, market, onboard, candles_get, now, previous):
     top = universe(tickers, market, onboard, now)
     diagnostics = []
@@ -262,6 +284,7 @@ def scan(directory, tickers, market, onboard, candles_get, now, previous):
             events.append(dict(r, id=key, observed_at=now, mode="MONITOR_ONLY",
                                execution_eligible=False))
     return dict(version=VERSION, observed_at=now, mode="MONITOR_ONLY", rows=diagnostics,
+                diagnostic_summary=diagnostic_counts(diagnostics),
                 selected=selected, events=events[-2000:], references=[
                     {"symbol":t["symbol"], "change":t.get("priceChangePercent")}
                     for t in tickers if t.get("symbol") in ("BTCUSDT", "ETHUSDT")])
@@ -282,14 +305,21 @@ def sheet_values(obj):
                and lookup[symbol].get("decision") in ("İZLE", "TEYİT VAR")]
     reversal = sum(r["method"] == "DÖNÜŞ" for r in visible)
     continuation = sum(r["method"] == "DEVAM" for r in visible)
-    waiting = sum(r["decision"] == "VERİ BEKLENİYOR" for r in obj["rows"])
+    diag = diagnostic_counts(obj["rows"])
+    waiting = diag["decisions"].get("VERİ BEKLENİYOR", 0)
+    top_reason_text = "; ".join(f"{reason}: {count}"
+                                for reason, count in diag["top_reasons"][:3]) or "YOK"
     values = [[TAB, "YALNIZ İZLEME — GERÇEK EMİR YOK", paris(obj["observed_at"]*1000)],
               ["Model", VERSION, "4s yapı / 15m teyit", "Giriş, stop ve TP gösterge seviyeleridir"],
               ["BTC / ETH", json.dumps(obj.get("references", []), ensure_ascii=False)],
               ["Aktif takip", f"DÖNÜŞ {reversal}/5 | DEVAM {continuation}/5",
                f"Arka planda {len(obj['rows'])}/50 coin taranıyor; aday kaybolursa yedek otomatik seçilir"],
               ["Veri bekleyen (arka plan)", waiting,
-               "Eksikler mevcut Crash history kuyruğunda tamamlanır; yapay mum yok"],
+               "Eksikler mevcut Crash history kuyruğunda tamamlanır; yapay mum yok",
+               "480/480 hazır", f'{diag["ready_480_and_age"]}/{diag["universe"]}',
+               "4s yapı hesaplanabilen", diag["four_ready"],
+               "Elendiği başlıca nedenler", top_reason_text,
+               "Aktif formasyon", diag["active"]],
               HEADERS]
     for r in visible:
         values.append([r["symbol"], r["rank"], r["volume"], r["change"], f'{r["count"]}/480',
@@ -357,11 +387,21 @@ class StructureMonitor:
                     # Persist a round-robin cursor so a bad symbol cannot starve the others.
                     cursor = load(self.path+".cursor", {}).get("cursor", 0)
                     row = missing[cursor % len(missing)]
-                    self.queue_history(row["symbol"], now)
+                    accepted = self.queue_history(row["symbol"], now)
+                    self.logger(f'[STRUCTURE HISTORY] missing={len(missing)}; '
+                                f'requested={row["symbol"]}; accepted={int(bool(accepted))}; '
+                                'priority=LOW; no extra REST')
                     save(self.path+".cursor", {"cursor":cursor+1})
                 sent = publish(obj)
+                diag = obj["diagnostic_summary"]
+                top_reasons = "; ".join(
+                    f'{reason}={count}' for reason, count in diag["top_reasons"][:3])
                 self.logger(f'[STRUCTURE MONITOR] rows={len(obj["rows"])}; selected={len(obj["selected"])}; '
-                            f'events={len(obj["events"])}; sheets_verified={int(sent)}; execution=OFF')
+                            f'events={len(obj["events"])}; sheets_verified={int(sent)}; execution=OFF; '
+                            f'age_ready={diag["age_ready"]}; complete_480={diag["exact_480"]}; '
+                            f'eligible_history={diag["ready_480_and_age"]}; '
+                            f'four_ready={diag["four_ready"]}; active_formations={diag["active"]}; '
+                            f'decisions={diag["decisions"]}; top_reasons={top_reasons}')
             except Exception as exc:
                 self.logger(f'[STRUCTURE MONITOR ERROR] {type(exc).__name__}; execution=OFF')
             finally:
