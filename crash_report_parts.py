@@ -51,7 +51,7 @@ def report_zip_parts(path, limit=REPORT_PART_LIMIT_BYTES,
         current_count = 0
 
     def push(name, size_hint, source, data=None):
-        nonlocal current_count
+        nonlocal current, current_count
         # Reserve the ZIP footer, central-directory entries and manifest.
         budget = limit - reserve
         if size_hint + 1024 + 2*len(name.encode("utf-8")) >= budget:
