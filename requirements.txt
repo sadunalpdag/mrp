@@ -12,3 +12,4 @@ websocket-client==1.7.0
 gspread
 google-auth
 gspread-formatting
+boto3>=1.35.0
