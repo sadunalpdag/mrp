@@ -48,6 +48,95 @@ class ShadowWeekTests(unittest.TestCase):
         sw._settle(b, [(sw.STEP_MS, 100, 101.2, 98.8, 100.5, 1)], 3600)
         self.assertEqual(b["status"], "AMBIGUOUS")
 
+    def test_pullback_long_has_no_stop_and_tp_after_three_pct_drawdown(self):
+        signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0,
+                  "side": "LONG", "entry": 100, "tp": 101, "risk": 99}
+        fall = (sw.STEP_MS, 100, 100.2, 96.5, 98, 1)
+        sw._settle(signal, [fall], 2 * sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "OPEN")
+        self.assertTrue(signal["minus_one_pct_seen"])
+        self.assertAlmostEqual(signal["mae_pct"], -3.5)
+        self.assertAlmostEqual(signal["mfe_pct"], 0.2)
+        rebound = (2 * sw.STEP_MS, 98, 102.5, 97, 101.5, 1)
+        after_tp = (3 * sw.STEP_MS, 101, 150, 40, 140, 1)
+        sw._settle(signal, [fall, rebound, after_tp], 5 * sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "TP")  # Was never stopped out
+        self.assertEqual(signal["exit_model"], sw.PULLBACK_NO_SL_MODEL)
+        self.assertAlmostEqual(signal["mae_pct"], -3.5)
+        self.assertAlmostEqual(signal["mfe_pct"], 2.5)
+        self.assertEqual(signal["lowest_price"], 96.5)
+        self.assertEqual(signal["highest_price"], 102.5)
+        self.assertEqual(signal["last_price"], 101.5)
+        self.assertEqual(signal["resolved_at"], 3 * sw.STEP_MS)
+
+    def test_pullback_short_has_no_stop_then_reverses_to_tp(self):
+        signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0,
+                  "side": "SHORT", "entry": 100, "tp": 99, "risk": None}
+        adverse = (sw.STEP_MS, 100, 105, 99.9, 104, 1)
+        sw._settle(signal, [adverse], 2 * sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "OPEN")
+        self.assertAlmostEqual(signal["mae_pct"], -5)
+        favorable = (2 * sw.STEP_MS, 104, 104.5, 97, 98.5, 1)
+        sw._settle(signal, [adverse, favorable], 3 * sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "TP")
+        self.assertAlmostEqual(signal["mfe_pct"], 3)
+        self.assertTrue(signal["minus_one_pct_seen"])
+
+    def test_pullback_no_tp_12h_timeout_has_last_return_and_full_path(self):
+        signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0,
+                  "side": "LONG", "entry": 100, "tp": 101}
+        rows = [(i * sw.STEP_MS, 99, 99.7, 96, 97, 1)
+                for i in range(1, 49)]
+        # At the 12h boundary the 48th candle has not yet closed.
+        sw._settle(signal, rows[:-1], sw.HORIZON_S)
+        self.assertEqual(signal["status"], "OPEN")
+        sw._settle(signal, rows, sw.HORIZON_S + sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "TIMEOUT")
+        self.assertEqual(signal["observed_bars"], 48)
+        self.assertAlmostEqual(signal["last_return_pct"], -3)
+        self.assertAlmostEqual(signal["mae_pct"], -4)
+        self.assertTrue(signal["minus_one_pct_seen"])
+
+    def test_pullback_gap_is_not_mislabeled_as_12h_timeout(self):
+        signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0,
+                  "side": "LONG", "entry": 100, "tp": 101}
+        rows = [(i * sw.STEP_MS, 99, 99.7, 95, 97, 1)
+                for i in range(1, 49) if i != 21]
+        sw._settle(signal, rows, sw.HORIZON_S + sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "DATA_GAP")
+        self.assertEqual(signal["observed_bars"], 47)
+        self.assertTrue(signal["minus_one_pct_seen"])
+        self.assertNotEqual(signal["status"], "RISK")
+
+    def test_break_bounce_legacy_sl_outcome_unchanged(self):
+        signal = {"status": "OPEN", "strategy": "BREAK_BOUNCE", "ts": 0,
+                  "side": "LONG", "entry": 100, "tp": 101, "risk": 99}
+        sw._settle(signal, [(sw.STEP_MS, 100, 100.1, 98, 98.5, 1)],
+                   2 * sw.STEP_MS / 1000)
+        self.assertEqual(signal["status"], "RISK")
+        self.assertNotIn("exit_model", signal)
+
+    def test_pullback_sheet_shows_no_sl_and_excursions(self):
+        record = {"selection_version": sw.SELECTION_VERSION,
+                  "exit_model": sw.PULLBACK_NO_SL_MODEL,
+                  "strategy": "PULLBACK", "symbol": "AUSDT", "side": "LONG",
+                  "ts": 1 * sw.STEP_MS, "entry": 100, "tp": 101,
+                  "risk": None, "status": "TP",
+                  "resolved_at": 3 * sw.STEP_MS,
+                  "lowest_price": 95, "highest_price": 102,
+                  "mae_pct": -5, "mfe_pct": 2, "last_price": 101.5,
+                  "last_return_pct": 1.5, "minus_one_pct_seen": True,
+                  "note": "paper only"}
+        obj = {"signals": [record], "last_scan": 2 * sw.STEP_MS / 1000,
+               "ready_groups": {}, "ranked_groups": {}, "diagnostics": {}}
+        rows = sw._tab_values(obj, "PULLBACK")
+        self.assertEqual(rows[8], sw.PULLBACK_HEADERS)
+        self.assertEqual(len(rows[9]), 16)
+        self.assertEqual(rows[9][5], "SL YOK")
+        self.assertEqual(rows[9][6], "TP")
+        self.assertEqual(rows[9][10:], [95, 102, -5, 2, 101.5, 1.5])
+        self.assertIn("1 tanesi sonra TP", rows[7][1])
+
     def test_no_synthetic_data_and_bounded_selection(self):
         now = 56 * sw.STEP_MS / 1000
         sample = candles(55)
@@ -68,7 +157,8 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertEqual(len(sw._tab_values(obj, "PULLBACK")), 80)
         self.assertEqual(len(obj["diagnostics"]["PULLBACK"]), 10)
         self.assertEqual(len(obj["diagnostics"]["BREAK_BOUNCE"]), 10)
-        self.assertEqual(sw._tab_values(obj, "PULLBACK")[59], sw.DIAG_HEADERS)
+        self.assertEqual(sw._tab_values(obj, "PULLBACK")[59][:10], sw.DIAG_HEADERS)
+        self.assertEqual(len(sw._tab_values(obj, "PULLBACK")[59]), 16)
         self.assertIn("MA50 eğimi yatay", str(obj["diagnostics"]["PULLBACK"]))
 
     def test_exact_gainer_bands_without_backfill_and_market_filter(self):
@@ -254,10 +344,14 @@ class ShadowWeekTests(unittest.TestCase):
                 "ranked_groups": {}, "ready_groups": {}, "diagnostics": {}}))
         self.assertEqual(len(book.body["data"]), 2)
         for item in book.body["data"]:
-            self.assertTrue(item["range"].endswith("!A1:J80"))
+            pullback = "Pullback Test" in item["range"]
+            self.assertTrue(item["range"].endswith(
+                "!A1:P80" if pullback else "!A1:J80"))
             self.assertEqual(len(item["values"]), 80)
-            self.assertEqual(item["values"][8], sw.HEADERS)
-            self.assertEqual(item["values"][59], sw.DIAG_HEADERS)
+            self.assertEqual(item["values"][8],
+                             sw.PULLBACK_HEADERS if pullback else sw.HEADERS)
+            self.assertEqual(item["values"][59][:10], sw.DIAG_HEADERS)
+            self.assertEqual(len(item["values"][59]), 16 if pullback else 10)
 
     def test_wrong_workbook_fail_closed(self):
         class Book:
