@@ -352,7 +352,16 @@ def _settle_pullback_no_sl(signal, bars, now):
         return
 
     expiry_ms = ts + HORIZON_S * 1000
-    later = sorted((r for r in bars if ts < r[0] <= expiry_ms), key=lambda r: r[0])
+    all_later = sorted((r for r in bars if ts < r[0] <= expiry_ms),
+                       key=lambda r: r[0])
+    first_tp_index = next((
+        i for i, r in enumerate(all_later)
+        if (r[2] >= tp if signal["side"] == "LONG" else r[3] <= tp)
+    ), None)
+    # Price excursions end at the FIRST TP candle, never include later
+    # candles that arrived before this observer processed its next scan.
+    later = (all_later[:first_tp_index + 1] if first_tp_index is not None
+             else all_later)
     # The signal is taken at the close of candle ts. Its 48th subsequent
     # 15m candle only becomes available another 15m after its opening.
     last_close_ms = expiry_ms + STEP_MS
@@ -387,15 +396,12 @@ def _settle_pullback_no_sl(signal, bars, now):
                 pnl = (1 - last[4] / entry) * 100
             signal["last_return_pct"] = round(pnl, 4)
 
-        # A TP reached after a -1% adverse excursion is still a TP because
-        # Pullback has NO SL. The first observed candle touching TP wins.
-        for r in later:
-            good = (r[2] >= tp if signal["side"] == "LONG"
-                    else r[3] <= tp)
-            if good:
-                signal["status"] = "TP"
-                signal["resolved_at"] = r[0] + STEP_MS
-                return
+        # A TP after a -1% adverse excursion is still TP: NO SL.
+        # High/low order within a single candle is not established.
+        if first_tp_index is not None:
+            signal["status"] = "TP"
+            signal["resolved_at"] = later[-1][0] + STEP_MS
+            return
 
     if now * 1000 >= last_close_ms:
         required = {ts + i * STEP_MS
