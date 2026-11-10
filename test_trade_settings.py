@@ -34,7 +34,7 @@ class TradeSettingsTests(unittest.TestCase):
             self.assertEqual(e.daily_count(), 3)
             self.assertEqual(e.state['orders'], {})
             self.assertIn('1000 USDT', e.summary())
-            for bad in ('symbols:0','symbols:21','symbols:1.5','limit:0','limit:21','limit:1.5','amount:NaN','amount:Infinity','amount:-1','amount:1001','amount:no'):
+            for bad in ('symbols:0','symbols:51','symbols:1.5','limit:0','limit:51','limit:1.5','amount:NaN','amount:Infinity','amount:-1','amount:1001','amount:no'):
                 self.assertIn('⚠️', e.apply_control(bad))
             self.assertEqual(e.max_daily, 18)
             self.assertEqual(e.max_symbols, 19)
@@ -48,6 +48,46 @@ class TradeSettingsTests(unittest.TestCase):
             self.assertEqual(e.position_usdt, Decimal('1000'))
             self.assertEqual(e.daily_count(), 3)
             e.guard.close()
+
+    def test_telegram_50_boundaries_persist_and_preserve_existing_orders(self):
+        with tempfile.TemporaryDirectory() as d:
+            e = NightExecutor(d, Mock(), Mock(), Mock())
+            e.apply_control('counter:8')
+            before_orders = dict(e.state['orders'])
+            self.assertIn('Yeni giriş ayarı', e.apply_control('limit:50'))
+            self.assertIn('Yeni giriş ayarı', e.apply_control('symbols:50'))
+            self.assertEqual((e.max_daily, e.max_symbols), (50, 50))
+            self.assertEqual(e.broker.max_symbols, 50)
+            self.assertEqual(e.daily_count(), 8)
+            self.assertEqual(e.state['orders'], before_orders)
+            self.assertIn('bugün 8/50', e.summary())
+            self.assertIn('sembol sınırı 50', e.summary())
+            for bad in ('limit:51', 'symbols:51', 'limit:50.5',
+                        'symbols:50.5', 'limit:NaN', 'symbols:Infinity'):
+                answer = e.apply_control(bad)
+                self.assertIn('⚠️', answer)
+                self.assertIn('1–50', answer)
+            self.assertEqual((e.max_daily, e.max_symbols), (50, 50))
+            e.guard.close()
+
+            restarted = NightExecutor(d, Mock(), Mock(), Mock())
+            self.assertEqual((restarted.max_daily, restarted.max_symbols), (50, 50))
+            self.assertEqual(restarted.broker.max_symbols, 50)
+            self.assertEqual(restarted.daily_count(), 8)
+            self.assertEqual(restarted.state['orders'], before_orders)
+            restarted.guard.close()
+
+    def test_concurrent_slot_limit_50_still_counts_pending_buy_not_tp(self):
+        b = object.__new__(BinanceBroker)
+        b.max_symbols = 50
+        active = {f'S{i}' for i in range(47)}
+        orders = [{'symbol':f'S{i}', 'side':'BUY'} for i in range(47, 49)]
+        orders += [{'symbol':f'S{i}', 'side':'SELL', 'reduceOnly':True}
+                   for i in range(47)]
+        b.check_slots(active, orders)
+        orders.append({'symbol':'S49','side':'BUY'})
+        with self.assertRaisesRegex(ValueError, 'MAX_50_WITH_PENDING_ORDERS'):
+            b.check_slots(active, orders)
 
     def test_new_defaults_migrate_and_telegram_off_survives_restart(self):
         with tempfile.TemporaryDirectory() as d:
