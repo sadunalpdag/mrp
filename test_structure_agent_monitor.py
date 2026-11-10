@@ -216,6 +216,56 @@ class StructureTests(unittest.TestCase):
                 self.assertFalse(any(view[8]))
                 self.assertIn("DÖNÜŞ 2/5 | DEVAM 0/5", view[3])
 
+    def test_zero_watchlist_explains_candle_and_formation_blockers_in_sheet(self):
+        records = [
+            dict(symbol="AAAUSDT", age_ready=True, count=479,
+                 four_count=0, method="—", decision="VERİ BEKLENİYOR",
+                 reason="480 gerçek kapanmış 15m mum gerekli"),
+            dict(symbol="BBBUSDT", age_ready=False, count=480,
+                 four_count=30, method="—", decision="VERİ BEKLENİYOR",
+                 reason="30 günlük sözleşme geçmişi bekleniyor"),
+            dict(symbol="CCCUSDT", age_ready=True, count=480,
+                 four_count=30, method="—", decision="YAPI YOK",
+                 reason="Etkin dönüş veya devam formasyonu yok"),
+            dict(symbol="DDDUSDT", age_ready=True, count=480,
+                 four_count=30, method="DEVAM", decision="REDDET",
+                 reason="Stop geçersiz veya yakın direnç 1,5R alan bırakmıyor"),
+        ]
+        counts = mon.diagnostic_counts(records)
+        self.assertEqual(counts["universe"], 4)
+        self.assertEqual(counts["exact_480"], 3)
+        self.assertEqual(counts["age_ready"], 3)
+        self.assertEqual(counts["ready_480_and_age"], 2)
+        self.assertEqual(counts["four_ready"], 2)
+        self.assertEqual(counts["active"], 0)
+        self.assertEqual(counts["decisions"]["VERİ BEKLENİYOR"], 2)
+        obj = dict(rows=records, selected=[], observed_at=self.now,
+                   references=[], mode="MONITOR_ONLY")
+        values = mon.sheet_values(obj)
+        self.assertEqual(values[4][0], "Veri bekleyen (arka plan)")
+        self.assertEqual(values[4][1], 2)
+        self.assertEqual(values[4][4], "2/4")
+        self.assertEqual(values[4][6], 2)
+        self.assertIn("480 gerçek kapanmış", values[4][8])
+        self.assertIn("Etkin dönüş", values[4][8])
+        self.assertEqual(len(values), 162)
+        self.assertEqual(len(values[5]), 18)
+        self.assertFalse(any(values[6]))  # Diagnostic counts never fake a signal.
+
+    def test_scan_attaches_structural_diagnostics_without_altering_universe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tickers = [dict(symbol="AAAUSDT", quoteVolume=1e8,
+                            lastPrice=100, priceChangePercent=2)]
+            obj = mon.scan(directory, tickers, {"AAAUSDT": ".01"},
+                           {"AAAUSDT": 1}, lambda s: [], self.now, {})
+            summary = obj["diagnostic_summary"]
+            self.assertEqual(summary["universe"], 1)
+            self.assertEqual(summary["exact_480"], 0)
+            self.assertEqual(summary["age_ready"], 1)
+            self.assertEqual(summary["active"], 0)
+            self.assertEqual(obj["selected"], [])
+            self.assertEqual(obj["events"], [])
+
     def test_publish_only_own_tab_and_readback(self):
         with tempfile.TemporaryDirectory() as directory:
             obj = mon.scan(directory, [], {}, {}, lambda s:[], self.now, {})

@@ -62,3 +62,26 @@ REST budget remain enforced; no synthetic bars are inserted. A failed source
 can leave a symbol waiting. Sheet/network failures remain in the observer's
 daemon and do not stop the Crash loop. Logs distinguish `sheets_verified=1`
 from local-only output and always include `execution=OFF`.
+
+## Neden 50 coin taranırken Google Sheets boş görünebilir?
+
+Bu izleyici 50 coin'i **24 saatlik USDT işlem hacmine** göre seçer; 50'ye kadar
+pozisyon veya 50 hazır formasyon olduğu anlamına gelmez. Her coin için 30 gün
+sözleşme yaşı, kesintisiz **480/480 gerçek 15 dakikalık kapanış**, yeterli 4 saatlik
+swing yapısı ve son dönemde aktif geri-test/impuls koşulları aranır. 5 dakikalık
+tarama aralığı, 15 dakikalık fiyat teyidi yerine geçmez.
+
+**Structure Agent Test** sayfasında 5. satırda yeni bir özet bulunur:
+veri bekleyen, 30 gün + 480 mum koşulunu karşılayan, 4 saatlik yapı
+hesaplanabilen, başlıca elenme nedenleri ve halen aktif formasyon sayısı.
+Boş aday alanları bir hata değildir; seçilmeye uygun formasyon yoksa boş
+kalır. Ana tabloda hâlâ en çok 5 dönüş ve 5 devam adayı gösterilir; diğer
+50 coinin tek tek araştırma verileri Sheet'e sinyal diye basılmaz.
+
+Render logunda `[STRUCTURE MONITOR]` satırı artık `age_ready`,
+`complete_480`, `eligible_history`, `four_ready`, `decisions` ve
+`top_reasons` sayılarını gösterir. `[STRUCTURE HISTORY]` satırındaki
+`accepted=0`, eksik mum düzeltme talebinin o döngüde öncelik/kuyruk
+sebebiyle kabul edilmediğini gösterir; başarılı veri indirme anlamına gelmez.
+Bu tanılama izleme/Sheets görünürlüğünü iyileştirir, gerçek Binance emirlerini
+etkilemez, sinyal koşullarını gevşetmez ve sahte mum üretmez.
