@@ -1,4 +1,4 @@
-"""Read-only Crash Bounce V2 -> existing EMA Filter 'Bot Status' / 'Sinyal' tabs.
+"""Read-only Crash Bounce V2 -> EMA Filter 'Bot Status' / 'Sinyal' / 'BOT_STATUS'.
 
 Never deletes worksheets, never creates new tabs, never calls Binance. All failures
 remain in this daemon exporter and cannot gate real orders or WS scanning.
@@ -10,7 +10,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from crash_policy import TRACKING_SECONDS, is_active_candidate
@@ -342,12 +342,40 @@ def _tabs(sheet):
     if "emafilter" not in _name(sheet.title):
         raise ValueError("SHEETS_TITLE_NOT_EMA_FILTER")
     tabs = sheet.worksheets()
-    by_name = {_name(w.title): w for w in tabs}
-    status = by_name.get("botstatus")
-    signal = by_name.get("sinyal") or by_name.get("signal") or by_name.get("signals")
-    if not status or not signal:
+    by_title = {w.title: w for w in tabs}
+    # '_name' removes punctuation. It makes 'BOT_STATUS' and 'Bot Status'
+    # indistinguishable in a dict, so whichever was enumerated last used
+    # to get updated while the other silently stopped.
+    legacy = by_title.get("BOT_STATUS")
+    status = by_title.get("Bot Status")
+    if status is None:
+        status = next((w for w in tabs
+                       if _name(w.title) == "botstatus" and w is not legacy),
+                      None) or legacy
+    signal = next((w for w in tabs
+                   if _name(w.title) in ("sinyal", "signal", "signals")), None)
+    if status is None or signal is None:
         raise ValueError("BOT_STATUS_OR_SINYAL_TAB_MISSING")
-    return status, signal
+    return status, signal, (legacy if legacy is not status else None)
+
+
+def _legacy_bot_status_rows(status_rows, now):
+    """Bridge live Crash V2 health into the old BOT_STATUS layout.
+
+    Don't restart the discontinued pre-signal scanner or label its stale
+    statistics live. Preserve the familiar 'Last alive' first row, and use
+    only facts from this same read-only Crash V2 dashboard snapshot.
+    """
+    rows = [
+        ["Last alive", datetime.fromtimestamp(now, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC")],
+        ["Service", "RUNNING — CRASH BOUNCE V2 (dashboard heartbeat)"],
+        ["Legacy pre-signal engine", "KAPALI — eski EMA/PRE_SIGNAL_TEST taraması aktif değil"],
+        ["Dashboard sync (Paris)", _time(now)],
+        ["Kaynak", "Crash Bounce V2 / yalnızca mevcut canlı durum"],
+    ]
+    rows.extend([list(row) for row in status_rows[2:]])
+    return rows + [["", ""] for _ in range(max(0, 32 - len(rows)))]
 
 def _format(sheet, status, signal, colors, signal_rows):
     requests = []
@@ -431,7 +459,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     if not client:
         return False
     sheet = client.open_by_key(sheet_id)
-    status, signal = _tabs(sheet)
+    status, signal, legacy_status = _tabs(sheet)
     # Expand only the existing Sinyal tab; never create or delete worksheets.
     if getattr(signal, "col_count", len(HEADERS)) < len(HEADERS):
         sheet.batch_update({"requests": [{"updateSheetProperties": {
@@ -451,10 +479,18 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
             n, rem = divmod(n - 1, 26)
             letters = chr(65 + rem) + letters
         return letters
-    sheet.values_batch_update({"valueInputOption": "RAW", "data": [
+    data = [
         {"range": "'" + status.title.replace("'", "''") + "'!A1:B26", "values": status_rows},
         {"range": "'" + signal.title.replace("'", "''") + "'!A1:" + column_letter(len(HEADERS)) + str(MAX_ROWS + 1), "values": signal_rows},
-    ]})
+    ]
+    if legacy_status is not None:
+        data.append({
+            "range": "'" + legacy_status.title.replace("'", "''") + "'!A1:B32",
+            "values": _legacy_bot_status_rows(status_rows, now),
+        })
+    # A single existing Sheets values batch updates all matching dashboard
+    # tabs; no extra API round trip or legacy scanner.
+    sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
     return True
