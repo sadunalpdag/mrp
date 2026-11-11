@@ -1,4 +1,4 @@
-"""Isolated CoinBeacon HBREAK 4h LONG paper monitor. No exchange order functions."""
+"""Isolated CoinBeacon HBREAK 15m LONG paper monitor. No exchange order functions."""
 import os,time,json,sqlite3,threading,hashlib,io,csv,zipfile,logging
 from datetime import datetime,timezone
 from zoneinfo import ZoneInfo
@@ -14,10 +14,10 @@ LOG.setLevel(logging.INFO)
 LOG.propagate=False
 BASE=Path(os.getenv("DATA_DIR","/data"))
 DB=BASE/"hbreak_paper.sqlite3"
-SHEET="HBREAK_4H_LONG_TEST"
-FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_4h atr14_4h atr_pct volume_4h_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at".split()
+SHEET="HBREAK_15M_LONG_TEST"
+FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_15m atr14_15m atr_pct volume_15m_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at".split()
 URL="https://api.coinbeacon.io/public/setups"
-PARAMS={"exchange":"binance-futures","timeframe":"4h","archetype":"breakout_watch,pattern_breakout,trendline_break,breakout_retest","bias":"bullish","minScore":"70"}
+PARAMS={"exchange":"binance-futures","timeframe":"15m","archetype":"breakout_watch,pattern_breakout,trendline_break,breakout_retest","bias":"bullish","minScore":"70"}
 PARIS=ZoneInfo("Europe/Paris")
 def utc(): return datetime.now(timezone.utc)
 def stamp(): return utc().isoformat(timespec="seconds")
@@ -59,25 +59,25 @@ def enroll(db,http,setups):
         try:
             a=s.get("archetype") or {}
             if a.get("key") not in ("pattern_breakout","trendline_break","breakout_retest"):continue
-            if s.get("tf")!="4h" or s.get("bias")!="bullish" or float(s.get("sqs") or 0)<70:continue
+            if s.get("tf")!="15m" or s.get("bias")!="bullish" or float(s.get("sqs") or 0)<70:continue
             age=int(a.get("barsSinceTrigger") or 0)
             if age<0 or age>2:continue
             sym=s["symbol"];price=float(s.get("price") or 0)
             if price<=0 or not sym.endswith("USDT"):continue
             # computedAt is epoch milliseconds at the last CLOSED 4h candle.
-            trigger=int(s["computedAt"])//14400000-age
-            key=hashlib.sha256(f"{sym}|{a['key']}|{trigger}".encode()).hexdigest()[:24]
+            trigger=int(s["computedAt"])//900000-age
+            key=hashlib.sha256(f"15m|{sym}|{a['key']}|{trigger}".encode()).hexdigest()[:24]
             if key in existing:continue
-            vals=rsi_atr(get_klines(http,sym,"4h",100))
+            vals=rsi_atr(get_klines(http,sym,"15m",100))
             if vals is None:continue
             part=s.get("participation") or {}
             obj=dict.fromkeys(FIELDS)
             obj.update(id=key,opened_at=stamp(),coin=sym,archetype=a["key"],
-               triggered_at=datetime.fromtimestamp(trigger*14400,timezone.utc).isoformat(),
+               triggered_at=datetime.fromtimestamp(trigger*900,timezone.utc).isoformat(),
                sqs=s.get("sqs"),rvol=part.get("rvol"),taker_flow_pct=part.get("takerFlowPct"),
                liquidity_usd_24h=part.get("liquidityUsd24h"),trend_direction=s.get("trendDirection"),
-               multi_tf_confirmed=s.get("multiTfConfirmed"),rsi14_4h=vals[0],atr14_4h=vals[1],
-               atr_pct=vals[2],volume_4h_usdt=vals[3],entry=price,tp=price*1.01,
+               multi_tf_confirmed=s.get("multiTfConfirmed"),rsi14_15m=vals[0],atr14_15m=vals[1],
+               atr_pct=vals[2],volume_15m_usdt=vals[3],entry=price,tp=price*1.01,
                status="OPEN",low_since_entry=price,max_drawdown_pct=0,checked_at=stamp(),
                cursor=int(utc().timestamp()*1000))
             save(db,obj);existing.add(key);added+=1
@@ -123,7 +123,7 @@ def archive(db):
     day=local.date().isoformat()
     if mget(db,"zip_day")==day:return
     data=rows(db);BASE.mkdir(exist_ok=True,parents=True)
-    path=BASE/f"hbreak_4h_long_{day}.zip"
+    path=BASE/f"hbreak_15m_long_{day}.zip"
     out=io.StringIO();writer=csv.DictWriter(out,fieldnames=FIELDS,extrasaction="ignore");writer.writeheader();writer.writerows(data)
     stats={"date":day,"mode":"PAPER_ONLY","total":len(data),"open":sum(x["status"]=="OPEN" for x in data),"tp":sum(x["status"]=="TP_1_PERCENT" for x in data)}
     with zipfile.ZipFile(path,"w",zipfile.ZIP_DEFLATED) as z:
@@ -137,8 +137,8 @@ def archive(db):
     mset(db,"zip_day",day)
     LOG.info("HBREAK R2 archive uploaded key=%s",result["key"])
 def step(db,http):
-    bucket=str(int(time.time()//300))
-    if mget(db,"bucket")!=bucket:
+    bucket=str(int(time.time()//600))
+    if mget(db,"bucket_15m")!=bucket:
         key=os.getenv("hbreak") or os.getenv("HBREAK") or os.getenv("COINBEACON_API_KEY")
         if not key:raise ValueError("Missing Render hbreak CoinBeacon key")
         resp=http.get(URL,params=PARAMS,headers={"X-API-Key":key},timeout=20)
@@ -146,7 +146,7 @@ def step(db,http):
         resp.raise_for_status();result=resp.json()
         if not isinstance(result.get("setups"),list):raise ValueError("CoinBeacon response missing setups")
         # Mark the bucket after successful fetch, before costly downstream processing.
-        mset(db,"bucket",bucket)
+        mset(db,"bucket_15m",bucket)
         LOG.info("HBREAK fetched %s setup rows; new %s",len(result["setups"]),enroll(db,http,result["setups"]))
     track(db,http)
     try:sheet_sync(db)
@@ -160,6 +160,6 @@ def run():
         while True:
             try:step(db,http)
             except Exception as e:LOG.warning("HBREAK cycle %s",str(e)[:180])
-            time.sleep(max(15,300-int(time.time())%300))
+            time.sleep(max(15,600-int(time.time())%600))
 def start():
     threading.Thread(target=run,name="hbreak-paper-only",daemon=True).start()
