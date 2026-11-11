@@ -7354,6 +7354,7 @@ def _crash_daily_report(state, now):
                  "Yeni sanal giriş/TP yalnız sıralı futures aggTrade WS olaylarıyla izlenir. "
                  "ENTRY_ABOVE_TP ayrı MISSED_SIGNAL sayılır, TP sayılmaz. "
                  "Eski sampled_upward_cross_v2 kayıtları tarihsel olarak ayrı tutulur. "
+                 Günlük ZIP yalnız son 7 UTC gününün observations/*.jsonl dosyalarını içerir; eski R2 ZIP dosyaları değiştirilmez. "
                  "observations/*.jsonl içindeki history_5d olayları sinyal/ giriş anından önceki en fazla 480 kapalı 15m mumu içerir. "
                  "as_of olay zamanı, fetched_at indirme zamanıdır; complete/missing_candles eksik geçmişi gösterir. "
                  "Eski girişlere sonradan entry_features üretilmez; geçmiş mumlar indirilebilir. "
@@ -7386,6 +7387,7 @@ def _crash_daily_report(state, now):
             archive.writestr("report.json", json.dumps({"schema_version":5,
                 "period_start":since, "period_end":now, "daily_cohort":summary,
                 "tracking_hours":24, "post_entry_tracking_hours":150, "export_days":14,
+                "observation_export_days":7,
                 "rolling_7d_cohort":rolling,
                 "five_day_context_daily":summarize_context(daily),
                 "five_day_context_rolling":summarize_context(filtered),
@@ -7410,8 +7412,9 @@ def _crash_daily_report(state, now):
                 archive.write(ai_market_path, 'ai_market/top_gainers_state.json')
             archive.writestr("derivatives_summary.json", json.dumps(summarize(records), ensure_ascii=False, indent=2))
             archive.writestr("signals_and_outcomes.json", json.dumps(records, ensure_ascii=False, indent=2))
-            # Archived observation files remain available for audit/research.
-            for offset in range(15):
+            # Only the latest seven UTC calendar-day observation logs go into each ZIP.
+            # Older R2 ZIPs remain intact; the rolling window drops one old day daily.
+            for offset in range(7):
                 day = datetime.fromtimestamp(now-offset*86400, tz=timezone.utc).strftime("%Y-%m-%d")
                 source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
                 if os.path.exists(source):
@@ -8702,6 +8705,14 @@ def _crash_bounce_worker():
                 _crash_daily_report(state, time.time())
             except Exception as error:
                 log(f"[CRASH REPORT ERR] {type(error).__name__}: {error}")
+            # Ten-day research-disk sweep is isolated from scanning/trading and
+            # never removes live broker state or an undelivered pending report.
+            try:
+                from crash_disk_retention import cleanup_if_due
+                cleanup_if_due(DATA_DIR, time.time(),
+                               pending=(state.get("report") or {}).get("pending"), log=log)
+            except Exception as error:
+                log(f"[CRASH DISK RETENTION ERR] {type(error).__name__}")
             now = time.time()
             # Recover queued downloads after restart; retain original event cutoffs.
             for historical in state['history']:
