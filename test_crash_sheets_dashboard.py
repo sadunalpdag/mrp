@@ -267,6 +267,58 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(table[1][27], "479/480")  # current trend window
         self.assertEqual(table[1][38], "455/480")  # original candidate
 
+    def test_old_three_flag_signal_displays_original_atr_without_enabling_buy(self):
+        from crash_failure_shadow import entry_block_reason
+        rec = dict(self.record)
+        rec["failure_shadow"] = {"version": "tp_nonclosure_entry_gate_v1",
+                                 "flags": {"weak_volume": False,
+                                           "falling_rsi_ema": True,
+                                           "repeat_lower_entry": False}}
+        rec["v2_features"] = {"strength_score": {"score": 55,
+                                               "metrics": {"atr14_pct": 0.98}}}
+        import copy
+        before = copy.deepcopy(rec)
+        _, table, colors, _ = dash.build_rows(
+            {"symbols": {"TESTUSDT": rec}, "history": [rec]},
+            self.tickers, {}, {}, self.now)
+        row = table[1]
+        self.assertEqual(row[13], 2)
+        self.assertEqual(row[17], "🔴 VAR")
+        self.assertIn("ESKİ SİNYAL", row[18])
+        self.assertIn("ESKİ SİNYAL", row[19])
+        self.assertEqual(colors[0][0], "grey")
+        self.assertEqual(entry_block_reason(rec), "RISK_ASSESSMENT_MISSING")
+        self.assertEqual(rec, before)
+
+    def test_old_signal_with_no_original_atr_keeps_risk_unknown(self):
+        rec = dict(self.record)
+        rec["failure_shadow"] = {"version": "tp_nonclosure_entry_gate_v1",
+                                 "flags": {"weak_volume": False,
+                                           "falling_rsi_ema": True,
+                                           "repeat_lower_entry": False}}
+        _, table, _, _ = dash.build_rows(
+            {"symbols": {"TESTUSDT": rec}, "history": [rec]},
+            self.tickers, {}, {}, self.now)
+        self.assertEqual(table[1][13], "—")
+        self.assertEqual(table[1][17], "VERİ EKSİK")
+        self.assertIn("gerçek alış yok", table[1][18])
+
+    def test_insert_atr_adjacent_only_once_and_remove_old_trailing_column(self):
+        old_header = ["Pozisyon kuralı"] + ["filler"] * 22 + [
+            "ATR riski (15dk < %1,3)"]
+        signal = SimpleNamespace(id=456, get=Mock(side_effect=[
+            [old_header], [["ATR riski (15dk < %1,3)"]]]))
+        book = Mock()
+        logs = []
+        self.assertTrue(dash._ensure_four_risk_columns(book, signal, logs.append))
+        reqs = book.batch_update.call_args.args[0]["requests"]
+        self.assertEqual(reqs[0]["insertDimension"]["range"]["startIndex"], 17)
+        self.assertFalse(reqs[0]["insertDimension"]["inheritFromBefore"])
+        self.assertEqual(reqs[1]["deleteDimension"]["range"]["startIndex"], 41)
+        self.assertEqual(len(reqs), 2)
+        self.assertFalse(dash._ensure_four_risk_columns(book, signal, logs.append))
+        self.assertEqual(book.batch_update.call_count, 1)
+
     def test_no_sheet_deletion_or_creation_on_missing_tab(self):
         book = Mock()
         book.title = "EMA Filter"
