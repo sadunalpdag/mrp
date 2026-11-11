@@ -6,6 +6,12 @@ from pathlib import Path
 import requests
 
 LOG=logging.getLogger("hbreak")
+if not LOG.handlers:
+    _stream=logging.StreamHandler()
+    _stream.setFormatter(logging.Formatter("[HBREAK] %(levelname)s %(message)s"))
+    LOG.addHandler(_stream)
+LOG.setLevel(logging.INFO)
+LOG.propagate=False
 BASE=Path(os.getenv("DATA_DIR","/data"))
 DB=BASE/"hbreak_paper.sqlite3"
 SHEET="HBREAK_4H_LONG_TEST"
