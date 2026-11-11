@@ -17,7 +17,7 @@ class SheetDashboardTests(unittest.TestCase):
             },
             "failure_shadow": {"flags": {
                 "weak_volume": True, "falling_rsi_ema": True,
-                "repeat_lower_entry": False}},
+                "repeat_lower_entry": False, "low_atr_15m": False}},
         }
         self.tickers = [{"symbol": "TESTUSDT", "priceChangePercent": "-24",
                          "lastPrice": "1.002"}]
@@ -35,8 +35,9 @@ class SheetDashboardTests(unittest.TestCase):
         status, table, colors, previous = self.data()
         row = table[1]
         self.assertEqual(len(row), len(dash.HEADERS))
-        self.assertEqual(len(dash.HEADERS), 40)
+        self.assertEqual(len(dash.HEADERS), 41)
         self.assertEqual(row[22], "⚪ VERİ YOK")
+        self.assertEqual(row[40], "🟢 YOK")
         self.assertEqual(row[26], "0/480")
         self.assertEqual(row[13], 2)
         self.assertIn("%50", row[17])
@@ -44,15 +45,25 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(status[3][1], "BAĞLI")
         self.assertEqual(previous["TESTUSDT"]["score"], 55)
 
-    def test_risk_zero_green_and_three_blocked(self):
+    def test_risk_zero_green_and_four_blocked(self):
         keys = dash.FLAGS
         _, table, colors, _ = self.data({k: False for k in keys})
         self.assertEqual(table[1][13], 0)
         self.assertEqual(colors[0], ("green", "green"))
         _, table, colors, _ = self.data({k: True for k in keys})
-        self.assertEqual(table[1][13], 3)
+        self.assertEqual(table[1][13], 4)
         self.assertEqual(colors[0], ("red", "red"))
         self.assertIn("İŞLEM YOK", table[1][17])
+
+    def test_three_risks_thirty_size_and_atr_last_column(self):
+        flags = {"weak_volume": True, "falling_rsi_ema": True,
+                 "repeat_lower_entry": False, "low_atr_15m": True}
+        _, table, colors, _ = self.data(flags)
+        row = table[1]
+        self.assertEqual(row[13], 3)
+        self.assertEqual(row[40], "🔴 VAR")
+        self.assertIn("%30", row[17])
+        self.assertEqual(colors[0], ("yellow", "yellow"))
 
     def test_missing_risk_is_unknown_not_zero(self):
         _, table, colors, _ = self.data({"weak_volume": True})
@@ -161,7 +172,7 @@ class SheetDashboardTests(unittest.TestCase):
                       {"userEnteredFormat": {}})]
         self.assertEqual({(op["range"]["startColumnIndex"],
                            op["range"]["endColumnIndex"])
-                          for op in clears}, {(5, 8), (13, 17)})
+                          for op in clears}, {(5, 8), (13, 17), (40, 41)})
         self.assertTrue(all(op["range"]["endRowIndex"] ==
                             dash.MAX_ROWS + 1 for op in clears))
         self.assertTrue(all(op["fields"] ==
