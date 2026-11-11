@@ -15,7 +15,7 @@ class SheetDashboardTests(unittest.TestCase):
                 "rsi14": 25.0, "recovery_4h_pct": 1.2,
                 "strength_score": {"score": 55.0},
             },
-            "failure_shadow": {"flags": {
+            "failure_shadow": {"version": 'tp_nonclosure_entry_gate_v2_atr', "flags": {
                 "weak_volume": True, "falling_rsi_ema": True,
                 "repeat_lower_entry": False, "low_atr_15m": False}},
         }
@@ -25,7 +25,7 @@ class SheetDashboardTests(unittest.TestCase):
     def data(self, flags=None, score_previous=None):
         rec = dict(self.record)
         if flags is not None:
-            rec["failure_shadow"] = {"flags": flags}
+            rec["failure_shadow"] = {"version": "tp_nonclosure_entry_gate_v2_atr", "flags": flags}
         return dash.build_rows(
             {"symbols": {"TESTUSDT": rec}, "history": [rec]}, self.tickers,
             {"auto": "AÇIK"}, {"connected": True}, self.now,
@@ -36,11 +36,11 @@ class SheetDashboardTests(unittest.TestCase):
         row = table[1]
         self.assertEqual(len(row), len(dash.HEADERS))
         self.assertEqual(len(dash.HEADERS), 41)
-        self.assertEqual(row[22], "⚪ VERİ YOK")
-        self.assertEqual(row[40], "🟢 YOK")
-        self.assertEqual(row[26], "0/480")
+        self.assertEqual(row[23], "⚪ VERİ YOK")
+        self.assertEqual(row[17], "🟢 YOK")
+        self.assertEqual(row[27], "0/480")
         self.assertEqual(row[13], 2)
-        self.assertIn("%50", row[17])
+        self.assertIn("%50", row[18])
         self.assertEqual(colors[0], ("yellow", "yellow"))
         self.assertEqual(status[3][1], "BAĞLI")
         self.assertEqual(previous["TESTUSDT"]["score"], 55)
@@ -53,16 +53,16 @@ class SheetDashboardTests(unittest.TestCase):
         _, table, colors, _ = self.data({k: True for k in keys})
         self.assertEqual(table[1][13], 4)
         self.assertEqual(colors[0], ("red", "red"))
-        self.assertIn("İŞLEM YOK", table[1][17])
+        self.assertIn("İŞLEM YOK", table[1][18])
 
-    def test_three_risks_thirty_size_and_atr_last_column(self):
+    def test_three_risks_thirty_size_and_adjacent_atr_column(self):
         flags = {"weak_volume": True, "falling_rsi_ema": True,
                  "repeat_lower_entry": False, "low_atr_15m": True}
         _, table, colors, _ = self.data(flags)
         row = table[1]
         self.assertEqual(row[13], 3)
-        self.assertEqual(row[40], "🔴 VAR")
-        self.assertIn("%30", row[17])
+        self.assertEqual(row[17], "🔴 VAR")
+        self.assertIn("%30", row[18])
         self.assertEqual(colors[0], ("yellow", "yellow"))
 
     def test_missing_risk_is_unknown_not_zero(self):
@@ -78,7 +78,7 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(row[14], "🔴 VAR")
         self.assertEqual(row[15], "VERİ EKSİK")
         self.assertEqual(row[16], "🟢 YOK")
-        self.assertIn("EKSİK", row[17])
+        self.assertIn("EKSİK", row[18])
 
     def test_missing_risk_never_claims_safe_or_displays_question_marks(self):
         rec = dict(self.record)
@@ -87,7 +87,7 @@ class SheetDashboardTests(unittest.TestCase):
             {"symbols":{"TESTUSDT":rec}, "history":[rec]},
             self.tickers, {}, {}, self.now)
         self.assertEqual(table[1][14:17], ["VERİ EKSİK"] * 3)
-        self.assertIn("EKSİK", table[1][17])
+        self.assertIn("EKSİK", table[1][18])
         self.assertEqual(colors[0], ("red", "grey"))
 
     def test_top_loser_without_v2_candidate_uses_only_cached_live_score(self):
@@ -122,7 +122,7 @@ class SheetDashboardTests(unittest.TestCase):
         _, table, colors, _ = dash.build_rows(
             {"symbols": {}, "history": []}, tickers, {}, {}, self.now)
         self.assertEqual(table[1][4], "EŞİK DIŞI — 24s düşüş %12 altında")
-        self.assertEqual(table[1][18], "⚪ AKTİF ADAY KAYDI YOK")
+        self.assertEqual(table[1][19], "⚪ AKTİF ADAY KAYDI YOK")
         self.assertEqual(table[1][14:17], ["—"] * 3)
         self.assertEqual(colors[0][0], "grey")
 
@@ -172,7 +172,7 @@ class SheetDashboardTests(unittest.TestCase):
                       {"userEnteredFormat": {}})]
         self.assertEqual({(op["range"]["startColumnIndex"],
                            op["range"]["endColumnIndex"])
-                          for op in clears}, {(5, 8), (13, 17), (40, 41)})
+                          for op in clears}, {(5, 8), (13, 18)})
         self.assertTrue(all(op["range"]["endRowIndex"] ==
                             dash.MAX_ROWS + 1 for op in clears))
         self.assertTrue(all(op["fields"] ==
@@ -190,7 +190,7 @@ class SheetDashboardTests(unittest.TestCase):
             self.tickers, {}, {}, self.now)
         self.assertEqual(table[1][7], 49.5)
         self.assertEqual(table[1][4], "MISSING_5D_HISTORY")
-        self.assertIn("canlı emir yok", table[1][39])
+        self.assertIn("canlı emir yok", table[1][40])
 
     def test_stored_late_research_never_shows_live_order(self):
         rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
@@ -200,8 +200,8 @@ class SheetDashboardTests(unittest.TestCase):
         _, table, _, _ = dash.build_rows(
             {"symbols":{"TESTUSDT":rec}, "history":[rec]},
             self.tickers, {}, {}, self.now)
-        self.assertIn("SONRADAN V2 ONAYLI (479/480)", table[1][39])
-        self.assertIn("canlı emir yok", table[1][39])
+        self.assertIn("SONRADAN V2 ONAYLI (479/480)", table[1][40])
+        self.assertIn("canlı emir yok", table[1][40])
         self.assertEqual(table[1][4], "MISSING_5D_HISTORY")
 
     def test_previous_score_delta_and_current_rescore(self):
@@ -221,7 +221,7 @@ class SheetDashboardTests(unittest.TestCase):
             {},{},self.now)
         self.assertEqual(table[1][0],"TESTUSDT")
         self.assertEqual(table[1][4],"ÖNCEKİ ADAY SÜRESİ DOLDU")
-        self.assertEqual(table[1][21],"—")
+        self.assertEqual(table[1][22],"—")
 
     def test_open_virtual_trade_stays_visible_after_24h(self):
         old=dict(self.record,created_at=self.now-24*3600-1,
@@ -230,7 +230,7 @@ class SheetDashboardTests(unittest.TestCase):
             {"symbols":{"TESTUSDT":old},"history":[old]},self.tickers,
             {},{},self.now)
         self.assertEqual(table[1][4],"STRONG_V2")
-        self.assertEqual(table[1][19],"OPEN")
+        self.assertEqual(table[1][20],"OPEN")
 
     def test_479_latest_missing_is_not_mislabeled_as_failed_v2(self):
         rec = dict(self.record, v2_status="MISSING_5D_HISTORY",
@@ -243,13 +243,13 @@ class SheetDashboardTests(unittest.TestCase):
             {"symbols": {"TESTUSDT": rec}, "history": [rec]}, self.tickers,
             {}, {}, self.now, rescore=rescore)
         row = table[1]
-        self.assertIn("VERİ EKSİK", row[18])
+        self.assertIn("VERİ EKSİK", row[19])
         self.assertEqual(colors[0][0], "yellow")
-        self.assertEqual(row[37], "479/480")
-        self.assertIn("Aday süresi içinde karar verilemedi", row[38])
-        self.assertIn("son kapanmış", row[38])
-        self.assertIn("SONRADAN V2 ONAYLI", row[39])
-        self.assertIn("canlı emir yok", row[39])
+        self.assertEqual(row[38], "479/480")
+        self.assertIn("Aday süresi içinde karar verilemedi", row[39])
+        self.assertIn("son kapanmış", row[39])
+        self.assertIn("SONRADAN V2 ONAYLI", row[40])
+        self.assertIn("canlı emir yok", row[40])
         rescore.assert_called_once_with(rec, rec["created_at"])
 
     def test_479_current_history_is_not_confused_with_signal_time(self):
@@ -264,8 +264,8 @@ class SheetDashboardTests(unittest.TestCase):
             _, table, _, _ = dash.build_rows(
                 {"symbols": {"TESTUSDT": rec}, "history": [rec]}, self.tickers,
                 {}, {}, self.now, candle_get=lambda _: [], directory="/tmp")
-        self.assertEqual(table[1][26], "479/480")  # current trend window
-        self.assertEqual(table[1][37], "455/480")  # original candidate
+        self.assertEqual(table[1][27], "479/480")  # current trend window
+        self.assertEqual(table[1][38], "455/480")  # original candidate
 
     def test_no_sheet_deletion_or_creation_on_missing_tab(self):
         book = Mock()
