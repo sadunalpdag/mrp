@@ -527,7 +527,9 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
-    if legacy_status is not None:
+    if legacy_status is not None or status.title == "BOT_STATUS":
+        # The active workbook already contains the exact legacy tab; do not
+        # double-write it through a second, possibly stale workbook ID.
         if logger:
             logger("[CRASH SHEETS LEGACY] BOT_STATUS refreshed in EMA Filter")
     else:
