@@ -15798,6 +15798,14 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     _crash_start_services()
+    # HBREAK 4H LONG: isolated read-only paper monitor; never submits orders.
+    if os.getenv("HBREAK_PAPER_ENABLED", "0") == "1":
+        try:
+            from hbreak_paper import start as _hbreak_paper_start
+            _hbreak_paper_start()
+            log("[HBREAK] paper-only 4H breakout monitor started")
+        except Exception as exc:
+            log(f"[HBREAK START ERR] {type(exc).__name__}: {str(exc)[:180]}")
     if os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1":
         log("[CRASH REST PRIORITY] non-history research Binance REST disabled; "
             "WS/cache/archive -> Bybit/Coinbase -> scoped 15m Binance REST last resort="
