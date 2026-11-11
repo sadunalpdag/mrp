@@ -1,0 +1,21 @@
+name = "trend-breakout-ai-review"
+main = "src/index.js"
+compatibility_date = "2026-11-11"
+workers_dev = false
+
+# Cron runs in UTC: 21:45 Paris in winter, 22:45 in summer.
+# Render's JSON+ZIP export happens from 21:15 Paris onward.
+[triggers]
+crons = ["45 20 * * *"]
+
+[vars]
+# Must match the value of CRASH_REPORT_R2_PREFIX in Render, default crash-bounce.
+R2_PREFIX = "crash-bounce"
+
+# Replace this placeholder with the EXISTING private R2 bucket name.
+[[r2_buckets]]
+binding = "ARCHIVE_BUCKET"
+bucket_name = "YOUR_EXISTING_PRIVATE_R2_BUCKET_NAME"
+
+[ai]
+binding = "AI"
