@@ -63,6 +63,7 @@ def open_shadow_symbols(directory, now, max_extra=16):
     live = sorted((r for r in state.get("signals", []) if isinstance(r, dict)
                    and r.get("selection_version") == SELECTION_VERSION
                    and r.get("status") == "OPEN"
+                   and r.get("strategy") == "PULLBACK"
                    and isinstance(r.get("ts"), (int, float))
                    and 0 <= now - r["ts"] / 1000 <= HORIZON_S),
                   key=lambda r: r["ts"], reverse=True)
