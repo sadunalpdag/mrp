@@ -119,9 +119,9 @@ class NightTests(unittest.TestCase):
         self.e = self.make()
         self.r = dict(symbol='AUSDT', signal_id='signal-1', entry='10', tp='10.10',
                       v2_status='STRONG_V2', v2_sent=True, tracking_status='OPEN',
-                      failure_shadow=dict(version='tp_nonclosure_entry_gate_v1',
+                      failure_shadow=dict(version='tp_nonclosure_entry_gate_v2_atr',
                           flags=dict(weak_volume=False, falling_rsi_ema=False,
-                                     repeat_lower_entry=False)))
+                                     repeat_lower_entry=False, low_atr_15m=False)))
 
     def make(self):
         e = NightExecutor(self.tmp.name, self.b, self.deliver, Mock(), lambda:self.now, enabled=True, max_daily=10)
@@ -160,15 +160,15 @@ class NightTests(unittest.TestCase):
         ]
         for sid, sym, risks, fraction, rate, tp in scenarios:
             self.e.deliver_pending()
-            shadow = dict(version='tp_nonclosure_entry_gate_v1',
+            shadow = dict(version='tp_nonclosure_entry_gate_v2_atr',
                           flags=dict(zip(
                               ('weak_volume', 'falling_rsi_ema',
-                               'repeat_lower_entry'), risks)))
+                               'repeat_lower_entry', 'low_atr_15m'), risks + (False,))))
             self.enter(signal_id=sid, symbol=sym, failure_shadow=shadow)
             order = self.e.state['orders'][sid]
             self.assertEqual(order['risk_position_fraction'], float(fraction))
             self.assertEqual(order['risk_tp_pct'], rate)
-            self.assertEqual(order['risk_tp_policy_version'], 'risk_tier_tp_v1')
+            self.assertEqual(order['risk_tp_policy_version'], 'risk_tier_tp_v2_four_flags')
             self.assertEqual(order['tp'], tp)
             self.assertEqual(self.b.tps[-1][2], tp)
             self.assertLessEqual(D(order['risk_effective_notional_usdt']),
@@ -181,10 +181,10 @@ class NightTests(unittest.TestCase):
                           for sid, *_ in scenarios],
                          ['10.10', '10.10', '10.050'])
 
-    def test_three_risk_flags_still_block_buy_and_tp(self):
-        shadow = dict(version='tp_nonclosure_entry_gate_v1',
+    def test_four_risk_flags_still_block_buy_and_tp(self):
+        shadow = dict(version='tp_nonclosure_entry_gate_v2_atr',
                       flags=dict(weak_volume=True, falling_rsi_ema=True,
-                                 repeat_lower_entry=True))
+                                 repeat_lower_entry=True, low_atr_15m=True))
         self.enter(failure_shadow=shadow)
         self.assertFalse(self.b.buys)
         self.assertFalse(self.b.tps)
