@@ -401,7 +401,17 @@ def _sync_external_legacy_status(client, dashboard_id, status_rows, now, logger=
             "values": _legacy_bot_status_rows(status_rows, now),
         }]})
         if logger:
-            logger("[CRASH SHEETS LEGACY] BOT_STATUS refreshed")
+            try:
+                actual = old_tab.get("B2")
+                received = actual[0][0] if actual and actual[0] else ""
+                expected = datetime.fromtimestamp(now, timezone.utc).strftime(
+                    "%Y-%m-%d %H:%M:%S UTC")
+                logger(f'[CRASH SHEETS LEGACY READBACK] target_suffix={legacy_id[-8:]}; '
+                       f'tab=BOT_STATUS; b2_matches={int(received == expected)}; '
+                       f'b2={received!r}; expected={expected!r}')
+            except Exception as exc:
+                logger(f'[CRASH SHEETS LEGACY READBACK] skipped: {type(exc).__name__}')
+            logger("[CRASH SHEETS LEGACY] BOT_STATUS refreshed in original workbook")
         return True
     except Exception as exc:
         # Never log HTTP errors, Google credentials or spreadsheet content.
@@ -527,15 +537,25 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
-    if legacy_status is not None or status.title == "BOT_STATUS":
-        # The active workbook already contains the exact legacy tab; do not
-        # double-write it through a second, possibly stale workbook ID.
-        if logger:
+    if logger:
+        try:
+            # A successful Sheets API write only proves something was written
+            # to the configured workbook, not the workbook on the user's screen.
+            actual = status.get("B2")
+            received = actual[0][0] if actual and actual[0] else ""
+            expected = status_rows[1][1]
+            logger(f'[CRASH SHEETS READBACK] target_suffix={sheet_id[-8:]}; '
+                   f'tab={status.title!r}; b2_matches={int(received == expected)}; '
+                   f'b2={received!r}; expected={expected!r}')
+        except Exception as exc:
+            logger(f'[CRASH SHEETS READBACK] skipped: {type(exc).__name__}')
+        if legacy_status is not None or status.title == "BOT_STATUS":
             logger("[CRASH SHEETS LEGACY] BOT_STATUS refreshed in EMA Filter")
-    else:
-        # If the old BOT_STATUS actually lives in the original pre-signal
-        # workbook, refresh it separately. This path is deliberately isolated.
-        _sync_external_legacy_status(client, sheet_id, status_rows, now, logger)
+    # The original pre-signal workbook is independent of the modern EMA Filter.
+    # Even if EMA Filter also has its own BOT_STATUS tab, the separately opened
+    # old workbook still needs the heartbeat. Never skip it based solely on a
+    # matching worksheet title in another workbook.
+    _sync_external_legacy_status(client, sheet_id, status_rows, now, logger)
     return True
 
 class DashboardPublisher:
