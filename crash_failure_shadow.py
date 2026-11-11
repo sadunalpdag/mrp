@@ -177,7 +177,7 @@ def summarize(records, executor_orders=None):
                 if (record.get("tracking_model") == "ws_aggtrade_upcross_v3"
                     and record.get("v2_status") == "STRONG_V2"
                     and record.get("v2_sent") is True
-                    and (record.get("failure_shadow") or {}).get("version") == VERSION)]
+                    and (record.get("failure_shadow") or {}).get("version") in (VERSION, LEGACY_VERSION))]
     def has_flag(record, name):
         return (record["failure_shadow"].get("flags") or {}).get(name)
     groups = {
@@ -185,10 +185,11 @@ def summarize(records, executor_orders=None):
         "weak_volume": [r for r in selected if has_flag(r, "weak_volume") is True],
         "falling_rsi_ema": [r for r in selected if has_flag(r, "falling_rsi_ema") is True],
         "repeat_lower_entry": [r for r in selected if has_flag(r, "repeat_lower_entry") is True],
+        "low_atr_15m": [r for r in selected if has_flag(r, "low_atr_15m") is True],
         "two_or_more": [r for r in selected if r["failure_shadow"].get("flag_count", 0) >= 2],
-        "none_known": [r for r in selected if r["failure_shadow"].get("known_flags") == 3
+        "none_known": [r for r in selected if r["failure_shadow"].get("known_flags") == len(FLAG_NAMES)
                        and r["failure_shadow"].get("flag_count") == 0],
-        "missing_some_data": [r for r in selected if r["failure_shadow"].get("known_flags", 0) < 3],
+        "missing_some_data": [r for r in selected if r["failure_shadow"].get("known_flags", 0) < len(FLAG_NAMES)],
     }
     executor_orders = executor_orders or {}
     result = {}
@@ -211,15 +212,17 @@ def summarize(records, executor_orders=None):
     prospective = [r for r in selected
                    if (r.get("failure_shadow") or {}).get("sizing_policy_version") == SIZING_VERSION]
     exclusive = {
-        "zero_flags_full": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+        "zero_flags_full": [r for r in prospective if r["failure_shadow"].get("known_flags")==4
                             and r["failure_shadow"].get("flag_count")==0],
-        "one_flag_full": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+        "one_flag_full": [r for r in prospective if r["failure_shadow"].get("known_flags")==4
                            and r["failure_shadow"].get("flag_count")==1],
-        "two_flags_half": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
+        "two_flags_half": [r for r in prospective if r["failure_shadow"].get("known_flags")==4
                             and r["failure_shadow"].get("flag_count")==2],
-        "three_flags_blocked": [r for r in prospective if r["failure_shadow"].get("known_flags")==3
-                                 and r["failure_shadow"].get("flag_count")==3],
-        "incomplete_blocked": [r for r in prospective if r["failure_shadow"].get("known_flags",0)<3],
+        "three_flags_thirty": [r for r in prospective if r["failure_shadow"].get("known_flags")==4
+                               and r["failure_shadow"].get("flag_count")==3],
+        "four_flags_blocked": [r for r in prospective if r["failure_shadow"].get("known_flags")==4
+                               and r["failure_shadow"].get("flag_count")==4],
+        "incomplete_blocked": [r for r in prospective if r["failure_shadow"].get("known_flags",0)<4],
     }
     sizing = {}
     for name, items in exclusive.items():
@@ -241,11 +244,11 @@ def summarize(records, executor_orders=None):
         "version": VERSION,
         "sizing_policy_version": SIZING_VERSION,
         "v2_gating": False,
-        "live_entry_gate": "0/1 flags full; 2 flags half; 3 flags or unknown blocked",
+        "live_entry_gate": "0/1 full; 2 half; 3 thirty percent; 4 or unknown blocked",
         "groups": result,
         "sizing_cohorts_prospective": sizing,
         "notes": "Cohorts overlap. OPEN is unresolved, not a loss. Resolved TP excludes OPEN. "
-                 "Only new V2/WS signals measured; 0/1 risk flags full-size, two half-size, three or unknown block real BUY. "
+                 "Only new 4-flag labels qualify for prospective sizing; 0/1 risk flags full, two half, three 30 percent, four or unknown block real BUY. "
                  "Cohorts are selection-biased and not calibrated TP probabilities.",
     }
 
@@ -256,8 +259,8 @@ def export_csv(records, executor_orders=None):
         "signal_id", "symbol", "created_at", "tracking_model", "tracking_status",
         "entered_at", "finished_at", "score", "green_volume_share_1h",
         "volume_ratio_vs_prior_12h", "rsi_delta_1h",
-        "ema25_slope_change_1h_pp", "repeat_prior_entry_drop_pct",
-        "weak_volume", "falling_rsi_ema", "repeat_lower_entry", "flag_count",
+        "ema25_slope_change_1h_pp", "repeat_prior_entry_drop_pct", "atr14_pct",
+        "weak_volume", "falling_rsi_ema", "repeat_lower_entry", "low_atr_15m", "flag_count",
         "known_flags", "risk_sizing_version", "risk_position_fraction",
         "risk_position_action", "real_order_phase", "real_configured_usdt",
         "real_target_usdt", "real_effective_notional_usdt",
@@ -270,12 +273,12 @@ def export_csv(records, executor_orders=None):
     out.writeheader()
     for record in records:
         shadow = record.get("failure_shadow") or {}
-        if shadow.get("version") != VERSION:
+        if shadow.get("version") not in (VERSION, LEGACY_VERSION):
             continue
         metrics, flags = shadow.get("metrics") or {}, shadow.get("flags") or {}
         strength = (record.get("v2_features") or {}).get("strength_score") or {}
         values = {k: record.get(k) for k in fields}
-        fraction = shadow.get("position_fraction") if shadow.get("sizing_policy_version")==SIZING_VERSION else None
+        fraction = shadow.get("position_fraction") if shadow.get("sizing_policy_version") in (SIZING_VERSION, LEGACY_SIZING_VERSION) else None
         values.update(score=strength.get("score"),
                       flag_count=shadow.get("flag_count"),
                       known_flags=shadow.get("known_flags"),
@@ -283,9 +286,10 @@ def export_csv(records, executor_orders=None):
                       risk_position_fraction=fraction,
                       risk_position_action=("UNKNOWN" if fraction is None else
                                             "BLOCK" if fraction == 0 else
-                                            "HALF" if fraction == 0.5 else "FULL"))
+                                            "HALF" if fraction == 0.5 else
+                                             "THIRTY" if fraction == 0.3 else "FULL"))
         order = executor_orders.get(record.get("signal_id")) or {}
-        if order.get("risk_sizing_version") == SIZING_VERSION:
+        if order.get("risk_sizing_version") in (SIZING_VERSION, LEGACY_SIZING_VERSION):
             values.update(real_order_phase=order.get("phase"),
                           real_configured_usdt=order.get("risk_configured_usdt"),
                           real_target_usdt=order.get("risk_target_usdt"),
