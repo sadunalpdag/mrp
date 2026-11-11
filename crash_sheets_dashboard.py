@@ -27,7 +27,7 @@ DEFAULT_LEGACY_STATUS_ID = "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI"
 HEADERS = [
     "Coin", "24s değişim %", "Düşüş sırası", "Son fiyat", "V2 durumu",
     "RSI14", "4s toparlanma %", "Güç /100", "Önceki güç", "Puan farkı",
-    "Giriş", "TP", "Giriş uzaklık %", "Risk /3", "Zayıf hacim",
+    "Giriş", "TP", "Giriş uzaklık %", "Risk /4", "Zayıf hacim",
     "RSI/EMA düşüyor", "Tekrar düşük sinyal", "Pozisyon kuralı",
     "Uygunluk", "Sinyal takibi", "Güncelleme", "Sinyal zamanı",
     "Trend kırılımı (5g / 15m)", "Üst çizgi uzaklık %", "Kırılım onay zamanı",
@@ -35,9 +35,9 @@ HEADERS = [
     "Fibo 0 dip", "Fibo 23,6", "Fibo 38,2", "Fibo 50",
     "Fibo 61,8", "Fibo 78,6", "Fibo 100 tepe", "Fibo bandı",
     "Sinyal anı V2 mum", "V2 eksik veri açıklaması",
-    "Sonradan V2 kontrolü (emirsiz)",
+    "Sonradan V2 kontrolü (emirsiz)", "ATR riski (15dk < %1,3)",
 ]
-FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")
+FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry", "low_atr_15m")
 PARIS = ZoneInfo("Europe/Paris")
 COLORS = {
     "green": {"red": 0.79, "green": 0.91, "blue": 0.82},
@@ -69,14 +69,15 @@ def _risk(rec):
     flags = item.get("flags") if isinstance(item, dict) else None
     if not isinstance(flags, dict):
         # Never claim YOK when the underlying signal-time measure is unknown.
-        return None, ["VERİ EKSİK"] * 3, "EKSİK: otomatik alış yok"
+        return None, ["VERİ EKSİK"] * 4, "EKSİK: otomatik alış yok"
     # Show each known criterion independently; unknown is never interpreted as safe.
     marks = [("🔴 VAR" if flags[k] else "🟢 YOK")
              if type(flags.get(k)) is bool else "VERİ EKSİK" for k in FLAGS]
     if any(type(flags.get(k)) is not bool for k in FLAGS):
         return None, marks, "EKSİK: otomatik alış yok"
     count = sum(flags[k] for k in FLAGS)
-    rule = ("⛔ İŞLEM YOK" if count == 3 else
+    rule = ("⛔ İŞLEM YOK" if count == 4 else
+            "⚠️ %30 / TP %0,5" if count == 3 else
             "⚖️ %50 / TP %0,5" if count == 2 else "✅ %100 / TP %1")
     return count, marks, rule
 
@@ -93,10 +94,10 @@ def _status(rec, risk):
     if not rec:
         return "⚪ AKTİF ADAY KAYDI YOK", "grey"
     v2 = rec.get("v2_status")
-    if risk == 3 or risk is None and v2 == "STRONG_V2":
+    if risk == 4 or risk is None and v2 == "STRONG_V2":
         return "🔴 ALIŞ YOK (RİSK)", "red"
     if v2 == "STRONG_V2" and risk is not None:
-        return ("🟢 V2 ONAYLI" if risk <= 1 else "🟡 V2 / YARIM"), ("green" if risk <= 1 else "yellow")
+        return ("🟢 V2 ONAYLI" if risk <= 1 else "🟡 V2 / YARIM" if risk == 2 else "🟠 V2 / %30"), ("green" if risk <= 1 else "yellow")
     if v2 == "PENDING_5D_HISTORY":
         return "🟡 VERİ BEKLENİYOR", "yellow"
     if v2 == "MISSING_5D_HISTORY":
@@ -191,7 +192,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
     names = (top + [sym for sym, _ in extra if sym not in rank])[:MAX_ROWS]
     previous = {}
     rows, colors = [], []
-    risk_summary = {0: 0, 1: 0, 2: 0, 3: 0, "unknown": 0}
+    risk_summary = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, "unknown": 0}
     eligible = 0
     for sym in names:
         stored_rec = symbols.get(sym)
@@ -201,7 +202,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         rec = stored_rec if active else {}
         v2 = rec.get("v2_features") or {}
         has_signal = bool(rec.get("signal_id"))
-        risk, flags, rule = _risk(rec) if has_signal else (None, ["—"] * 3, "—")
+        risk, flags, rule = _risk(rec) if has_signal else (None, ["—"] * 4, "—")
         current = _score(rec)
         live = None  # Optional cache-only view of the current CLOSED-candle window.
         # Display-only CURRENT 5-day strength on each ranked coin when cached
@@ -279,7 +280,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
              "HESAPLANAMADI"),
             old_score if old_score is not None else "—", difference,
             entry if entry is not None else "—", tp if tp is not None else "—", dist,
-            risk if risk is not None else "—", *flags, rule, status,
+            risk if risk is not None else "—", *flags[:3], rule, status,
             rec.get("tracking_status", "—") if has_signal else "—",
             _time(now), _time(rec.get("created_at")) if has_signal else "—",
             trend_label, trend["distance_pct"] if trend["distance_pct"] is not None else "—",
@@ -290,8 +291,9 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
             *[(trend["fib"].get(k) if trend["fib"].get(k) is not None else "—")
               for k in ("0", "23.6", "38.2", "50", "61.8", "78.6", "100")],
             trend["fib_band"], original_coverage, missing_explanation, retrospective,
+            flags[3],
         ])
-        colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk == 2 else 'red'))
+        colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk in (2, 3) else 'red'))
     history = state.get("history") or []
     since = now - 86400
     recent = [r for r in history if isinstance(r, dict) and (_num(r.get("created_at")) or 0) > since]
@@ -320,8 +322,9 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         ["1 risk sinyali", risk_summary[1]],
         ["2 risk sinyali", risk_summary[2]],
         ["3 risk sinyali", risk_summary[3]],
+        ["4 risk sinyali", risk_summary[4]],
         ["Eksik risk verisi", risk_summary["unknown"]],
-        ["Not", "Risk/puan bilgilendirme amaçlıdır; Binance emirlerini değiştirmez."],
+        ["Not", "Risk /4: 0-1 tam, 2 yarım, 3 %30, 4 veya eksik veri alış yok; yalnız yeni emirler."],
     ]
     return status_rows, [HEADERS] + rows, colors, previous
 
@@ -435,7 +438,7 @@ def _format(sheet, status, signal, colors, signal_rows):
     # background fills used to survive when a coin moved to a different row.
     # Clear ONLY panel-owned indicator/risk backgrounds before recoloring the
     # currently measured cells (no other workbook content or tabs touched).
-    for first_col, last_col in ((5, 8), (13, 17)):
+    for first_col, last_col in ((5, 8), (13, 17), (40, 41)):
         requests.append({"repeatCell": {
             "range": {"sheetId": signal.id, "startRowIndex": 1,
                       "endRowIndex": MAX_ROWS + 1,
@@ -457,7 +460,7 @@ def _format(sheet, status, signal, colors, signal_rows):
         if distance is not None:
             extra.append((12, "green" if abs(distance) <= 0.3 else
                           "yellow" if abs(distance) <= 1 else "red"))
-        for j in (14, 15, 16):
+        for j in (14, 15, 16, 40):
             if data[j] in ("🟢 YOK", "🔴 VAR"):
                 extra.append((j, "green" if data[j] == "🟢 YOK" else "red"))
         trend_status = str(data[22])
