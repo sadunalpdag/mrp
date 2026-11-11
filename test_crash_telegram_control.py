@@ -115,7 +115,7 @@ class GateTests(unittest.TestCase):
         self.now=timestamp('2026-10-27T21:00:00')
         self.b=FakeBroker()
         self.e=self.make()
-        self.r=dict(symbol='AUSDT',signal_id='id1',entry='10',tp='10.1',v2_status='STRONG_V2',v2_sent=True,tracking_status='OPEN',failure_shadow=dict(version='tp_nonclosure_entry_gate_v1',flags=dict(weak_volume=False,falling_rsi_ema=False,repeat_lower_entry=False)))
+        self.r=dict(symbol='AUSDT',signal_id='id1',entry='10',tp='10.1',v2_status='STRONG_V2',v2_sent=True,tracking_status='OPEN',failure_shadow=dict(version='tp_nonclosure_entry_gate_v2_atr',flags=dict(weak_volume=False,falling_rsi_ema=False,repeat_lower_entry=False,low_atr_15m=False)))
 
     def make(self):
         e=NightExecutor(self.tmp.name,self.b,Mock(return_value={'ok':True}),Mock(),lambda:self.now)

@@ -98,15 +98,15 @@ class FiveDayLevelsTests(unittest.TestCase):
             record = {"signal_id": "s1", "v2_status": "STRONG_V2",
                       "created_at": self.now-60, "entry": 1, "tp": 1.01,
                       "failure_shadow": {"flags": {"weak_volume": False,
-                          "falling_rsi_ema": False, "repeat_lower_entry": False}}}
+                          "falling_rsi_ema": False, "repeat_lower_entry": False, "low_atr_15m": False}}}
             state = {"symbols": {"TESTUSDT": record}, "history": []}
             before = json.dumps(state, sort_keys=True)
             tickers = [{"symbol": "TESTUSDT", "priceChangePercent": "-20", "lastPrice": "1"}]
             _, rows, _, _ = build_rows(state, tickers, {}, {}, self.now,
                                        candle_get=lambda _: self.candles("up")[-64:],
                                        directory=td)
-            self.assertEqual(len(HEADERS), 40)
-            self.assertEqual(len(rows[1]), 40)
+            self.assertEqual(len(HEADERS), 41)
+            self.assertEqual(len(rows[1]), 41)
             self.assertEqual(rows[1][22], "🟢 KIRDI")
             self.assertEqual(rows[1][25], "YUKARI")
             self.assertEqual(rows[1][26], "480/480")

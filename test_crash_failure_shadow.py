@@ -13,7 +13,7 @@ from test_crash_services import FakeBroker, timestamp
 
 
 def candidate(symbol="AUSDT", at=1_000_000.0, entry="10",
-              green=0.50, volume=2.0, rsi=1.0, ema=0.04):
+              green=0.50, volume=2.0, rsi=1.0, ema=0.04, atr=2.0):
     return {
         "symbol": symbol, "signal_id": symbol + ":" + str(at),
         "created_at": at, "entry": entry, "tp": "10.10",
@@ -26,6 +26,7 @@ def candidate(symbol="AUSDT", at=1_000_000.0, entry="10",
                 "volume_ratio_vs_prior_12h": volume,
                 "rsi_delta_1h": rsi,
                 "ema25_slope_change_1h_pp": ema,
+                "atr14_pct": atr,
             }
         }}
     }
@@ -41,7 +42,7 @@ class NonclosureLabelsTests(unittest.TestCase):
         r = candidate()
         shadow = self.risk(r)
         self.assertEqual(shadow["flag_count"], 0)
-        self.assertEqual(shadow["known_flags"], 3)
+        self.assertEqual(shadow["known_flags"], 4)
         self.assertFalse(shadow["blocks_live_entry"])
         self.assertIsNone(entry_block_reason(r))
 
@@ -50,7 +51,7 @@ class NonclosureLabelsTests(unittest.TestCase):
         shadow = self.risk(r)
         self.assertEqual(shadow["flags"], {
             "weak_volume": True, "falling_rsi_ema": False,
-            "repeat_lower_entry": False})
+            "repeat_lower_entry": False, "low_atr_15m": False})
         self.assertEqual(shadow["flag_count"], 1)
         self.assertIsNone(entry_block_reason(r))
         self.assertEqual(position_fraction(r), 1.0)
@@ -79,7 +80,7 @@ class NonclosureLabelsTests(unittest.TestCase):
         r = candidate(volume=None)
         shadow = self.risk(r)
         self.assertIsNone(shadow["flags"]["weak_volume"])
-        self.assertEqual(shadow["known_flags"], 2)
+        self.assertEqual(shadow["known_flags"], 3)
         self.assertEqual(entry_block_reason(r), "RISK_METRICS_INCOMPLETE")
         self.assertIn("EKSİK VERİ", format_warning(shadow))
         self.assertEqual(entry_block_reason(candidate()),
@@ -105,7 +106,7 @@ class NonclosureLabelsTests(unittest.TestCase):
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[2]["weak_volume"], "True")
 
-    def test_two_risks_half_sized_and_three_risks_blocked(self):
+    def test_two_risks_half_sized_and_four_risks_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
             broker = FakeBroker()
             clock = timestamp("2026-11-03T20:00:00")
@@ -136,16 +137,56 @@ class NonclosureLabelsTests(unittest.TestCase):
             executor = NightExecutor(directory, broker, Mock(return_value={"ok":True}),
                                      Mock(), lambda:clock, enabled=True, max_daily=20)
             self.addCleanup(executor.guard.close)
-            three = candidate(green=.1, volume=1.1, rsi=-6, ema=-.11)
+            three = candidate(green=.1, volume=1.1, rsi=-6, ema=-.11, atr=1.0)
             three.update(created_at=clock-1, signal_id="three-risks")
             shadow=self.risk(three,[older])
-            self.assertEqual(shadow["flag_count"],3)
+            self.assertEqual(shadow["flag_count"],4)
             self.assertEqual(shadow["position_fraction"],0)
-            self.assertEqual(entry_block_reason(three),"RISK_3_OF_3")
+            self.assertEqual(entry_block_reason(three),"RISK_4_OF_4")
             self.assertIn("YAPILMAYACAK",format_warning(shadow))
             executor.enter(three,clock)
             self.assertEqual(len(broker.buys),0)
             self.assertEqual(executor.daily_count(),0)
+
+    def test_three_risks_trades_thirty_percent_and_half_percent_tp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broker = FakeBroker()
+            clock = timestamp("2026-11-03T20:00:00")
+            executor = NightExecutor(directory, broker, Mock(return_value={"ok": True}),
+                                     Mock(), lambda: clock, enabled=True, max_daily=20)
+            self.addCleanup(executor.guard.close)
+            r = candidate(green=.1, volume=1.1, rsi=-6, ema=-.11, atr=1.0)
+            r.update(created_at=clock-1, signal_id="three-risks-thirty")
+            shadow = self.risk(r)
+            self.assertEqual(shadow["flag_count"], 3)
+            self.assertEqual(shadow["known_flags"], 4)
+            self.assertEqual(shadow["position_fraction"], .3)
+            self.assertEqual(position_fraction(r), .3)
+            self.assertIn("%30", format_warning(shadow))
+            self.assertIsNone(entry_block_reason(r))
+            executor.enter(r, clock)
+            self.assertEqual(len(broker.buys), 1)
+            order = executor.state["orders"]["three-risks-thirty"]
+            self.assertEqual(order["risk_target_usdt"], "150.0")
+            self.assertEqual(order["risk_flag_count"], 3)
+            self.assertEqual(order["risk_position_fraction"], .3)
+            self.assertEqual(order["risk_tp_pct"], "0.005")
+            self.assertTrue(order["risk_flags"]["low_atr_15m"])
+
+    def test_atr_missing_and_legacy_three_flags_fail_closed(self):
+        r = candidate(atr=None)
+        shadow = self.risk(r)
+        self.assertEqual(shadow["known_flags"], 3)
+        self.assertIsNone(shadow["flags"]["low_atr_15m"])
+        self.assertEqual(entry_block_reason(r), "RISK_METRICS_INCOMPLETE")
+        old = candidate()
+        old["failure_shadow"] = {
+            "version": "tp_nonclosure_entry_gate_v1",
+            "flags": {"weak_volume": False, "falling_rsi_ema": False,
+                      "repeat_lower_entry": False},
+        }
+        self.assertEqual(entry_block_reason(old), "RISK_ASSESSMENT_MISSING")
+        self.assertIsNone(position_fraction(old))
 
     def test_one_risk_trades_full_notional_and_logs_execution(self):
         with tempfile.TemporaryDirectory() as directory:

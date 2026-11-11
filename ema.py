@@ -6647,10 +6647,10 @@ def _crash_send_pending(state, now):
             block_reason = entry_block_reason(record)
             if block_reason:
                 message = message.replace('Gerçek emir yok.',
-                    '3 risk kriteri veya eksik risk verisi: otomatik GTC alış emri GÖNDERİLMEZ.')
+                    '4 risk kriteri veya eksik risk verisi: otomatik GTC alış emri GÖNDERİLMEZ.')
             else:
                 fraction = position_fraction(record)
-                size_label = '%50' if fraction == 0.5 else '%100'
+                size_label = '%30' if fraction == 0.3 else '%50' if fraction == 0.5 else '%100'
                 if age > CRASH_LIVE_ENTRY_TTL_SECONDS:
                     message = message.replace('Gerçek emir yok.',
                         '⚠️ Adayın 120 saniyelik güvenli alış süresi doldu. '
@@ -6702,7 +6702,7 @@ def _crash_send_pending(state, now):
                         # Tell the operator why without blocking other coins.
                         executor.entry_skip(record['symbol'],
                                             'SIGNAL_CANDIDATE_EXPIRED')
-                # Three true risk flags or incomplete labels: Telegram + virtual tracking only.
+                # Four true risk flags or incomplete/legacy labels: Telegram + virtual tracking only.
                 # NightExecutor.enter independently rechecks sizing and safety before real BUY.
         else:
             record["v2_delivery_status"] = ("UNKNOWN_DELIVERY" if receipt.get("ambiguous")
@@ -7372,10 +7372,10 @@ def _crash_daily_report(state, now):
                  "TP oranı yalnız sonuçlanmış sanal girişlerden hesaplanır; açıklar ve girişsizler ayrı. "
                  "Eski kayıtlarda geçmiş sonuçlar bilinmez. UTC epoch saniye; kline zamanları milisaniye. "
                  "Yeni algoritmaları zaman bazlı eğitim/test ayrımıyla karşılaştırın; gelecek verilerini giriş özelliklerine katmayın. "
-                 "Gölge TP-olmama araştırması (tp_nonclosure_shadow_v1) 3 işaret kaydeder: "
+                 "Gölge TP-olmama araştırması (tp_nonclosure_shadow_v2) 4 işaret kaydeder: "
                  "zayıf yeşil mum hacmi + zayıf hacim, düşen RSI + kötüleşen EMA eğimi, "
-                 "aynı coinde daha düşük seviyede tekrar. Bunlar yalnız sinyal anında bilinen verileri kullanır, "
-                 "0 veya 1 risk kriterinde tam tutar, 2 kriterde yarım tutar, 3 kriterde veya eksik risk verisinde alış yoktur. "
+                 "aynı coinde daha düşük seviyede tekrar ve 15dk ATR14 <%1,3. Bunlar yalnız sinyal anında bilinen verileri kullanır, "
+                 "0 veya 1 risk kriterinde tam tutar ve TP %1, 2 kriterde yarım tutar ve TP %0,5, 3 kriterde %30 tutar ve TP %0,5, 4 kriterde veya eksik risk verisinde alış yoktur. "
                  "Pozisyon tutarı kaldıraç teminatı değil, emrin USDT büyüklüğüdür. "
                  "Bu politika yalnız yeni BUY için uygulanır; önceki emirlerin TP'si değiştirilmez. "
                  "V2 sinyali, sanal izleme ve mevcut TP emirleri değişmez. "

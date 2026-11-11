@@ -87,9 +87,9 @@ class CrashV2Tests(unittest.TestCase):
                       change_24h=-15, entry="1.000", tp="1.010", last_price="0.995",
                       v2_features=dict(recovery_4h_pct=1.2, rsi14=24, candles=480,
                                        return_5d_pct=-13),
-                      failure_shadow=dict(version='tp_nonclosure_entry_gate_v1',
+                      failure_shadow=dict(version='tp_nonclosure_entry_gate_v2_atr',
                           flags=dict(weak_volume=False, falling_rsi_ema=False,
-                                     repeat_lower_entry=False)))
+                                     repeat_lower_entry=False, low_atr_15m=False)))
         return {"history":[record], "symbols":{"TESTUSDT":dict(record)}}, record
 
     def test_legacy_candidate_not_resent(self):
@@ -111,13 +111,14 @@ class CrashV2Tests(unittest.TestCase):
         self.assertEqual(submitted['tracking_status'],'WAIT_ENTRY')
         self.assertEqual(observed,101)
 
-    def test_risk_size_policy_queues_zero_one_two_but_not_three(self):
+    def test_risk_size_policy_queues_zero_one_two_three_but_not_four(self):
         from crash_failure_shadow import entry_block_reason, position_fraction
         scenarios=[
-            ((False,False,False),True,1.0),
-            ((True,False,False),True,1.0),
-            ((True,True,False),True,0.5),
-            ((True,True,True),False,0.0),
+            ((False,False,False,False),True,1.0),
+            ((True,False,False,False),True,1.0),
+            ((True,True,False,False),True,0.5),
+            ((True,True,True,False),True,0.3),
+            ((True,True,True,True),False,0.0),
         ]
         for vals,allowed,fraction in scenarios:
             with self.subTest(flags=vals):
@@ -126,7 +127,7 @@ class CrashV2Tests(unittest.TestCase):
                 env['_CRASH_NIGHT']=executor
                 state,record=self._candidate()
                 record['failure_shadow']['flags']=dict(
-                    zip(('weak_volume','falling_rsi_ema','repeat_lower_entry'),vals))
+                    zip(('weak_volume','falling_rsi_ema','repeat_lower_entry','low_atr_15m'),vals))
                 self.assertEqual(position_fraction(record),fraction)
                 self.assertEqual(entry_block_reason(record) is None,allowed)
                 env['_crash_send_pending'](state,105)
@@ -237,7 +238,7 @@ class CrashV2Tests(unittest.TestCase):
         state = {"history":[record], "symbols":{"TESTUSDT":dict(record)}}
         env["_crash_review_candidate"](state, record, at)
         self.assertEqual(record["v2_status"], "FILTERED_V2")
-        self.assertEqual(record["failure_shadow"]["known_flags"], 3)
+        self.assertEqual(record["failure_shadow"]["known_flags"], 4)
         self.assertEqual(record["v2_delivery_status"], "FILTERED_NOT_SENT")
         self.assertNotIn("v2_sent", record)
 
