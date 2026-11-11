@@ -174,8 +174,9 @@ class FourHourBreakShadowTests(unittest.TestCase):
             sym = url.rsplit("/", 2)[-2]
             return Reply({"symbol":sym, "timeframe":"4h", "bars":candles})
         with tempfile.TemporaryDirectory() as d:
+            messages = []
             monitor=sh.Breakout4HShadow(
-                d, lambda _:None, http_get=get, sheet_writer=lambda *_:True,
+                d, messages.append, http_get=get, sheet_writer=lambda *_:True,
                 r2_upload=lambda *_:{"json":"x","zip":"y"})
             with patch.dict(os.environ, {"hbreak":"secret","COINBEACON_API_KEY":""}):
                 monitor.lock.acquire()
@@ -183,7 +184,8 @@ class FourHourBreakShadowTests(unittest.TestCase):
                 self.assertEqual(len(monitor.state["signals"]),2)
                 for paper in monitor.state["signals"]:
                     self.assertEqual(paper["status"],"OPEN")
-                    self.assertEqual(paper["metric_status"],"COMPLETE")
+                    self.assertEqual(paper["metric_status"],"COMPLETE",
+                                     (messages,calls,paper))
                     self.assertEqual(paper["metric_source"],"coinbeacon_closed_4h_ohlcv")
                     self.assertGreater(paper["atr14_pct_4h"],0)
                     self.assertGreater(paper["volume_ratio_4h"],0)
