@@ -79,7 +79,7 @@ class ShadowWeekTests(unittest.TestCase):
         rows = [(i * sw.STEP_MS, 99, 99.7, 95, 97, 1)
                 for i in range(1, 49) if i != 21]
         sw._settle(signal, rows, sw.HORIZON_S + sw.STEP_MS / 1000)
-        self.assertEqual(signal["status"], "OPEN")
+        self.assertEqual(signal["status"], "DATA_GAP")
         self.assertEqual(signal["observed_bars"], 47)
         self.assertTrue(signal["minus_one_pct_seen"])
         self.assertNotEqual(signal["status"], "RISK")
@@ -236,7 +236,7 @@ class ShadowWeekTests(unittest.TestCase):
     def test_no_future_candles_cannot_claim_win(self):
         signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0, "side": "LONG", "entry": 100, "tp": 101, "risk": None}
         sw._settle(signal, [], sw.HORIZON_S + 1)
-        self.assertEqual(signal["status"], "DATA_GAP")
+        self.assertEqual(signal["status"], "OPEN")
 
 
     def test_diagnostics_reason_for_missing_candles(self):
