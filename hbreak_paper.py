@@ -17,7 +17,7 @@ DB=BASE/"hbreak_paper.sqlite3"
 SHEET="HBREAK_15M_LONG_TEST"
 FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_15m atr14_15m atr_pct volume_15m_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at".split()
 URL="https://api.coinbeacon.io/public/setups"
-PARAMS={"exchange":"binance-futures","timeframe":"15m","archetype":"breakout_watch,pattern_breakout,trendline_break,breakout_retest","bias":"bullish","minScore":"70"}
+PARAMS={"exchange":"binance-futures","timeframe":"15m","archetype":"breakout_watch,pattern_breakout,trendline_break,breakout_retest","bias":"bullish","minScore":"50"}
 PARIS=ZoneInfo("Europe/Paris")
 def utc(): return datetime.now(timezone.utc)
 def stamp(): return utc().isoformat(timespec="seconds")
@@ -59,7 +59,7 @@ def enroll(db,http,setups):
         try:
             a=s.get("archetype") or {}
             if a.get("key") not in ("pattern_breakout","trendline_break","breakout_retest"):continue
-            if s.get("tf")!="15m" or s.get("bias")!="bullish" or float(s.get("sqs") or 0)<70:continue
+            if s.get("tf")!="15m" or s.get("bias")!="bullish" or float(s.get("sqs") or 0)<50:continue
             age=int(a.get("barsSinceTrigger") or 0)
             if age<0 or age>2:continue
             sym=s["symbol"];price=float(s.get("price") or 0)
