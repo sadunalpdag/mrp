@@ -171,7 +171,7 @@ def _r2_upload_files(json_path, zip_path, day, env=None):
 
 
 class TrendBreakoutShadow:
-    """Prospective top-20 loser channel-break observations, cache-only.
+    """Prospective observations of <=20 EXISTING Crash Bounce watched coins only.
 
     API operations run on daemon thread. Only code named in this class controls
     its own state; exception handling never changes the trading executor.
@@ -202,15 +202,20 @@ class TrendBreakoutShadow:
     def _save(self):
         _atomic(self.state_file, self.state)
 
-    def _scan(self, tickers, candle_get, history, now):
+    def _scan(self, tickers, candle_get, history, now, watched_symbols):
         from crash_levels_5d import analyze
+        # CrashBounceWebSocketCache.reconcile() already selects these symbols.
+        # Research is strictly a CONSUMER of existing kline subscriptions,
+        # never a second scanner for another 20 or 50 coins.
+        allowed = {s for s in watched_symbols if isinstance(s, str)
+                   and SYMBOL.fullmatch(s)}
         eligible = []
         for ticker in tickers:
             if not isinstance(ticker, dict):
                 continue
             symbol = ticker.get("symbol", "")
             drop = _number(ticker.get("priceChangePercent"))
-            if SYMBOL.fullmatch(symbol) and drop is not None:
+            if symbol in allowed and drop is not None:
                 eligible.append((drop, symbol))
         ranked = [s for _, s in sorted(eligible)[:MAX_SYMBOLS]]
         active = sorted(
@@ -221,7 +226,10 @@ class TrendBreakoutShadow:
         # At most 20 symbols total, INCLUDING existing 72h follow-ups.
         # Prioritize outstanding follow-ups over discovering new signals.
         active_symbols = list(dict.fromkeys(e["symbol"] for e in active))
-        symbols = list(dict.fromkeys(active_symbols + ranked))[:MAX_SYMBOLS]
+        # Do not add websocket subscriptions even for 72h follow-ups.
+        # If a coin leaves Crash's watchlist, any follow-up gaps remain explicit.
+        symbols = [s for s in dict.fromkeys(active_symbols + ranked)
+                   if s in allowed][:MAX_SYMBOLS]
         events_seen = {(e["symbol"], e["direction"], e["confirmed_at"])
                        for e in self.state["events"]}
         new_count = 0
@@ -274,7 +282,7 @@ class TrendBreakoutShadow:
                     "coverage": result["coverage"],
                     "support": result["support"], "resistance": result["resistance"],
                     "fib_band": result["fib_band"],
-                    "rank_in_top_50": ranked.index(symbol) + 1,
+                    "rank_in_crash_watch": ranked.index(symbol) + 1,
                     "signal_context": _match_signal(symbol, baseline_at, history),
                     "phase": "TRACKING", "last_bar_at": baseline_at,
                     "last_close_pct": 0.0, "max_up_pct": 0.0,
@@ -313,7 +321,8 @@ class TrendBreakoutShadow:
             "export_day_paris": day,
             "exported_at": now,
             "time_zone": "Europe/Paris",
-            "sampling": "top_20_usdtm_daily_losers_15m_close_only",
+            "sampling": "max_20_of_existing_crash_bounce_watched_symbols",
+            "no_extra_websocket_subscriptions": True,
             "breakout_definition": "5d channel; 2 consecutive closed 15m bars; 0.15% buffer",
             "followup_hours": list(HORIZONS),
             "price_path_disclaimer": "Candle OHLC does not reveal intrabar order; no fill or profit claims.",
@@ -365,7 +374,7 @@ class TrendBreakoutShadow:
             self.log(f"[TREND R2] retry_60m; reason={type(error).__name__}; "
                      "orders_untouched=1")
 
-    def tick(self, tickers, candle_get, history=None):
+    def tick(self, tickers, candle_get, history=None, watched_symbols=None):
         """Never block the caller: full scan/upload is in a research daemon."""
         now = self.now_fn()
         if self.running or not self.lock.acquire(blocking=False):
@@ -381,10 +390,11 @@ class TrendBreakoutShadow:
                 return
             cloned = [dict(t) for t in tickers or [] if isinstance(t, dict)]
             records = [dict(r) for r in (history or []) if isinstance(r, dict)]
+            allowed = set(watched_symbols or ())
             def worker():
                 try:
                     if want_scan:
-                        self._scan(cloned, candle_get, records, now)
+                        self._scan(cloned, candle_get, records, now, allowed)
                     self._upload(now)
                 except Exception as error:
                     self.log("[TREND SHADOW ERROR] " + type(error).__name__)
