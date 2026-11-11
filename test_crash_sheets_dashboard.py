@@ -285,7 +285,8 @@ class SheetDashboardTests(unittest.TestCase):
                     for i, title in enumerate(titles)]
                 client = Mock()
                 client.open_by_key.return_value = book
-                with patch.object(dash, "_credentials",
+                with patch.dict(dash.os.environ, {"GOOGLE_SHEETS_ID": "testing-id"}), \
+                     patch.object(dash, "_credentials",
                                   return_value=(client, "testing-id")), \
                      patch.object(dash, "_read_previous", return_value={}), \
                      patch.object(dash, "_write_previous"), \
@@ -351,6 +352,39 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertFalse(modern.add_worksheet.called)
         self.assertFalse(modern.del_worksheet.called)
 
+    def test_both_local_legacy_and_separate_old_workbook_are_refreshed(self):
+        modern = Mock(title="EMA Filter")
+        modern.worksheets.return_value = [
+            SimpleNamespace(title="Bot Status", id=1),
+            SimpleNamespace(title="Sinyal", id=2),
+            SimpleNamespace(title="BOT_STATUS", id=3)]
+        old = Mock(title="Original Pre-Signal Sheet")
+        old.worksheets.return_value = [
+            SimpleNamespace(title="BOT_STATUS", id=4)]
+        client = Mock()
+        client.open_by_key.side_effect = lambda key: (
+            modern if key == "modern-book" else old)
+        logs = []
+        with patch.dict(dash.os.environ, {"GOOGLE_SHEETS_ID": "old-book"}), \
+             patch.object(dash, "_credentials",
+                          return_value=(client, "modern-book")), \
+             patch.object(dash, "_read_previous", return_value={}), \
+             patch.object(dash, "_write_previous"), \
+             patch.object(dash.os, "makedirs"):
+            self.assertTrue(dash.publish(
+                {"symbols": {}, "history": []}, self.tickers, {},
+                {"connected": True}, self.now, "/tmp/test-dashboard",
+                logger=logs.append))
+        self.assertEqual(modern.values_batch_update.call_count, 1)
+        self.assertEqual(len(modern.values_batch_update.call_args.args[0]["data"]), 3)
+        self.assertEqual(old.values_batch_update.call_count, 1)
+        self.assertEqual(old.values_batch_update.call_args.args[0]["data"][0]["range"],
+                         "'BOT_STATUS'!A1:B32")
+        self.assertTrue(any("refreshed in EMA Filter" in line for line in logs))
+        self.assertTrue(any("refreshed in original workbook" in line for line in logs))
+        self.assertFalse(old.add_worksheet.called)
+        self.assertFalse(modern.add_worksheet.called)
+
     def test_external_legacy_status_failure_does_not_block_modern_dashboard(self):
         modern = Mock(title="EMA Filter")
         modern.worksheets.return_value = [
@@ -374,7 +408,9 @@ class SheetDashboardTests(unittest.TestCase):
                 {"connected": True}, self.now, "/tmp/test-dashboard",
                 logger=logs.append))
         modern.values_batch_update.assert_called_once()
-        self.assertEqual(logs, ["[CRASH SHEETS LEGACY] update skipped: PermissionError"])
+        self.assertTrue(any("[CRASH SHEETS LEGACY] update skipped: PermissionError" == line
+                            for line in logs))
+        self.assertFalse(any("sensitive data" in line for line in logs))
 
     def test_only_legacy_bot_status_fallback_remains_live(self):
         book = Mock(title="EMA Filter")
@@ -383,7 +419,8 @@ class SheetDashboardTests(unittest.TestCase):
             SimpleNamespace(title="BOT_STATUS", id=1)]
         client = Mock()
         client.open_by_key.return_value = book
-        with patch.object(dash, "_credentials",
+        with patch.dict(dash.os.environ, {"GOOGLE_SHEETS_ID": "testing-id"}), \
+             patch.object(dash, "_credentials",
                           return_value=(client, "testing-id")), \
              patch.object(dash, "_read_previous", return_value={}), \
              patch.object(dash, "_write_previous"), \
