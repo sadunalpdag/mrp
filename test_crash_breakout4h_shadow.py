@@ -134,6 +134,84 @@ class FourHourBreakShadowTests(unittest.TestCase):
         self.assertEqual(args.kwargs["params"]["timeframe"],"4h")
         self.assertEqual(args.kwargs["params"]["exchange"],"binance-futures")
 
+    def test_every_new_coin_breakout_creates_one_paper_long_even_without_ws_ticker(self):
+        from pathlib import Path
+        now = self.now
+        board = setup(now)
+        board["setups"][0]["price"] = 22.0
+        duplicate = dict(board["setups"][0])
+        duplicate["sqs"] = 60
+        board["setups"].append(duplicate)
+        other = dict(board["setups"][0])
+        other["symbol"] = "OTHERUSDT"
+        other["price"] = 40.0
+        board["setups"].append(other)
+        class Reply:
+            def __init__(self, value):
+                self.value = value
+            def raise_for_status(self):
+                pass
+            def json(self):
+                return self.value
+        candles = []
+        close = sh.last_four_hour_close(now)
+        for j in range(32):
+            t = close + 1 - (32-j) * sh.FOUR_H_MS
+            price = 20 + j * .25
+            candles.append({"openTime":t, "closeTime":t+sh.FOUR_H_MS-1,
+                            "open": price, "high": price + .5,
+                            "low": price - .5, "close": price + .1,
+                            "volume": 100+j})
+        # A still-forming candle must never enter RSI or ATR.
+        candles.append({"openTime":close+1, "closeTime":close+sh.FOUR_H_MS,
+                        "open": 100, "high": 200, "low": 1, "close": 199,
+                        "volume": 100000})
+        calls=[]
+        def get(url, **kwargs):
+            calls.append(url)
+            if url.endswith("/public/setups"):
+                return Reply(board)
+            sym = url.rsplit("/", 2)[-2]
+            return Reply({"symbol":sym, "timeframe":"4h", "bars":candles})
+        with tempfile.TemporaryDirectory() as d:
+            monitor=sh.Breakout4HShadow(
+                d, lambda _:None, http_get=get, sheet_writer=lambda *_:True,
+                r2_upload=lambda *_:{"json":"x","zip":"y"})
+            with patch.dict(os.environ, {"hbreak":"secret","COINBEACON_API_KEY":""}):
+                monitor.lock.acquire()
+                monitor._work({}, {"TESTUSDT":".1", "OTHERUSDT":".1"}, lambda _:[], now)
+                self.assertEqual(len(monitor.state["signals"]),2)
+                for paper in monitor.state["signals"]:
+                    self.assertEqual(paper["status"],"OPEN")
+                    self.assertEqual(paper["metric_status"],"COMPLETE")
+                    self.assertEqual(paper["metric_source"],"coinbeacon_closed_4h_ohlcv")
+                    self.assertGreater(paper["atr14_pct_4h"],0)
+                    self.assertGreater(paper["volume_ratio_4h"],0)
+                    self.assertEqual(paper["entry_source"],"COINBEACON_BINANCE_FUTURES_PRICE")
+                self.assertEqual({p["entry"] for p in monitor.state["signals"]},{22.0,40.0})
+                monitor.lock.acquire()
+                monitor._work({}, {"TESTUSDT":".1", "OTHERUSDT":".1"}, lambda _:[], now+60)
+                self.assertEqual(len(monitor.state["signals"]),2)
+                self.assertEqual(len(calls),3)  # 1 board + 1 OHLCV for each coin
+
+    def test_stale_setup_board_is_retried_not_silently_marked_processed(self):
+        now = self.now
+        doc = setup(now)
+        doc["setups"][0]["computedAt"] -= sh.FOUR_H_MS
+        class Reply:
+            def raise_for_status(self): pass
+            def json(self): return doc
+        with tempfile.TemporaryDirectory() as d:
+            monitor=sh.Breakout4HShadow(
+                d, lambda _:None, http_get=lambda *_a,**_k:Reply(),
+                sheet_writer=lambda *_: True,
+                r2_upload=lambda *_:{"json":"ok","zip":"ok"})
+            with patch.dict(os.environ, {"hbreak":"secret"}):
+                monitor.lock.acquire()
+                monitor._work({}, {"TESTUSDT":".1"},lambda _:[],now)
+            self.assertEqual(monitor.state["last_scan_slot"],0)
+            self.assertEqual(len(monitor.state["signals"]),0)
+
     def test_separate_r2_json_and_zip_match_exactly(self):
         stored={}
         class FakeS3:
