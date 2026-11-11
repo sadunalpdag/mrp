@@ -115,7 +115,10 @@ def _status(rec, risk):
     v2 = rec.get("v2_status")
     if v2 == "STRONG_V2":
         from crash_failure_shadow import VERSION
-        if (rec.get("failure_shadow") or {}).get("version") != VERSION:
+        shadow = rec.get("failure_shadow") or {}
+        if not isinstance(shadow, dict) or not isinstance(shadow.get("flags"), dict):
+            return "🔴 RİSK VERİSİ EKSİK — ALIŞ YOK", "red"
+        if shadow.get("version") != VERSION:
             return "⚪ ESKİ SİNYAL / EMİR YOK", "grey"
     if risk == 4 or risk is None and v2 == "STRONG_V2":
         return "🔴 ALIŞ YOK (RİSK)", "red"
@@ -547,7 +550,7 @@ def _ensure_four_risk_columns(sheet, signal, logger=None):
     requests = [{"insertDimension": {
         "range": {"sheetId": signal.id, "dimension": "COLUMNS",
                   "startIndex": 17, "endIndex": 18},
-        "inheritFromBefore": True}}]
+        "inheritFromBefore": False}}]
     if existing_atr:
         requests.append({"deleteDimension": {"range": {
             "sheetId": signal.id, "dimension": "COLUMNS",
