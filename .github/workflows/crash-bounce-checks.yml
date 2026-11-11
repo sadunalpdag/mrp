@@ -17,6 +17,9 @@ on:
       - 'structure_agent_monitor.py'
       - 'test_structure_agent_monitor.py'
       - 'day_trader_ws_feed.py'
+      - 'trend_breakout_shadow.py'
+      - 'test_trend_breakout_shadow.py'
+      - 'cloudflare/trend-breakout-agent/**'
       - 'test_day_trader_ws_feed.py'
       - '.github/workflows/crash-bounce-checks.yml'
   pull_request:
@@ -36,6 +39,9 @@ on:
       - 'structure_agent_monitor.py'
       - 'test_structure_agent_monitor.py'
       - 'day_trader_ws_feed.py'
+      - 'trend_breakout_shadow.py'
+      - 'test_trend_breakout_shadow.py'
+      - 'cloudflare/trend-breakout-agent/**'
       - 'test_day_trader_ws_feed.py'
       - '.github/workflows/crash-bounce-checks.yml'
   workflow_dispatch:
@@ -52,9 +58,13 @@ jobs:
         with:
           python-version: '3.11'
       - name: Check Python syntax
-        run: python -m py_compile structure_agent_monitor.py day_trader_ws_feed.py ai_top_gainers.py ai_market_agents.py ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py crash_context.py
+        run: python -m py_compile structure_agent_monitor.py day_trader_ws_feed.py ai_top_gainers.py ai_market_agents.py ema.py crash_v2.py crash_history.py crash_live_v2.py crash_score_v3.py crash_context.py trend_breakout_shadow.py
       - name: Run offline Crash Bounce tests
-        run: python -m unittest discover -p 'test_crash*.py' -v && python -m unittest test_day_trader_ws_feed test_structure_agent_monitor -v
+        run: python -m unittest discover -p 'test_crash*.py' -v && python -m unittest test_day_trader_ws_feed test_structure_agent_monitor test_trend_breakout_shadow -v
 
       - name: Run offline AI market research tests
         run: python -m unittest test_ai_top_gainers test_ai_market_agents -v
+
+      - name: Check Cloudflare agent syntax and unit tests (no network)
+        working-directory: cloudflare/trend-breakout-agent
+        run: node --check src/index.js && npm test
