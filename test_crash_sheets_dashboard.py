@@ -443,7 +443,7 @@ class SheetDashboardTests(unittest.TestCase):
         batch = book.values_batch_update.call_args.args[0]["data"]
         self.assertEqual(len(batch), 2)
         self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B26")
-        self.assertEqual(batch[1]["range"], "'Sinyal'!A1:AN61")
+        self.assertEqual(batch[1]["range"], "'Sinyal'!A1:AO61")
 
     def test_update_uses_existing_tabs_and_does_not_reset(self):
         book = Mock()
@@ -463,7 +463,7 @@ class SheetDashboardTests(unittest.TestCase):
         batch = book.values_batch_update.call_args.args[0]
         self.assertEqual(len(batch["data"]), 2)
         self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B26")
-        self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:AN61")
+        self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:AO61")
         self.assertEqual(len(batch["data"][1]["values"]), 61)
         self.assertTrue(state_store.called)
         self.assertFalse(book.add_worksheet.called)
