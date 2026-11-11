@@ -185,7 +185,8 @@ def parse_setups(payload, close_ms, prices, now, directory, candle_get, market):
 def update_prices(state, prices, now):
     changed = False
     for r in state["signals"]:
-        if r.get("status") not in ("OPEN", "TP") or now < r["created_at"]:
+        if (r.get("status") not in ("OPEN", "TP") or now < r["created_at"]
+                or r.get("finished_at") is not None):
             continue
         # TP records continue tracking for all 72 hours to measure post-TP paths.
         if now - r["created_at"] > MAX_AGE_SECONDS:
@@ -285,6 +286,12 @@ def publish_sheet(state, now, log=None):
     if "emafilter" not in _name(book.title):
         raise ValueError("WRONG_SHEETS_WORKBOOK")
     tabs = {t.title: t for t in book.worksheets()}
+    # Exact worksheet names only; never delete users' other sheets or
+    # overwrite archival R2 objects. User explicitly retired these experiments.
+    for obsolete in ("Structure Agent Test", "Break Bounce Test"):
+        old = tabs.get(obsolete)
+        if old is not None:
+            book.del_worksheet(old)
     tab = tabs.get(TAB)
     if tab is None:
         tab = book.add_worksheet(title=TAB, rows=82, cols=len(HEADERS))
@@ -325,6 +332,7 @@ class Breakout4HShadow:
         self.next_tick = 0
         self.next_attempt = 0
         self.next_sheet = 0
+        self.next_upload_at = 0
         self.lock = threading.Lock()
 
     def _fetch(self):
@@ -378,7 +386,9 @@ class Breakout4HShadow:
                     self.sheet_writer(self.state, now)
                 except Exception as error:
                     self.logger(f"[4H BREAK SHEETS] skipped: {type(error).__name__}")
-            if is_export_time and self.state["upload_day"] != today and now >= self.next_attempt - 15*60:
+            if (is_export_time and self.state["upload_day"] != today
+                    and now >= self.next_upload_at):
+                self.next_upload_at = now + 30*60
                 try:
                     keys = self.r2_upload(self.directory, export_payload(self.state, now), now)
                     self.state["upload_day"] = today
