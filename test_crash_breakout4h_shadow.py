@@ -165,7 +165,7 @@ class FourHourBreakShadowTests(unittest.TestCase):
         book.add_worksheet.return_value=created
         client=Mock()
         client.open_by_key.return_value=book
-        with patch("crash_sheets_dashboard._credentials",return_value=(client,"id")), \\
+        with patch("crash_sheets_dashboard._credentials",return_value=(client,"id")), \
              patch("crash_sheets_dashboard._name",return_value="emafilter"):
             self.assertTrue(sh.publish_sheet({"signals":[]},self.now))
         self.assertEqual([c.args[0].title for c in book.del_worksheet.call_args_list],
