@@ -244,7 +244,7 @@ class TrendBreakoutShadow:
                     continue
                 valid.sort()
                 relevant = [e for e in self.state["events"] if e["symbol"] == symbol
-                            and e.get("phase") != "MATURED"]
+                            and e.get("phase") == "TRACKING"]
                 for e in relevant:
                     for closed, high, low, price in valid:
                         if _add_bar(e, closed, high, low, price):
@@ -383,8 +383,15 @@ class TrendBreakoutShadow:
             self.running = True
             want_scan = now >= self.next_scan
             self.next_scan = max(self.next_scan, (int(now) // 900 + 1) * 900)
-            if not want_scan and (self.state.get("last_uploaded_day") == _date(now)
-                                  or now < (_number(self.state.get("retry_after")) or 0)):
+            # Main worker calls tick() frequently. A no-op must be truly cheap:
+            # no threads/files until next closed 15m scan or scheduled R2 upload.
+            local = datetime.fromtimestamp(now, PARIS)
+            upload_due = (
+                (local.hour, local.minute) >= (21, 15)
+                and self.state.get("last_uploaded_day") != _date(now)
+                and now >= (_number(self.state.get("retry_after")) or 0)
+            )
+            if not want_scan and not upload_due:
                 self.running = False
                 self.lock.release()
                 return
