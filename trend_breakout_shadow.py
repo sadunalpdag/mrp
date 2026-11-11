@@ -18,7 +18,7 @@ SCHEMA = "trend_breakout_shadow_v1"
 HORIZONS = (24, 48, 72)
 FOLLOWUP_SECONDS = 72 * 3600
 KEEP_SECONDS = 10 * 86400
-MAX_SYMBOLS = 50
+MAX_SYMBOLS = 20
 MAX_EVENTS = 500
 STEP_MS = 900000
 SYMBOL = re.compile(r"^[A-Z0-9]{2,24}USDT$")
@@ -171,7 +171,7 @@ def _r2_upload_files(json_path, zip_path, day, env=None):
 
 
 class TrendBreakoutShadow:
-    """Prospective top-50 loser channel-break observations, cache-only.
+    """Prospective top-20 loser channel-break observations, cache-only.
 
     API operations run on daemon thread. Only code named in this class controls
     its own state; exception handling never changes the trading executor.
@@ -213,10 +213,15 @@ class TrendBreakoutShadow:
             if SYMBOL.fullmatch(symbol) and drop is not None:
                 eligible.append((drop, symbol))
         ranked = [s for _, s in sorted(eligible)[:MAX_SYMBOLS]]
-        active = {e["symbol"] for e in self.state["events"]
-                  if e.get("phase") != "MATURED"
-                  and now < e["observed_at"] + FOLLOWUP_SECONDS + 3600}
-        symbols = list(dict.fromkeys(ranked + sorted(active)))
+        active = sorted(
+            (e for e in self.state["events"]
+             if e.get("phase") == "TRACKING"
+             and now < e["observed_at"] + FOLLOWUP_SECONDS + 3600),
+            key=lambda e: e["observed_at"], reverse=True)
+        # At most 20 symbols total, INCLUDING existing 72h follow-ups.
+        # Prioritize outstanding follow-ups over discovering new signals.
+        active_symbols = list(dict.fromkeys(e["symbol"] for e in active))
+        symbols = list(dict.fromkeys(active_symbols + ranked))[:MAX_SYMBOLS]
         events_seen = {(e["symbol"], e["direction"], e["confirmed_at"])
                        for e in self.state["events"]}
         new_count = 0
@@ -292,7 +297,7 @@ class TrendBreakoutShadow:
             if now - e.get("observed_at", 0) < KEEP_SECONDS
             or e.get("phase") == "TRACKING"][-MAX_EVENTS:]
         self._save()
-        self.log(f"[TREND SHADOW] symbols={len(symbols)}; new_breakouts={new_count}; "
+        self.log(f"[TREND SHADOW] symbols={len(symbols)}/20; new_breakouts={new_count}; "
                  f"events={len(self.state['events'])}; followup_bars={completed_bars}; "
                  "execution=OFF; no_extra_rest=1")
 
@@ -308,7 +313,7 @@ class TrendBreakoutShadow:
             "export_day_paris": day,
             "exported_at": now,
             "time_zone": "Europe/Paris",
-            "sampling": "top_50_usdtm_daily_losers_15m_close_only",
+            "sampling": "top_20_usdtm_daily_losers_15m_close_only",
             "breakout_definition": "5d channel; 2 consecutive closed 15m bars; 0.15% buffer",
             "followup_hours": list(HORIZONS),
             "price_path_disclaimer": "Candle OHLC does not reveal intrabar order; no fill or profit claims.",
