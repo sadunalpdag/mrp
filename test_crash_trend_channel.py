@@ -67,7 +67,7 @@ class TrendChannelTests(unittest.TestCase):
     def test_dashboard_uses_read_only_candle_callback_and_keeps_risk(self):
         symbols = {"TESTUSDT": {"signal_id": "1", "created_at": self.now - 60,
                     "v2_status": "STRONG_V2", "entry": 1, "tp": 1.01,
-                    "failure_shadow": {"flags": {"weak_volume": False,
+                    "failure_shadow": {"version": "tp_nonclosure_entry_gate_v2_atr", "flags": {"weak_volume": False,
                         "falling_rsi_ema": True, "repeat_lower_entry": False, "low_atr_15m": False}}}}
         calls = []
         def cached(symbol):
@@ -78,8 +78,8 @@ class TrendChannelTests(unittest.TestCase):
             {}, {}, self.now, candle_get=cached)
         self.assertEqual(calls, ["TESTUSDT"])
         self.assertEqual(table[1][13], 1)
-        self.assertEqual(table[1][22], "⚪ VERİ YOK")
-        self.assertEqual(table[1][26], "64/480")  # Short WS-only history cannot claim a 5d break
+        self.assertEqual(table[1][23], "⚪ VERİ YOK")
+        self.assertEqual(table[1][27], "64/480")  # Short WS-only history cannot claim a 5d break
         self.assertEqual(len(table[1]), len(HEADERS))
         self.assertEqual(colors[0], ("green", "green"))
 
