@@ -7779,8 +7779,8 @@ class CrashBounceWebSocketCache:
         with self.lock:
             if research_symbols is not None:
                 research = {s for s in research_symbols if supported_symbol(s)}
-                # 36 existing scalp slots + 50 structure monitor slots.
-                if len(research) > 86:
+                # Only bounded Pullback paper observers use shadow subscriptions.
+                if len(research) > 20:
                     raise ValueError("Too many shadow research subscriptions")
                 self.shadow_wanted = research
             wanted = base | self.shadow_wanted
@@ -8083,41 +8083,19 @@ def _crash_load_market_cache():
 
 
 
-def _crash_structure_onboard():
-    """Metadata only; no network, unknown ages stay unknown in the monitor."""
-    try:
-        with open(CRASH_BOUNCE_MARKET_FILE, encoding='utf-8') as handle:
-            return json.load(handle).get('onboard_dates', {})
-    except (OSError, ValueError):
-        return {}
-
-
-def _crash_structure_queue(symbol, now, source='structure'):
-    """Shared low-priority research warmup, capped at three queued symbols.
-
-    Both StructureAgent and paper-scalp observers may propose missing history.
-    Real Crash signal/entry jobs always go first; the existing collector owns
-    all archive/REST pacing, cooldown and fallback decisions.
-    """
-    if source not in ('structure', 'scalp'):
-        raise ValueError('INVALID_RESEARCH_WARMUP_SOURCE')
-    prefixes = ('structure-warmup:', 'scalp-warmup:')
+def _crash_pullback_queue(symbol, now):
+    """Only Pullback's low-priority warmup remains; no Structure/Break Bounce jobs."""
     with _CRASH_STATE_LOCK:
         collector = globals().get('_CRASH_HISTORY_COLLECTOR')
         if collector is not None:
             with collector.lock:
                 jobs = list(collector.jobs.values())
-                def research(job):
-                    return (job.get('phase') == 'warmup' and
-                            str(job.get('signal_id', '')).startswith(prefixes))
-                if (sum(research(j) for j in jobs) >= 3
-                        or any(j.get('symbol') == symbol and
-                               j.get('phase') == 'warmup' for j in jobs)
-                        or any(not research(j) and j.get('retry_after', 0) <= now
+                if (sum(j.get('phase') == 'warmup' for j in jobs) >= 3
+                        or any(j.get('symbol') == symbol and j.get('phase') == 'warmup' for j in jobs)
+                        or any(j.get('phase') != 'warmup' and j.get('retry_after', 0) <= now
                                for j in jobs)):
                     return False
-        _crash_queue_history({'symbol':symbol,
-                              'signal_id':source+'-warmup:'+symbol},
+        _crash_queue_history({'symbol': symbol, 'signal_id': 'pullback-warmup:' + symbol},
                              'warmup', now)
         return True
 
@@ -8173,26 +8151,19 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                       r.get("tracking_model")=="ws_aggtrade_upcross_v3"
                       and r.get("v2_status")=="STRONG_V2"
                       and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
-    # Shadow uses different 24h top-GAINER rank bands, leaving the V2 loser
-    # selection and order-watching streams completely unchanged.
+    # No Structure Agent or Break Bounce extra ticker/aggTrade subscribers.
+    # Pullback still uses its existing bounded 10-symbol observer universe.
     research_symbols = set()
     if os.getenv("SCALP_SHADOW_ENABLED", "1") == "1":
         try:
             from scalp_shadow_week import gainer_groups, open_shadow_symbols
             groups = gainer_groups(tickers, market)
-            research_symbols = set(groups["PULLBACK"] + groups["BREAK_BOUNCE"])
-            research_symbols.update(open_shadow_symbols(DATA_DIR, now, max_extra=16))
+            research_symbols = set(groups["PULLBACK"])
+            research_symbols.update(open_shadow_symbols(DATA_DIR, now, max_extra=10))
         except Exception as error:
-            log(f"[SCALP SHADOW SUBS] skipped: {type(error).__name__}")
-    if os.getenv("STRUCTURE_MONITOR_ENABLED", "1") == "1":
-        try:
-            from structure_agent_monitor import universe
-            research_symbols.update(t['symbol'] for t in universe(
-                tickers, market, _crash_structure_onboard(), now))
-        except Exception as error:
-            log(f"[STRUCTURE MONITOR SUBS] skipped: {type(error).__name__}")
+            log(f"[PULLBACK SHADOW SUBS] skipped: {type(error).__name__}")
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
-                              trade_watching, research_symbols=research_symbols)
+                               trade_watching, research_symbols=research_symbols)
     _crash_append_data({"type":"scan", "observed_at":now,
         "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":150,"tracking_model":"ws_aggtrade_upcross_v3",
                          "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480,
@@ -8643,31 +8614,24 @@ def _crash_bounce_worker():
         candle_audit = CandleAudit(CRASH_BOUNCE_RESEARCH_DIR, log)
     except Exception as error:
         log(f'[CRASH 15M AUDIT SETUP SKIPPED] {type(error).__name__}')
-    # Prospective 7-day scalp research: existing CLOSED WS candles only,
-    # independent paper outcomes, no REST/orders/new WS subscriptions.
+    # Keep the Pullback paper test; removed Structure Agent and Break Bounce.
     scalp_shadow = None
     if os.getenv("SCALP_SHADOW_ENABLED", "1") == "1":
         try:
             from scalp_shadow_week import ShadowWeek
-            scalp_shadow = ShadowWeek(
-                DATA_DIR, log,
-                queue_history=lambda symbol, at: _crash_structure_queue(
-                    symbol, at, source='scalp'))
-            log("[SCALP SHADOW] paper monitor ready; no REST, no trades")
+            scalp_shadow = ShadowWeek(DATA_DIR, log, queue_history=_crash_pullback_queue)
+            log("[PULLBACK SHADOW] active; structure/break-bounce removed")
         except Exception as error:
-            log(f"[SCALP SHADOW SETUP] skipped: {type(error).__name__}")
-    structure_monitor = None
-    if os.getenv("STRUCTURE_MONITOR_ENABLED", "1") == "1":
+            log(f"[PULLBACK SHADOW SETUP] skipped: {type(error).__name__}")
+    # Independent 4h CoinBeacon paper-long observer; no real broker/order access.
+    break4h = None
+    if os.getenv("BREAKOUT4H_SHADOW_ENABLED", "1") == "1":
         try:
-            from structure_agent_monitor import StructureMonitor
-            structure_monitor = StructureMonitor(DATA_DIR, log, _crash_structure_queue)
-            # Refresh old metadata once to learn contract ages. The existing
-            # metadata gate, cooldown and IP budget remain in force.
-            if market and not _crash_structure_onboard():
-                next_metadata = 0
-            log('[STRUCTURE MONITOR] ready; mode=MONITOR_ONLY; execution=OFF')
+            from breakout4h_shadow import Breakout4HShadow
+            break4h = Breakout4HShadow(DATA_DIR, log)
+            log("[4H BREAK] ready; CoinBeacon key env=hbreak; PAPER ONLY")
         except Exception as error:
-            log(f'[STRUCTURE MONITOR SETUP] skipped: {type(error).__name__}')
+            log(f"[4H BREAK SETUP] skipped: {type(error).__name__}")
     try:
         _crash_start_shadow()
     except Exception as error:
@@ -8794,13 +8758,12 @@ def _crash_bounce_worker():
                                   _CRASH_WS_CACHE.candles, market)
             except Exception as error:
                 log(f"[SCALP SHADOW SCHEDULE] skipped: {type(error).__name__}")
-        if structure_monitor is not None:
+        if break4h is not None:
             try:
-                structure_monitor.tick(_CRASH_WS_CACHE.snapshot(time.time()),
-                                       _CRASH_WS_CACHE.candles, dict(market),
-                                       _crash_structure_onboard())
+                break4h.tick(_CRASH_WS_CACHE.snapshot(time.time()),
+                             market, _CRASH_WS_CACHE.candles)
             except Exception as error:
-                log(f'[STRUCTURE MONITOR SCHEDULE] skipped: {type(error).__name__}')
+                log(f"[4H BREAK SCHEDULE] skipped: {type(error).__name__}; no trading impact")
         time.sleep(max(1,min(15,next_scan-time.time())))
 
 
