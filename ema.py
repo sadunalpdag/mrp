@@ -7354,7 +7354,7 @@ def _crash_daily_report(state, now):
                  "Yeni sanal giriş/TP yalnız sıralı futures aggTrade WS olaylarıyla izlenir. "
                  "ENTRY_ABOVE_TP ayrı MISSED_SIGNAL sayılır, TP sayılmaz. "
                  "Eski sampled_upward_cross_v2 kayıtları tarihsel olarak ayrı tutulur. "
-                 Günlük ZIP yalnız son 7 UTC gününün observations/*.jsonl dosyalarını içerir; eski R2 ZIP dosyaları değiştirilmez. "
+                 "Günlük ZIP yalnız son 7 UTC gününün observations/*.jsonl dosyalarını içerir; eski R2 ZIP dosyaları değiştirilmez. "
                  "observations/*.jsonl içindeki history_5d olayları sinyal/ giriş anından önceki en fazla 480 kapalı 15m mumu içerir. "
                  "as_of olay zamanı, fetched_at indirme zamanıdır; complete/missing_candles eksik geçmişi gösterir. "
                  "Eski girişlere sonradan entry_features üretilmez; geçmiş mumlar indirilebilir. "
