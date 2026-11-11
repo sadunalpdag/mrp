@@ -155,6 +155,10 @@ def parse_setups(payload, close_ms, prices, now, directory, candle_get, market):
         if event_at is None or abs(event_at - close_ms) > 1000:
             continue
         entry = finite(prices.get(sym))
+        entry_source = "BINANCE_FUTURES_WS_TICKER"
+        if entry is None or entry <= 0:
+            entry = finite(item.get("price"))
+            entry_source = "COINBEACON_BINANCE_FUTURES_PRICE"
         if entry is None or entry <= 0:
             continue
         bars = _four_hour_bars(directory, sym, candle_get(sym), now)
@@ -164,6 +168,7 @@ def parse_setups(payload, close_ms, prices, now, directory, candle_get, market):
         rid = f"{MODEL}:{sym}:{int(event_at)}:{arch.get('eventKind')}"
         result.append({
             "id": rid, "symbol": sym, "status": "OPEN", "created_at": now,
+            "entry_source": entry_source,
             "breakout_close_ms": int(event_at), "breakout": arch.get("eventKind"),
             "breakout_label": str(arch.get("label", ""))[:120],
             "sqs": finite(item.get("sqs")), "entry": entry,
@@ -333,6 +338,8 @@ class Breakout4HShadow:
         self.next_attempt = 0
         self.next_sheet = 0
         self.next_upload_at = 0
+        self.metrics_requests_today = ""
+        self.metrics_requests_count = 0
         self.lock = threading.Lock()
 
     def _fetch(self):
@@ -352,6 +359,44 @@ class Breakout4HShadow:
         result.raise_for_status()
         return result.json()
 
+    def _fetch_ohlcv(self, symbol, close_ms):
+        """Optional 1-credit lookup for 4h indicators missing from local cache."""
+        import requests
+        key = (os.getenv("hbreak") or os.getenv("HBREAK") or
+               os.getenv("COINBEACON_API_KEY") or "").strip()
+        if not key:
+            raise ValueError("HBREAK_KEY_NOT_CONFIGURED")
+        if not symbol.isascii() or not symbol.isalnum() or not symbol.endswith("USDT"):
+            raise ValueError("INVALID_MARKET_SYMBOL")
+        url = f"https://api.coinbeacon.io/public/ohlcv/binance-futures/{symbol}/4h"
+        client = requests.get if self.http_get is None else self.http_get
+        response = client(url, headers={"X-API-Key": key},
+                          params={"limit": 64}, timeout=25)
+        response.raise_for_status()
+        payload = response.json()
+        if (not isinstance(payload, dict) or payload.get("symbol") != symbol
+                or payload.get("timeframe") != "4h"
+                or not isinstance(payload.get("bars"), list)):
+            raise ValueError("INVALID_COINBEACON_OHLCV")
+        bars = []
+        # Do not use any still-forming or post-signal candles (no lookahead).
+        for obj in payload["bars"]:
+            if not isinstance(obj, dict):
+                continue
+            try:
+                start, end = int(obj["openTime"]), int(obj["closeTime"])
+                values = [float(obj[k]) for k in ("open", "high", "low", "close", "volume")]
+                if (start % FOUR_H_MS or end != start + FOUR_H_MS - 1
+                        or end > close_ms or min(values[0],values[2],values[3]) <= 0
+                        or values[4] < 0 or values[1] < max(values[0],values[3],values[2])
+                        or values[2] > min(values[0],values[3])
+                        or not all(math.isfinite(v) for v in values)):
+                    continue
+                bars.append([start, *values, end])
+            except (ValueError, KeyError, TypeError, OverflowError):
+                continue
+        return sorted(bars, key=lambda row: row[0])
+
     def _work(self, prices, market, candle_get, now):
         try:
             changed = update_prices(self.state, prices, now)
@@ -362,15 +407,49 @@ class Breakout4HShadow:
                     data = self._fetch()
                     new = parse_setups(data, slot, prices, now, self.directory, candle_get, market)
                     ids = {r["id"] for r in self.state["signals"]}
-                    active_symbols = {r["symbol"] for r in self.state["signals"] if r["status"] == "OPEN"}
                     appended = 0
+                    # One new paper entry per coin per 4h candle. An older
+                    # paper entry may still be open; it must not suppress a
+                    # genuinely new independent breakout on a later candle.
+                    seen_on_bar = set()
                     for rec in new:
-                        if rec["id"] not in ids and rec["symbol"] not in active_symbols:
-                            self.state["signals"].append(rec)
-                            appended += 1
-                    self.state["last_scan_slot"] = slot
+                        unique = (rec["symbol"], rec["breakout_close_ms"])
+                        if rec["id"] in ids or unique in seen_on_bar:
+                            continue
+                        seen_on_bar.add(unique)
+                        if rec["metric_status"] != "COMPLETE":
+                            day = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y-%m-%d")
+                            if day != self.metrics_requests_today:
+                                self.metrics_requests_today, self.metrics_requests_count = day, 0
+                            # At most 900 individual 1-credit OHLCV lookups per
+                            # UTC day; 6 x 150 is the maximum setup-board size.
+                            if self.metrics_requests_count < 900:
+                                self.metrics_requests_count += 1
+                                try:
+                                    bars = self._fetch_ohlcv(rec["symbol"], rec["breakout_close_ms"])
+                                    values = indicators(bars)
+                                    if values["bars_4h"] > rec["bars_4h"]:
+                                        rec.update(values)
+                                        rec["metric_source"] = "coinbeacon_closed_4h_ohlcv"
+                                        rec["metric_status"] = (
+                                            "COMPLETE" if all(values.get(k) is not None for k in
+                                                ("rsi14_4h", "atr14_pct_4h", "volume_ratio_4h"))
+                                            else "PARTIAL")
+                                except Exception as exc:
+                                    self.logger("[4H BREAK OHLCV] deferred for indicator: " +
+                                                type(exc).__name__)
+                        self.state["signals"].append(rec)
+                        ids.add(rec["id"])
+                        appended += 1
+                    # Skip stale board snapshots; retry within this 4h candle.
+                    observed_fresh = any(
+                        isinstance(row,dict) and row.get("tf") == "4h" and
+                        finite(row.get("computedAt")) == slot
+                        for row in data.get("setups", []))
+                    if observed_fresh or not data.get("setups"):
+                        self.state["last_scan_slot"] = slot
                     changed = True
-                    self.logger(f"[4H BREAK BEACON] candidates={len(new)}; new_paper_longs={appended}; source=coinbeacon; real_orders=0")
+                    self.logger(f"[4H BREAK BEACON] candidates={len(new)}; new_paper_longs={appended}; board_fresh={int(observed_fresh)}; source=coinbeacon; real_orders=0")
                 except Exception as error:
                     # Never print the URL, request headers, API key or HTTP error body.
                     self.logger(f"[4H BREAK BEACON] scan deferred: {type(error).__name__}; retry_15m=1")
