@@ -28,14 +28,14 @@ HEADERS = [
     "Coin", "24s değişim %", "Düşüş sırası", "Son fiyat", "V2 durumu",
     "RSI14", "4s toparlanma %", "Güç /100", "Önceki güç", "Puan farkı",
     "Giriş", "TP", "Giriş uzaklık %", "Risk /4", "Zayıf hacim",
-    "RSI/EMA düşüyor", "Tekrar düşük sinyal", "Pozisyon kuralı",
+    "RSI/EMA düşüyor", "Tekrar düşük sinyal", "ATR riski (15dk < %1,3)", "Pozisyon kuralı",
     "Uygunluk", "Sinyal takibi", "Güncelleme", "Sinyal zamanı",
     "Trend kırılımı (5g / 15m)", "Üst çizgi uzaklık %", "Kırılım onay zamanı",
     "Kırılım yönü", "5g veri (15m)", "Destek 1 (5g)", "Direnç 1 (5g)",
     "Fibo 0 dip", "Fibo 23,6", "Fibo 38,2", "Fibo 50",
     "Fibo 61,8", "Fibo 78,6", "Fibo 100 tepe", "Fibo bandı",
     "Sinyal anı V2 mum", "V2 eksik veri açıklaması",
-    "Sonradan V2 kontrolü (emirsiz)", "ATR riski (15dk < %1,3)",
+    "Sonradan V2 kontrolü (emirsiz)",
 ]
 FLAGS = ("weak_volume", "falling_rsi_ema", "repeat_lower_entry", "low_atr_15m")
 PARIS = ZoneInfo("Europe/Paris")
@@ -65,20 +65,39 @@ def _name(title):
     return re.sub(r"[^a-z0-9]", "", str(title).lower())
 
 def _risk(rec):
+    """Four signal-time risk flags for display; never grants BUY permission.
+
+    Before the ATR tier existed, stored failure_shadow held only three flags.
+    Display the fourth from original-time V2 strength metrics when available;
+    never rewrite historical failure_shadow or the live executor's decisions.
+    """
+    from crash_failure_shadow import ATR_MIN_PCT, LEGACY_VERSION, VERSION
     item = rec.get("failure_shadow") or {}
     flags = item.get("flags") if isinstance(item, dict) else None
     if not isinstance(flags, dict):
-        # Never claim YOK when the underlying signal-time measure is unknown.
         return None, ["VERİ EKSİK"] * 4, "EKSİK: otomatik alış yok"
-    # Show each known criterion independently; unknown is never interpreted as safe.
-    marks = [("🔴 VAR" if flags[k] else "🟢 YOK")
-             if type(flags.get(k)) is bool else "VERİ EKSİK" for k in FLAGS]
-    if any(type(flags.get(k)) is not bool for k in FLAGS):
-        return None, marks, "EKSİK: otomatik alış yok"
-    count = sum(flags[k] for k in FLAGS)
+    legacy = item.get("version") == LEGACY_VERSION
+    # Historical records without a version also predate the new ATR marker.
+    # Dashboard may show these, but never treats them as eligible for real BUY.
+    legacy = legacy or item.get("version") not in (VERSION, LEGACY_VERSION)
+    observed = [flags.get(k) for k in FLAGS]
+    if legacy and type(observed[3]) is not bool:
+        strength = (rec.get("v2_features") or {}).get("strength_score") or {}
+        metrics = strength.get("metrics") or {}
+        atr = _num(metrics.get("atr14_pct"))
+        if atr is not None and atr >= 0:
+            observed[3] = atr < ATR_MIN_PCT
+    marks = [("🔴 VAR" if val else "🟢 YOK")
+             if type(val) is bool else "VERİ EKSİK" for val in observed]
+    if any(type(val) is not bool for val in observed):
+        return None, marks, ("ESKİ SİNYAL: risk kaydı eksik; gerçek alış yok"
+                             if legacy else "EKSİK: otomatik alış yok")
+    count = sum(observed)
     rule = ("⛔ İŞLEM YOK" if count == 4 else
             "⚠️ %30 / TP %0,5" if count == 3 else
             "⚖️ %50 / TP %0,5" if count == 2 else "✅ %100 / TP %1")
+    if legacy:
+        rule = f"📚 ESKİ SİNYAL: {count}/4 risk; gerçek alış yok"
     return count, marks, rule
 
 
@@ -94,6 +113,13 @@ def _status(rec, risk):
     if not rec:
         return "⚪ AKTİF ADAY KAYDI YOK", "grey"
     v2 = rec.get("v2_status")
+    if v2 == "STRONG_V2":
+        from crash_failure_shadow import VERSION
+        shadow = rec.get("failure_shadow") or {}
+        if not isinstance(shadow, dict) or not isinstance(shadow.get("flags"), dict):
+            return "🔴 RİSK VERİSİ EKSİK — ALIŞ YOK", "red"
+        if shadow.get("version") != VERSION:
+            return "⚪ ESKİ SİNYAL / EMİR YOK", "grey"
     if risk == 4 or risk is None and v2 == "STRONG_V2":
         return "🔴 ALIŞ YOK (RİSK)", "red"
     if v2 == "STRONG_V2" and risk is not None:
@@ -280,7 +306,7 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
              "HESAPLANAMADI"),
             old_score if old_score is not None else "—", difference,
             entry if entry is not None else "—", tp if tp is not None else "—", dist,
-            risk if risk is not None else "—", *flags[:3], rule, status,
+            risk if risk is not None else "—", *flags, rule, status,
             rec.get("tracking_status", "—") if has_signal else "—",
             _time(now), _time(rec.get("created_at")) if has_signal else "—",
             trend_label, trend["distance_pct"] if trend["distance_pct"] is not None else "—",
@@ -291,7 +317,6 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
             *[(trend["fib"].get(k) if trend["fib"].get(k) is not None else "—")
               for k in ("0", "23.6", "38.2", "50", "61.8", "78.6", "100")],
             trend["fib_band"], original_coverage, missing_explanation, retrospective,
-            flags[3],
         ])
         colors.append((color, 'grey' if risk is None else 'green' if risk <= 1 else 'yellow' if risk in (2, 3) else 'red'))
     history = state.get("history") or []
@@ -438,7 +463,7 @@ def _format(sheet, status, signal, colors, signal_rows):
     # background fills used to survive when a coin moved to a different row.
     # Clear ONLY panel-owned indicator/risk backgrounds before recoloring the
     # currently measured cells (no other workbook content or tabs touched).
-    for first_col, last_col in ((5, 8), (13, 17), (40, 41)):
+    for first_col, last_col in ((5, 8), (13, 18)):
         requests.append({"repeatCell": {
             "range": {"sheetId": signal.id, "startRowIndex": 1,
                       "endRowIndex": MAX_ROWS + 1,
@@ -460,22 +485,22 @@ def _format(sheet, status, signal, colors, signal_rows):
         if distance is not None:
             extra.append((12, "green" if abs(distance) <= 0.3 else
                           "yellow" if abs(distance) <= 1 else "red"))
-        for j in (14, 15, 16, 40):
+        for j in (14, 15, 16, 17):
             if data[j] in ("🟢 YOK", "🔴 VAR"):
                 extra.append((j, "green" if data[j] == "🟢 YOK" else "red"))
-        trend_status = str(data[22])
+        trend_status = str(data[23])
         trend_tone = ("green" if trend_status.startswith("🟢") else
                       "yellow" if trend_status.startswith("🟡") else
                       "red" if trend_status.startswith("🔴") else "grey")
-        extra.append((22, trend_tone))
-        direction_tone = ("green" if data[25] == "YUKARI" else
-                          "red" if data[25] == "AŞAĞI" else "grey")
-        extra.append((25, direction_tone))
-        distance_to_upper = _num(data[23])
+        extra.append((23, trend_tone))
+        direction_tone = ("green" if data[26] == "YUKARI" else
+                          "red" if data[26] == "AŞAĞI" else "grey")
+        extra.append((26, direction_tone))
+        distance_to_upper = _num(data[24])
         if distance_to_upper is not None:
-            extra.append((23, "green" if trend_tone == "green" else
+            extra.append((24, "green" if trend_tone == "green" else
                           "yellow" if abs(distance_to_upper) <= 0.5 else "grey"))
-        for column, tone in [(18, kind), (13, risk_kind)] + extra:
+        for column, tone in [(19, kind), (13, risk_kind)] + extra:
             requests.append({"repeatCell": {"range": {"sheetId": signal.id,
                 "startRowIndex": i, "endRowIndex": i + 1,
                 "startColumnIndex": column, "endColumnIndex": column + 1},
@@ -500,6 +525,43 @@ def _write_previous(path, data):
         os.fsync(fh.fileno())
     os.replace(tmp, path)
 
+def _ensure_four_risk_columns(sheet, signal, logger=None):
+    """One-time Sheets schema migration: add ATR column R beside O/P/Q.
+
+    Detect the prior layout by the original position-rule header. Sheets shifts
+    the existing dropdown validation, formatting, formulas and cell content as
+    a real column insert; remove the now-obsolete last ATR-only column if present.
+    This touches only the existing Sinyal worksheet, never other tabs or broker.
+    """
+    if not callable(getattr(signal, "get", None)):
+        return False
+    try:
+        current = signal.get("R1:AO1")
+    except Exception as error:
+        if logger:
+            logger("[CRASH SHEETS ATR COLUMN] header read skipped: " + type(error).__name__)
+        return False
+    if not (isinstance(current, list) and current and isinstance(current[0], list)
+            and current[0] and current[0][0] == "Pozisyon kuralı"):
+        return False
+    # Old ATR was in AO (41st column); R becomes new fourth-risk column.
+    existing_atr = (len(current[0]) >= 24
+                    and current[0][23] == "ATR riski (15dk < %1,3)")
+    requests = [{"insertDimension": {
+        "range": {"sheetId": signal.id, "dimension": "COLUMNS",
+                  "startIndex": 17, "endIndex": 18},
+        "inheritFromBefore": False}}]
+    if existing_atr:
+        requests.append({"deleteDimension": {"range": {
+            "sheetId": signal.id, "dimension": "COLUMNS",
+            "startIndex": 41, "endIndex": 42}}})
+    sheet.batch_update({"requests": requests})
+    if logger:
+        logger("[CRASH SHEETS ATR COLUMN] fourth flag inserted at R; "
+               f"old_ATR_last_column_removed={int(existing_atr)}")
+    return True
+
+
 def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_get=None,
             logger=None):
     client, sheet_id = _credentials()
@@ -507,6 +569,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
         return False
     sheet = client.open_by_key(sheet_id)
     status, signal, legacy_status = _tabs(sheet)
+    _ensure_four_risk_columns(sheet, signal, logger)
     # Expand only the existing Sinyal tab; never create or delete worksheets.
     if getattr(signal, "col_count", len(HEADERS)) < len(HEADERS):
         sheet.batch_update({"requests": [{"updateSheetProperties": {

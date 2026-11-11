@@ -97,7 +97,7 @@ class FiveDayLevelsTests(unittest.TestCase):
                 json.dump(self.candles("up")[:-64], fh)
             record = {"signal_id": "s1", "v2_status": "STRONG_V2",
                       "created_at": self.now-60, "entry": 1, "tp": 1.01,
-                      "failure_shadow": {"flags": {"weak_volume": False,
+                      "failure_shadow": {"version": "tp_nonclosure_entry_gate_v2_atr", "flags": {"weak_volume": False,
                           "falling_rsi_ema": False, "repeat_lower_entry": False, "low_atr_15m": False}}}
             state = {"symbols": {"TESTUSDT": record}, "history": []}
             before = json.dumps(state, sort_keys=True)
@@ -107,10 +107,10 @@ class FiveDayLevelsTests(unittest.TestCase):
                                        directory=td)
             self.assertEqual(len(HEADERS), 41)
             self.assertEqual(len(rows[1]), 41)
-            self.assertEqual(rows[1][22], "🟢 KIRDI")
-            self.assertEqual(rows[1][25], "YUKARI")
-            self.assertEqual(rows[1][26], "480/480")
-            self.assertIsInstance(rows[1][32], float)
+            self.assertEqual(rows[1][23], "🟢 KIRDI")
+            self.assertEqual(rows[1][26], "YUKARI")
+            self.assertEqual(rows[1][27], "480/480")
+            self.assertIsInstance(rows[1][33], float)
             self.assertEqual(json.dumps(state, sort_keys=True), before)
             self.assertEqual(rows[1][13], 0)
 
