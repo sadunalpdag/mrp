@@ -56,7 +56,7 @@ def plan(record, info, position_usdt='50', tp_pct='0.01'):
     if rate not in (D('0.005'), D('0.01')):
         raise ValueError('INVALID_TP_RATE')
     # Full-sized entries retain the original 1% signal target. Half-sized,
-    # 2/3-risk entries use a new 0.5% target from the rounded entry price;
+    # 2–3 risk entries use a 0.5% target from the rounded entry price;
     # never inherit the 1% TP from the original V2 signal.
     target = (max(D(str(record['tp'])), entry * (D('1') + rate))
               if rate == D('0.01') else entry * (D('1') + rate))
@@ -1285,7 +1285,7 @@ class NightExecutor:
             'SYMBOL_QUARANTINED': 'Bu coin 8 saatlik güvenlik karantinasında.',
             'ALERT_PENDING': 'İşlemi engelleyen güvenlik uyarısı henüz tamamlanmadı.',
             'TRACKING_INACTIVE': 'Sanal giriş takibi artık aktif değil.',
-            'RISK_BLOCKED': '3 risk kriteri veya eksik risk değerlendirmesi nedeniyle giriş yasak.',
+            'RISK_BLOCKED': '4 risk kriteri, eski veya eksik risk değerlendirmesi nedeniyle giriş yasak.',
         }
         # A safety halt already has its own durable warning. Do NOT put
         # optional skip notices into the blocking outbox: a failed Telegram
@@ -1359,8 +1359,8 @@ class NightExecutor:
         if reason:
             self.entry_skip(symbol, reason)
             return
-        # Three concurrent risk flags or incomplete assessment fail closed.
-        # Zero/one flags use the configured notional; two flags use half.
+        # Four concurrent risk flags or incomplete/old assessment fail closed.
+        # 0/1 full, 2 half, 3 thirty percent; existing orders stay unchanged.
         # This is an entry-only decision. Existing orders/TPs are untouched.
         risk_block = entry_block_reason(record)
         fraction = position_fraction(record)
@@ -1372,7 +1372,7 @@ class NightExecutor:
         target_usdt = configured_usdt * D(str(fraction))
         flags = record['failure_shadow']['flags']
         risk_count = sum(flags.values())
-        tp_pct = D('0.005') if risk_count == 2 else D('0.01')
+        tp_pct = D('0.005') if risk_count in (2, 3) else D('0.01')
         if self.daily_count() >= self.max_daily:
             self.entry_skip(symbol, 'DAILY_LIMIT')
             return
@@ -1436,15 +1436,15 @@ class NightExecutor:
         order = dict(symbol=symbol, day=day(now), phase='ENTRY_UNKNOWN',
                      entry_kind='GTC', submitted_at=now, entry_id=cid+'e',
                      tp_id=cid+'t', risk_sizing_version=SIZING_VERSION,
-                     risk_flags={k: flags[k] for k in ("weak_volume", "falling_rsi_ema", "repeat_lower_entry")},
+                     risk_flags={k: flags[k] for k in ("weak_volume", "falling_rsi_ema", "repeat_lower_entry", "low_atr_15m")},
                      risk_flag_count=risk_count, risk_position_fraction=fraction,
                      risk_configured_usdt=str(configured_usdt),
                      risk_target_usdt=str(target_usdt),
-                     risk_tp_pct=str(tp_pct), risk_tp_policy_version='risk_tier_tp_v1',
+                     risk_tp_pct=str(tp_pct), risk_tp_policy_version='risk_tier_tp_v2_four_flags',
                      risk_effective_notional_usdt=str(D(p['quantity'])*D(p['price'])), **p)
         self.state['orders'][sid] = order
         self.save()  # Persist before POST; unknown responses are never blindly retried.
-        self.log(f'[CRASH RISK SIZING] {symbol}; flags={risk_count}/3; '
+        self.log(f'[CRASH RISK SIZING] {symbol}; flags={risk_count}/4; '
                  f'fraction={fraction}; base_usdt={configured_usdt}; '
                  f'target_usdt={target_usdt}; tp_pct={tp_pct}; tp_price={p["tp"]}; '
                  f'quantity={p["quantity"]}; '
