@@ -516,8 +516,8 @@ def _publish(obj):
         if strategy == "PULLBACK" and getattr(tabs[key], "col_count", 16) < 16:
             tabs[key].resize(cols=16)
     # Writes only own tabs, overwrites fixed ranges (never appends indefinitely).
-    data = [{"range": "'" + ws.title.replace("'", "''") +
-                       "'!A1:P80"             "values": _tab_values(obj, strategy)}
+    data = [{"range": "'" + ws.title.replace("'", "''") + "'!A1:P80",
+             "values": _tab_values(obj, strategy)}
             for strategy, ws in targets.items()]
     book.values_batch_update({"valueInputOption": "RAW", "data": data})
     return True
