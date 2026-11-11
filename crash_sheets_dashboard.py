@@ -90,7 +90,7 @@ def _risk(rec):
     marks = [("🔴 VAR" if val else "🟢 YOK")
              if type(val) is bool else "VERİ EKSİK" for val in observed]
     if any(type(val) is not bool for val in observed):
-        return None, marks, ("ESKİ SİNYAL: risk kaydı eksik; yeni alış yok"
+        return None, marks, ("ESKİ SİNYAL: risk kaydı eksik; gerçek alış yok"
                              if legacy else "EKSİK: otomatik alış yok")
     count = sum(observed)
     rule = ("⛔ İŞLEM YOK" if count == 4 else
