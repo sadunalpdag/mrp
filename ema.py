@@ -7597,6 +7597,7 @@ class CrashBounceWebSocketCache:
         self.rows = {}
         self.last_ws_closed = {}  # Direct x=true events during THIS connection only.
         self.wanted = set()
+        self.crash_watched = set()  # Crash Bounce's existing subscribed base only.
         self.shadow_wanted = set()  # bounded research-only kline streams
         self.trade_wanted = set()
         self._loading = False
@@ -7770,6 +7771,10 @@ class CrashBounceWebSocketCache:
             except Exception:
                 ws.close()
 
+    def crash_watched_symbols(self):
+        with self.lock:
+            return set(self.crash_watched)
+
     def reconcile(self, symbols, trade_symbols=None, research_symbols=None):
         from crash_policy import supported_symbol
         base = {s for s in symbols if supported_symbol(s)}
@@ -7784,6 +7789,7 @@ class CrashBounceWebSocketCache:
                     raise ValueError("Too many shadow research subscriptions")
                 self.shadow_wanted = research
             wanted = base | self.shadow_wanted
+            self.crash_watched = set(base)
             old, self.wanted = self.wanted, wanted
             old_trades, self.trade_wanted = self.trade_wanted, trades
         # Existing single WebSocket: NO REST, no extra socket or real orders.
@@ -8668,6 +8674,16 @@ def _crash_bounce_worker():
             log('[STRUCTURE MONITOR] ready; mode=MONITOR_ONLY; execution=OFF')
         except Exception as error:
             log(f'[STRUCTURE MONITOR SETUP] skipped: {type(error).__name__}')
+    # Breakout shadow observes top 50 losers every closed 15m candle,
+    # tracks 24/48/72h price movement and privately archives JSON+ZIP to R2.
+    # No execution flags, Binance REST or new WS subscriptions.
+    trend_shadow = None
+    if os.getenv("TREND_BREAKOUT_SHADOW_ENABLED", "1") == "1":
+        try:
+            from trend_breakout_shadow import TrendBreakoutShadow
+            trend_shadow = TrendBreakoutShadow(DATA_DIR, log)
+        except Exception as error:
+            log(f'[TREND SHADOW SETUP] skipped: {type(error).__name__}')
     try:
         _crash_start_shadow()
     except Exception as error:
@@ -8801,6 +8817,15 @@ def _crash_bounce_worker():
                                        _crash_structure_onboard())
             except Exception as error:
                 log(f'[STRUCTURE MONITOR SCHEDULE] skipped: {type(error).__name__}')
+        if trend_shadow is not None and state is not None:
+            try:
+                # Read-only input snapshot; follow-up and R2 uploads execute
+                # in a separate daemon and can never hold the trading lock.
+                trend_shadow.tick(_CRASH_WS_CACHE.snapshot(time.time()),
+                                  _CRASH_WS_CACHE.candles, state.get("history", []),
+                                  _CRASH_WS_CACHE.crash_watched_symbols())
+            except Exception as error:
+                log(f'[TREND SHADOW SCHEDULE] skipped: {type(error).__name__}')
         time.sleep(max(1,min(15,next_scan-time.time())))
 
 
