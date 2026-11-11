@@ -272,6 +272,131 @@ class SheetDashboardTests(unittest.TestCase):
             dash._tabs(book)
         self.assertFalse(book.worksheets.called)
 
+    def test_both_bot_status_tab_spellings_update_in_one_batch(self):
+        # Regression: normalized keys 'Bot Status' and 'BOT_STATUS' collide.
+        for titles in (
+            ["BOT_STATUS", "Bot Status", "Sinyal"],
+            ["Bot Status", "Sinyal", "BOT_STATUS"],
+        ):
+            with self.subTest(order=titles):
+                book = Mock(title="EMA Filter")
+                book.worksheets.return_value = [
+                    SimpleNamespace(title=title, id=i+1)
+                    for i, title in enumerate(titles)]
+                client = Mock()
+                client.open_by_key.return_value = book
+                with patch.object(dash, "_credentials",
+                                  return_value=(client, "testing-id")), \
+                     patch.object(dash, "_read_previous", return_value={}), \
+                     patch.object(dash, "_write_previous"), \
+                     patch.object(dash.os, "makedirs"):
+                    self.assertTrue(dash.publish(
+                        {"symbols": {"TESTUSDT": self.record}, "history": []},
+                        self.tickers, {"auto": "AÇIK", "daily": 7,
+                                       "max_daily": 50},
+                        {"connected": True}, self.now, "/tmp/test-dashboard"))
+                book.values_batch_update.assert_called_once()
+                data = book.values_batch_update.call_args.args[0]["data"]
+                self.assertEqual([d["range"].split("'!")[0] for d in data],
+                                 ["'Bot Status", "'Sinyal", "'BOT_STATUS"])
+                self.assertEqual(data[0]["values"][1][0],
+                                 "Son güncelleme (Paris)")
+                self.assertEqual(data[2]["range"], "'BOT_STATUS'!A1:B32")
+                self.assertEqual(data[2]["values"][0][0], "Last alive")
+                self.assertIn("UTC", data[2]["values"][0][1])
+                self.assertIn("CRASH BOUNCE V2", data[2]["values"][1][1])
+                self.assertIn("KAPALI", data[2]["values"][2][1])
+                self.assertIn("Otomatik alış",
+                              [r[0] for r in data[2]["values"]])
+                self.assertIn(["Günlük giriş limiti", 50],
+                              data[2]["values"])
+                self.assertEqual(len(data[2]["values"]), 32)
+                self.assertFalse(book.add_worksheet.called)
+                self.assertFalse(book.del_worksheet.called)
+
+    def test_old_bot_status_workbook_updates_when_separate_from_ema_filter(self):
+        modern = Mock(title="EMA Filter")
+        modern.worksheets.return_value = [
+            SimpleNamespace(title="Bot Status", id=100),
+            SimpleNamespace(title="Sinyal", id=200)]
+        old = Mock(title="Original Pre-Signal Sheet")
+        old.worksheets.return_value = [
+            SimpleNamespace(title="BOT_STATUS", id=300),
+            SimpleNamespace(title="PRE_SIGNAL_TEST", id=301)]
+        client = Mock()
+        client.open_by_key.side_effect = lambda key: (
+            modern if key == "modern-book" else
+            old if key == "old-book" else None)
+        logs = []
+        with patch.dict(dash.os.environ, {"GOOGLE_SHEETS_ID": "old-book"}), \
+             patch.object(dash, "_credentials",
+                          return_value=(client, "modern-book")), \
+             patch.object(dash, "_read_previous", return_value={}), \
+             patch.object(dash, "_write_previous"), \
+             patch.object(dash.os, "makedirs"):
+            self.assertTrue(dash.publish(
+                {"symbols": {}, "history": []},
+                self.tickers, {"daily": 4, "max_daily": 28},
+                {"connected": True}, self.now, "/tmp/test-dashboard", logger=logs.append))
+        self.assertEqual(modern.values_batch_update.call_count, 1)
+        self.assertEqual(old.values_batch_update.call_count, 1)
+        legacy = old.values_batch_update.call_args.args[0]["data"]
+        self.assertEqual(len(legacy), 1)
+        self.assertEqual(legacy[0]["range"], "'BOT_STATUS'!A1:B32")
+        self.assertEqual(legacy[0]["values"][0][0], "Last alive")
+        self.assertIn(["Günlük giriş limiti", 28], legacy[0]["values"])
+        self.assertTrue(any("BOT_STATUS refreshed" in line for line in logs))
+        self.assertFalse(old.add_worksheet.called)
+        self.assertFalse(old.del_worksheet.called)
+        self.assertFalse(modern.add_worksheet.called)
+        self.assertFalse(modern.del_worksheet.called)
+
+    def test_external_legacy_status_failure_does_not_block_modern_dashboard(self):
+        modern = Mock(title="EMA Filter")
+        modern.worksheets.return_value = [
+            SimpleNamespace(title="Bot Status", id=100),
+            SimpleNamespace(title="Sinyal", id=200)]
+        client = Mock()
+        def open_book(key):
+            if key == "modern-book":
+                return modern
+            raise PermissionError("sensitive data is never logged")
+        client.open_by_key.side_effect = open_book
+        logs = []
+        with patch.dict(dash.os.environ, {"GOOGLE_SHEETS_ID": "old-book"}), \
+             patch.object(dash, "_credentials",
+                          return_value=(client, "modern-book")), \
+             patch.object(dash, "_read_previous", return_value={}), \
+             patch.object(dash, "_write_previous"), \
+             patch.object(dash.os, "makedirs"):
+            self.assertTrue(dash.publish(
+                {"symbols": {}, "history": []}, self.tickers, {},
+                {"connected": True}, self.now, "/tmp/test-dashboard",
+                logger=logs.append))
+        modern.values_batch_update.assert_called_once()
+        self.assertEqual(logs, ["[CRASH SHEETS LEGACY] update skipped: PermissionError"])
+
+    def test_only_legacy_bot_status_fallback_remains_live(self):
+        book = Mock(title="EMA Filter")
+        book.worksheets.return_value = [
+            SimpleNamespace(title="Sinyal", id=2),
+            SimpleNamespace(title="BOT_STATUS", id=1)]
+        client = Mock()
+        client.open_by_key.return_value = book
+        with patch.object(dash, "_credentials",
+                          return_value=(client, "testing-id")), \
+             patch.object(dash, "_read_previous", return_value={}), \
+             patch.object(dash, "_write_previous"), \
+             patch.object(dash.os, "makedirs"):
+            self.assertTrue(dash.publish(
+                {"symbols": {}, "history": []},
+                self.tickers, {}, {"connected": True},
+                self.now, "/tmp/test-dashboard"))
+        batch = book.values_batch_update.call_args.args[0]["data"]
+        self.assertEqual(len(batch), 2)
+        self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B26")
+        self.assertEqual(batch[1]["range"], "'Sinyal'!A1:AN61")
+
     def test_update_uses_existing_tabs_and_does_not_reset(self):
         book = Mock()
         book.title = "EMA Filter"
