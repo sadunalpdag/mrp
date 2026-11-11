@@ -68,7 +68,7 @@ class TrendChannelTests(unittest.TestCase):
         symbols = {"TESTUSDT": {"signal_id": "1", "created_at": self.now - 60,
                     "v2_status": "STRONG_V2", "entry": 1, "tp": 1.01,
                     "failure_shadow": {"flags": {"weak_volume": False,
-                        "falling_rsi_ema": True, "repeat_lower_entry": False}}}}
+                        "falling_rsi_ema": True, "repeat_lower_entry": False, "low_atr_15m": False}}}}
         calls = []
         def cached(symbol):
             calls.append(symbol)
