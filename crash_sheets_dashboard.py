@@ -20,6 +20,10 @@ MAX_ROWS = 60
 # User-confirmed EMA Filter workbook link; independent of legacy GOOGLE_SHEETS_ID.
 # Only this dashboard uses this key. Optional override is deliberate and explicit.
 DEFAULT_EMA_FILTER_ID = "1qJ1rcmmAdhhELmdzUovYq1n1UIF5lxdCb1lT3CDPF58"
+# The earlier pre-signal-only scanner wrote BOT_STATUS in a separate workbook.
+# Existing GOOGLE_SHEETS_ID may override that original target. Only write to
+# an existing exact BOT_STATUS tab, never create worksheets or rerun that scanner.
+DEFAULT_LEGACY_STATUS_ID = "1mu_LA7xJpWlBG2PFYscfFeUToUYPtSPsByUZHNkDzhI"
 HEADERS = [
     "Coin", "24s değişim %", "Düşüş sırası", "Son fiyat", "V2 durumu",
     "RSI14", "4s toparlanma %", "Güç /100", "Önceki güç", "Puan farkı",
@@ -377,6 +381,35 @@ def _legacy_bot_status_rows(status_rows, now):
     rows.extend([list(row) for row in status_rows[2:]])
     return rows + [["", ""] for _ in range(max(0, 32 - len(rows)))]
 
+def _sync_external_legacy_status(client, dashboard_id, status_rows, now, logger=None):
+    """Bridge current V2 health to a separate historical BOT_STATUS workbook.
+
+    This requires access to an existing tab with the exact original title.
+    Errors must never block the successful modern dashboard or trading.
+    """
+    legacy_id = (os.environ.get("GOOGLE_SHEETS_ID") or DEFAULT_LEGACY_STATUS_ID).strip()
+    if not legacy_id or legacy_id == dashboard_id:
+        return False
+    try:
+        old_book = client.open_by_key(legacy_id)
+        old_tab = next((ws for ws in old_book.worksheets()
+                        if ws.title == "BOT_STATUS"), None)
+        if old_tab is None:
+            return False
+        old_book.values_batch_update({"valueInputOption": "RAW", "data": [{
+            "range": "'BOT_STATUS'!A1:B32",
+            "values": _legacy_bot_status_rows(status_rows, now),
+        }]})
+        if logger:
+            logger("[CRASH SHEETS LEGACY] BOT_STATUS refreshed")
+        return True
+    except Exception as exc:
+        # Never log HTTP errors, Google credentials or spreadsheet content.
+        if logger:
+            logger("[CRASH SHEETS LEGACY] update skipped: " + type(exc).__name__)
+        return False
+
+
 def _format(sheet, status, signal, colors, signal_rows):
     requests = []
     for tab, end_col in ((status, 2), (signal, len(HEADERS))):
@@ -454,7 +487,8 @@ def _write_previous(path, data):
         os.fsync(fh.fileno())
     os.replace(tmp, path)
 
-def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_get=None):
+def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_get=None,
+            logger=None):
     client, sheet_id = _credentials()
     if not client:
         return False
@@ -493,6 +527,13 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
     _write_previous(prev_path, previous)
+    if legacy_status is not None:
+        if logger:
+            logger("[CRASH SHEETS LEGACY] BOT_STATUS refreshed in EMA Filter")
+    else:
+        # If the old BOT_STATUS actually lives in the original pre-signal
+        # workbook, refresh it separately. This path is deliberately isolated.
+        _sync_external_legacy_status(client, sheet_id, status_rows, now, logger)
     return True
 
 class DashboardPublisher:
@@ -532,7 +573,8 @@ class DashboardPublisher:
         def writer():
             try:
                 if publish({"symbols": symbols, "history": recent}, copied_tickers,
-                           trading, copied_ws, now, self.directory, self.rescore, self.candle_get):
+                           trading, copied_ws, now, self.directory, self.rescore,
+                           self.candle_get, logger=self.logger):
                     self.logger("[CRASH SHEETS] Bot Status / Sinyal updated")
             except Exception as exc:
                 # Never log service-account JSON or raw Google error response.
