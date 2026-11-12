@@ -637,7 +637,7 @@ def sheet_sync(db):
                 round(sum(dds) / len(dds), 3) if dds else "",
                 round(sum(tp_times) / len(tp_times), 1) if tp_times else ""]
 
-    # 13 fixed rows above the transactions: one sheet for the entire monitor.
+    # 14 fixed rows (including transaction header); one sheet for the entire monitor.
     header = ["Strateji", "Sanal Giriş", "TP Oldu", "Açık", "WATCH",
               "Veri Bekliyor", "TP/Tüm Giriş %", "Ort. Düşüş %", "Ort. TP dk"]
     values = [
@@ -653,7 +653,7 @@ def sheet_sync(db):
     values.append(["TOPLAM"] + metrics(all_rows))
     values.append([])
     values.append(["TÜM SANAL İŞLEMLER | EN YENİ EN ÜSTTE | STRATEJİ/DURUM SÜTUNUNDAN FİLTRELE"])
-    values.append([names[field] for field in output_fields])  # row 13
+    values.append([names[field] for field in output_fields])  # row 14
 
     data = sorted(all_rows, key=lambda r: r.get("opened_at") or "", reverse=True)
     max_details = max(0, MAX_SHEET_ROWS - len(values))
@@ -683,10 +683,10 @@ def sheet_sync(db):
     # Applied once on creation/first rollout; failures here are cosmetic only.
     try:
         if meta(db, "combined_sheet_formatted") != "1":
-            ws.freeze(rows=13)
+            ws.freeze(rows=14)
             ws.format("A4:I4", {"textFormat":{"bold":True},
                                  "backgroundColor":{"red":0.86,"green":0.91,"blue":0.97}})
-            ws.format("A13:AA13", {"textFormat":{"bold":True},
+            ws.format("A14:AA14", {"textFormat":{"bold":True},
                                     "backgroundColor":{"red":0.86,"green":0.91,"blue":0.97}})
             ws.format("A1", {"textFormat":{"bold":True,"fontSize":14}})
             put_meta(db, "combined_sheet_formatted", "1")
