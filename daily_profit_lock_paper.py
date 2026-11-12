@@ -32,9 +32,11 @@ PARIS = ZoneInfo("Europe/Paris")
 URL = "https://fapi.binance.com"
 STATE_FILE = Path(os.getenv("DATA_DIR", "/data")) / "daily_profit_lock_paper.json"
 INTERVAL = max(120, int(os.getenv("DAILY_PROFIT_PAPER_INTERVAL_SEC", "180")))
-PCT = Decimal(os.getenv("DAILY_PROFIT_PAPER_TARGET_PCT", "5"))
-if not (Decimal("0.1") <= PCT <= Decimal("100")):
+DEFAULT_PCT = Decimal(os.getenv("DAILY_PROFIT_PAPER_TARGET_PCT", "5"))
+if not (Decimal("0.5") <= DEFAULT_PCT <= Decimal("20")):
     raise ValueError("DAILY_PROFIT_PAPER_TARGET_OUT_OF_RANGE")
+CONFIG_FILE = STATE_FILE.with_name("daily_profit_lock_paper_settings.json")
+CONTROL_LOCK = threading.RLock()
 
 
 def utc():
@@ -59,6 +61,73 @@ def persist(st):
         file.flush()
         os.fsync(file.fileno())
     os.replace(tmp, STATE_FILE)
+
+
+def load_settings():
+    """Independent persisted Telegram config; cannot change live trading state."""
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, encoding="utf8") as file:
+            raw = json.load(file)
+        pct = money(raw.get("target_pct", str(DEFAULT_PCT)))
+        if not Decimal("0.5") <= pct <= Decimal("20"):
+            raise ValueError("PAPER_PCT_OUT_OF_RANGE")
+        if type(raw.get("enabled")) is not bool:
+            raise ValueError("PAPER_ENABLED_INVALID")
+        return {"enabled": raw["enabled"], "target_pct": str(pct)}
+    return {"enabled": True, "target_pct": str(DEFAULT_PCT)}
+
+
+def persist_settings(settings):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = CONFIG_FILE.with_suffix(".json.tmp")
+    with open(temp, "w", encoding="utf8") as file:
+        json.dump(settings, file, ensure_ascii=False, sort_keys=True)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp, CONFIG_FILE)
+
+
+def control(action):
+    """Telegram commands control PAPER observation only, never exchange orders."""
+    with CONTROL_LOCK:
+        settings = load_settings()
+        if action in ("paper_on", "paper_off"):
+            settings["enabled"] = action == "paper_on"
+            persist_settings(settings)
+        elif action.startswith("paper_target:"):
+            value = action.split(":", 1)[1].replace(",", ".")
+            try:
+                pct = money(value)
+                if not Decimal("0.5") <= pct <= Decimal("20"):
+                    raise ValueError("PAPER_PCT_OUT_OF_RANGE")
+            except (ValueError, InvalidOperation):
+                return "⚠️ Kullanım: /gunluk_kar 0.5–20 (örnek /gunluk_kar 7)"
+            settings["target_pct"] = str(pct)
+            persist_settings(settings)
+        elif action != "paper_status":
+            return "Bilinmeyen sanal kâr komutu."
+
+        st = load_state()
+        if st is None:
+            return ("🧪 SANAL günlük kâr izleme: "
+                    + ("AÇIK" if settings["enabled"] else "KAPALI")
+                    + f" | sonraki hedef %{settings['target_pct']} | İlk hesap ölçümü bekleniyor. "
+                      "Gerçek emir ve TP değişmez.")
+        active = st.get("active_lock")
+        last = st.get("snapshots", [])[-1] if st.get("snapshots") else None
+        waiting = sum(p.get("paper_status") == "WAIT" for p in active.get("positions", [])) if active else 0
+        status = "AÇIK" if settings["enabled"] else "KAPALI"
+        return (f"📊 SANAL kâr takibi {status}\n"
+                f"Paris günü: {st.get('paris_day')}\n"
+                f"Zirve: {st.get('all_time_peak', '?')} USDT\n"
+                f"Son hesap: {st.get('last_equity', '?')} USDT\n"
+                f"Bugünün sabit hedefi: {st.get('target') or 'İlk gece 00:00 bekleniyor'} USDT\n"
+                f"Bugünün oranı: %{st.get('current_pct') or 'henüz yok'}\n"
+                f"Sonraki günün ayarlı oranı: %{settings['target_pct']}\n"
+                f"Fotoğraf: {'VAR' if last else 'YOK'} | sanal bekleyen: {waiting}\n"
+                "Gerçek alım/TP/kapatma emri uygulanmaz."
+                + ("\nHedef yüzdesi değişikliği bir sonraki Paris gününde uygulanır."
+                   if action.startswith("paper_target:") else ""))
 
 
 def load_state():
@@ -152,9 +221,9 @@ class MarketReader:
         return rows
 
 
-def maybe_trigger(st, equity, positions_fn, observed):
+def maybe_trigger(st, equity, positions_fn, observed, enabled=True):
     """Pure target transition; positions_fn is invoked once only after crossing."""
-    if not st.get("target") or st.get("active_lock") or st.get("triggered_today"):
+    if not enabled or not st.get("target") or st.get("active_lock") or st.get("triggered_today"):
         return False
     if equity < money(st["target"]):
         return False
@@ -174,14 +243,16 @@ def maybe_trigger(st, equity, positions_fn, observed):
     return True
 
 
-def roll_day(st, day):
+def roll_day(st, day, pct=None):
     if day == st["paris_day"]:
         return False
     # Previous day's highest *ever observed* equity becomes today's reference.
     peak = money(st["all_time_peak"])
     st["paris_day"] = day
     st["reference_peak"] = str(peak)
-    st["target"] = str(peak * (Decimal("1") + PCT / 100))
+    pct = DEFAULT_PCT if pct is None else money(pct)
+    st["current_pct"] = str(pct)
+    st["target"] = str(peak * (Decimal("1") + pct / 100))
     st["triggered_today"] = False
     st["day_peak"] = None
     st["reference_status"] = "READY"
@@ -189,8 +260,9 @@ def roll_day(st, day):
     return True
 
 
-def tick(st, reader, observed=None):
+def tick(st, reader, observed=None, settings=None):
     observed = observed or utc()
+    settings = settings or {"enabled": True, "target_pct": str(DEFAULT_PCT)}
     day = observed.astimezone(PARIS).date().isoformat()
     equity, wallet, unrealized = reader.equity()
     if st is None:
@@ -199,7 +271,7 @@ def tick(st, reader, observed=None):
             "mode": "PAPER_ONLY", "version": 1, "paris_day": day,
             "reference_status": "BOOTSTRAP",
             "all_time_peak": str(equity), "day_peak": str(equity),
-            "reference_peak": None, "target": None,
+            "reference_peak": None, "target": None, "current_pct": None,
             "triggered_today": False, "active_lock": None, "snapshots": [],
             "last_equity": str(equity), "wallet": str(wallet),
             "unrealized": str(unrealized), "sampled_at": observed.isoformat(),
@@ -207,7 +279,7 @@ def tick(st, reader, observed=None):
             "disclaimer": "No real trading lock, no real TP/cancel, paper only",
         }, False, False
 
-    rolled = roll_day(st, day)
+    rolled = roll_day(st, day, settings["target_pct"])
     st["last_equity"] = str(equity)
     st["wallet"] = str(wallet)
     st["unrealized"] = str(unrealized)
@@ -215,7 +287,7 @@ def tick(st, reader, observed=None):
     st["samples"] = int(st.get("samples", 0)) + 1
     st["day_peak"] = str(max(money(st["day_peak"]) if st.get("day_peak") else equity, equity))
     st["all_time_peak"] = str(max(money(st["all_time_peak"]), equity))
-    triggered = maybe_trigger(st, equity, reader.positions, observed)
+    triggered = maybe_trigger(st, equity, reader.positions, observed, enabled=settings["enabled"])
     # Keep all historical snapshots; never alter frozen entry/target prices.
     active = st.get("active_lock")
     if active:
@@ -271,8 +343,8 @@ def alert(st):
 
 def run():
     reader = MarketReader()
-    LOG.info("Starting READ-ONLY paper monitor: every=%ds target=%s%%; orders=NEVER",
-             INTERVAL, PCT)
+    LOG.info("Starting READ-ONLY paper monitor: every=%ds default_target=%s%%; orders=NEVER",
+             INTERVAL, DEFAULT_PCT)
     backoff_until = 0
     previous_hour = None
     while True:
@@ -280,9 +352,11 @@ def run():
             time.sleep(min(INTERVAL, max(1, backoff_until - time.time())))
             continue
         try:
-            st = load_state()
-            st, triggered, rolled = tick(st, reader)
-            persist(st)
+            with CONTROL_LOCK:
+                settings = load_settings()
+                st = load_state()
+                st, triggered, rolled = tick(st, reader, settings=settings)
+                persist(st)
             hour = utc().strftime("%Y-%m-%dT%H")
             if rolled or previous_hour != hour:
                 LOG.info("paper state=%s day=%s peak=%s reference=%s target=%s equity=%s lock=%s transfers=%s",
