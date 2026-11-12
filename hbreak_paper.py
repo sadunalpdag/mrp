@@ -106,10 +106,24 @@ def enroll(db,http,setups):
         except Exception as e:LOG.warning("HBREAK candidate skip %s %s",s.get("symbol"),str(e)[:100])
     return added
 def track(db,http):
-    # Bounded REST calls, round robin; deliberately separated from Crash orders.
+    # Pending/error backfills have priority, while reserving at least 25% of
+    # the budget for previously verified OPEN trades (ongoing TP monitoring).
+    # All lists use oldest checked_at first to avoid starving any one trade.
     batch=max(1,min(24,int(os.getenv("HBREAK_TRACK_BATCH","16"))))
-    pending=sorted((x for x in rows(db) if x["status"]=="OPEN"),
-                   key=lambda v:v.get("checked_at",""))[:batch]
+    open_trades=[x for x in rows(db) if x["status"]=="OPEN"]
+    needs_data=sorted((x for x in open_trades if x.get("data_status")!="OK"),
+                      key=lambda v:v.get("checked_at",""))
+    verified=sorted((x for x in open_trades if x.get("data_status")=="OK"),
+                    key=lambda v:v.get("checked_at",""))
+    normal_slots=max(1,batch//4) if batch>1 else 0
+    priority_slots=batch-normal_slots
+    pending=needs_data[:priority_slots]+verified[:normal_slots]
+    if len(pending)<batch:
+        pending+=needs_data[priority_slots:priority_slots+batch-len(pending)]
+    if len(pending)<batch:
+        pending+=verified[normal_slots:normal_slots+batch-len(pending)]
+    selected_pending=sum(x.get("data_status")!="OK" for x in pending)
+    selected_verified=len(pending)-selected_pending
     refreshed=0
     changed=0
     for trade in pending:
@@ -153,8 +167,8 @@ def track(db,http):
             LOG.warning("HBREAK track %s %s",trade["coin"],str(e)[:120])
     all_open=[x for x in rows(db) if x["status"]=="OPEN"]
     waiting=sum(x.get("data_status")!="OK" for x in all_open)
-    LOG.info("HBREAK 5m tracked=%s bars=%s remaining_open=%s pending_or_error=%s batch=%s",
-             refreshed,changed,len(all_open),waiting,batch)
+    LOG.info("HBREAK 5m tracked=%s bars=%s remaining_open=%s pending_or_error=%s batch=%s selected_pending=%s selected_verified=%s",
+             refreshed,changed,len(all_open),waiting,batch,selected_pending,selected_verified)
 def sheet_sync(db):
     import gspread
     from google.oauth2.service_account import Credentials
