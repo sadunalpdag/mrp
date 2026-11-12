@@ -110,6 +110,53 @@ class PaperTests(unittest.TestCase):
         self.assertTrue(rolled)
         self.assertIsNotNone(st["active_lock"])
 
+    def test_telegram_target_is_persistent_and_only_tomorrow_applies(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(p, "STATE_FILE", Path(root) / "state.json"), \
+                 patch.object(p, "CONFIG_FILE", Path(root) / "settings.json"):
+                st, *_ = p.tick(None, Reader(1000), dt("2026-11-11"))
+                st, *_ = p.tick(st, Reader(950), dt("2026-11-12"))
+                p.persist(st)
+                self.assertEqual(Decimal(st["target"]), Decimal("1050"))
+                response = p.control("paper_target:7")
+                self.assertIn("%7", response)
+                settings = p.load_settings()
+                self.assertEqual(settings["target_pct"], "7")
+                self.assertEqual(Decimal(p.load_state()["target"]), Decimal("1050"))
+                st, fired, _ = p.tick(st, Reader(940), dt("2026-11-13"),
+                                       settings=p.load_settings())
+                self.assertFalse(fired)
+                self.assertEqual(Decimal(st["target"]), Decimal("1070"))
+                self.assertEqual(st["current_pct"], "7")
+
+    def test_telegram_off_disables_paper_trigger_but_keeps_peak(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(p, "STATE_FILE", Path(root) / "state.json"), \
+                 patch.object(p, "CONFIG_FILE", Path(root) / "settings.json"):
+                st, *_ = p.tick(None, Reader(1000), dt("2026-11-11"))
+                st, *_ = p.tick(st, Reader(1000), dt("2026-11-12"))
+                p.persist(st)
+                self.assertIn("KAPALI", p.control("paper_off"))
+                reader = Reader(1100)
+                st, fired, _ = p.tick(st, reader, dt("2026-11-12", 13),
+                                       settings=p.load_settings())
+                self.assertFalse(fired)
+                self.assertEqual(reader.position_calls, 0)
+                self.assertEqual(st["all_time_peak"], "1100")
+                p.persist(st)
+                self.assertIn("AÇIK", p.control("paper_on"))
+                self.assertIn("1100", p.control("paper_status"))
+
+    def test_invalid_telegram_targets_do_not_change_settings(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(p, "STATE_FILE", Path(root) / "state.json"), \
+                 patch.object(p, "CONFIG_FILE", Path(root) / "settings.json"):
+                for target in ("0.1", "21", "-1", "NaN", "xyz", "1e100", "7%"):
+                    self.assertIn("Kullanım", p.control("paper_target:" + target))
+                    self.assertEqual(p.load_settings()["target_pct"], "5")
+                self.assertIn("%7.5", p.control("paper_target:7,5"))
+                self.assertEqual(p.load_settings()["target_pct"], "7.5")
+
     def test_signed_get_disallows_any_order_endpoint(self):
         reader = p.MarketReader(session=object())
         with self.assertRaisesRegex(ValueError, "READ_ONLY_ENDPOINT"):
