@@ -34,6 +34,45 @@ def _load_last_run(path):
     return None
 
 
+def purge_disabled_risk_v1_raw(data_dir, log=None):
+    """Explicit opt-in purge of ONLY raw daily risk_v1 JSONL files.
+
+    Requires both the shadow collector off and the operator purge flag on.
+    Never removes state.json, summary.json, exchange data or report ZIPs.
+    """
+    if (os.getenv("CRASH_RISK_V1_ENABLED", "0") == "1"
+            or os.getenv("CRASH_RISK_V1_PURGE_LOGS", "0") != "1"):
+        return None
+    root = os.path.join(os.path.abspath(data_dir), "crash_research")
+    target = os.path.join(root, "risk_v1")
+    if (not os.path.isdir(root) or os.path.islink(root)
+            or not os.path.isdir(target) or os.path.islink(target)):
+        return None
+    deleted = 0
+    freed = 0
+    errors = 0
+    try:
+        with os.scandir(target) as entries:
+            for entry in entries:
+                # Strict YYYY-MM-DD.jsonl ONLY; no recursion, no symlinks.
+                if not OBSERVATION_RE.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    size = entry.stat(follow_symlinks=False).st_size
+                    os.unlink(entry.path)
+                    deleted += 1
+                    freed += size
+                except OSError:
+                    errors += 1
+    except OSError:
+        errors += 1
+    if (deleted or errors) and callable(log):
+        log(f"[CRASH RISK V1 RAW CLEANUP] deleted={deleted}; "
+            f"freed_bytes={freed}; errors={errors}; "
+            "state_summary_and_live_orders_untouched=1")
+    return {"deleted_files": deleted, "freed_bytes": freed, "errors": errors}
+
+
 def cleanup_if_due(data_dir, now=None, pending=None, log=None):
     """Run at most once per 10 days; first run cleans pre-existing stale files.
 
@@ -44,6 +83,9 @@ def cleanup_if_due(data_dir, now=None, pending=None, log=None):
     now = time.time() if now is None else float(now)
     if not math.isfinite(now) or now <= 0:
         raise ValueError("INVALID_RETENTION_TIME")
+    # Independent of the normal ten-day retention throttle: raw shadow
+    # research was explicitly retired to prevent disk exhaustion.
+    purge_disabled_risk_v1_raw(data_dir, log=log)
     research = os.path.join(os.path.abspath(data_dir), "crash_research")
     # Do not traverse a symlink-controlled or absent research directory.
     if not os.path.isdir(research) or os.path.islink(research):
