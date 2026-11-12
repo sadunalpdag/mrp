@@ -549,7 +549,7 @@ class NightExecutor:
             self.enabled.set()
             return ('✅ Otomatik girişler AÇIK. Yalnız yeni giriş geçişleri işlenecek.\n'
                     f'24 saat | 10x | en fazla {self.position_usdt} USDT pozisyon / yaklaşık {self.position_usdt/10} USDT teminat\n'
-                    f'Günde en fazla {self.max_daily} giriş denemesi, aynı anda en fazla {self.max_symbols} sembol. TP +%1; SL yok.\n'+self.summary())
+                    f'Günde en fazla {self.max_daily} giriş denemesi; açık en fazla {self.max_open_positions}, bekleyen en fazla {self.max_pending_entries} emir; toplam sembol sınırı {self.max_symbols}. TP +%1; SL yok.\n'+self.summary())
         if action == 'off':
             self.enabled.clear()
             self.state['paused'] = True
@@ -1339,11 +1339,15 @@ class NightExecutor:
             'ALERT_PENDING': 'İşlemi engelleyen güvenlik uyarısı henüz tamamlanmadı.',
             'TRACKING_INACTIVE': 'Sanal giriş takibi artık aktif değil.',
             'RISK_BLOCKED': '4 risk kriteri, eski veya eksik risk değerlendirmesi nedeniyle giriş yasak.',
+            'OPEN_LIMIT_REACHED': 'Açık pozisyon limiti doldu. Yeni BUY gönderilmedi.',
+            'PENDING_LIMIT_REACHED': 'Bekleyen giriş emri limiti doldu. Yeni BUY gönderilmedi.',
         }
         # A safety halt already has its own durable warning. Do NOT put
         # optional skip notices into the blocking outbox: a failed Telegram
         # delivery must not block tomorrow's otherwise valid new entries.
-        key = (symbol, reason)
+        # Limit notices are global (once per 30m), not per rejected coin.
+        key = ('_CAPACITY_' if reason in ('OPEN_LIMIT_REACHED',
+                                          'PENDING_LIMIT_REACHED') else symbol, reason)
         blocking_alert = any(item.get('blocks_entries', True)
                              for item in self.state['outbox'])
         if (reason in notices and not blocking_alert
@@ -1437,6 +1441,14 @@ class NightExecutor:
             position_side = self.broker.preflight(symbol)
             p['position_side'] = position_side if position_side in ('BOTH', 'LONG') else 'BOTH'
         except Exception as error:
+            # A full capacity gate is not a fault; do not quarantine a coin.
+            # Existing TP protection and reconciliation continue normally.
+            if isinstance(error, ValueError) and str(error) in (
+                    'MAX_OPEN_POSITIONS_REACHED', 'MAX_PENDING_ENTRY_ORDERS_REACHED'):
+                self.entry_skip(symbol, 'OPEN_LIMIT_REACHED'
+                                if str(error) == 'MAX_OPEN_POSITIONS_REACHED'
+                                else 'PENDING_LIMIT_REACHED')
+                return
             if (isinstance(error, BrokerError) and error.not_sent
                     and error.deferred_reason == 'IP_WEIGHT_SOFT_CEILING'):
                 retry = self.preflight_retries.get(sid, {})
