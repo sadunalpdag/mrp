@@ -42,6 +42,7 @@ SHEETS = {
     "volume": "CB2_05_VOLUME",
     "oi_squeeze": "CB2_06_OI_SQUEEZE",
 }
+COMBINED_SHEET = "CB2_TUM_STRATEJILER"
 FIELDS = (
     "id strategy symbol status signal_at opened_at source_id source_archetype "
     "sqs rvol trend_1h trend_4h oi_change_pct short_liq_usd "
@@ -572,6 +573,11 @@ def reopen_24h(db):
 
 
 def sheet_sync(db):
+    """One combined monitoring tab with six-strategy rollup and all paper trades.
+
+    Old CB2_0x tabs are intentionally not deleted (historic copies), but this
+    function no longer writes to them. Existing HBREAK sheet is untouched.
+    """
     import gspread
     from google.oauth2.service_account import Credentials
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -584,22 +590,110 @@ def sheet_sync(db):
             if raw.startswith("{")
             else Credentials.from_service_account_file(raw, scopes=scopes))
     workbook = gspread.authorize(auth).open_by_key(sid)
-    for strategy, tab in SHEETS.items():
-        data = sorted(all_trades(db, strategy), key=lambda r: r["opened_at"])
-        if len(data) + 1 > MAX_SHEET_ROWS:
-            LOG.warning("Sheets %s has %d rows: export trimmed; full JSON remains in R2",
-                        tab, len(data))
-            data = data[-(MAX_SHEET_ROWS - 1):]
-        values = [FIELDS] + [[str(r.get(k) if r.get(k) is not None else "")
-                               for k in FIELDS] for r in data]
-        try:
-            ws = workbook.worksheet(tab)
-        except gspread.WorksheetNotFound:
-            ws = workbook.add_worksheet(title=tab, rows=1000, cols=len(FIELDS))
-        if ws.row_count < len(values):
-            ws.add_rows(len(values) - ws.row_count + 100)
-        ws.update(range_name="A1", values=values)
-    LOG.info("Google Sheets synced 6 isolated CB2 tabs")
+    all_rows = all_trades(db)
+    readable = {
+        "rvol": "01 | 15M Kırılım + RVOL",
+        "retest": "02 | Kırılım Retest",
+        "trend": "03 | 15M + 1H/4H Trend",
+        "squeeze": "04 | Sıkışma Kırılım",
+        "volume": "05 | Hacim Patlaması",
+        "oi_squeeze": "06 | OI + Short Squeeze",
+    }
+    output_fields = [
+        "strategy", "symbol", "status", "opened_at", "entry", "tp",
+        "max_drawdown_pct", "tp_minutes", "sqs", "rvol", "data_status",
+        "observed_candles", "last_candle_at", "trend_1h", "trend_4h",
+        "oi_change_pct", "short_liq_usd", "last_price", "age_hours",
+        "tp_at", "source_archetype", "signal_at", "note", "id",
+        "source_id", "lowest", "checked_at",
+    ]
+    names = {
+        "strategy": "Strateji", "symbol": "Coin", "status": "Durum",
+        "opened_at": "Giriş Zamanı (UTC)", "entry": "Sanal Giriş",
+        "tp": "TP +%1", "max_drawdown_pct": "Maks. Düşüş %",
+        "tp_minutes": "TP Süresi (dk)", "sqs": "SQS", "rvol": "RVOL",
+        "data_status": "Veri Durumu", "observed_candles": "İşlenen 5M Mum",
+        "last_candle_at": "Son Mum (UTC)", "trend_1h": "Trend 1H",
+        "trend_4h": "Trend 4H", "oi_change_pct": "OI Değişim %",
+        "short_liq_usd": "Short Likidasyon $", "last_price": "Son Fiyat",
+        "age_hours": "Açık Süre (s)", "tp_at": "TP Zamanı",
+        "source_archetype": "Kırılım Tipi", "signal_at": "Sinyal Zamanı",
+        "note": "Not", "id": "İşlem ID", "source_id": "Kaynak ID",
+        "lowest": "En Düşük Fiyat", "checked_at": "Son Kontrol",
+    }
+
+    def metrics(data):
+        entered = [x for x in data if x.get("entry") is not None]
+        tp_rows = [x for x in entered if x.get("status") == "TP_1_PERCENT"]
+        opened = [x for x in entered if x.get("status") in ("OPEN", "OPEN_24H")]
+        watching = sum(x.get("status") == "WATCH" for x in data)
+        no_data = sum(x.get("data_status") in ("PENDING_DATA", "ERROR") for x in opened)
+        dds = [num(x.get("max_drawdown_pct")) for x in entered]
+        dds = [x for x in dds if x is not None]
+        tp_times = [num(x.get("tp_minutes")) for x in tp_rows]
+        tp_times = [x for x in tp_times if x is not None]
+        return [len(entered), len(tp_rows), len(opened), watching, no_data,
+                round(100 * len(tp_rows) / len(entered), 2) if entered else "",
+                round(sum(dds) / len(dds), 3) if dds else "",
+                round(sum(tp_times) / len(tp_times), 1) if tp_times else ""]
+
+    # 13 fixed rows above the transactions: one sheet for the entire monitor.
+    header = ["Strateji", "Sanal Giriş", "TP Oldu", "Açık", "WATCH",
+              "Veri Bekliyor", "TP/Tüm Giriş %", "Ort. Düşüş %", "Ort. TP dk"]
+    values = [
+        ["COINBEACON API2 | 6 STRATEJİ TEK SANAL TAKİP"],
+        ["Güncelleme (UTC): " + now_iso() +
+         " | Gerçek emir: YOK | TP +%1 | SL: YOK"],
+        ["NOT: TP oranı = TP olmuş işlemler / tüm sanal girişler; açık işlemler paydada."],
+        header,
+    ]
+    for strategy in SHEETS:
+        items = [x for x in all_rows if x.get("strategy") == strategy]
+        values.append([readable[strategy]] + metrics(items))
+    values.append(["TOPLAM"] + metrics(all_rows))
+    values.append([])
+    values.append(["TÜM SANAL İŞLEMLER | EN YENİ EN ÜSTTE | STRATEJİ/DURUM SÜTUNUNDAN FİLTRELE"])
+    values.append([names[field] for field in output_fields])  # row 13
+
+    data = sorted(all_rows, key=lambda r: r.get("opened_at") or "", reverse=True)
+    max_details = max(0, MAX_SHEET_ROWS - len(values))
+    if len(data) > max_details:
+        LOG.warning("Combined sheet has %d records; showing latest %d, full R2 JSON retained",
+                    len(data), max_details)
+        data = data[:max_details]
+    for trade in data:
+        row = []
+        for field in output_fields:
+            value = readable.get(trade.get("strategy"), trade.get("strategy")) if field == "strategy" else trade.get(field)
+            row.append(value if isinstance(value, (int, float)) else
+                       (str(value) if value is not None else ""))
+        values.append(row)
+
+    try:
+        ws = workbook.worksheet(COMBINED_SHEET)
+    except gspread.WorksheetNotFound:
+        ws = workbook.add_worksheet(title=COMBINED_SHEET,
+                                    rows=max(1000, len(values)+100),
+                                    cols=len(output_fields))
+    if ws.row_count < len(values):
+        ws.add_rows(len(values) - ws.row_count + 100)
+    if ws.col_count < len(output_fields):
+        ws.add_cols(len(output_fields)-ws.col_count)
+    ws.update(range_name="A1", values=values, value_input_option="RAW")
+    # Applied once on creation/first rollout; failures here are cosmetic only.
+    try:
+        if meta(db, "combined_sheet_formatted") != "1":
+            ws.freeze(rows=13)
+            ws.format("A4:I4", {"textFormat":{"bold":True},
+                                 "backgroundColor":{"red":0.86,"green":0.91,"blue":0.97}})
+            ws.format("A13:AA13", {"textFormat":{"bold":True},
+                                    "backgroundColor":{"red":0.86,"green":0.91,"blue":0.97}})
+            ws.format("A1", {"textFormat":{"bold":True,"fontSize":14}})
+            put_meta(db, "combined_sheet_formatted", "1")
+    except Exception as exc:
+        LOG.warning("Combined Sheets formatting skipped (%s)", type(exc).__name__)
+    LOG.info("Google Sheets synced ONE combined CB2 tab=%s trades=%d",
+             COMBINED_SHEET, len(data))
 
 
 def json_archive(db, current=None):
@@ -628,7 +722,7 @@ def json_archive(db, current=None):
     payload = {
         "date_paris": date, "as_of_utc": now_iso(), "mode": "PAPER_ONLY",
         "api_key_env": "api2", "source": "CoinBeacon + public Binance futures",
-        "daily_cumulative": True, "strategy_tabs": SHEETS,
+        "daily_cumulative": True, "sheet_tab": COMBINED_SHEET, "strategies": list(SHEETS),
         "statistics": stats, "trades": all_rows,
     }
     env = os.environ
