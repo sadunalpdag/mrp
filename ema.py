@@ -15806,6 +15806,17 @@ def main():
             log("[HBREAK] paper-only 4H breakout monitor started")
         except Exception as exc:
             log(f"[HBREAK START ERR] {type(exc).__name__}: {str(exc)[:180]}")
+    # CoinBeacon API2: six isolated PAPER-ONLY strategies. Never imports or
+    # calls the real Binance broker; HBREAK SQLite accessed read-only.
+    # An import check is useful even when the monitor is disabled.
+    try:
+        import coinbeacon_six_paper as _cb2_paper
+        log("[CB-API2] paper module import OK")
+        if os.getenv("COINBEACON_SIX_PAPER_ENABLED", "0") == "1":
+            _cb2_paper.start()
+            log("[CB-API2] six independent paper-only monitors started")
+    except Exception as exc:
+        log(f"[CB-API2 START ERR] {type(exc).__name__}: {str(exc)[:180]}")
     if os.getenv("CRASH_RESEARCH_REST_ENABLED", "1") != "1":
         log("[CRASH REST PRIORITY] non-history research Binance REST disabled; "
             "WS/cache/archive -> Bybit/Coinbase -> scoped 15m Binance REST last resort="
