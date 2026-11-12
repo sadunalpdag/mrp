@@ -240,6 +240,10 @@ def tick(st, reader, observed=None):
             active["all_paper_crossed"] = True
             active["completed_at"] = observed.isoformat(timespec="seconds")
             st["active_lock"] = None
+        # JSON serialization does not preserve shared object references.
+        # Keep history in sync with the active simulated exit state.
+        if st.get("snapshots"):
+            st["snapshots"][-1] = dict(active)
     return st, triggered, rolled
 
 
