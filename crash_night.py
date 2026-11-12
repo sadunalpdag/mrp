@@ -585,7 +585,10 @@ class NightExecutor:
             live_hint = (f' | son Binance ön kontrol {checked_at}: '
                          f'açık {snapshot["open_positions"]}/{self.max_open_positions}, '
                          f'bekleyen {pending_str}/{self.max_pending_entries}')
-        return (f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | açık pozisyon limiti {self.max_open_positions} | bekleyen alış limiti {self.max_pending_entries} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | karantina: {quarantined}{live_hint} | {stream}")
+        sizing = self.state.get('auto_position_sizing') or {}
+        auto_size_text = ('AÇIK: ' + str(sizing.get('day') or 'referans bekleniyor')
+                          if self._auto_sizing_on() else 'KAPALI')
+        return (f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | açık pozisyon limiti {self.max_open_positions} | bekleyen alış limiti {self.max_pending_entries} | pozisyon {self.position_usdt} USDT | sermaye oranlı günlük tutar {auto_size_text} | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | karantina: {quarantined}{live_hint} | {stream}")
 
     def apply_control(self, action):
         if action in ('auto_size_on', 'auto_size_off'):
@@ -1556,6 +1559,11 @@ class NightExecutor:
             return
         configured_usdt = self.position_usdt
         target_usdt = configured_usdt * D(str(fraction))
+        # User requested whole-USDT budgets even for half-size/30% risk tiers.
+        # Existing trades and static-sized strategy remain unchanged.
+        if self._auto_sizing_on():
+            target_usdt = max(D('1'), target_usdt.quantize(
+                D('1'), rounding=ROUND_HALF_UP))
         flags = record['failure_shadow']['flags']
         risk_count = sum(flags.values())
         tp_pct = D('0.005') if risk_count in (2, 3) else D('0.01')
