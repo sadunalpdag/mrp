@@ -154,7 +154,7 @@ def new_trade(db, strategy, symbol, source_id, signal_at, price, *, watch=False,
                  status="WATCH" if watch else "OPEN", source_id=source_id,
                  signal_at=signal_at, opened_at=opened,
                  entry=None if watch else float(price),
-                 tp=None if watch else round(float(price) * 1.01, 12),
+                 tp=None if watch else float(price) * 1.01,
                  lowest=None if watch else float(price),
                  max_drawdown_pct=None, data_status="WATCH" if watch else "PENDING_DATA",
                  observed_candles=0, checked_at=opened, age_hours=0,
@@ -250,6 +250,9 @@ class MarketClient:
     def price(self, symbol):
         if symbol in self.price_cache:
             return self.price_cache[symbol]
+        if symbol not in self.new_symbols and len(self.new_symbols) >= MAX_NEW_SYMBOLS_PER_CYCLE:
+            return None
+        self.new_symbols.add(symbol)
         try:
             r = self.http.get(BINANCE + "/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
             r.raise_for_status()
@@ -362,7 +365,7 @@ def screen_rows(result):
 def check_watch(db, market):
     changed = 0
     watches = sorted((x for x in all_trades(db, "squeeze") if x["status"] == "WATCH"),
-                     key=lambda x: x["opened_at"])
+                     key=lambda x: x.get("checked_at") or x["opened_at"])
     for t in watches[:MAX_NEW_SYMBOLS_PER_CYCLE]:
         if now_ms() - iso_to_ms(t["opened_at"]) > 12 * 3600 * 1000:
             t["status"], t["data_status"] = "WATCH_EXPIRED", "OK"
@@ -370,6 +373,8 @@ def check_watch(db, market):
             save(db, t)
             continue
         candles = market.klines(t["symbol"], "15m", limit=50)
+        t["checked_at"] = now_iso()
+        save(db, t)
         if not bullish_closed_break(candles):
             continue
         # Breakout must occur AFTER the watch was added.
@@ -379,7 +384,7 @@ def check_watch(db, market):
         if not price:
             continue
         t.update(status="OPEN", data_status="PENDING_DATA", entry=price,
-                 tp=round(price * 1.01, 12), lowest=price,
+                 tp=price * 1.01, lowest=price,
                  opened_at=now_iso(), checked_at=now_iso(),
                  observed_candles=0, max_drawdown_pct=None)
         t["cursor"] = first_full_5m(t["opened_at"])
