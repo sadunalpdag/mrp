@@ -19,11 +19,19 @@ class FakeExecutor:
         self.max_open_positions = 10
         self.max_pending_entries = 15
         self.manual_tp_enabled = False
+        self.auto_size_enabled = False
         self.calls = []
+
+    def _auto_sizing_on(self):
+        return self.auto_size_enabled
 
     def request_control(self, action):
         self.calls.append(action)
-        if action == "on":
+        if action == "auto_size_on":
+            self.auto_size_enabled = True
+        elif action == "auto_size_off":
+            self.auto_size_enabled = False
+        elif action == "on":
             self.enabled.is_set.return_value = True
             self.state["paused"] = False
         elif action == "off":
@@ -102,8 +110,8 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(result, 0)
         apply.assert_not_called()
         ranges = [d["range"] for d in sheet.values_batch_update.call_args.args[0]["data"]]
-        self.assertIn("'Bot Status'!F2:F15", ranges)
-        self.assertIn("'Bot Status'!I2:I15", ranges)
+        self.assertIn(f"'Bot Status'!F2:F{ctrl.COUNT}", ranges)
+        self.assertIn(f"'Bot Status'!I2:I{ctrl.COUNT}", ranges)
         self.assertIn("'Bot Status'!F1", ranges)
         self.assertIn("'Bot Status'!I1", ranges)
         self.assertFalse(any("A1" in r or "B1" in r for r in ranges))
@@ -157,6 +165,18 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(executor.calls, ["on"])
         self.assertTrue(ctrl._apply("LIVE", "KAPALI", "UYGULA", executor)[0])
         self.assertEqual(executor.calls, ["on", "off"])
+
+    def test_auto_size_control_uses_executor_queue_and_render_gate(self):
+        executor = FakeExecutor()
+        with patch.dict(os.environ, {"CRASH_AUTO_POSITION_SIZING_ENABLED":"0"}):
+            with self.assertRaisesRegex(ValueError, "Render"):
+                ctrl._apply("AUTO_SIZE", "AÇIK", "UYGULA", executor)
+        self.assertEqual(executor.calls, [])
+        with patch.dict(os.environ, {"CRASH_AUTO_POSITION_SIZING_ENABLED":"1"}):
+            self.assertTrue(ctrl._apply("AUTO_SIZE", "AÇIK", "UYGULA", executor)[0])
+            self.assertTrue(executor._auto_sizing_on())
+            self.assertTrue(ctrl._apply("AUTO_SIZE", "KAPALI", "UYGULA", executor)[0])
+        self.assertEqual(executor.calls, ["auto_size_on", "auto_size_off"])
 
     def test_bad_numbers_and_uneditable_counter(self):
         executor = FakeExecutor()
