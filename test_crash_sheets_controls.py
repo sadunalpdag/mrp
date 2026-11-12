@@ -39,6 +39,60 @@ class FakeExecutor:
 
 
 class PanelTests(unittest.TestCase):
+    def test_visible_today_target_remaining_and_next_day_7_percent(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "DATA_DIR": directory, "DAILY_PROFIT_PAPER_ENABLED": "1"}):
+            root = Path(directory)
+            (root / "daily_profit_lock_paper_settings.json").write_text(
+                json.dumps({"enabled": True, "target_pct": "7"}), encoding="utf8")
+            (root / "daily_profit_lock_paper.json").write_text(json.dumps({
+                "mode": "PAPER_ONLY", "all_time_peak": "1000",
+                "last_equity": "1015", "target": "1050",
+                "sampled_at": "2026-11-12T20:00:00+00:00",
+            }), encoding="utf8")
+            values = {row[0]: row[1] for row in ctrl.paper_target_rows()}
+            self.assertEqual(values["Bugunun sabit hedefi"], "1,050.00 USDT")
+            self.assertEqual(values["Hedefe kalan"], "35.00 USDT")
+            self.assertEqual(values["Yarinin tahmini hedefi"], "1,070.00 USDT")
+            self.assertEqual(values["Guncel ozsermaye"], "1,015.00 USDT")
+            self.assertEqual(values["Bir sonraki gun hedef orani"], "%7")
+
+    def test_first_paris_day_has_no_fabricated_fixed_target(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {
+                "DATA_DIR": directory, "DAILY_PROFIT_PAPER_TARGET_PCT": "5"}):
+            root = Path(directory)
+            (root / "daily_profit_lock_paper_settings.json").write_text(
+                json.dumps({"enabled": True, "target_pct": "7"}), encoding="utf8")
+            (root / "daily_profit_lock_paper.json").write_text(json.dumps({
+                "mode": "PAPER_ONLY", "all_time_peak": "1040",
+                "last_equity": "990", "target": None,
+                "sampled_at": "2026-11-12T20:00:00+00:00",
+            }), encoding="utf8")
+            values = {row[0]: row[1] for row in ctrl.paper_target_rows()}
+            self.assertEqual(values["Bugunun sabit hedefi"], "ILK 00:00 BEKLENIYOR")
+            self.assertEqual(values["Hedefe kalan"], "—")
+            self.assertEqual(values["Yarinin tahmini hedefi"], "1,112.80 USDT")
+
+    def test_separate_readonly_target_rows_never_touch_user_confirmation(self):
+        tab = SimpleNamespace(id=7, title="Bot Status", col_count=9,
+                              get=Mock(return_value=[list(ctrl.HEADER)] +
+                                  [[label, "old", "", description, "", ""] for
+                                   _,label,description,_ in ctrl.ROWS]))
+        sheet = SimpleNamespace(batch_update=Mock(), values_batch_update=Mock())
+        with patch.object(ctrl, "_values", return_value={}), patch.object(
+                ctrl, "paper_target_rows", return_value=[["Title", "Amount", "Explanation"]]):
+            ctrl.sync_panel(sheet, tab, FakeExecutor())
+        ranges = {record["range"] for record in sheet.values_batch_update.call_args.args[0]["data"]}
+        self.assertIn("'Bot Status'!D17:E17", ranges)
+        self.assertIn("'Bot Status'!G17:G17", ranges)
+        self.assertFalse(any("F17" in r or "I17" in r for r in ranges))
+
     def test_first_sync_discards_stale_approvals_without_executing(self):
         tab = SimpleNamespace(id=7, title="Bot Status", col_count=2,
                               get=Mock(return_value=[]))
