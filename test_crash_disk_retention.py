@@ -5,8 +5,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
-from crash_disk_retention import cleanup_if_due, RETENTION_DAYS, SWEEP_INTERVAL_SECONDS
+from crash_disk_retention import cleanup_if_due, purge_disabled_risk_v1_raw, RETENTION_DAYS, SWEEP_INTERVAL_SECONDS
 
 
 def epoch(year=2026, month=11, day=11, hour=18):
@@ -34,6 +35,38 @@ class DiskRetentionTests(unittest.TestCase):
     def sweep(self, now=None, pending=None):
         return cleanup_if_due(self.base, self.now if now is None else now,
                               pending=pending, log=self.logs.append)
+
+    def test_risk_v1_purge_requires_explicit_flag_and_disabled_collector(self):
+        raw = self.write(self.root / "risk_v1" / "2026-11-09.jsonl", content="huge shadow test")
+        with patch.dict(os.environ, {"CRASH_RISK_V1_ENABLED": "0",
+                                    "CRASH_RISK_V1_PURGE_LOGS": "0"}):
+            self.assertIsNone(purge_disabled_risk_v1_raw(self.base))
+        self.assertTrue(raw.exists())
+        with patch.dict(os.environ, {"CRASH_RISK_V1_ENABLED": "1",
+                                    "CRASH_RISK_V1_PURGE_LOGS": "1"}):
+            self.assertIsNone(purge_disabled_risk_v1_raw(self.base))
+        self.assertTrue(raw.exists())
+
+    def test_risk_v1_purge_only_raw_jsonl_preserves_summaries_and_orders(self):
+        risk = self.root / "risk_v1"
+        raw_old = self.write(risk / "2026-11-09.jsonl", content="a" * 97)
+        raw_today = self.write(risk / "2026-11-12.jsonl", content="b" * 17)
+        keep = [self.write(risk / n) for n in
+                ("summary.json", "state.json", "experiment.jsonl", "2026-11-09.jsonl.gz")]
+        keep += [self.write(self.root / "2026-11-09.jsonl"),
+                 self.write(self.base / "crash_night_state.json")]
+        external = self.write(self.base / "external.jsonl")
+        (risk / "2026-11-08.jsonl").symlink_to(external)
+        with patch.dict(os.environ, {"CRASH_RISK_V1_ENABLED": "0",
+                                    "CRASH_RISK_V1_PURGE_LOGS": "1"}):
+            result = purge_disabled_risk_v1_raw(self.base, log=self.logs.append)
+        self.assertEqual(result["deleted_files"], 2)
+        self.assertEqual(result["freed_bytes"], 114)
+        self.assertFalse(raw_old.exists())
+        self.assertFalse(raw_today.exists())
+        self.assertTrue(all(x.exists() for x in keep))
+        self.assertTrue(external.exists())
+        self.assertTrue((risk / "2026-11-08.jsonl").is_symlink())
 
     def test_first_sweep_keeps_latest_ten_utc_dates(self):
         day = datetime.fromtimestamp(self.now, timezone.utc).date()
