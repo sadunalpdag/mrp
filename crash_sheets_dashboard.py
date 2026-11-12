@@ -563,7 +563,7 @@ def _ensure_four_risk_columns(sheet, signal, logger=None):
 
 
 def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_get=None,
-            logger=None):
+            logger=None, executor=None):
     client, sheet_id = _credentials()
     if not client:
         return False
@@ -602,6 +602,14 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     # tabs; no extra API round trip or legacy scanner.
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
+    # D:I is a separate user-controlled parameter area. A:B and Sinyal remain
+    # read-only. Sheet control faults must not interrupt reports or live trading.
+    try:
+        from crash_sheets_controls import sync_panel
+        sync_panel(sheet, status, executor, logger=logger)
+    except Exception as exc:
+        if logger:
+            logger('[CRASH SHEETS CONTROL] skipped: ' + type(exc).__name__)
     _write_previous(prev_path, previous)
     if logger:
         try:
@@ -662,7 +670,7 @@ class DashboardPublisher:
             try:
                 if publish({"symbols": symbols, "history": recent}, copied_tickers,
                            trading, copied_ws, now, self.directory, self.rescore,
-                           self.candle_get, logger=self.logger):
+                           self.candle_get, logger=self.logger, executor=executor):
                     self.logger("[CRASH SHEETS] Bot Status / Sinyal updated")
             except Exception as exc:
                 # Never log service-account JSON or raw Google error response.
