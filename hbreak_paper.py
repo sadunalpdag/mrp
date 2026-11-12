@@ -15,7 +15,7 @@ LOG.propagate=False
 BASE=Path(os.getenv("DATA_DIR","/data"))
 DB=BASE/"hbreak_paper.sqlite3"
 SHEET="HBREAK_15M_LONG_TEST"
-FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_15m atr14_15m atr_pct volume_15m_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at".split()
+FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_15m atr14_15m atr_pct volume_15m_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at data_status observed_candles last_candle_at".split()
 URL="https://api.coinbeacon.io/public/setups"
 PARAMS={"exchange":"binance-futures","timeframe":"15m","archetype":"breakout_watch,pattern_breakout,trendline_break,breakout_retest","bias":"bullish","minScore":"50"}
 PARIS=ZoneInfo("Europe/Paris")
@@ -34,6 +34,27 @@ def rows(db):
     return [json.loads(r[0]) for r in db.execute("select data from trades")]
 def save(db,v):
     db.execute("insert or replace into trades values (?,?)",(v["id"],json.dumps(v)));db.commit()
+def first_full_candle_ms(opened_at):
+    """Start from first full 5m candle after paper entry."""
+    ts=int(datetime.fromisoformat(opened_at).timestamp()*1000)
+    return ((ts + 299999)//300000)*300000
+
+def migrate_tracking(db):
+    """Backfill legacy OPEN paper trades without a data-observation marker."""
+    repaired=0
+    for trade in rows(db):
+        if "observed_candles" in trade:continue
+        trade["observed_candles"]=0
+        trade["last_candle_at"]=None
+        trade["data_status"]="PENDING" if trade["status"]=="OPEN" else "LEGACY_CLOSED"
+        if trade["status"]=="OPEN":
+            trade["cursor"]=first_full_candle_ms(trade["opened_at"])
+            trade["low_since_entry"]=float(trade["entry"])
+            trade["max_drawdown_pct"]=None
+        save(db,trade)
+        repaired+=1
+    if repaired:LOG.info("HBREAK tracking migration: %d trades; backfill scheduled",repaired)
+
 def get_klines(http,symbol,tf,limit=100,start=None):
     p={"symbol":symbol,"interval":tf,"limit":limit}
     if start is not None:p["startTime"]=int(start)
@@ -78,29 +99,62 @@ def enroll(db,http,setups):
                liquidity_usd_24h=part.get("liquidityUsd24h"),trend_direction=s.get("trendDirection"),
                multi_tf_confirmed=s.get("multiTfConfirmed"),rsi14_15m=vals[0],atr14_15m=vals[1],
                atr_pct=vals[2],volume_15m_usdt=vals[3],entry=price,tp=price*1.01,
-               status="OPEN",low_since_entry=price,max_drawdown_pct=0,checked_at=stamp(),
-               cursor=int(utc().timestamp()*1000))
+               status="OPEN",low_since_entry=price,max_drawdown_pct=None,checked_at=stamp(),
+               data_status="PENDING",observed_candles=0,last_candle_at=None,
+               cursor=first_full_candle_ms(stamp()))
             save(db,obj);existing.add(key);added+=1
         except Exception as e:LOG.warning("HBREAK candidate skip %s %s",s.get("symbol"),str(e)[:100])
     return added
 def track(db,http):
-    # Hard cap reduces Binance REST load. Round-robin on oldest checked.
-    pending=sorted((x for x in rows(db) if x["status"]=="OPEN"),key=lambda v:v.get("checked_at",""))[:8]
-    for t in pending:
+    # Bounded REST calls, round robin; deliberately separated from Crash orders.
+    batch=max(1,min(24,int(os.getenv("HBREAK_TRACK_BATCH","16"))))
+    pending=sorted((x for x in rows(db) if x["status"]=="OPEN"),
+                   key=lambda v:v.get("checked_at",""))[:batch]
+    refreshed=0
+    changed=0
+    for trade in pending:
         try:
-            start=int(t.get("cursor") or int(datetime.fromisoformat(t["opened_at"]).timestamp()*1000))
-            candles=get_klines(http,t["coin"],"5m",limit=1000,start=start)
-            for c in candles:
-                if int(c[6])<int(datetime.fromisoformat(t["opened_at"]).timestamp()*1000):continue
-                t["low_since_entry"]=min(t["low_since_entry"],float(c[3]))
-                if float(c[2])>=t["tp"]:
-                    t["status"]="TP_1_PERCENT"
-                    t["tp_at"]=datetime.fromtimestamp(int(c[6])/1000,timezone.utc).isoformat()
+            first=first_full_candle_ms(trade["opened_at"])
+            start=max(first,int(trade.get("cursor") or first))
+            candles=get_klines(http,trade["coin"],"5m",limit=200,start=start)
+            processed=0
+            for candle in candles:
+                if int(candle[0])<start:continue
+                processed+=1
+                trade["low_since_entry"]=min(float(trade["low_since_entry"]),float(candle[3]))
+                trade["last_candle_at"]=datetime.fromtimestamp(int(candle[6])/1000,timezone.utc).isoformat()
+                if float(candle[2])>=float(trade["tp"]):
+                    trade["status"]="TP_1_PERCENT"
+                    trade["tp_at"]=trade["last_candle_at"]
                     break
-            if candles:t["cursor"]=int(candles[-1][0])+1
-            t["max_drawdown_pct"]=round((t["low_since_entry"]/t["entry"]-1)*100,4)
-            t["checked_at"]=stamp();save(db,t)
-        except Exception as e:LOG.warning("HBREAK track %s %s",t["coin"],str(e)[:120])
+            if processed:
+                trade["cursor"]=int(candles[processed-1][0])+300000
+                trade["observed_candles"]=int(trade.get("observed_candles") or 0)+processed
+                trade["max_drawdown_pct"]=round(min(0.0,(float(trade["low_since_entry"])/float(trade["entry"])-1)*100),4)
+                trade["data_status"]="OK"
+                refreshed+=1
+                changed+=processed
+            else:
+                trade["data_status"]="PENDING" if not trade.get("observed_candles") else "OK"
+            trade["checked_at"]=stamp()
+            save(db,trade)
+        except requests.HTTPError as e:
+            trade["data_status"]="ERROR"
+            trade["checked_at"]=stamp()
+            save(db,trade)
+            LOG.warning("HBREAK track %s HTTP %s",trade["coin"],str(e)[:120])
+            if getattr(e.response,"status_code",None) in (418,429):
+                LOG.warning("HBREAK Binance REST rate limit; stop tracking this cycle")
+                break
+        except Exception as e:
+            trade["data_status"]="ERROR"
+            trade["checked_at"]=stamp()
+            save(db,trade)
+            LOG.warning("HBREAK track %s %s",trade["coin"],str(e)[:120])
+    all_open=[x for x in rows(db) if x["status"]=="OPEN"]
+    waiting=sum(x.get("data_status")!="OK" for x in all_open)
+    LOG.info("HBREAK 5m tracked=%s bars=%s remaining_open=%s pending_or_error=%s batch=%s",
+             refreshed,changed,len(all_open),waiting,batch)
 def sheet_sync(db):
     import gspread
     from google.oauth2.service_account import Credentials
@@ -157,6 +211,7 @@ def run():
     BASE.mkdir(parents=True,exist_ok=True)
     with sqlite3.connect(DB) as db,requests.Session() as http:
         initialize(db)
+        migrate_tracking(db)
         while True:
             try:step(db,http)
             except Exception as e:LOG.warning("HBREAK cycle %s",str(e)[:180])
