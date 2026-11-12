@@ -386,6 +386,16 @@ class NightExecutor:
             else:
                 # Python's off switch always wins; preserve explicit Telegram /otomatik_kapat.
                 self.state['paused'] = not enabled or bool(self.state.get('paused', False))
+            # One-time upgrade. Install both protection caps before expanding
+            # daily orders; future Telegram modifications survive redeploys.
+            if not self.state.get('entry_capacity_limits_20261112'):
+                settings = dict(self.state.get('trade_settings') or {})
+                settings['max_open_positions'] = 10
+                settings['max_pending_entries'] = 15
+                if int(max_daily) == 50:
+                    settings['max_daily'] = 50
+                self.state['trade_settings'] = settings
+                self.state['entry_capacity_limits_20261112'] = True
             self.save()
             with open(marker, 'a') as handle:
                 handle.flush()
@@ -397,8 +407,16 @@ class NightExecutor:
         self.max_daily = int(settings.get('max_daily', max_daily))
         self.max_symbols = int(settings.get('max_symbols', 20))
         self.broker.max_symbols = self.max_symbols
+        self.max_open_positions = int(settings.get('max_open_positions', 10))
+        self.max_pending_entries = int(settings.get('max_pending_entries', 15))
+        self.broker.max_open_positions = self.max_open_positions
+        self.broker.max_pending_entries = self.max_pending_entries
         self.position_usdt = D(str(settings.get('position_usdt', '500')))
-        if not 1 <= self.max_symbols <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS or not 1 <= self.max_daily <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 1000:
+        if (not 1 <= self.max_symbols <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS
+                or not 1 <= self.max_daily <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS
+                or not 1 <= self.max_open_positions <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS
+                or not 1 <= self.max_pending_entries <= MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS
+                or not self.position_usdt.is_finite() or not 1 <= self.position_usdt <= 1000):
             self.guard.close()
             raise ValueError('INVALID_TRADE_SETTINGS')
         self.manual_tp_enabled = manual_tp
