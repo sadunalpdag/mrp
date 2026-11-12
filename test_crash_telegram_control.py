@@ -72,24 +72,30 @@ class ControlTests(unittest.TestCase):
         update=self.update(text='/gunluk_kar 7')
         update['message']['chat']['id']=-100999
         member=Mock(status_code=200)
+        # CI intentionally has no requests installed: supply a synthetic
+        # module instead of importing/installing the package just to mock GET.
+        import sys
+        from types import ModuleType
+        fake_requests = ModuleType('requests')
+        fake_requests.get = Mock()
         member.json.return_value={'ok': True, 'result': {'status':'administrator'}}
-        with patch('requests.get',return_value=member) as call:
+        with patch.dict(sys.modules, {'requests': fake_requests}), patch('requests.get',return_value=member) as call:
             self.assertIsNone(c.command(update))
             call.assert_called_once()
             self.assertEqual(call.call_args.kwargs['params']['user_id'],123)
         member.json.return_value={'ok': True, 'result': {'status':'creator'}}
-        with patch('requests.get',return_value=member) as call:
+        with patch.dict(sys.modules, {'requests': fake_requests}), patch('requests.get',return_value=member) as call:
             self.assertEqual(c.command(update),'paper_target:7')
             self.assertEqual(call.call_args.kwargs['params']['chat_id'],'-100999')
         # Explicit owner always overrides group creator verification.
         explicit=TelegramControl(self.tmp.name,'fake','-100999','456',
                           self.action,self.deliver,Mock(),lambda:self.now,self.fetch,
                           counter_only=True,require_owner=False,allow_toggle=True)
-        with patch('requests.get') as call:
+        with patch.dict(sys.modules, {'requests': fake_requests}), patch('requests.get') as call:
             self.assertIsNone(explicit.command(update))
             call.assert_not_called()
         update['message']['from']['id']=456
-        with patch('requests.get') as call:
+        with patch.dict(sys.modules, {'requests': fake_requests}), patch('requests.get') as call:
             self.assertEqual(explicit.command(update),'paper_target:7')
             call.assert_not_called()
 
