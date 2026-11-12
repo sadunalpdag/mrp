@@ -7419,17 +7419,17 @@ def _crash_daily_report(state, now):
                 source = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, day+".jsonl")
                 if os.path.exists(source):
                     archive.write(source, "observations/"+day+".jsonl")
-            # Research exports are independent of the signal statistics above.
-            risk_dir = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'risk_v1')
-            for name in ('summary.json', 'state.json'):
-                source = os.path.join(risk_dir, name)
-                if os.path.isfile(source):
-                    archive.write(source, 'risk_scenarios/'+name)
-            archive.writestr("README.txt", notes + "\nRisk scenarios: see risk_scenarios/summary.json. "
-                "15-day prospective enrollment + 5-day followup; 50 USDT paper positions, "
-                "1000 USDT reference capital, unlimited slots. Fee 5bps/side and extra slippage "
-                "2bps/side are assumptions. Funding/liquidation excluded. Missing spreads and "
-                "coverage gaps are flagged. Raw quotes/connection logs retained in risk_v1 for 20 days.")
+            # Stop adding stale disabled risk_v1 snapshots to fresh daily ZIPs.
+            if os.getenv("CRASH_RISK_V1_ENABLED", "0") == "1":
+                risk_dir = os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'risk_v1')
+                for name in ('summary.json', 'state.json'):
+                    source = os.path.join(risk_dir, name)
+                    if os.path.isfile(source):
+                        archive.write(source, 'risk_scenarios/'+name)
+            archive.writestr("README.txt", notes + "\nRisk v1 shadow test: " +
+                ("ENABLED; see risk_scenarios/*.json."
+                 if os.getenv("CRASH_RISK_V1_ENABLED", "0") == "1"
+                 else "DISABLED; no new risk_v1 quote/strategy logs are recorded."))
         os.replace(path+".tmp",path)
         rate = rolling["observed_tp_rate_resolved_pct"]
         avg = rolling["average_tp_hours"]
@@ -8613,15 +8613,22 @@ def _crash_start_services():
 def _crash_bounce_worker():
     global _CRASH_ACTIVE_STATE, _CRASH_RISK_RESEARCH
     from crash_policy import supported_symbol, prune_active_state, TRACKING_SECONDS
-    try:
-        from crash_risk_research import RiskResearch
-        import websocket
-        _CRASH_RISK_RESEARCH = RiskResearch(
-            os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'risk_v1'), websocket, log)
-        _CRASH_RISK_RESEARCH.start()
-        log('[CRASH RESEARCH] 15-day paper enrollment started/resumed; signal rules unchanged')
-    except Exception as error:
-        log(f'[CRASH RESEARCH START ERR] {type(error).__name__}: {str(error)[:200]}')
+    # Operator disabled risk_v1 shadow strategy on 2026-11-12 to prevent
+    # large raw quote JSONL files. Other Crash services, real orders and
+    # independent HBREAK/API2 paper tests continue unchanged.
+    _CRASH_RISK_RESEARCH = None
+    if os.getenv("CRASH_RISK_V1_ENABLED", "0") == "1":
+        try:
+            from crash_risk_research import RiskResearch
+            import websocket
+            _CRASH_RISK_RESEARCH = RiskResearch(
+                os.path.join(CRASH_BOUNCE_RESEARCH_DIR, 'risk_v1'), websocket, log)
+            _CRASH_RISK_RESEARCH.start()
+            log('[CRASH RESEARCH] risk_v1 paper research enabled')
+        except Exception as error:
+            log(f'[CRASH RESEARCH START ERR] {type(error).__name__}: {str(error)[:200]}')
+    else:
+        log('[CRASH RESEARCH] risk_v1 DISABLED; no shadow quote JSONL recording')
     state = None
     market, refreshed = _crash_load_market_cache()
     next_metadata = refreshed + 86400 if market else 0
