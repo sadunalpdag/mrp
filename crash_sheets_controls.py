@@ -33,6 +33,62 @@ KINDS = {"DAILY": ("limit", "max_daily", 50),
          "PENDING": ("pending_limit", "max_pending_entries", 50)}
 
 
+def paper_target_rows():
+    """Read-only high-water metrics; never query Binance or issue orders.
+
+    Put this below the D:I controls instead of adding editable control rows,
+    so pending F/I confirmations survive deploys and continue working.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from daily_profit_lock_paper import load_settings, load_state, money
+    paris = ZoneInfo("Europe/Paris")
+    settings = load_settings()
+    state = load_state()
+    def fmt(value):
+        if value is None or value == "":
+            return "—"
+        return f"{money(value):,.2f} USDT"
+    rows = [
+        ["SANAL KAR GOZLEMI", "DEGER", "ACIKLAMA"],
+        ["Bir sonraki gun hedef orani", "%" + str(settings["target_pct"]),
+         "Saat 00:00 Paris'te yeni hedef hesaplanir"],
+        ["Sanal izleme", "AÇIK" if settings["enabled"] else "KAPALI",
+         "Gercek emir veya TP degistirmez"],
+    ]
+    if not state:
+        return rows + [
+            ["Kaydedilen zirve", "VERI BEKLENIYOR", "Hesap ilk kez okunuyor"],
+            ["Guncel ozsermaye", "VERI BEKLENIYOR", "Cuzdan + gerceklesmemis kar/zarar"],
+            ["Bugunun sabit hedefi", "VERI BEKLENIYOR", "Ilk Paris gece yarisindan sonra hazir"],
+            ["Hedefe kalan", "VERI BEKLENIYOR", "Bugunun hedefi henuz bilinmiyor"],
+            ["Yarinin tahmini hedefi", "VERI BEKLENIYOR", "Zirve x ayarli hedef orani"],
+            ["Son Binance olcumu", "—", "Europe/Paris"],
+        ]
+    peak = money(state.get("all_time_peak")) if state.get("all_time_peak") else None
+    current = money(state.get("last_equity")) if state.get("last_equity") else None
+    target = money(state.get("target")) if state.get("target") else None
+    planned = peak * (1 + money(settings["target_pct"]) / 100) if peak is not None else None
+    remaining = max(money("0"), target - current) if target is not None and current is not None else None
+    sample = state.get("sampled_at")
+    try:
+        measured = datetime.fromisoformat(sample).astimezone(paris).strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError, AttributeError):
+        measured = "BILINMIYOR"
+    rows += [
+        ["Kaydedilen zirve", fmt(peak), "Gorulmus en yuksek hesap ozsermayesi"],
+        ["Guncel ozsermaye", fmt(current), "Son okuma; canli fiyat degil"],
+        ["Bugunun sabit hedefi", fmt(target) if target is not None else "ILK 00:00 BEKLENIYOR",
+         "Paris takvim gunu basinda sabitlenir; sanal"],
+        ["Hedefe kalan", fmt(remaining) if target is not None else "—",
+         "Bugunun hedefine gore, son olcumden"],
+        ["Yarinin tahmini hedefi", fmt(planned),
+         "Guncel zirve x (1 + ayarlanmis hedef %); degisebilir"],
+        ["Son Binance olcumu", measured, "Fransa saati"],
+    ]
+    return rows
+
+
 def _mode(raw):
     value = str(raw).strip().upper()
     if value in ("AÇIK", "ACIK", "ON", "1"):
@@ -195,6 +251,15 @@ def sync_panel(sheet, tab, executor, logger=None):
             data.append({"range": prefix + f"I{row}", "values": [[""]]})
             if success:
                 data.append({"range": prefix + f"F{row}", "values": [[""]]})
+    # Separate read-only target amounts beneath controls; never overwrite F/I.
+    target_rows = paper_target_rows()
+    start = COUNT + 2
+    data.extend([
+        {"range": prefix + f"D{start}:E{start + len(target_rows) - 1}",
+         "values": [[row[0], row[1]] for row in target_rows]},
+        {"range": prefix + f"G{start}:G{start + len(target_rows) - 1}",
+         "values": [[row[2]] for row in target_rows]},
+    ])
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     if not ready:
         # Formatting does not change other tabs or any existing A:B status data.
