@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from crash_telegram_control import TelegramControl
 from crash_night import NightExecutor
 from test_crash_services import FakeBroker, timestamp
@@ -64,6 +64,34 @@ class ControlTests(unittest.TestCase):
         u=self.update(text='/gunluk_kar 7')
         u['message']['chat']['id']=222
         self.assertIsNone(c.command(u))
+
+    def test_group_paper_commands_allow_only_telegram_verified_creator(self):
+        c=TelegramControl(self.tmp.name,'fake','-100999',None,
+                          self.action,self.deliver,Mock(),lambda:self.now,self.fetch,
+                          counter_only=True,require_owner=False,allow_toggle=True)
+        update=self.update(text='/gunluk_kar 7')
+        update['message']['chat']['id']=-100999
+        member=Mock(status_code=200)
+        member.json.return_value={'ok': True, 'result': {'status':'administrator'}}
+        with patch('requests.get',return_value=member) as call:
+            self.assertIsNone(c.command(update))
+            call.assert_called_once()
+            self.assertEqual(call.call_args.kwargs['params']['user_id'],123)
+        member.json.return_value={'ok': True, 'result': {'status':'creator'}}
+        with patch('requests.get',return_value=member) as call:
+            self.assertEqual(c.command(update),'paper_target:7')
+            self.assertEqual(call.call_args.kwargs['params']['chat_id'],'-100999')
+        # Explicit owner always overrides group creator verification.
+        explicit=TelegramControl(self.tmp.name,'fake','-100999','456',
+                          self.action,self.deliver,Mock(),lambda:self.now,self.fetch,
+                          counter_only=True,require_owner=False,allow_toggle=True)
+        with patch('requests.get') as call:
+            self.assertIsNone(explicit.command(update))
+            call.assert_not_called()
+        update['message']['from']['id']=456
+        with patch('requests.get') as call:
+            self.assertEqual(explicit.command(update),'paper_target:7')
+            call.assert_not_called()
 
     def test_counter_only_commands_authorized_and_cannot_toggle_trading(self):
         self.c.counter_only=True
