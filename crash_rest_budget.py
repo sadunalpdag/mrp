@@ -13,9 +13,11 @@ import time
 # Leave generous headroom for other clients on a shared Render egress IP.
 # These are conservative software caps, NOT exchange guarantees.
 RESEARCH_CEILING = 180
+# PAPER-ONLY HBREAK/API2 is strictly lower than Crash V2 research.
+PAPER_CEILING = 120
 ACCOUNT_CEILING = 1400
 PROTECT_CEILING = 1750
-PACED_SECONDS = {"research": 20.0, "account": 3.0, "protect": 0.5}
+PACED_SECONDS = {"paper": 20.0, "research": 20.0, "account": 3.0, "protect": 0.5}
 
 
 class RateDeferred(RuntimeError):
@@ -105,7 +107,7 @@ class IpBudget:
     def reserve(self, kind, weight):
         if kind not in PACED_SECONDS or not 0 <= weight <= 40:
             raise ValueError("INVALID_IP_BUDGET_REQUEST")
-        ceiling = {"research": RESEARCH_CEILING, "account": ACCOUNT_CEILING,
+        ceiling = {"paper": PAPER_CEILING, "research": RESEARCH_CEILING, "account": ACCOUNT_CEILING,
                    "protect": PROTECT_CEILING}[kind]
         while True:
             with self.lock:
@@ -122,7 +124,7 @@ class IpBudget:
                     raise RateDeferred(kind, wait, "IP_WEIGHT_SOFT_CEILING")
                 # Once external/server IP usage is high, stop background
                 # research for the rest of the minute, keeping TP capacity.
-                if kind == "research" and self.server_used >= RESEARCH_CEILING:
+                if kind in ("paper", "research") and self.server_used >= ceiling:
                     wait = (int(now // 60)+1)*60 + 5 - now
                     self._notice(kind, "RESEARCH_SERVER_WEIGHT", wait, now)
                     raise RateDeferred(kind, wait, "RESEARCH_SERVER_WEIGHT")
