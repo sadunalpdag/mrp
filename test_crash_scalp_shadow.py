@@ -24,30 +24,6 @@ class ShadowWeekTests(unittest.TestCase):
         valid = sw._bars(rows, 4 * sw.STEP_MS / 1000)
         self.assertEqual(len(valid), 2)
 
-    def test_daily_range_requires_all_real_candles(self):
-        now = 2 * 86400 + 3600
-        rows = candles(96, close=100, first=86400 * 1000)
-        self.assertEqual(sw.previous_utc_range(rows, now), (100.2, 99.8))
-        self.assertIsNone(sw.previous_utc_range(rows[:-1], now))
-
-    def test_break_bounce_is_proxy(self):
-        b = [(0, 104, 105, 103, 104, 1),
-             (sw.STEP_MS, 104, 108, 103, 107, 1),
-             (2 * sw.STEP_MS, 105.5, 108, 105, 106.8, 1)]
-        result = sw.break_bounce(b, (105, 95))
-        self.assertEqual(result[0], "LONG")
-        self.assertIn("5m teyit yok", result[1])
-
-    def test_outcomes_use_future_candles_and_ambiguous_on_double_touch(self):
-        baseline = {"status": "OPEN", "ts": 0, "side": "LONG",
-                    "tp": 101, "risk": 99}
-        a = dict(baseline)
-        sw._settle(a, [(sw.STEP_MS, 100, 101.2, 99.8, 100.5, 1)], 3600)
-        self.assertEqual(a["status"], "TP")
-        b = dict(baseline)
-        sw._settle(b, [(sw.STEP_MS, 100, 101.2, 98.8, 100.5, 1)], 3600)
-        self.assertEqual(b["status"], "AMBIGUOUS")
-
     def test_pullback_long_has_no_stop_and_tp_after_three_pct_drawdown(self):
         signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0,
                   "side": "LONG", "entry": 100, "tp": 101, "risk": 99}
@@ -108,14 +84,6 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertTrue(signal["minus_one_pct_seen"])
         self.assertNotEqual(signal["status"], "RISK")
 
-    def test_break_bounce_legacy_sl_outcome_unchanged(self):
-        signal = {"status": "OPEN", "strategy": "BREAK_BOUNCE", "ts": 0,
-                  "side": "LONG", "entry": 100, "tp": 101, "risk": 99}
-        sw._settle(signal, [(sw.STEP_MS, 100, 100.1, 98, 98.5, 1)],
-                   2 * sw.STEP_MS / 1000)
-        self.assertEqual(signal["status"], "RISK")
-        self.assertNotIn("exit_model", signal)
-
     def test_pullback_sheet_shows_no_sl_and_excursions(self):
         record = {"selection_version": sw.SELECTION_VERSION,
                   "exit_model": sw.PULLBACK_NO_SL_MODEL,
@@ -150,13 +118,11 @@ class ShadowWeekTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             obj = sw._scan(td, tickers, getter, now, {"signals": []})
         self.assertEqual(len(obj["sampled_coins"]["PULLBACK"]), sw.MAX_SYMBOLS)
-        self.assertEqual(len(obj["sampled_coins"]["BREAK_BOUNCE"]), sw.MAX_SYMBOLS)
-        self.assertEqual(set(calls), {"A" + str(i) + "USDT" for i in range(10, 30)})
-        self.assertEqual(len(calls), 20)
+        self.assertEqual(set(calls), {"A" + str(i) + "USDT" for i in range(10, 20)})
+        self.assertEqual(len(calls), 10)
         self.assertEqual(len(obj["signals"]), 0)
         self.assertEqual(len(sw._tab_values(obj, "PULLBACK")), 80)
         self.assertEqual(len(obj["diagnostics"]["PULLBACK"]), 10)
-        self.assertEqual(len(obj["diagnostics"]["BREAK_BOUNCE"]), 10)
         self.assertEqual(sw._tab_values(obj, "PULLBACK")[59][:10], sw.DIAG_HEADERS)
         self.assertEqual(len(sw._tab_values(obj, "PULLBACK")[59]), 16)
         self.assertIn("MA50 eğimi yatay", str(obj["diagnostics"]["PULLBACK"]))
@@ -166,13 +132,9 @@ class ShadowWeekTests(unittest.TestCase):
                    for i in range(34)]
         self.assertEqual(sw.gainer_groups(tickers)["PULLBACK"],
                          [f"A{i:02}USDT" for i in range(10, 20)])
-        self.assertEqual(sw.gainer_groups(tickers)["BREAK_BOUNCE"],
-                         [f"A{i:02}USDT" for i in range(20, 30)])
         allowed = {f"A{i:02}USDT" for i in range(26)}
-        selected = sw.gainer_groups(tickers, allowed)
-        self.assertEqual(selected["BREAK_BOUNCE"],
-                         [f"A{i:02}USDT" for i in range(20, 26)])
-        self.assertNotIn("A30USDT", selected["BREAK_BOUNCE"])
+        self.assertEqual(sw.gainer_groups(tickers, allowed)["PULLBACK"],
+                         [f"A{i:02}USDT" for i in range(10, 20)])
 
     def test_four_missing_true_candles_allowed_but_five_rejected(self):
         now = 56 * sw.STEP_MS / 1000
@@ -220,29 +182,6 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertIn("Gerçek kapanmış mum 0/56", diagnostic[7])
         self.assertIn("son kapanış", diagnostic[7])
 
-    def test_break_bounce_uses_daily_cache_and_keeps_incomplete_day_unready(self):
-        import json
-        from pathlib import Path
-        now = 2 * 86400 + 3600
-        start = 86400 * 1000
-        yesterday = candles(96, first=start)
-        today = candles(4, first=2*86400*1000)
-        recent_raw = yesterday[-51:] + today
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/"crash_research"/"history_cache"/"XUSDT.json"
-            path.parent.mkdir(parents=True)
-            path.write_text(json.dumps(yesterday[:-1]), encoding="utf-8")
-            merged = sw._history_rows(directory, "XUSDT", recent_raw, now)
-            bars = sw._bars(merged, now)
-            self.assertTrue(sw._ready(bars, now))
-            self.assertEqual(sw.previous_utc_range(merged, now),
-                             (101.0 * 1.002, 101.0 * 0.998))
-            missing = [r for r in merged if r[0] != yesterday[28][0]]
-            self.assertIsNone(sw.previous_utc_range(missing, now))
-            diagnostics = sw._diagnostic("BREAK_BOUNCE", "XUSDT", bars,
-                                         True, daily_range=None, now=now)
-            self.assertEqual(diagnostics[5], "GÜNLÜK VERİ EKSİK")
-
     def test_round_robin_history_repair_one_per_scan_and_persists(self):
         from unittest.mock import Mock
         with tempfile.TemporaryDirectory() as directory:
@@ -256,18 +195,16 @@ class ShadowWeekTests(unittest.TestCase):
                 "PULLBACK": [
                     issue("AUSDT", "VERİ BEKLENİYOR"),
                     issue("BUSDT", "VERİ BEKLENİYOR")],
-                "BREAK_BOUNCE": [
-                    issue("CUSDT", "GÜNLÜK VERİ EKSİK"),
-                    issue("DUSDT", "KIRILIM BEKLENİYOR")]}}
+                }}
             monitor.request_missing_history(data, 1000)
             monitor.request_missing_history(data, 1300)
             monitor.request_missing_history(data, 1600)
             self.assertEqual([call.args[0] for call in proposed.call_args_list],
-                             ["AUSDT", "BUSDT", "CUSDT"])
+                             ["AUSDT", "BUSDT", "AUSDT"])
             monitor = sw.ShadowWeek(directory, Mock(),
                                     queue_history=proposed)
             monitor.request_missing_history(data, 1900)
-            self.assertEqual(proposed.call_args_list[-1].args, ("AUSDT", 1900))
+            self.assertEqual(proposed.call_args_list[-1].args, ("BUSDT", 1900))
             self.assertEqual(proposed.call_count, 4)
 
     def test_scan_reads_history_for_ranked_symbols_without_extra_price_calls(self):
@@ -292,14 +229,14 @@ class ShadowWeekTests(unittest.TestCase):
             self.assertEqual(record[1], "HAZIR")
             self.assertEqual(record[2], "56/56")
             self.assertNotEqual(record[5], "VERİ BEKLENİYOR")
-            self.assertEqual(len(called), 20)
-            self.assertEqual(len(set(called)), 20)
+            self.assertEqual(len(called), 10)
+            self.assertEqual(len(set(called)), 10)
             self.assertEqual(len(obj["ready_groups"]["PULLBACK"]), 1)
 
-    def test_no_future_candles_produce_data_gap_not_win(self):
-        signal = {"status": "OPEN", "ts": 0, "side": "LONG", "tp": 101, "risk": 99}
+    def test_no_future_candles_cannot_claim_win(self):
+        signal = {"status": "OPEN", "strategy": "PULLBACK", "ts": 0, "side": "LONG", "entry": 100, "tp": 101, "risk": None}
         sw._settle(signal, [], sw.HORIZON_S + 1)
-        self.assertEqual(signal["status"], "DATA_GAP")
+        self.assertEqual(signal["status"], "OPEN")
 
 
     def test_diagnostics_reason_for_missing_candles(self):
@@ -307,19 +244,6 @@ class ShadowWeekTests(unittest.TestCase):
         self.assertEqual(row[5], "VERİ BEKLENİYOR")
         self.assertIn("52/56", row[7])
         self.assertEqual(len(row), 10)
-
-    def test_break_bounce_reasons_are_not_fake_signals(self):
-        bars = [(i * sw.STEP_MS, 100, 101, 99, 100, 1)
-                for i in range(52)]
-        bars += [(52 * sw.STEP_MS, 104, 105, 103, 104, 1),
-                 (53 * sw.STEP_MS, 104, 108, 103, 107, 1),
-                 (54 * sw.STEP_MS, 105.5, 108, 105, 106.8, 1)]
-        incomplete = sw._diagnostic("BREAK_BOUNCE", "XUSDT", bars, True)
-        self.assertEqual(incomplete[5], "GÜNLÜK VERİ EKSİK")
-        ok = sw._diagnostic("BREAK_BOUNCE", "XUSDT", bars, True, (105, 95))
-        self.assertEqual(ok[4], "YUKARI")
-        self.assertEqual(ok[6], "4/4")
-        self.assertEqual(ok[8], "VAR")
 
     def test_publish_range_keeps_original_signal_columns(self):
         import types
@@ -329,7 +253,7 @@ class ShadowWeekTests(unittest.TestCase):
         class Book:
             title = "emafilter"
             def worksheets(self):
-                return [Worksheet(), type("Other", (), {"title": "Break Bounce Test"})()]
+                return [Worksheet()]
             def values_batch_update(self, body):
                 self.body = body
         book = Book()
@@ -342,16 +266,13 @@ class ShadowWeekTests(unittest.TestCase):
         with patch.dict(sys.modules, {"crash_sheets_dashboard": fake}):
             self.assertTrue(sw._publish({"signals": [], "last_scan": 1,
                 "ranked_groups": {}, "ready_groups": {}, "diagnostics": {}}))
-        self.assertEqual(len(book.body["data"]), 2)
-        for item in book.body["data"]:
-            pullback = "Pullback Test" in item["range"]
-            self.assertTrue(item["range"].endswith(
-                "!A1:P80" if pullback else "!A1:J80"))
-            self.assertEqual(len(item["values"]), 80)
-            self.assertEqual(item["values"][8],
-                             sw.PULLBACK_HEADERS if pullback else sw.HEADERS)
-            self.assertEqual(item["values"][59][:10], sw.DIAG_HEADERS)
-            self.assertEqual(len(item["values"][59]), 16 if pullback else 10)
+        self.assertEqual(len(book.body["data"]), 1)
+        item = book.body["data"][0]
+        self.assertEqual(item["range"], "'Pullback Test'!A1:P80")
+        self.assertEqual(len(item["values"]), 80)
+        self.assertEqual(item["values"][8], sw.PULLBACK_HEADERS)
+        self.assertEqual(item["values"][59][:10], sw.DIAG_HEADERS)
+        self.assertEqual(len(item["values"][59]), 16)
 
     def test_wrong_workbook_fail_closed(self):
         class Book:

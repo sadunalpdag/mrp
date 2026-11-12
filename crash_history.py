@@ -35,7 +35,11 @@ class HistoryCollector:
         self.next_download = self._read(self.pacing_path, {}).get('next_download', 0)
         self.jobs = self._read(self.path, {})
         discarded = [key for key,job in self.jobs.items()
-                     if not isinstance(job, dict) or not supported_symbol(job.get('symbol'))]
+                     if (not isinstance(job, dict)
+                         or not supported_symbol(job.get('symbol'))
+                         or (job.get('phase') == 'warmup' and
+                             str(job.get('signal_id','')).startswith(
+                                 ('structure-warmup:', 'scalp-warmup:'))))]
         for key in discarded:
             self.jobs.pop(key)
         if discarded:
