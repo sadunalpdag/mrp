@@ -235,7 +235,7 @@ BINANCE_SECRET = os.getenv("BINANCE_SECRET_KEY")
 # İlk çalıştırmada otomatik giriş AÇIK; kullanıcı Telegram'dan kapatırsa kapalı durumu korunur.
 AUTO_TRADING_ENABLED = 1
 MANUAL_TP_REPAIR_ENABLED = 1
-AUTO_MAX_DAILY_ENTRIES = 20
+AUTO_MAX_DAILY_ENTRIES = 50
 
 BINANCE_FAPI   = "https://fapi.binance.com"
 
