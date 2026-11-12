@@ -150,7 +150,7 @@ def sync_panel(sheet, tab, executor, logger=None):
             "fields": "gridProperties.columnCount"}}]})
     observed = _rect(tab.get(f"D1:I{COUNT}"), COUNT)
     ready = (observed[0] == HEADER and
-             all(observed[i + 1][0] == key for i, (key, _, _, _) in enumerate(ROWS)))
+             all(observed[i + 1][0] == label for i, (_, label, _, _) in enumerate(ROWS)))
     current = _values(executor)
     left, right, clears, applied = [HEADER[:2]], [[HEADER[3], HEADER[4]]], [], 0
     for i, (key, label, description, editable) in enumerate(ROWS, start=2):
