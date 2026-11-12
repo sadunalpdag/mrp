@@ -75,10 +75,12 @@ class TelegramControl:
         if text == '/rapor':
             return 'report'
         parts = text.split()
-        if text in ('/limit', '/tutar', '/sembol'):
+        if text in ('/limit', '/tutar', '/sembol', '/acik', '/pozisyon', '/bekleyen'):
             return 'status'
-        if len(parts) == 2 and parts[0] in ('/limit', '/tutar', '/sembol') and len(parts[1]) <= 12:
-            return {'/limit':'limit:', '/tutar':'amount:', '/sembol':'symbols:'}[parts[0]] + parts[1]
+        if len(parts) == 2 and parts[0] in ('/limit', '/tutar', '/sembol', '/acik', '/pozisyon', '/bekleyen') and len(parts[1]) <= 12:
+            return {'/limit':'limit:', '/tutar':'amount:', '/sembol':'symbols:',
+                    '/acik':'open_limit:', '/pozisyon':'open_limit:',
+                    '/bekleyen':'pending_limit:'}[parts[0]] + parts[1]
         if self.counter_only:
             if text in ('/sayac', '/otomatik_durum'):
                 return 'status'
