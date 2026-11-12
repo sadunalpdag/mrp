@@ -8297,10 +8297,16 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
 
 _CRASH_SHADOW = None
 _CRASH_AI = None
+_CRASH_DAILY_PROFIT_PAPER = None  # Read-only, isolated; NEVER controls live orders.
 _CRASH_REPORT_REQUEST = threading.Event()
 
 
 def _crash_control_action(action):
+    if action.startswith('paper_'):
+        monitor = globals().get('_CRASH_DAILY_PROFIT_PAPER')
+        if monitor is None:
+            return '⚠️ SANAL günlük kâr izleyicisi hazır değil. Render loglarını kontrol edin.'
+        return monitor.control(action)
     if action == 'report':
         _CRASH_REPORT_REQUEST.set()
         return '✅ Günlük rapor sıraya alındı; özet ve ZIP ayrı gönderilecek.'
@@ -8548,10 +8554,11 @@ def _crash_one_time_fresh_start(directory, broker, report, *, expected_mount='/d
 
 def _crash_start_services():
     """Python controls startup defaults; configured-chat commands can toggle new entries."""
-    global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL
+    global _CRASH_HEALTH, _CRASH_NIGHT, _CRASH_CONTROL, _CRASH_DAILY_PROFIT_PAPER
     from crash_heartbeat import Heartbeat
     _CRASH_NIGHT = None
     _CRASH_CONTROL = None
+    _CRASH_DAILY_PROFIT_PAPER = None
     auto_flag = globals().get('AUTO_TRADING_ENABLED', 0)
     repair_flag = globals().get('MANUAL_TP_REPAIR_ENABLED', 0)
     if auto_flag not in (0, 1) or repair_flag not in (0, 1):
@@ -8577,6 +8584,16 @@ def _crash_start_services():
             _CRASH_NIGHT = executor
             executor.public_rest_blocked = lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
             executor.start()
+            # Account-equity paper watcher. Its ONLY exchange methods are GET.
+            # Errors never stop the real executor or affect buying/TP flows.
+            try:
+                from crash_daily_profit_paper_live import DailyProfitPaperMonitor
+                _CRASH_DAILY_PROFIT_PAPER = DailyProfitPaperMonitor(
+                    directory, broker, log, _crash_telegram_receipt)
+                _CRASH_DAILY_PROFIT_PAPER.start()
+                log('[DAILY PROFIT PAPER] read-only observer started; NO BINANCE ORDERS')
+            except Exception as paper_error:
+                log(f'[DAILY PROFIT PAPER START ERR] {type(paper_error).__name__}')
         except Exception as error:
             reasons = {
                 'MISSING_BINANCE_CREDENTIALS': 'Binance API anahtarı veya secret boş',

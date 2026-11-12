@@ -70,6 +70,21 @@ class TelegramControl:
             return None
         # Exact commands only. Quoted, edited, forwarded and free-form signals cannot arm trading.
         text = msg.get('text', '').strip()
+        # Paper-only controls require owner identity, even in counter_only mode.
+        # No paper command is allowed to enable/disable live trading.
+        if text.startswith('/gunluk_kar'):
+            if str(sender.get('id')) != self.owner_id:
+                return None
+            if text == '/gunluk_kar_durum':
+                return 'paper_status'
+            if text == '/gunluk_kar_ac':
+                return 'paper_on'
+            if text == '/gunluk_kar_kapat':
+                return 'paper_off'
+            pieces = text.split()
+            if len(pieces) == 2 and pieces[0] == '/gunluk_kar' and len(pieces[1]) <= 6:
+                return 'paper_target:' + pieces[1]
+            return None
         if self.allow_toggle and text in COMMANDS:
             return COMMANDS[text]
         if text == '/rapor':

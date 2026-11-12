@@ -55,6 +55,8 @@ def estimated_weight(path, params=None, method=None):
         return 1 if params.get("symbol") else 40
     if path in ("/fapi/v3/positionRisk", "/fapi/v2/positionRisk"):
         return 5
+    if path == "/fapi/v1/income":
+        return 30  # Binance income-history documented IP weight.
     if path == "/fapi/v1/positionSide/dual":
         return 30  # conservative
     if path.startswith("/futures/data/"):
