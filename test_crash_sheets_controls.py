@@ -55,8 +55,8 @@ class PanelTests(unittest.TestCase):
         self.assertFalse(any("A1" in r or "B1" in r for r in ranges))
 
     def test_existing_panel_only_processes_approved_change(self):
-        cells = [list(ctrl.HEADER)] + [[key, "old", "", description, "", ""]
-                     for key, _, description, _ in ctrl.ROWS]
+        cells = [list(ctrl.HEADER)] + [[label, "old", "", description, "", ""]
+                     for _, label, description, _ in ctrl.ROWS]
         # One desired value without confirmation must not run.
         cells[3][2] = "7"
         cells[4][2] = "15"
