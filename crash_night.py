@@ -289,9 +289,17 @@ class BinanceBroker:
         if symbol in active or len(active) >= getattr(self, 'max_symbols', 5):
             raise ValueError(f"POSITION_EXISTS_OR_MAX_{getattr(self, 'max_symbols', 5)}")
         orders = self.request('GET', '/fapi/v1/openOrders')
+        if not isinstance(orders, list):
+            raise ValueError('INVALID_OPEN_ORDER_RESPONSE')
         if any(o['symbol'] == symbol for o in orders):
             raise ValueError('EXISTING_SYMBOL_ORDER')
-        # Pending orders on other symbols can also occupy future position slots.
+        # Check the independent order cap before legacy combined symbol slots.
+        # No need to fetch algo orders if normal entries already fill the cap.
+        normal_entry_count = sum(not self.is_closing_order(o) for o in orders)
+        if normal_entry_count >= getattr(self, 'max_pending_entries', 15):
+            self.last_capacity_snapshot = dict(open_positions=len(active),
+                                               pending_entries=normal_entry_count, at=time.time())
+            raise ValueError('MAX_PENDING_ENTRY_ORDERS_REACHED')
         self.check_slots(active, orders)
         algo_orders = self.request('GET', '/fapi/v1/openAlgoOrders')
         if not isinstance(algo_orders, list):
@@ -299,7 +307,6 @@ class BinanceBroker:
         if any(o['symbol'] == symbol for o in algo_orders):
             raise ValueError('EXISTING_SYMBOL_ALGO_ORDER')
         all_orders = orders + algo_orders
-        self.check_slots(active, all_orders)
         # Count orders, not unique symbols; exclude reduce-only/closing orders.
         # All existing manual and unidentified opening orders count for safety.
         opening_orders = [o for o in all_orders if not self.is_closing_order(o)]
@@ -308,6 +315,7 @@ class BinanceBroker:
                                            at=time.time())
         if len(opening_orders) >= getattr(self, 'max_pending_entries', 15):
             raise ValueError('MAX_PENDING_ENTRY_ORDERS_REACHED')
+        self.check_slots(active, all_orders)
         # Operator visibility without another REST call or any cancellation.
         # Only explicitly tagged bot BUY orders count as the bot's own pending
         # entries; manual orders and closing/TP orders are never modified.
