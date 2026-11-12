@@ -15813,6 +15813,15 @@ def main():
             log("[HBREAK] paper-only 4H breakout monitor started")
         except Exception as exc:
             log(f"[HBREAK START ERR] {type(exc).__name__}: {str(exc)[:180]}")
+    # Daily profit high-water paper OBSERVER: only signed account/position GET
+    # and public orderbook GET. No real buy/TP/cancel actions or trading locks.
+    if os.getenv("DAILY_PROFIT_PAPER_ENABLED", "0") == "1":
+        try:
+            from daily_profit_lock_paper import start as _daily_profit_paper_start
+            _daily_profit_paper_start()
+            log("[PROFIT-PAPER] high-water observer started; NO REAL ORDERS")
+        except Exception as exc:
+            log(f"[PROFIT-PAPER START ERR] {type(exc).__name__}: {str(exc)[:160]}")
     # CoinBeacon API2: six isolated PAPER-ONLY strategies. Never imports or
     # calls the real Binance broker; HBREAK SQLite accessed read-only.
     # An import check is useful even when the monitor is disabled.
