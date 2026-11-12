@@ -14,6 +14,7 @@ LOG.setLevel(logging.INFO)
 LOG.propagate=False
 BASE=Path(os.getenv("DATA_DIR","/data"))
 DB=BASE/"hbreak_paper.sqlite3"
+from crash_paper_rest_priority import paper_get, paper_rest_available, PaperRestDeferred
 SHEET="HBREAK_15M_LONG_TEST"
 FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_15m atr14_15m atr_pct volume_15m_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at data_status observed_candles last_candle_at".split()
 URL="https://api.coinbeacon.io/public/setups"
@@ -58,7 +59,7 @@ def migrate_tracking(db):
 def get_klines(http,symbol,tf,limit=100,start=None):
     p={"symbol":symbol,"interval":tf,"limit":limit}
     if start is not None:p["startTime"]=int(start)
-    resp=http.get("https://fapi.binance.com/fapi/v1/klines",params=p,timeout=12);resp.raise_for_status()
+    resp=paper_get(http,"https://fapi.binance.com/fapi/v1/klines",params=p,timeout=12);resp.raise_for_status()
     t=int(time.time()*1000)
     return [v for v in resp.json() if int(v[6])<t]
 def rsi_atr(data):
@@ -103,6 +104,9 @@ def enroll(db,http,setups):
                data_status="PENDING",observed_candles=0,last_candle_at=None,
                cursor=first_full_candle_ms(stamp()))
             save(db,obj);existing.add(key);added+=1
+        except PaperRestDeferred as exc:
+            LOG.info("HBREAK paper candidate REST deferred reason=%s; Crash Bounce first", exc.reason)
+            break
         except Exception as e:LOG.warning("HBREAK candidate skip %s %s",s.get("symbol"),str(e)[:100])
     return added
 def track(db,http):
@@ -152,6 +156,11 @@ def track(db,http):
                 trade["data_status"]="PENDING" if not trade.get("observed_candles") else "OK"
             trade["checked_at"]=stamp()
             save(db,trade)
+        except PaperRestDeferred as exc:
+            # No candle read, no status ERROR, no synthetic TP. Resume from
+            # the persisted cursor on the next paper cycle.
+            LOG.info("HBREAK paper TP tracking deferred reason=%s; kept cursor", exc.reason)
+            break
         except requests.HTTPError as e:
             trade["data_status"]="ERROR"
             trade["checked_at"]=stamp()
@@ -205,6 +214,16 @@ def archive(db):
     mset(db,"zip_day",day)
     LOG.info("HBREAK R2 archive uploaded key=%s",result["key"])
 def step(db,http):
+    if not paper_rest_available():
+        # Defer even paid CoinBeacon discovery rather than consuming credits
+        # for signals whose RSI/ATR and TP candles cannot be validated now.
+        LOG.info("HBREAK REST LOW PRIORITY | Crash/Binance capacity first; "
+                 "paper data and existing trades preserved")
+        try:sheet_sync(db)
+        except Exception as e:LOG.warning("HBREAK sheet %s",str(e)[:180])
+        try:archive(db)
+        except Exception as e:LOG.warning("HBREAK archive %s",str(e)[:180])
+        return
     bucket=str(int(time.time()//600))
     if mget(db,"bucket_15m")!=bucket:
         key=os.getenv("hbreak") or os.getenv("HBREAK") or os.getenv("COINBEACON_API_KEY")
