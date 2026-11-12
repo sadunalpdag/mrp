@@ -24,6 +24,8 @@ ROWS = [
     ("HBREAK", "HBREAK sanal test", "Yalniz durum; bu panelden acilip kapatilmaz.", False),
     ("API2", "CoinBeacon API2 sanal test", "Alti strateji. Bu panelden acilip kapatilmaz.", False),
     ("REAL_PROFIT", "Gunluk karla GERCEK kapanis", "GELISTIRILMEDI: Yalniz sanal fotoğraf; GERCEK TP YOK.", False),
+    ("AUTO_SIZE", "Sermayeye gore gunluk pozisyon tutari",
+     "AÇIK/KAPALI; Fransa 00:00 sonrasi ozsermaye degisimine gore tam USDT. Yalniz yeni alis.", True),
 ]
 COUNT = len(ROWS) + 1
 KINDS = {"DAILY": ("limit", "max_daily", 50),
@@ -142,9 +144,10 @@ def _values(executor):
     }
     if executor is None:
         result.update({key: "MODUL YOK" for key in
-                       ("LIVE", "DAILY", "AMOUNT", "SYMBOLS", "OPEN", "PENDING", "COUNTER", "MANUAL_TP")})
+                       ("LIVE", "DAILY", "AMOUNT", "SYMBOLS", "OPEN", "PENDING", "COUNTER", "MANUAL_TP", "AUTO_SIZE")})
     else:
         result.update({
+            "AUTO_SIZE": "AÇIK" if executor._auto_sizing_on() else "KAPALI",
             "LIVE": "AÇIK" if executor.enabled.is_set() else "KAPALI",
             "DAILY": str(executor.max_daily),
             "AMOUNT": str(executor.position_usdt),
@@ -183,6 +186,19 @@ def _apply(key, raw, approval, executor):
         if bool(executor.enabled.is_set()) == on and (on or bool(executor.state.get("paused"))):
             return True, "✅ Gercek yeni alislar " + ("ACIK" if on else "KAPALI")
         return False, "⚠️ Islem onaylanmadi: " + str(response)[:95]
+    if key == "AUTO_SIZE":
+        if text != "UYGULA":
+            raise ValueError("I sutununa UYGULA yazin")
+        if executor is None:
+            raise ValueError("Gercek islem modulu bulunamadi")
+        on = _mode(raw)
+        if on and os.getenv("CRASH_AUTO_POSITION_SIZING_ENABLED", "0") != "1":
+            raise ValueError("Render sermaye oranli tutar izni kapali")
+        response = executor.request_control("auto_size_on" if on else "auto_size_off")
+        if bool(executor._auto_sizing_on()) != on:
+            return False, "⚠️ Degisim dogrulanamadi: " + str(response)[:95]
+        return True, ("✅ Sermaye oranli tutar " + ("AÇIK" if on else "KAPALI")
+                      + " | mevcut tutar " + str(executor.position_usdt) + " USDT")
     if key == "TARGET":
         if text != "UYGULA":
             raise ValueError("I sutununa UYGULA yazin")
@@ -273,7 +289,9 @@ def sync_panel(sheet, tab, executor, logger=None):
                 data.append({"range": prefix + f"F{row}", "values": [[""]]})
     # Separate read-only target amounts beneath controls; never overwrite F/I.
     target_rows = paper_target_rows()
-    start = COUNT + 2
+    # Keep the previously deployed read-only targets starting at row 17;
+    # adding the automatic sizing control occupies previously blank row 16.
+    start = COUNT + 1
     data.extend([
         {"range": prefix + f"D{start}:E{start + len(target_rows) - 1}",
          "values": [[row[0], row[1]] for row in target_rows]},
