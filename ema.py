@@ -15816,6 +15816,32 @@ def main():
             raise ValueError("Invalid persisted REST cooldown")
         _crash_cooldown_until = until
     _crash_start_services()
+    # HBREAK/API2 public Binance calls use the SAME process-wide IP weight
+    # accounting, in a lower priority band than Crash history and live TP.
+    # A fresh V2 signal/history deadline or live BUY pending blocks paper REST,
+    # not the Crash worker, existing positions, or protective account checks.
+    try:
+        from crash_paper_rest_priority import set_crash_priority_checker
+        def _paper_must_yield_to_crash():
+            if _crash_live_entry_priority_active():
+                return True
+            collector = globals().get('_CRASH_HISTORY_COLLECTOR')
+            if collector is None:
+                return False
+            now = time.time()
+            with collector.lock:
+                return any(
+                    job.get('phase') == 'signal'
+                    and 0 <= now-float(job.get('as_of', 0)) < 280
+                    for job in collector.jobs.values()
+                    if isinstance(job, dict))
+        set_crash_priority_checker(_paper_must_yield_to_crash)
+        log("[CRASH REST PRIORITY] live TP/account > Crash V2 signal/history > "
+            "HBREAK/API2 paper; paper budget 120 weight/min; "
+            "paper requests deferred on fresh Crash signals")
+    except Exception as exc:
+        log("[CRASH REST PRIORITY ERROR] " + type(exc).__name__
+            + "; paper Binance calls retain independent low budget")
     # HBREAK 4H LONG: isolated read-only paper monitor; never submits orders.
     if os.getenv("HBREAK_PAPER_ENABLED", "0") == "1":
         try:
