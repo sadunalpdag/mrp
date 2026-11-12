@@ -41,6 +41,30 @@ class ControlTests(unittest.TestCase):
         self.assertIsNone(c.command(u))
         self.assertEqual(c.command(self.update(text='/sayac 3')),'counter:3')
 
+    def test_owner_only_paper_commands_do_not_toggle_live_execution(self):
+        c=TelegramControl(self.tmp.name,'fake','123',None,self.action,self.deliver,Mock(),
+                          lambda:self.now,self.fetch,counter_only=True,
+                          require_owner=False,allow_toggle=True)
+        pairs=[('/gunluk_kar_ac','paper_on'),('/gunluk_kar_kapat','paper_off'),
+               ('/gunluk_kar_durum','paper_status'),
+               ('/gunluk_kar 7','paper_target:7'),
+               ('/gunluk_kar 7,5','paper_target:7,5')]
+        for text, expected in pairs:
+            self.assertEqual(c.command(self.update(text=text)), expected)
+        for text in ('/gunluk_kar','/gunluk_kar 7 extra',
+                     '/gunluk_kar_ac extra','/gunluk_kar@another_bot 5'):
+            self.assertIsNone(c.command(self.update(text=text)))
+        for field, value in [('forward_origin', {'type':'user'}),
+                             ('edit_date', self.now)]:
+            u=self.update(text='/gunluk_kar 7');u['message'][field]=value
+            self.assertIsNone(c.command(u))
+        u=self.update(text='/gunluk_kar 7')
+        u['message']['from']['id']=456
+        self.assertIsNone(c.command(u))
+        u=self.update(text='/gunluk_kar 7')
+        u['message']['chat']['id']=222
+        self.assertIsNone(c.command(u))
+
     def test_counter_only_commands_authorized_and_cannot_toggle_trading(self):
         self.c.counter_only=True
         self.assertEqual(self.c.command(self.update(text='/sayac 0')),'counter:0')
