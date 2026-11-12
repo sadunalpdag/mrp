@@ -474,23 +474,37 @@ class NightExecutor:
         pending_check = sum(o.get('phase') == 'ENTRY_UNKNOWN'
                             for o in self.state['orders'].values())
         quarantined = ','.join(sorted(self.state['symbol_quarantine'])) or 'yok'
-        return f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | karantina: {quarantined} | {stream}"
+        snapshot = getattr(self.broker, 'last_capacity_snapshot', None)
+        live_hint = ''
+        if isinstance(snapshot, dict):
+            pending_str = (str(snapshot.get('pending_entries'))
+                           if snapshot.get('pending_entries') is not None else '?')
+            checked_at = datetime.fromtimestamp(snapshot['at'], ZONE).strftime('%H:%M')
+            live_hint = (f' | son Binance ön kontrol {checked_at}: '
+                         f'açık {snapshot["open_positions"]}/{self.max_open_positions}, '
+                         f'bekleyen {pending_str}/{self.max_pending_entries}')
+        return (f"{'DURDU: '+self.state['halt'] if self.state['halt'] else ('AÇIK' if self.enabled.is_set() else 'KAPALI')} | bugün {count}/{self.max_daily} | sembol sınırı {self.max_symbols} | açık pozisyon limiti {self.max_open_positions} | bekleyen alış limiti {self.max_pending_entries} | pozisyon {self.position_usdt} USDT | 10x | 24 saat | giriş mutabakatı: {pending_check} (yerel kayıt) | karantina: {quarantined}{live_hint} | {stream}")
 
     def apply_control(self, action):
-        if action.startswith(('limit:', 'amount:', 'symbols:')):
+        if action.startswith(('limit:', 'amount:', 'symbols:', 'open_limit:', 'pending_limit:')):
             kind, raw = action.split(':', 1)
             try:
                 value = D(raw)
                 ceiling = {'amount':1000, 'symbols':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS,
-                           'limit':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS}[kind]
+                           'limit':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS,
+                           'open_limit':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS,
+                           'pending_limit':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS}[kind]
                 if not value.is_finite() or not 1 <= value <= ceiling or (kind != 'amount' and value != value.to_integral_value()):
                     raise ValueError('range')
             except (ValueError, ArithmeticError):
                 return (f'⚠️ Kullanım: /sembol 1–{MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS}, '
                         f'/limit 1–{MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS} veya '
-                        '/tutar 1–1000 (USDT toplam pozisyon, teminat değil).')
+                        '/tutar 1–1000 (USDT toplam pozisyon, teminat değil), '
+                        f'/acik 1–{MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS} veya '
+                        f'/bekleyen 1–{MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS}.')
             settings = dict(self.state.get('trade_settings', {}))
-            key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols'}[kind]
+            key = {'limit':'max_daily', 'amount':'position_usdt', 'symbols':'max_symbols',
+                   'open_limit':'max_open_positions', 'pending_limit':'max_pending_entries'}[kind]
             settings[key] = str(value) if kind == 'amount' else int(value)
             self.state['trade_settings'] = settings
             self.save()
@@ -499,6 +513,12 @@ class NightExecutor:
             elif kind == 'symbols':
                 self.max_symbols = int(value)
                 self.broker.max_symbols = self.max_symbols
+            elif kind == 'open_limit':
+                self.max_open_positions = int(value)
+                self.broker.max_open_positions = self.max_open_positions
+            elif kind == 'pending_limit':
+                self.max_pending_entries = int(value)
+                self.broker.max_pending_entries = self.max_pending_entries
             else:
                 self.position_usdt = value
             return (f'✅ Yeni giriş ayarı kaydedildi. Kullanılan sayaç, mevcut pozisyonlar ve bekleyen emirler değişmedi. Aynı anda sembol sınırı: {self.max_symbols}.\n'+self.summary())
