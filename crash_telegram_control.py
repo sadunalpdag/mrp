@@ -32,6 +32,34 @@ class TelegramControl:
         self.thread = None
         self.last_poll_at = None
         self.last_error = None
+        # Group chats have negative chat IDs, which are not user IDs.
+        # Explicit owner_id wins. Without it, require Telegram-verified group creator.
+        self.log('[CRASH CONTROL AUTH] chat_type='
+                 + ('private' if fallback else 'group_or_channel')
+                 + ' owner_mode='
+                 + ('explicit' if owner_id else ('private_user' if fallback else 'telegram_creator_lookup')))
+
+    def _authorized_paper_sender(self, sender_id):
+        if not str(sender_id).isdigit() or int(sender_id) <= 0:
+            return False
+        if self.owner_id.isdigit() and int(self.owner_id) > 0:
+            return str(sender_id) == self.owner_id
+        if not self.chat_id.startswith('-'):
+            return False
+        # Only the Telegram-verified creator may control group paper settings.
+        # Never grant access to ordinary members or administrators.
+        import requests
+        try:
+            r = requests.get(
+                f'https://api.telegram.org/bot{self.token}/getChatMember',
+                params={'chat_id': self.chat_id, 'user_id': int(sender_id)},
+                timeout=(5, 10))
+            j = r.json()
+            return (r.status_code == 200 and j.get('ok') is True
+                    and j.get('result', {}).get('status') == 'creator')
+        except Exception:
+            self.log('[CRASH CONTROL PAPER REJECT] group_creator_check_failed')
+            return False
 
     def get_updates(self, offset):
         import requests
@@ -73,7 +101,8 @@ class TelegramControl:
         # Paper-only controls require owner identity, even in counter_only mode.
         # No paper command is allowed to enable/disable live trading.
         if text.startswith('/gunluk_kar'):
-            if str(sender.get('id')) != self.owner_id:
+            if not self._authorized_paper_sender(sender.get('id')):
+                self.log('[CRASH CONTROL PAPER REJECT] owner_not_verified')
                 return None
             if text == '/gunluk_kar_durum':
                 return 'paper_status'
@@ -84,6 +113,7 @@ class TelegramControl:
             pieces = text.split()
             if len(pieces) == 2 and pieces[0] == '/gunluk_kar' and len(pieces[1]) <= 6:
                 return 'paper_target:' + pieces[1]
+            self.log('[CRASH CONTROL PAPER REJECT] invalid_command_syntax')
             return None
         if self.allow_toggle and text in COMMANDS:
             return COMMANDS[text]
