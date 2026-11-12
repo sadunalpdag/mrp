@@ -255,7 +255,7 @@ class FileFlagTests(unittest.TestCase):
         values={n.targets[0].id:n.value.value for n in tree.body if isinstance(n,ast.Assign) and isinstance(n.targets[0],ast.Name) and isinstance(n.value,ast.Constant)}
         self.assertIn(values['AUTO_TRADING_ENABLED'],(0,1))
         self.assertIn(values['MANUAL_TP_REPAIR_ENABLED'],(0,1))
-        self.assertEqual(values['AUTO_MAX_DAILY_ENTRIES'],20)
+        self.assertEqual(values['AUTO_MAX_DAILY_ENTRIES'],50)
         self.assertIn('os.getenv("BINANCE_API_KEY")',source)
         self.assertIn('os.getenv("BINANCE_SECRET_KEY")',source)
 
