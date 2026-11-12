@@ -280,6 +280,12 @@ class BinanceBroker:
         position_side = 'LONG' if dual else 'BOTH'
         positions = self.request('GET', '/fapi/v3/positionRisk')
         active = {p['symbol'] for p in positions if D(p['positionAmt']) != 0}
+        # Reject at the active-position cap before additional REST requests.
+        open_cap = getattr(self, 'max_open_positions', 10)
+        if len(active) >= open_cap:
+            self.last_capacity_snapshot = dict(open_positions=len(active),
+                                               pending_entries=None, at=time.time())
+            raise ValueError('MAX_OPEN_POSITIONS_REACHED')
         if symbol in active or len(active) >= getattr(self, 'max_symbols', 5):
             raise ValueError(f"POSITION_EXISTS_OR_MAX_{getattr(self, 'max_symbols', 5)}")
         orders = self.request('GET', '/fapi/v1/openOrders')
@@ -292,7 +298,16 @@ class BinanceBroker:
             raise ValueError('INVALID_ALGO_ORDER_RESPONSE')
         if any(o['symbol'] == symbol for o in algo_orders):
             raise ValueError('EXISTING_SYMBOL_ALGO_ORDER')
-        self.check_slots(active, orders+algo_orders)
+        all_orders = orders + algo_orders
+        self.check_slots(active, all_orders)
+        # Count orders, not unique symbols; exclude reduce-only/closing orders.
+        # All existing manual and unidentified opening orders count for safety.
+        opening_orders = [o for o in all_orders if not self.is_closing_order(o)]
+        self.last_capacity_snapshot = dict(open_positions=len(active),
+                                           pending_entries=len(opening_orders),
+                                           at=time.time())
+        if len(opening_orders) >= getattr(self, 'max_pending_entries', 15):
+            raise ValueError('MAX_PENDING_ENTRY_ORDERS_REACHED')
         # Operator visibility without another REST call or any cancellation.
         # Only explicitly tagged bot BUY orders count as the bot's own pending
         # entries; manual orders and closing/TP orders are never modified.
