@@ -1,6 +1,6 @@
 # Daily Profit Lock — Paper Test Plan (approved 2026-11-12)
 
-Status: **approved design for offline/paper tests; NOT active on live Binance**.
+Status (2026-11-12): **paper-only monitor implemented for master deployment**. It reads signed Binance account and income history, stores a baseline from its first successful observation, and saves virtual snapshots. It has NO Binance POST/DELETE path, sends no closing orders, and does not block real entries. Live order-close feature is NOT implemented.
 
 ## User-approved rules
 - Clock: Europe/Paris midnight-to-midnight, including DST. Default target = 5%, adjustable by authorized Telegram command.
@@ -31,5 +31,15 @@ Status: **approved design for offline/paper tests; NOT active on live Binance**.
 | Restart between snapshot and exits | Recover durable state, no duplicate order |
 | Telegram toggles after trigger | Already triggered lock preserved |
 
-## Implementation boundary
-An independent offline module can test frozen daily goals and lock transitions. It must not call Binance order placement, Telegram, Sheets, or Render. **No main-branch deploy, no change to `ema.py` or `crash_night.py`, and no real order modification from this plan.** Before real trading rollout, build account-equity/transfer data validation, durable state persistence, price/precision filters, order reconciliation, partial-fill logic, and comprehensive isolated tests.
+## Implemented read-only runtime
+- `crash_daily_profit_paper_live.py` samples USD-M account equity approximately every 5 minutes using the shared REST budget.
+- Accounts in Binance multi-assets mode or with non-USDT margin are skipped until validated.
+- Cashflows seen in income history since activation are removed from the paper equity series; this is a best-effort estimator, not a reconciled audited PnL statement.
+- The initial historical high is **unknown**: the first validated equity sample becomes the initial peak. No previous-day high is invented.
+- Trigger snapshots capture Binance position mark prices; revisiting such prices is an **indicative paper observation**, never a confirmed limit execution.
+- Durable state: `<CRASH_NIGHT_STATE_DIR>/daily_profit_paper_state.json` or `<DATA_DIR>/night_execution/daily_profit_paper_state.json`.
+- Owner-checked Telegram: `/gunluk_kar_durum`, `/gunluk_kar_ac`, `/gunluk_kar_kapat`, `/gunluk_kar 5`. Target changes apply next Paris day.
+- Enabled in paper-only mode at worker startup when the normal Crash broker exists; failures skip only paper samples. No real trading safety change has been deployed.
+
+## Remaining before real orders
+Build an independently reviewed, restart-safe real closing engine with authenticated order ownership, precise fill reconciliation, partial fills, order replacement, price filters, and live dry-run test coverage. The currently deployed paper monitor must **not** be mistaken for a live profit lock.
