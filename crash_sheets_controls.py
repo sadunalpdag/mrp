@@ -39,12 +39,32 @@ def paper_target_rows():
     Put this below the D:I controls instead of adding editable control rows,
     so pending F/I confirmations survive deploys and continue working.
     """
+    import json
     from datetime import datetime
+    from pathlib import Path
     from zoneinfo import ZoneInfo
-    from daily_profit_lock_paper import load_settings, load_state, money
     paris = ZoneInfo("Europe/Paris")
-    settings = load_settings()
-    state = load_state()
+    # Consume already persisted observer snapshots. No importing the
+    # observer's optional requests dependency, no exchange calls.
+    base = Path(os.getenv("DATA_DIR", "/data"))
+    default_pct = os.getenv("DAILY_PROFIT_PAPER_TARGET_PCT", "5")
+    settings = {"enabled": True, "target_pct": default_pct}
+    settings_path = base / "daily_profit_lock_paper_settings.json"
+    state_path = base / "daily_profit_lock_paper.json"
+    if settings_path.exists():
+        with settings_path.open(encoding="utf8") as file:
+            settings = json.load(file)
+    state = None
+    if state_path.exists():
+        with state_path.open(encoding="utf8") as file:
+            state = json.load(file)
+        if state.get("mode") != "PAPER_ONLY":
+            raise ValueError("PAPER_MODE_INVALID")
+    def money(x):
+        value = Decimal(str(x))
+        if not value.is_finite():
+            raise ValueError("INVALID_PAPER_MONEY")
+        return value
     def fmt(value):
         if value is None or value == "":
             return "—"
