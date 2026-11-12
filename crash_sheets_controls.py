@@ -185,6 +185,8 @@ def sync_panel(sheet, tab, executor, logger=None):
     ]
     if not ready:
         data.extend([
+            {"range": prefix + "F1", "values": [[HEADER[2]]]},
+            {"range": prefix + "I1", "values": [[HEADER[5]]]},
             {"range": prefix + f"F2:F{COUNT}", "values": [[""] for _ in ROWS]},
             {"range": prefix + f"I2:I{COUNT}", "values": [[""] for _ in ROWS]},
         ])
