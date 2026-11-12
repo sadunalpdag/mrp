@@ -605,13 +605,11 @@ def sheet_sync(db):
 def json_archive(db, current=None):
     """One separate cumulative JSON per Paris day, encrypted/private R2 bucket."""
     current = current or datetime.now(PARIS)
-    if current.hour == 0 and current.minute < 10:
-        return
-    # Snapshot every Paris day at/after 21:00; full history stays cumulative.
-    if current.hour < 21:
-        return
+    # Create the day's standalone JSON immediately and refresh hourly.
+    # A new Paris day starts a new object; each object is cumulative.
     date = current.date().isoformat()
-    if meta(db, "json_day") == date:
+    last_save = float(meta(db, "json_upload_at", "0"))
+    if meta(db, "json_day") == date and time.time() - last_save < 3600:
         return
     from crash_report_storage import r2_configured, R2_ENV_NAMES
     if not r2_configured():
@@ -647,6 +645,7 @@ def json_archive(db, current=None):
     if int(client.head_object(Bucket=bucket, Key=key)["ContentLength"]) != len(body):
         raise ValueError("R2_JSON_UPLOAD_SIZE_MISMATCH")
     put_meta(db, "json_day", date)
+    put_meta(db, "json_upload_at", time.time())
     LOG.info("Private Cloudflare R2 JSON saved key=%s rows=%d", key, len(all_rows))
 
 
