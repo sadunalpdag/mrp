@@ -34,6 +34,7 @@ DB = BASE / "coinbeacon_six_paper.sqlite3"
 HBREAK_DB = BASE / "hbreak_paper.sqlite3"
 API = "https://api.coinbeacon.io"
 BINANCE = "https://fapi.binance.com"
+from crash_paper_rest_priority import paper_get, paper_rest_available, PaperRestDeferred
 SHEETS = {
     "rvol": "CB2_01_RVOL",
     "retest": "CB2_02_RETEST",
@@ -174,11 +175,13 @@ class MarketClient:
         self.public_candle_cache = {}
         self.price_cache = {}
         self.new_symbols = set()
+        self.paper_rest_deferred = False
 
     def begin_cycle(self):
         self.public_candle_cache.clear()
         self.price_cache.clear()
         self.new_symbols.clear()
+        self.paper_rest_deferred = False
 
     def usage(self):
         if not self.key:
@@ -239,11 +242,15 @@ class MarketClient:
             params = {"symbol": symbol, "interval": tf, "limit": limit}
             if start is not None:
                 params["startTime"] = int(start)
-            r = self.http.get(BINANCE + "/fapi/v1/klines", params=params, timeout=12)
+            r = paper_get(self.http, BINANCE + "/fapi/v1/klines", params=params, timeout=12)
             r.raise_for_status()
             candles = [x for x in r.json() if int(x[6]) < now_ms()]
             self.public_candle_cache[cache_key] = candles
             return candles
+        except PaperRestDeferred as exc:
+            self.paper_rest_deferred = True
+            LOG.info("CB-API2 paper kline REST deferred: %s; preserve history", exc.reason)
+            return []
         except Exception as exc:
             LOG.warning("Binance public candles %s %s (%s)", symbol, tf, type(exc).__name__)
             return []
@@ -255,11 +262,15 @@ class MarketClient:
             return None
         self.new_symbols.add(symbol)
         try:
-            r = self.http.get(BINANCE + "/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
+            r = paper_get(self.http, BINANCE + "/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
             r.raise_for_status()
             price = num(r.json().get("price"))
             self.price_cache[symbol] = price
             return price
+        except PaperRestDeferred as exc:
+            self.paper_rest_deferred = True
+            LOG.info("CB-API2 paper price REST deferred: %s; preserve history", exc.reason)
+            return None
         except Exception:
             return None
 
@@ -516,6 +527,8 @@ def track(db, market):
     checked = 0
     bars_total = 0
     for symbol in symbols[:MAX_TRACK_SYMBOLS_PER_CYCLE]:
+        if market.paper_rest_deferred:
+            break  # Do not walk 12 positions after the first priority denial.
         active = groups[symbol]
         start = min(int(t.get("cursor") or first_full_5m(t["opened_at"]))
                     for t in active)
@@ -745,6 +758,20 @@ def json_archive(db, current=None):
 
 def cycle(db, market):
     market.begin_cycle()
+    if not paper_rest_available():
+        # No Binance candles means no trustworthy new paper signal/fill.
+        # Preserve recorded open trades and cursors for later backfill.
+        LOG.info("CB-API2 REST LOW PRIORITY | Crash/Binance capacity first; "
+                 "paper data preserved; scanning deferred")
+        try:
+            sheet_sync(db)
+        except Exception as exc:
+            LOG.warning("Sheets sync failed (%s): %s", type(exc).__name__, str(exc)[:140])
+        try:
+            json_archive(db)
+        except Exception as exc:
+            LOG.warning("R2 JSON failed (%s): %s", type(exc).__name__, str(exc)[:100])
+        return
     market.usage()
     # A previously verified matrix may be reused between hourly requests,
     # but must never be treated as fresh beyond 90 minutes.
