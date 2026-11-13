@@ -771,7 +771,8 @@ def cycle(db, market):
     if liq:
         counts["oi_squeeze"] = evaluate_oi(db, market, liq)
     reopen_24h(db)
-    checked, bars = track(db, market)\n    LOG.info("CB2 archive-only: Binance REST disabled; 15m ZIP results delayed until publication")
+    checked, bars = track(db, market)
+    LOG.info("CB2 archive-only: Binance REST disabled; 15m ZIP results delayed until publication")
     LOG.info("Cycle paper_new=%s tracked=%d candle_bars=%d, total=%d",
              counts, checked, bars, len(all_trades(db)))
     try:
