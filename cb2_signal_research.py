@@ -46,7 +46,7 @@ def _id(*parts):
 
 def _insert(db, *, symbol, family, source_id, seen_at, reference_price=None,
             source_signal_at=None, archetype=None, sqs=None, rvol=None,
-            confidence=None):
+            confidence=None, status="WAITING_ARCHIVE", extras=None):
     if not isinstance(symbol, str) or not symbol.endswith("USDT"):
         return False
     sid = _id(family, source_id)
@@ -54,15 +54,18 @@ def _insert(db, *, symbol, family, source_id, seen_at, reference_price=None,
         return False
     ref = _as_number(reference_price)
     obj = {
-        "id": sid, "family": family, "source_id": str(source_id),
+        "id": sid, "family": family, "strategy": family, "source_id": str(source_id),
         "symbol": symbol, "observed_at": seen_at,
         "source_signal_at": source_signal_at,
         "archetype": archetype, "sqs": sqs, "rvol": rvol,
         "reference_price": ref, "reference_status": (
             "API_SNAPSHOT_NOT_VERIFIED_FILL" if ref else "MISSING_PRICE"),
-        "status": "WAITING_ARCHIVE", "entry_scenarios": {},
+        "status": status, "entry_scenarios": {},
         "last_check": None, "note": "Signal observation only; no order placed",
     }
+    if extras:
+        obj.update({k:v for k,v in extras.items()
+                    if k not in ("id", "family", "strategy", "source_id", "observed_at", "status")})
     db.execute("INSERT INTO signal_observations VALUES (?, ?)",
                (sid, json.dumps(obj, ensure_ascii=False, allow_nan=False)))
     db.commit()
@@ -183,10 +186,10 @@ def analyze(db, archive_klines, http, now_iso):
         if count >= MAX_CHECK_PER_CYCLE:
             break
         record = json.loads(raw)
-        if record.get("status") == "COMPLETE_48H":
+        if record.get("status") in ("COMPLETE_48H", "WATCH", "WATCH_EXPIRED", "UNCONFIRMED_OI"):
             continue
         seen_ms = _ms(record["observed_at"])
-        if now - seen_ms < 36 * 3600000:
+        if now - seen_ms < 25 * 3600000:
             continue
         if record.get("last_check") and now - _ms(record["last_check"]) < 2 * 3600000:
             continue
