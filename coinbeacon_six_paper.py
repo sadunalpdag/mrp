@@ -826,7 +826,7 @@ def run():
                 cycle(db, client)
             except Exception as exc:
                 LOG.warning("Paper cycle failed (%s): %s", type(exc).__name__, str(exc)[:170])
-            time.sleep(max(15, 600 - int(time.time()) % 600))
+            time.sleep(max(15, 900 - int(time.time()) % 900))
 
 
 def start():
