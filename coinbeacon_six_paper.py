@@ -124,7 +124,7 @@ def save(db, trade):
 
 
 def first_full_5m(opened):
-    return ((iso_to_ms(opened) + 299999) // 300000) * 300000
+    return ((iso_to_ms(opened) + 899999) // 900000) * 900000
 
 
 def read_hbreak_new(db):
