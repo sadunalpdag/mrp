@@ -232,7 +232,8 @@ def step(db,http):
         # Mark the bucket after successful fetch, before costly downstream processing.
         mset(db,"bucket_15m",bucket)
         LOG.info("HBREAK fetched %s setup rows; new %s",len(result["setups"]),enroll(db,http,result["setups"]))
-    track(db,http)\n    LOG.info("HBREAK archive-only mode: Binance REST disabled; daily 15m ZIP backfill")
+    track(db,http)
+    LOG.info("HBREAK archive-only mode: Binance REST disabled; daily 15m ZIP backfill")
     try:sheet_sync(db)
     except Exception as e:LOG.warning("HBREAK sheet %s",str(e)[:180])
     try:archive(db)
