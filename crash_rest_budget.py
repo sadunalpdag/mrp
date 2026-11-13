@@ -88,10 +88,23 @@ class IpBudget:
         self.next_global = 0.0
         self.last_notice = {}
         self.research_next_allowed = 0.0
+        self.endpoint_counts = {}
+        self.endpoint_weights = {}
+        self.endpoint_deferred = {}
+        self.last_server_peak = 0.0
 
     def _roll(self, now):
         minute = int(now // 60)
         if minute != self.minute:
+            if self.minute is not None and (self.endpoint_counts or self.endpoint_deferred):
+                items = sorted(self.endpoint_counts, key=lambda k: self.endpoint_weights[k], reverse=True)
+                top = ",".join(f"{k}:{self.endpoint_counts[k]}calls/{self.endpoint_weights[k]}w" for k in items[:12])
+                deferred = ",".join(f"{k}:{v}" for k, v in sorted(self.endpoint_deferred.items()))
+                print(f"[CRASH REST ENDPOINT AUDIT 1M] minute={self.minute}; admitted={sum(self.endpoint_counts.values())}; estimated_weight={sum(self.endpoint_weights.values())}; server_peak={int(self.last_server_peak)}; top={top or '-'}; deferred={deferred or '-'}; scope=local_admissions_not_confirmed_http", flush=True)
+            self.endpoint_counts = {}
+            self.endpoint_weights = {}
+            self.endpoint_deferred = {}
+            self.last_server_peak = 0.0
             self.minute = minute
             self.estimated_used = 0.0
             self.server_used = 0.0
@@ -104,7 +117,7 @@ class IpBudget:
                   f"estimated_weight={int(self.estimated_used)}", flush=True)
             self.last_notice[key] = now + 60
 
-    def reserve(self, kind, weight):
+    def reserve(self, kind, weight, endpoint="unknown"):
         if kind not in PACED_SECONDS or not 0 <= weight <= 40:
             raise ValueError("INVALID_IP_BUDGET_REQUEST")
         ceiling = {"paper": PAPER_CEILING, "research": RESEARCH_CEILING, "account": ACCOUNT_CEILING,
@@ -119,6 +132,8 @@ class IpBudget:
                     raise RateDeferred(kind, wait, "EXCHANGE_COOLDOWN")
                 projected = max(self.estimated_used, self.server_used) + weight
                 if projected > ceiling:
+                    key = kind + ":" + endpoint
+                    self.endpoint_deferred[key] = self.endpoint_deferred.get(key, 0) + 1
                     wait = (int(now // 60)+1)*60 + 5 - now
                     self._notice(kind, "IP_WEIGHT_SOFT_CEILING", wait, now)
                     raise RateDeferred(kind, wait, "IP_WEIGHT_SOFT_CEILING")
@@ -130,6 +145,9 @@ class IpBudget:
                     raise RateDeferred(kind, wait, "RESEARCH_SERVER_WEIGHT")
                 remaining = max(self.next_per_kind[kind], self.next_global) - now
                 if remaining <= 0:
+                    key = kind + ":" + endpoint
+                    self.endpoint_counts[key] = self.endpoint_counts.get(key, 0) + 1
+                    self.endpoint_weights[key] = self.endpoint_weights.get(key, 0) + weight
                     self.estimated_used = projected
                     self.next_per_kind[kind] = now + PACED_SECONDS[kind]
                     self.next_global = now + 0.15
@@ -146,6 +164,7 @@ class IpBudget:
                 used = float((headers or {}).get("X-MBX-USED-WEIGHT-1M", 0))
                 if math.isfinite(used) and used >= 0:
                     self.server_used = max(self.server_used, used)
+                    self.last_server_peak = max(self.last_server_peak, used)
             except (ValueError, TypeError):
                 pass
             if status_code in (418, 429):
