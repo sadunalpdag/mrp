@@ -35,6 +35,7 @@ HBREAK_DB = BASE / "hbreak_paper.sqlite3"
 API = "https://api.coinbeacon.io"
 BINANCE = "https://fapi.binance.com"
 from paper_archive_15m import klines as archive_klines
+import cb2_signal_research as signal_research
 SHEETS = {
     "rvol": "CB2_01_RVOL",
     "retest": "CB2_02_RETEST",
@@ -94,6 +95,7 @@ def initialize(db):
     db.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL)")
     db.execute("CREATE INDEX IF NOT EXISTS trades_by_strategy ON trades(strategy)")
     db.commit()
+    signal_research.initialize(db)
     if not meta(db, "start_ms"):
         put_meta(db, "start_ms", str(now_ms()))
         LOG.info("Forward-only paper experiments initialized; no historic HBREAK fills imported")
@@ -707,6 +709,7 @@ def json_archive(db, current=None):
         "api_key_env": "api2", "source": "CoinBeacon + public Binance futures",
         "daily_cumulative": True, "sheet_tab": COMBINED_SHEET, "strategies": list(SHEETS),
         "statistics": stats, "trades": all_rows,
+        "signal_research": signal_research.export(db),
     }
     env = os.environ
     account, bucket, access, secret = [env[n].strip() for n in R2_ENV_NAMES]
@@ -743,12 +746,23 @@ def cycle(db, market):
             LOG.warning("R2 JSON failed (%s): %s", type(exc).__name__, str(exc)[:100])
         return
     market.usage()
+    # Archive-only signal observation. Does not create paper entries or orders.
+    try:
+        observed = signal_research.capture_hbreak(db, read_hbreak_new(db), now_iso())
+        if observed:
+            LOG.info("[CB2 SIGNAL JOURNAL] HBREAK triggers=%d", observed)
+    except Exception as exc:
+        LOG.warning("[CB2 SIGNAL JOURNAL] HBREAK capture error %s", type(exc).__name__)
     # A previously verified matrix may be reused between hourly requests,
     # but must never be treated as fresh beyond 90 minutes.
     trend = run_paid_board(db, market, "trend", "/public/trend-scanner",
                            {"exchange": "binance-futures", "sort": "1h",
                             "dir": "desc", "quote": "USDT"})
     if trend:
+        try:
+            signal_research.capture_board(db, "trend_scanner_candidate", trend, now_iso())
+        except Exception as exc:
+            LOG.warning("[CB2 SIGNAL JOURNAL] trend snapshot error %s", type(exc).__name__)
         put_meta(db, "trend_cache", json.dumps({"at": time.time(), "data": trend}))
     if not trend:
         try:
@@ -761,17 +775,30 @@ def cycle(db, market):
     squeeze = run_paid_board(db, market, "squeeze", "/public/screener",
                              {"preset": "squeeze"})
     if squeeze:
+        try:
+            signal_research.capture_board(db, "squeeze_watch_candidate", squeeze, now_iso())
+        except Exception as exc:
+            LOG.warning("[CB2 SIGNAL JOURNAL] squeeze snapshot error %s", type(exc).__name__)
         counts["squeeze_watch"] = evaluate_squeeze(db, market, squeeze)
     counts["squeeze_triggered"] = check_watch(db, market)
     volume = run_paid_board(db, market, "volume", "/public/screener",
                             {"preset": "volume-surge"})
     if volume:
+        try:
+            signal_research.capture_board(db, "volume_surge_candidate", volume, now_iso())
+        except Exception as exc:
+            LOG.warning("[CB2 SIGNAL JOURNAL] volume snapshot error %s", type(exc).__name__)
         counts["volume"] = evaluate_volume(db, market, volume)
     liq = run_paid_board(db, market, "liquidations", "/public/liquidations/board")
     if liq:
         counts["oi_squeeze"] = evaluate_oi(db, market, liq)
     reopen_24h(db)
     checked, bars = track(db, market)
+    try:
+        signal_research.analyze(db, archive_klines, market.http, now_iso())
+    except Exception as exc:
+        LOG.warning("[CB2 SIGNAL JOURNAL] archive study error %s: %s",
+                    type(exc).__name__, str(exc)[:100])
     LOG.info("CB2 archive-only: Binance REST disabled; 15m ZIP results delayed until publication")
     LOG.info("Cycle paper_new=%s tracked=%d candle_bars=%d, total=%d",
              counts, checked, bars, len(all_trades(db)))
