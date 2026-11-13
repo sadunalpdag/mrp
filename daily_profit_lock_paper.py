@@ -31,7 +31,7 @@ LOG.propagate = False
 PARIS = ZoneInfo("Europe/Paris")
 URL = "https://fapi.binance.com"
 STATE_FILE = Path(os.getenv("DATA_DIR", "/data")) / "daily_profit_lock_paper.json"
-INTERVAL = max(120, int(os.getenv("DAILY_PROFIT_PAPER_INTERVAL_SEC", "180")))
+INTERVAL = max(120, int(os.getenv("DAILY_PROFIT_PAPER_INTERVAL_SEC", "900")))
 DEFAULT_PCT = Decimal(os.getenv("DAILY_PROFIT_PAPER_TARGET_PCT", "5"))
 if not (Decimal("0.5") <= DEFAULT_PCT <= Decimal("20")):
     raise ValueError("DAILY_PROFIT_PAPER_TARGET_OUT_OF_RANGE")
