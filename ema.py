@@ -15842,7 +15842,7 @@ def main():
     except Exception as exc:
         log("[CRASH REST PRIORITY ERROR] " + type(exc).__name__
             + "; paper Binance calls retain independent low budget")
-    # HBREAK 4H LONG: isolated read-only paper monitor; never submits orders.
+    # Telegram-only daily R2 signed links (no Binance calls or order changes).\n    try:\n        from r2_archive_link_notifier import start as _r2_archive_links_start\n        _r2_archive_links_start()\n        log("[R2 LINK] daily Telegram read-only links enabled for 21:30 Europe/Paris")\n    except Exception as exc:\n        log(f"[R2 LINK START ERR] {type(exc).__name__}: {str(exc)[:140]}")\n    # HBREAK 4H LONG: isolated read-only paper monitor; never submits orders.
     if os.getenv("HBREAK_PAPER_ENABLED", "0") == "1":
         try:
             from hbreak_paper import start as _hbreak_paper_start
