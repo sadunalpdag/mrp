@@ -84,7 +84,9 @@ def _notify_once(now):
     date = previous.isoformat()
     client, bucket = _client()
     files = [
-        ("CoinBeacon JSON", f"coinbeacon-api2/{stamp}/coinbeacon_six_{date}.json"),
+        ("CoinBeacon SINYAL JSON", f"coinbeacon-api2/{stamp}/coinbeacon_six_{date}.json"),
+        ("CoinBeacon ERTESİ GÜN ANALİZ JSON",
+         f"coinbeacon-api2/analysis/{stamp}/coinbeacon_six_analysis_{date}.json"),
         ("HBREAK ZIP", f"hbreak/{stamp}/hbreak_15m_long_{date}.zip"),
     ]
     sections = [f"📦 R2 GÜNLÜK ARŞİV LİNKLERİ | {date}", "ChatGPT analiz ajanına iletebilirsin.", ""]
