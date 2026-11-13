@@ -158,7 +158,8 @@ def capture_setups(db, setups, now_iso, trend_data):
         # A squeeze must have been on the watchlist BEFORE the breakout.
         sw = _recent(db, "squeeze_watch", sym, now_ms - 12 * 3600000,
                      status="WATCH")
-        if sw and research._ms(sw["observed_at"]) < now_ms - 900000:
+        if (sw and research._ms(sw["observed_at"]) < now_ms - 900000
+                and event_ms >= research._ms(sw["observed_at"])):
             candidates.append(("squeeze", "WATCH_THEN_BREAKOUT"))
         for strategy, signal_quality in candidates:
             if counts[strategy] >= MAX_NEW_PER_STRATEGY_PER_CYCLE:
