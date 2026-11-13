@@ -638,6 +638,43 @@ def sheet_sync(db):
         values.append([readable[strategy]] + metrics(items))
     values.append(["TOPLAM"] + metrics(all_rows))
     values.append([])
+    # Independent source signals are not filled trades. Display them first,
+    # separate from historic hypothetical fills, with all six strategy labels.
+    observations = signal_research.export(db)["signals"]
+    research_families = set(SHEETS)
+    live_observations = [
+        x for x in observations
+        if (x.get("strategy") or x.get("family") or "").removesuffix("_watch")
+           in research_families
+        and x.get("source", "").startswith("coinbeacon-api2")
+    ]
+    values.append(["COINBEACON | BAĞIMSIZ 6 STRATEJİ SİNYALLERİ | GERÇEK/SANAL ALIŞ YAPILMADI"])
+    values.append(["Strateji", "Coin", "Gözlem Durumu", "Gözlem Zamanı UTC",
+                   "Kaynak Sinyal UTC", "SQS", "RVOL", "API Referans Fiyatı",
+                   "Sonraki 15M Giriş", "Sonraki 15M TP +%1", "Maks. Düşüş %",
+                   "15dk Bekleme", "30dk Bekleme", "%0,5 Pullback", "%1 Pullback",
+                   "Sinyal Türü", "Doğrulama", "Kaynak", "Son Kontrol", "Kayıt ID"])
+    for signal in live_observations[:3000]:
+        scenarios = signal.get("entry_scenarios") or {}
+        immediate = scenarios.get("next_15m_open") or {}
+        def _scenario_status(name):
+            entry = scenarios.get(name) or {}
+            return entry.get("status") or "ARŞİV BEKLENİYOR"
+        strategy_name = (signal.get("strategy") or signal.get("family") or "").removesuffix("_watch")
+        values.append([
+            readable.get(strategy_name, strategy_name), signal.get("symbol"),
+            signal.get("status"), signal.get("observed_at"),
+            signal.get("source_signal_at"), signal.get("sqs"), signal.get("rvol"),
+            signal.get("reference_price"), immediate.get("entry_price"),
+            _scenario_status("next_15m_open"),
+            immediate.get("max_drawdown_pct_observed"),
+            _scenario_status("wait_15m"), _scenario_status("wait_30m"),
+            _scenario_status("pullback_0_5pct"), _scenario_status("pullback_1pct"),
+            signal.get("archetype"), signal.get("signal_quality"),
+            signal.get("source"), signal.get("last_check"), signal.get("id")
+        ])
+    values.append([])
+    # Historic filled paper trades stay unchanged in a separate section.
     values.append(["TÜM SANAL İŞLEMLER | EN YENİ EN ÜSTTE | STRATEJİ/DURUM SÜTUNUNDAN FİLTRELE"])
     values.append([names[field] for field in output_fields])  # row 14
 
