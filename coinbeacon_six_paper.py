@@ -762,6 +762,62 @@ def json_archive(db, current=None):
                       ContentType="application/json")
     if int(client.head_object(Bucket=bucket, Key=key)["ContentLength"]) != len(body):
         raise ValueError("R2_JSON_UPLOAD_SIZE_MISMATCH")
+
+    # Previous Paris calendar day's source observations are re-analysed using
+    # published public daily 15m Binance ZIPs. Keep a separate durable JSON for
+    # agents instead of rewriting the original signal snapshot.
+    previous = (current - timedelta(days=1))
+    previous_date = previous.date().isoformat()
+    journal_rows = signal_research.export(db)["signals"]
+    def _signal_day(record):
+        try:
+            observed = datetime.fromisoformat(
+                str(record["observed_at"]).replace("Z", "+00:00"))
+            return observed.astimezone(PARIS).date().isoformat()
+        except (ValueError, TypeError, KeyError):
+            return None
+    daily_signals = [
+        record for record in journal_rows
+        if _signal_day(record) == previous_date and
+        (record.get("family") or "").removesuffix("_watch") in SHEETS and
+        str(record.get("source") or "").startswith("coinbeacon-api2")
+    ]
+    analysis = {
+        "analysis_date_paris": previous_date,
+        "generated_at_utc": now_iso(),
+        "source": "coinbeacon-api2 six-strategy independent signals",
+        "mode": "PAPER_ONLY_NO_REAL_ORDER",
+        "exchange": "binance-futures",
+        "signal_count": len(daily_signals),
+        "strategy_status": {
+            strategy: {
+                "signals": sum((x.get("family") or "").removesuffix("_watch") == strategy
+                               and not str(x.get("family") or "").endswith("_watch")
+                               for x in daily_signals),
+                "watch": sum(x.get("family") == strategy + "_watch"
+                             for x in daily_signals),
+                "archive_complete": sum(
+                    (x.get("family") or "") == strategy and
+                    x.get("status") == "COMPLETE_48H" for x in daily_signals),
+            } for strategy in SHEETS
+        },
+        "no_fabricated_fills": True, "tp_target_pct": 1.0,
+        "archive_timeframe": "15m", "binance_rest_requests": 0,
+        "notes": "Results are published ZIP-based 15m OHLC approximations; "
+                 "entry/TP same-bar ordering unknown. The archive may be pending.",
+        "signals": daily_signals,
+    }
+    analysis_key = (
+        "coinbeacon-api2/analysis/" + previous.strftime("%Y/%m/%d") +
+        "/coinbeacon_six_analysis_" + previous_date + ".json")
+    analysis_body = json.dumps(analysis, ensure_ascii=False, allow_nan=False,
+                               separators=(",", ":")).encode("utf-8")
+    client.put_object(Bucket=bucket, Key=analysis_key,
+                      Body=analysis_body, ContentType="application/json")
+    if int(client.head_object(Bucket=bucket, Key=analysis_key)["ContentLength"]) != len(analysis_body):
+        raise ValueError("R2_ANALYSIS_JSON_SIZE_MISMATCH")
+    LOG.info("[CB2 INDEPENDENT] previous-day analysis saved key=%s signals=%d",
+             analysis_key, len(daily_signals))
     put_meta(db, "json_day", date)
     put_meta(db, "json_upload_at", time.time())
     LOG.info("Private Cloudflare R2 JSON saved key=%s rows=%d", key, len(all_rows))
