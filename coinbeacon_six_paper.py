@@ -34,7 +34,7 @@ DB = BASE / "coinbeacon_six_paper.sqlite3"
 HBREAK_DB = BASE / "hbreak_paper.sqlite3"
 API = "https://api.coinbeacon.io"
 BINANCE = "https://fapi.binance.com"
-from crash_paper_rest_priority import paper_get, paper_rest_available, PaperRestDeferred
+from paper_archive_15m import klines as archive_klines
 SHEETS = {
     "rvol": "CB2_01_RVOL",
     "retest": "CB2_02_RETEST",
@@ -229,50 +229,20 @@ class MarketClient:
             return None
 
     def klines(self, symbol, tf, start=None, limit=60, track=False):
-        if not symbol.endswith("USDT") or not symbol.isalnum() or len(symbol) > 20:
+        # Binance REST is disabled for every CB2 strategy.
+        # Only published, completed UTC daily 15m ZIPs are considered.
+        if tf != "15m":
             return []
-        if not track:
-            if symbol not in self.new_symbols and len(self.new_symbols) >= MAX_NEW_SYMBOLS_PER_CYCLE:
-                return []
-            self.new_symbols.add(symbol)
-        cache_key = (symbol, tf, start, limit)
-        if cache_key in self.public_candle_cache:
-            return self.public_candle_cache[cache_key]
-        try:
-            params = {"symbol": symbol, "interval": tf, "limit": limit}
-            if start is not None:
-                params["startTime"] = int(start)
-            r = paper_get(self.http, BINANCE + "/fapi/v1/klines", params=params, timeout=12)
-            r.raise_for_status()
-            candles = [x for x in r.json() if int(x[6]) < now_ms()]
-            self.public_candle_cache[cache_key] = candles
-            return candles
-        except PaperRestDeferred as exc:
-            self.paper_rest_deferred = True
-            LOG.info("CB-API2 paper kline REST deferred: %s; preserve history", exc.reason)
-            return []
-        except Exception as exc:
-            LOG.warning("Binance public candles %s %s (%s)", symbol, tf, type(exc).__name__)
-            return []
+        key = (symbol, tf, start, limit)
+        if key not in self.public_candle_cache:
+            self.public_candle_cache[key] = archive_klines(
+                symbol, tf, start=start, limit=limit, http=self.http)
+        return self.public_candle_cache[key]
 
     def price(self, symbol):
-        if symbol in self.price_cache:
-            return self.price_cache[symbol]
-        if symbol not in self.new_symbols and len(self.new_symbols) >= MAX_NEW_SYMBOLS_PER_CYCLE:
-            return None
-        self.new_symbols.add(symbol)
-        try:
-            r = paper_get(self.http, BINANCE + "/fapi/v1/ticker/price", params={"symbol": symbol}, timeout=10)
-            r.raise_for_status()
-            price = num(r.json().get("price"))
-            self.price_cache[symbol] = price
-            return price
-        except PaperRestDeferred as exc:
-            self.paper_rest_deferred = True
-            LOG.info("CB-API2 paper price REST deferred: %s; preserve history", exc.reason)
-            return None
-        except Exception:
-            return None
+        # No live Binance ticker in archive-only mode. Never substitute
+        # yesterday's closing price for a live paper entry.
+        return None
 
 
 def rvol_from_candles(c):
@@ -338,7 +308,7 @@ def evaluate_hbreak(db, market, trend_data):
         ).fetchone()]
         if not fresh:
             continue
-        price = market.price(symbol)
+        price = num(row.get("entry"))  # CoinBeacon HBREAK signal-time entry, not stale ZIP close.
         if not price:
             continue
         for strategy, extra in fresh:
@@ -532,7 +502,7 @@ def track(db, market):
         active = groups[symbol]
         start = min(int(t.get("cursor") or first_full_5m(t["opened_at"]))
                     for t in active)
-        candles = market.klines(symbol, "5m", start=start, limit=200, track=True)
+        candles = market.klines(symbol, "15m", start=start, limit=200, track=True)
         if not candles:
             # Missing candles is not evidence of 0% drawdown.
             continue
@@ -559,7 +529,7 @@ def track(db, market):
             if processed:
                 # Never skip unprocessed candles after TP or a page of history.
                 processed_last = [c for c in candles if int(c[0]) >= cursor][processed - 1]
-                t["cursor"] = int(processed_last[0]) + 300000
+                t["cursor"] = int(processed_last[0]) + 900000
                 t["observed_candles"] = int(t.get("observed_candles") or 0) + processed
                 t["max_drawdown_pct"] = round(min(0, (float(t["lowest"]) /
                                                        float(t["entry"]) - 1) * 100), 4)
@@ -758,7 +728,7 @@ def json_archive(db, current=None):
 
 def cycle(db, market):
     market.begin_cycle()
-    if not paper_rest_available():
+    if False:  # Archive-only paper mode, no Binance REST capacity check.
         # No Binance candles means no trustworthy new paper signal/fill.
         # Preserve recorded open trades and cursors for later backfill.
         LOG.info("CB-API2 REST LOW PRIORITY | Crash/Binance capacity first; "
@@ -801,7 +771,7 @@ def cycle(db, market):
     if liq:
         counts["oi_squeeze"] = evaluate_oi(db, market, liq)
     reopen_24h(db)
-    checked, bars = track(db, market)
+    checked, bars = track(db, market)\n    LOG.info("CB2 archive-only: Binance REST disabled; 15m ZIP results delayed until publication")
     LOG.info("Cycle paper_new=%s tracked=%d candle_bars=%d, total=%d",
              counts, checked, bars, len(all_trades(db)))
     try:
