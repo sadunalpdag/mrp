@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 LOG = logging.getLogger("cb2_signal_research")
-MAX_SIGNALS = 2000
+MAX_SIGNALS = 5000
 MAX_CHECK_PER_CYCLE = 12
 FIFTEEN = 900000
 
@@ -189,7 +189,9 @@ def analyze(db, archive_klines, http, now_iso):
         if record.get("status") in ("COMPLETE_48H", "WATCH", "WATCH_EXPIRED", "UNCONFIRMED_OI"):
             continue
         seen_ms = _ms(record["observed_at"])
-        if now - seen_ms < 25 * 3600000:
+        # First next-day public ZIP may be available before 24h has elapsed.
+        # Only completed archive bars are evaluated; no future candle is assumed.
+        if now - seen_ms < 12 * 3600000:
             continue
         if record.get("last_check") and now - _ms(record["last_check"]) < 2 * 3600000:
             continue
