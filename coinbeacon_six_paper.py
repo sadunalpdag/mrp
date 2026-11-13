@@ -726,7 +726,8 @@ def json_archive(db, current=None):
     # A new Paris day starts a new object; each object is cumulative.
     date = current.date().isoformat()
     last_save = float(meta(db, "json_upload_at", "0"))
-    if meta(db, "json_day") == date and time.time() - last_save < 3600:
+    if (meta(db, "json_day") == date and time.time() - last_save < 3600
+            and meta(db, "cb2_analysis_json_enabled") == "1"):
         return
     from crash_report_storage import r2_configured, R2_ENV_NAMES
     if not r2_configured():
@@ -818,6 +819,7 @@ def json_archive(db, current=None):
         raise ValueError("R2_ANALYSIS_JSON_SIZE_MISMATCH")
     LOG.info("[CB2 INDEPENDENT] previous-day analysis saved key=%s signals=%d",
              analysis_key, len(daily_signals))
+    put_meta(db, "cb2_analysis_json_enabled", "1")
     put_meta(db, "json_day", date)
     put_meta(db, "json_upload_at", time.time())
     LOG.info("Private Cloudflare R2 JSON saved key=%s rows=%d", key, len(all_rows))
