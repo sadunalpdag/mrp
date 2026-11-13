@@ -88,7 +88,9 @@ def enroll(db,http,setups):
             trigger=int(s["computedAt"])//900000-age
             key=hashlib.sha256(f"15m|{sym}|{a['key']}|{trigger}".encode()).hexdigest()[:24]
             if key in existing:continue
-            vals=None  # Live RSI/ATR unavailable without Binance REST; do not invent.
+            # Live RSI/ATR cannot be verified without Binance REST.
+            # Store NULL values and fill from published daily archive later.
+            vals=(None,None,None,None)
             part=s.get("participation") or {}
             obj=dict.fromkeys(FIELDS)
             obj.update(id=key,opened_at=stamp(),coin=sym,archetype=a["key"],
@@ -101,9 +103,6 @@ def enroll(db,http,setups):
                data_status="PENDING",observed_candles=0,last_candle_at=None,
                cursor=first_full_candle_ms(stamp()))
             save(db,obj);existing.add(key);added+=1
-        except PaperRestDeferred as exc:
-            LOG.info("HBREAK paper candidate REST deferred reason=%s; Crash Bounce first", exc.reason)
-            break
         except Exception as e:LOG.warning("HBREAK candidate skip %s %s",s.get("symbol"),str(e)[:100])
     return added
 def track(db,http):
@@ -153,11 +152,6 @@ def track(db,http):
                 trade["data_status"]="PENDING" if not trade.get("observed_candles") else "OK"
             trade["checked_at"]=stamp()
             save(db,trade)
-        except PaperRestDeferred as exc:
-            # No candle read, no status ERROR, no synthetic TP. Resume from
-            # the persisted cursor on the next paper cycle.
-            LOG.info("HBREAK paper TP tracking deferred reason=%s; kept cursor", exc.reason)
-            break
         except requests.HTTPError as e:
             trade["data_status"]="ERROR"
             trade["checked_at"]=stamp()
@@ -229,10 +223,13 @@ def step(db,http):
         if resp.status_code==429:raise ValueError("CoinBeacon 429, skipping retry this cycle")
         resp.raise_for_status();result=resp.json()
         if not isinstance(result.get("setups"),list):raise ValueError("CoinBeacon response missing setups")
-        # Mark the bucket after successful fetch, before costly downstream processing.
+        # Mark the 15m bucket only after the signal enrollment completed.
+        created=enroll(db,http,result["setups"])
         mset(db,"bucket_15m",bucket)
-        LOG.info("HBREAK fetched %s setup rows; new %s",len(result["setups"]),enroll(db,http,result["setups"]))
-    track(db,http)
+        LOG.info("HBREAK fetched %s setup rows; new %s",len(result["setups"]),created)
+    # A tracking error must not stop fresh signal rows from reaching Sheets.
+    try:track(db,http)
+    except Exception as exc:LOG.warning("HBREAK tracking failed %s: %s",type(exc).__name__,str(exc)[:140])
     LOG.info("HBREAK archive-only mode: Binance REST disabled; daily 15m ZIP backfill")
     try:sheet_sync(db)
     except Exception as e:LOG.warning("HBREAK sheet %s",str(e)[:180])
