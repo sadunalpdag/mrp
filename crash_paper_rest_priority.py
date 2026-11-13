@@ -71,7 +71,7 @@ def paper_get(http, url, params=None, timeout=12):
         raise PaperRestDeferred("FRESH_CRASH_SIGNAL")
     weight = estimated_weight(parts.path, params or {}, "GET")
     try:
-        BUDGET.reserve("paper", weight)
+        BUDGET.reserve("paper", weight, endpoint="GET:" + parts.path)
     except RateDeferred as exc:
         raise PaperRestDeferred(exc.reason, exc.seconds) from exc
     # Crash priority may have changed while waiting for the paced budget.
