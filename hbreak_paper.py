@@ -14,7 +14,7 @@ LOG.setLevel(logging.INFO)
 LOG.propagate=False
 BASE=Path(os.getenv("DATA_DIR","/data"))
 DB=BASE/"hbreak_paper.sqlite3"
-from crash_paper_rest_priority import paper_get, paper_rest_available, PaperRestDeferred
+from paper_archive_15m import klines as archive_klines
 SHEET="HBREAK_15M_LONG_TEST"
 FIELDS="id opened_at coin archetype triggered_at sqs rvol taker_flow_pct liquidity_usd_24h trend_direction multi_tf_confirmed rsi14_15m atr14_15m atr_pct volume_15m_usdt entry tp status tp_at low_since_entry max_drawdown_pct checked_at data_status observed_candles last_candle_at".split()
 URL="https://api.coinbeacon.io/public/setups"
@@ -36,9 +36,9 @@ def rows(db):
 def save(db,v):
     db.execute("insert or replace into trades values (?,?)",(v["id"],json.dumps(v)));db.commit()
 def first_full_candle_ms(opened_at):
-    """Start from first full 5m candle after paper entry."""
+    """Start from first full 15m candle after paper entry."""
     ts=int(datetime.fromisoformat(opened_at).timestamp()*1000)
-    return ((ts + 299999)//300000)*300000
+    return ((ts + 899999)//900000)*900000
 
 def migrate_tracking(db):
     """Backfill legacy OPEN paper trades without a data-observation marker."""
@@ -59,9 +59,7 @@ def migrate_tracking(db):
 def get_klines(http,symbol,tf,limit=100,start=None):
     p={"symbol":symbol,"interval":tf,"limit":limit}
     if start is not None:p["startTime"]=int(start)
-    resp=paper_get(http,"https://fapi.binance.com/fapi/v1/klines",params=p,timeout=12);resp.raise_for_status()
-    t=int(time.time()*1000)
-    return [v for v in resp.json() if int(v[6])<t]
+    return archive_klines(symbol,tf,start=start,limit=limit,http=http)
 def rsi_atr(data):
     if len(data)<40:return None
     closes=[float(v[4]) for v in data]; highs=[float(v[2]) for v in data];lows=[float(v[3]) for v in data]
@@ -90,8 +88,7 @@ def enroll(db,http,setups):
             trigger=int(s["computedAt"])//900000-age
             key=hashlib.sha256(f"15m|{sym}|{a['key']}|{trigger}".encode()).hexdigest()[:24]
             if key in existing:continue
-            vals=rsi_atr(get_klines(http,sym,"15m",100))
-            if vals is None:continue
+            vals=None  # Live RSI/ATR unavailable without Binance REST; do not invent.
             part=s.get("participation") or {}
             obj=dict.fromkeys(FIELDS)
             obj.update(id=key,opened_at=stamp(),coin=sym,archetype=a["key"],
@@ -134,7 +131,7 @@ def track(db,http):
         try:
             first=first_full_candle_ms(trade["opened_at"])
             start=max(first,int(trade.get("cursor") or first))
-            candles=get_klines(http,trade["coin"],"5m",limit=200,start=start)
+            candles=get_klines(http,trade["coin"],"15m",limit=200,start=start)
             processed=0
             for candle in candles:
                 if int(candle[0])<start:continue
@@ -146,7 +143,7 @@ def track(db,http):
                     trade["tp_at"]=trade["last_candle_at"]
                     break
             if processed:
-                trade["cursor"]=int(candles[processed-1][0])+300000
+                trade["cursor"]=int(candles[processed-1][0])+900000
                 trade["observed_candles"]=int(trade.get("observed_candles") or 0)+processed
                 trade["max_drawdown_pct"]=round(min(0.0,(float(trade["low_since_entry"])/float(trade["entry"])-1)*100),4)
                 trade["data_status"]="OK"
@@ -214,7 +211,7 @@ def archive(db):
     mset(db,"zip_day",day)
     LOG.info("HBREAK R2 archive uploaded key=%s",result["key"])
 def step(db,http):
-    if not paper_rest_available():
+    if False:  # Archive mode: no Binance REST budget required.
         # Defer even paid CoinBeacon discovery rather than consuming credits
         # for signals whose RSI/ATR and TP candles cannot be validated now.
         LOG.info("HBREAK REST LOW PRIORITY | Crash/Binance capacity first; "
@@ -224,7 +221,7 @@ def step(db,http):
         try:archive(db)
         except Exception as e:LOG.warning("HBREAK archive %s",str(e)[:180])
         return
-    bucket=str(int(time.time()//600))
+    bucket=str(int(time.time()//900))
     if mget(db,"bucket_15m")!=bucket:
         key=os.getenv("hbreak") or os.getenv("HBREAK") or os.getenv("COINBEACON_API_KEY")
         if not key:raise ValueError("Missing Render hbreak CoinBeacon key")
@@ -235,7 +232,7 @@ def step(db,http):
         # Mark the bucket after successful fetch, before costly downstream processing.
         mset(db,"bucket_15m",bucket)
         LOG.info("HBREAK fetched %s setup rows; new %s",len(result["setups"]),enroll(db,http,result["setups"]))
-    track(db,http)
+    track(db,http)\n    LOG.info("HBREAK archive-only mode: Binance REST disabled; daily 15m ZIP backfill")
     try:sheet_sync(db)
     except Exception as e:LOG.warning("HBREAK sheet %s",str(e)[:180])
     try:archive(db)
