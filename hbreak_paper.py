@@ -248,6 +248,6 @@ def run():
         while True:
             try:step(db,http)
             except Exception as e:LOG.warning("HBREAK cycle %s",str(e)[:180])
-            time.sleep(max(15,600-int(time.time())%600))
+            time.sleep(max(15,900-int(time.time())%900))
 def start():
     threading.Thread(target=run,name="hbreak-paper-only",daemon=True).start()
