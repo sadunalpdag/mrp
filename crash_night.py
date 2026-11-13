@@ -157,7 +157,7 @@ class BinanceBroker:
             raise ValueError('UNSAFE_PROTECTION_PRIORITY')
         try:
             BUDGET.reserve(budget_priority or priority_for(method, path, params),
-                           estimated_weight(path, params, method=method))
+                           estimated_weight(path, params, method=method), endpoint=method + ':' + path)
         except RateDeferred as deferred:
             raise BrokerError('-1003', deferred_reason=deferred.reason,
                               deferred_seconds=deferred.seconds, not_sent=True) from None
