@@ -36,6 +36,7 @@ API = "https://api.coinbeacon.io"
 BINANCE = "https://fapi.binance.com"
 from paper_archive_15m import klines as archive_klines
 import cb2_signal_research as signal_research
+import cb2_independent_signals as cb2_independent
 SHEETS = {
     "rvol": "CB2_01_RVOL",
     "retest": "CB2_02_RETEST",
@@ -730,39 +731,17 @@ def json_archive(db, current=None):
 
 
 def cycle(db, market):
+    """Independent CB2 candidate collection; legacy paper fills remain read-only."""
     market.begin_cycle()
-    if False:  # Archive-only paper mode, no Binance REST capacity check.
-        # No Binance candles means no trustworthy new paper signal/fill.
-        # Preserve recorded open trades and cursors for later backfill.
-        LOG.info("CB-API2 REST LOW PRIORITY | Crash/Binance capacity first; "
-                 "paper data preserved; scanning deferred")
-        try:
-            sheet_sync(db)
-        except Exception as exc:
-            LOG.warning("Sheets sync failed (%s): %s", type(exc).__name__, str(exc)[:140])
-        try:
-            json_archive(db)
-        except Exception as exc:
-            LOG.warning("R2 JSON failed (%s): %s", type(exc).__name__, str(exc)[:100])
-        return
+    current = now_iso()
     market.usage()
-    # Archive-only signal observation. Does not create paper entries or orders.
-    try:
-        observed = signal_research.capture_hbreak(db, read_hbreak_new(db), now_iso())
-        if observed:
-            LOG.info("[CB2 SIGNAL JOURNAL] HBREAK triggers=%d", observed)
-    except Exception as exc:
-        LOG.warning("[CB2 SIGNAL JOURNAL] HBREAK capture error %s", type(exc).__name__)
-    # A previously verified matrix may be reused between hourly requests,
-    # but must never be treated as fresh beyond 90 minutes.
+
+    # Reuse existing paid CoinBeacon boards. Never read HBREAK's SQLite DB
+    # for NEW CB2 setups; neither Binance REST nor a live paper fill is needed.
     trend = run_paid_board(db, market, "trend", "/public/trend-scanner",
                            {"exchange": "binance-futures", "sort": "1h",
                             "dir": "desc", "quote": "USDT"})
     if trend:
-        try:
-            signal_research.capture_board(db, "trend_scanner_candidate", trend, now_iso())
-        except Exception as exc:
-            LOG.warning("[CB2 SIGNAL JOURNAL] trend snapshot error %s", type(exc).__name__)
         put_meta(db, "trend_cache", json.dumps({"at": time.time(), "data": trend}))
     if not trend:
         try:
@@ -771,37 +750,62 @@ def cycle(db, market):
                 trend = cached.get("data")
         except (ValueError, TypeError):
             pass
-    counts = evaluate_hbreak(db, market, trend)
+
+    new_watches = {}
     squeeze = run_paid_board(db, market, "squeeze", "/public/screener",
                              {"preset": "squeeze"})
-    if squeeze:
-        try:
-            signal_research.capture_board(db, "squeeze_watch_candidate", squeeze, now_iso())
-        except Exception as exc:
-            LOG.warning("[CB2 SIGNAL JOURNAL] squeeze snapshot error %s", type(exc).__name__)
-        counts["squeeze_watch"] = evaluate_squeeze(db, market, squeeze)
-    counts["squeeze_triggered"] = check_watch(db, market)
+    if squeeze is not None:
+        new_watches["squeeze"] = cb2_independent.watch_screener(
+            db, "squeeze", squeeze, current)
+
     volume = run_paid_board(db, market, "volume", "/public/screener",
                             {"preset": "volume-surge"})
-    if volume:
-        try:
-            signal_research.capture_board(db, "volume_surge_candidate", volume, now_iso())
-        except Exception as exc:
-            LOG.warning("[CB2 SIGNAL JOURNAL] volume snapshot error %s", type(exc).__name__)
-        counts["volume"] = evaluate_volume(db, market, volume)
-    liq = run_paid_board(db, market, "liquidations", "/public/liquidations/board")
+    if volume is not None:
+        new_watches["volume"] = cb2_independent.watch_screener(
+            db, "volume", volume, current)
+
+    setups = None
+    if due(db, "setups", 900):
+        fetched = market.cb("/public/setups", 5,
+                            cb2_independent.SETUPS_PARAMS)
+        if isinstance(fetched, dict) and isinstance(fetched.get("setups"), list):
+            setups = fetched
+            set_due(db, "setups", 900)
+        else:
+            LOG.warning("[CB2 INDEPENDENT] setups API unavailable; preserving old data")
+
+    new_signals = {}
+    fresh_count = 0
+    if setups:
+        new_signals, fresh_count = cb2_independent.capture_setups(
+            db, setups, current, trend)
+
+    liq = run_paid_board(db, market, "liquidations",
+                         "/public/liquidations/board")
     if liq:
-        counts["oi_squeeze"] = evaluate_oi(db, market, liq)
+        oi = cb2_independent.capture_liquidations(
+            db, liq, current, market, setups)
+        new_signals["oi_squeeze"] = oi["oi_squeeze"]
+        new_watches["oi_squeeze"] = oi["oi_watch"]
+    cb2_independent.expire_watches(db, current)
+
+    # Existing 380+ paper records are preserved. Only daily published 15m
+    # ZIPs are used for outcome tracking; no public Binance REST calls.
     reopen_24h(db)
     checked, bars = track(db, market)
     try:
-        signal_research.analyze(db, archive_klines, market.http, now_iso())
+        studied = signal_research.analyze(db, archive_klines, market.http, current)
     except Exception as exc:
-        LOG.warning("[CB2 SIGNAL JOURNAL] archive study error %s: %s",
-                    type(exc).__name__, str(exc)[:100])
-    LOG.info("CB2 archive-only: Binance REST disabled; 15m ZIP results delayed until publication")
-    LOG.info("Cycle paper_new=%s tracked=%d candle_bars=%d, total=%d",
-             counts, checked, bars, len(all_trades(db)))
+        LOG.warning("[CB2 INDEPENDENT] archive outcome error %s: %s",
+                    type(exc).__name__, str(exc)[:120])
+        studied = 0
+    observation_count = signal_research.export(db)["count"]
+    LOG.info("[CB2 INDEPENDENT] setups_recent=%d new=%s watch=%s archive_checked=%d "
+             "observations=%d legacy_trades=%d; Binance REST=OFF",
+             fresh_count, new_signals, new_watches, studied,
+             observation_count, len(all_trades(db)))
+    LOG.info("CB2 archive-only: 15m Binance daily ZIP evaluation after publication; "
+             "legacy tracked=%d bars=%d", checked, bars)
     try:
         sheet_sync(db)
     except Exception as exc:
