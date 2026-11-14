@@ -39,7 +39,7 @@ class CapacityShadowTests(unittest.TestCase):
         rec = sample()
         self.assertTrue(attach(rec, "PENDING_LIMIT_REACHED",
                                {"price": "100", "tp": "101"}, "500", "0.01", 1002))
-        self.assertIsNone(advance(rec, 101.2, 1003, 1))
+        self.assertEqual(advance(rec, 101.2, 1003, 1), "MISSED_SIGNAL")
         self.assertNotEqual(rec["capacity_virtual"]["tracking_status"], "TP")
 
     def test_no_entry_is_not_counted_as_tp_failure(self):
