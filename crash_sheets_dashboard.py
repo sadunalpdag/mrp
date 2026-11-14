@@ -18,7 +18,7 @@ from crash_capacity_shadow import summarize as summarize_capacity
 
 INTERVAL = 300
 MAX_ROWS = 60
-STATUS_ROWS = 40
+STATUS_ROWS = 39  # Row 40 begins the user-requested append-only daily history.
 LEGACY_STATUS_ROWS = 32
 # User-confirmed EMA Filter workbook link; independent of legacy GOOGLE_SHEETS_ID.
 # Only this dashboard uses this key. Optional override is deliberate and explicit.
@@ -665,6 +665,37 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     except Exception as exc:
         if logger:
             logger("[CRASH DAILY SHEETS] skipped: " + type(exc).__name__)
+    # User-requested daily history is INSIDE the existing Bot Status tab:
+    # A40 is the header, A41 onward one dated row per Paris day. The 5-minute
+    # publisher captures yesterday on the first cycle at/after 01:05 Paris.
+    # These rows never overlap the live A1:B39 panel or D:I controls.
+    try:
+        from crash_status_daily_history import report as daily_status_report
+        from crash_status_daily_history import HEADERS as HISTORY_HEADERS, START_ROW
+        if status.title == "Bot Status":
+            historical_rows = daily_status_report(directory, now, executor)
+            last_row = START_ROW + len(historical_rows) - 1
+            requests = []
+            if getattr(status, "row_count", 0) < last_row:
+                requests.append({"updateSheetProperties": {
+                    "properties": {"sheetId": status.id,
+                                   "gridProperties": {"rowCount": last_row}},
+                    "fields": "gridProperties.rowCount"}})
+            if getattr(status, "col_count", len(HISTORY_HEADERS)) < len(HISTORY_HEADERS):
+                requests.append({"updateSheetProperties": {
+                    "properties": {"sheetId": status.id,
+                                   "gridProperties": {"columnCount": len(HISTORY_HEADERS)}},
+                    "fields": "gridProperties.columnCount"}})
+            if requests:
+                sheet.batch_update({"requests": requests})
+            data.append({
+                "range": "'Bot Status'!A" + str(START_ROW) + ":" +
+                         column_letter(len(HISTORY_HEADERS)) + str(last_row),
+                "values": historical_rows,
+            })
+    except Exception as exc:
+        if logger:
+            logger("[CRASH DAILY BOT STATUS] skipped: " + type(exc).__name__)
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
     # D:I is a separate user-controlled parameter area. A:B and Sinyal remain

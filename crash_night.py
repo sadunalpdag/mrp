@@ -1818,6 +1818,15 @@ class NightExecutor:
                 if qty < 0 or qty > D(order['quantity']):
                     raise ValueError('INVALID_FILLED_QUANTITY')
                 order['filled_qty'] = str(qty)
+                # Report-only metadata: the exchange timestamp, not the
+                # submission date, identifies the real fill day.
+                if not order.get('entry_filled_at'):
+                    try:
+                        exchange_time = float(entry.get('updateTime') or 0)
+                        if exchange_time > 0:
+                            order['entry_filled_at'] = exchange_time / 1000
+                    except (ValueError, TypeError, OverflowError):
+                        pass
                 order['phase'] = 'TP_UNKNOWN'
                 self.save()  # On restart query this client ID; never duplicate TP.
                 try:
@@ -1835,6 +1844,14 @@ class NightExecutor:
                     raise ValueError('TP_PROPERTIES_NOT_CONFIRMED')
                 if tp.get('status') == 'FILLED':
                     order['phase'] = 'DONE'
+                    # Report-only TP completion timestamp; no order logic change.
+                    if not order.get('tp_filled_at'):
+                        try:
+                            exchange_time = float(tp.get('updateTime') or 0)
+                            if exchange_time > 0:
+                                order['tp_filled_at'] = exchange_time / 1000
+                        except (ValueError, TypeError, OverflowError):
+                            pass
                     self.release_verified_tp(order)
                     self.save()
                     self.alert(f'✅ OTOMATİK TP DOLDU | {symbol}\nTP: {order["tp"]}')
