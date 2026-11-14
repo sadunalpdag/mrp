@@ -1582,9 +1582,19 @@ class NightExecutor:
             # Existing TP protection and reconciliation continue normally.
             if isinstance(error, ValueError) and str(error) in (
                     'MAX_OPEN_POSITIONS_REACHED', 'MAX_PENDING_ENTRY_ORDERS_REACHED'):
-                self.entry_skip(symbol, 'OPEN_LIMIT_REACHED'
-                                if str(error) == 'MAX_OPEN_POSITIONS_REACHED'
-                                else 'PENDING_LIMIT_REACHED')
+                capacity_reason = ('OPEN_LIMIT_REACHED'
+                                   if str(error) == 'MAX_OPEN_POSITIONS_REACHED'
+                                   else 'PENDING_LIMIT_REACHED')
+                # A failing/unavailable paper callback must never change the
+                # existing limit rejection or protection of live orders.
+                try:
+                    callback = getattr(self, 'capacity_virtual_callback', None)
+                    if callable(callback):
+                        callback(record, capacity_reason, p, target_usdt, tp_pct)
+                except Exception as shadow_error:
+                    self.log('[CRASH CAPACITY PAPER ERR] ' +
+                             type(shadow_error).__name__)
+                self.entry_skip(symbol, capacity_reason)
                 return
             if (isinstance(error, BrokerError) and error.not_sent
                     and error.deferred_reason == 'IP_WEIGHT_SOFT_CEILING'):

@@ -14,9 +14,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from crash_policy import TRACKING_SECONDS, is_active_candidate
+from crash_capacity_shadow import summarize as summarize_capacity
 
 INTERVAL = 300
 MAX_ROWS = 60
+STATUS_ROWS = 40
+LEGACY_STATUS_ROWS = 32
 # User-confirmed EMA Filter workbook link; independent of legacy GOOGLE_SHEETS_ID.
 # Only this dashboard uses this key. Optional override is deliberate and explicit.
 DEFAULT_EMA_FILTER_ID = "1qJ1rcmmAdhhELmdzUovYq1n1UIF5lxdCb1lT3CDPF58"
@@ -324,6 +327,12 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
     recent = [r for r in history if isinstance(r, dict) and (_num(r.get("created_at")) or 0) > since]
     scores = [_score(r) for r in recent]
     scores = [x for x in scores if x is not None]
+    capacity_all = summarize_capacity([
+        r for r in history if isinstance(r, dict)
+        and (_num(r.get("created_at")) or 0) > now - 10 * 86400])
+    capacity_24h = summarize_capacity([
+        r for r in history if isinstance(r, dict)
+        and (_num(r.get("created_at")) or 0) > now - 86400])
     status_rows = [
         ["Gösterge", "Değer"],
         ["Son güncelleme (Paris)", _time(now)],
@@ -343,6 +352,23 @@ def build_rows(state, tickers, trading, ws, now, score_cache=None, rescore=None,
         ["V2 onaylı / düşük risk", eligible],
         ["Son 24 saat V2 adayı", len(recent)],
         ["Son 24 saat ort. güç puanı", round(sum(scores)/len(scores), 1) if scores else "—"],
+        ["Limitten sanal (son 24s)", capacity_24h["total"]],
+        ["Limitten sanal (10g toplam)", capacity_all["total"]],
+        ["Açık pozisyon limiti sanal (10g)", capacity_all["open_limit"]],
+        ["Bekleyen emir limiti sanal (10g)", capacity_all["pending_limit"]],
+        ["Sanal giriş bekleyen (10g)", capacity_all["wait_entry"]],
+        ["Sanal açık (10g)", capacity_all["open"]],
+        ["Sanal TP (10g)", capacity_all["tp"]],
+        ["Sanal zaman aşımı (10g)", capacity_all["timeout"]],
+        ["Sanal TP başarı (sonuçlanan, 10g)", (
+            str(capacity_all["tp_rate_resolved_pct"]) + "%"
+            if capacity_all["tp_rate_resolved_pct"] is not None else "VERİ YOK")],
+        ["Sanal ort. TP süresi (dakika, 10g)", (
+            capacity_all["avg_tp_minutes"] if capacity_all["avg_tp_minutes"] is not None
+            else "VERİ YOK")],
+        ["Sanal en kötü MAE % (10g)", (
+            capacity_all["worst_mae_pct"] if capacity_all["worst_mae_pct"] is not None
+            else "VERİ YOK")],
         ["0 risk sinyali", risk_summary[0]],
         ["1 risk sinyali", risk_summary[1]],
         ["2 risk sinyali", risk_summary[2]],
@@ -407,7 +433,8 @@ def _legacy_bot_status_rows(status_rows, now):
         ["Kaynak", "Crash Bounce V2 / yalnızca mevcut canlı durum"],
     ]
     rows.extend([list(row) for row in status_rows[2:]])
-    return rows + [["", ""] for _ in range(max(0, 32 - len(rows)))]
+    rows = rows[:LEGACY_STATUS_ROWS]
+    return rows + [["", ""] for _ in range(max(0, LEGACY_STATUS_ROWS - len(rows)))]
 
 def _sync_external_legacy_status(client, dashboard_id, status_rows, now, logger=None):
     """Bridge current V2 health to a separate historical BOT_STATUS workbook.
@@ -570,7 +597,12 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     sheet = client.open_by_key(sheet_id)
     status, signal, legacy_status = _tabs(sheet)
     _ensure_four_risk_columns(sheet, signal, logger)
-    # Expand only the existing Sinyal tab; never create or delete worksheets.
+    # Expand only existing panel tabs; do not create or delete worksheets.
+    if getattr(status, "row_count", STATUS_ROWS) < STATUS_ROWS:
+        sheet.batch_update({"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": status.id,
+                           "gridProperties": {"rowCount": STATUS_ROWS}},
+            "fields": "gridProperties.rowCount"}}]})
     if getattr(signal, "col_count", len(HEADERS)) < len(HEADERS):
         sheet.batch_update({"requests": [{"updateSheetProperties": {
             "properties": {"sheetId": signal.id,
@@ -581,7 +613,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     status_rows, signal_rows, colors, previous = build_rows(
         state, tickers, trading, ws, now, _read_previous(prev_path), rescore, candle_get, directory)
     # Update only panel-owned rectangular ranges. Old worksheets and other data untouched.
-    status_rows = status_rows + [["", ""]] * max(0, 26 - len(status_rows))
+    status_rows = status_rows[:STATUS_ROWS] + [["", ""]] * max(0, STATUS_ROWS - len(status_rows))
     signal_rows = signal_rows + [[""] * len(HEADERS)] * max(0, MAX_ROWS + 1 - len(signal_rows))
     def column_letter(n):
         letters = ""
@@ -590,12 +622,12 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
             letters = chr(65 + rem) + letters
         return letters
     data = [
-        {"range": "'" + status.title.replace("'", "''") + "'!A1:B26", "values": status_rows},
+        {"range": "'" + status.title.replace("'", "''") + "'!A1:B" + str(STATUS_ROWS), "values": status_rows},
         {"range": "'" + signal.title.replace("'", "''") + "'!A1:" + column_letter(len(HEADERS)) + str(MAX_ROWS + 1), "values": signal_rows},
     ]
     if legacy_status is not None:
         data.append({
-            "range": "'" + legacy_status.title.replace("'", "''") + "'!A1:B32",
+            "range": "'" + legacy_status.title.replace("'", "''") + "'!A1:B" + str(LEGACY_STATUS_ROWS),
             "values": _legacy_bot_status_rows(status_rows, now),
         })
     # A single existing Sheets values batch updates all matching dashboard
@@ -650,7 +682,10 @@ class DashboardPublisher:
             # Small immutable snapshot; never send state files or API keys to Sheets.
             symbols = copy.deepcopy(state.get("symbols", {}))
             recent = copy.deepcopy([r for r in state.get("history", [])
-                if isinstance(r, dict) and (_num(r.get("created_at")) or 0) > now - 86400])
+                if isinstance(r, dict)
+                and ((_num(r.get("created_at")) or 0) > now - 86400
+                     or (isinstance(r.get("capacity_virtual"), dict)
+                         and (_num(r.get("created_at")) or 0) > now - 10 * 86400))])
             trading = {}
             if executor is not None:
                 trading = {

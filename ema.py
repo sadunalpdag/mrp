@@ -7121,6 +7121,18 @@ def _crash_initialize_tracking(record):
 
 def _crash_track_results(state, tickers, now):
     from crash_policy import TRACKING_SECONDS, POST_ENTRY_TRACKING_SECONDS, supported_symbol
+    from crash_capacity_shadow import expire as expire_capacity
+    for record in state["history"]:
+        transition = expire_capacity(record, now)
+        if transition:
+            _crash_append_data({"type":"capacity_virtual_result",
+                                "observed_at":now,
+                                "signal_id":record.get("signal_id"),
+                                "symbol":record.get("symbol"),
+                                "transition":transition,
+                                "paper":dict(record["capacity_virtual"])}, now)
+            log(f'[CRASH CAPACITY PAPER RESULT] {record.get("symbol")}; '
+                f'transition={transition}; no real order')
     prices = {}
     for ticker in tickers:
         try:
@@ -7914,37 +7926,100 @@ def _crash_trade_consumer():
             log(f"[CRASH TRADE CONSUMER ERR] {type(error).__name__}: {str(error)[:200]}")
 
 
+
+def _crash_capacity_virtual_skip(record, reason, planned, target_usdt, tp_pct):
+    """Record a capacity-rejected candidate in the EXISTING Crash V2 state.
+
+    Invoked only when live preflight refused a new BUY at a capacity gate;
+    it never retries or modifies any real order.
+    """
+    from crash_capacity_shadow import attach
+    with _CRASH_STATE_LOCK:
+        state = _CRASH_ACTIVE_STATE
+        if state is None:
+            log('[CRASH CAPACITY PAPER] state unavailable')
+            return
+        original = next((r for r in state.get('history', ())
+                         if r.get('signal_id') == record.get('signal_id')), None)
+        if original is None:
+            log('[CRASH CAPACITY PAPER] original V2 record not found')
+            return
+        stamp = time.time()
+        if not attach(original, reason, planned, target_usdt, tp_pct, stamp):
+            log(f'[CRASH CAPACITY PAPER] {record.get("symbol")}; ignored duplicate/expired')
+            return
+        latest = state.get('symbols', {}).get(original.get('symbol'))
+        if latest and latest.get('signal_id') == original.get('signal_id'):
+            latest.update(original)
+        _crash_save_state(state)
+        shadow = original['capacity_virtual']
+        _crash_append_data({'type': 'capacity_virtual_created',
+                            'observed_at': stamp, 'signal_id': original.get('signal_id'),
+                            'symbol': original['symbol'], 'reason': reason,
+                            'target_usdt': str(target_usdt), 'risk_tp_pct': str(tp_pct),
+                            'entry': shadow['entry'], 'tp': shadow['tp'],
+                            'tracking_status': shadow['tracking_status']}, stamp)
+        log(f'[CRASH CAPACITY PAPER] {original["symbol"]}; reason={reason}; '
+            f'entry={shadow["entry"]}; tp={shadow["tp"]}; '
+            f'status={shadow["tracking_status"]}; no real BUY')
+
+
 def _crash_ws_track_trade(symbol, price, observed_at, trade_id, force_gap=False):
-    """Act on ordered live trade transitions; persist only when state changes."""
+    """Advance existing V2 and capacity-only paper tracking independently."""
     with _CRASH_STATE_LOCK:
         state = _CRASH_ACTIVE_STATE
         if state is None:
             return
         from crash_live_v2 import advance_trade
-        changed = []
+        from crash_capacity_shadow import advance as advance_paper
+        changed, paper_changed = [], []
         for record in state["history"]:
-            if (record.get("symbol") != symbol or
-                    record.get("tracking_model") != "ws_aggtrade_upcross_v3" or
-                    record.get("v2_status") != "STRONG_V2" or
-                    record.get("tracking_status") not in ("WAIT_ENTRY","OPEN")):
+            if record.get("symbol") != symbol:
                 continue
-            if force_gap:
-                # Dropped WS prints mean no reliable entry/TP ordering.
-                record["ws_last_event_at"] = observed_at - 60
-                record["coverage_gaps"] = record.get("coverage_gaps",0) + 1
-            transition = advance_trade(record, price, observed_at, trade_id)
-            if transition:
-                changed.append((record, transition))
+            primary = (record.get("tracking_model") == "ws_aggtrade_upcross_v3"
+                       and record.get("v2_status") == "STRONG_V2"
+                       and record.get("tracking_status") in ("WAIT_ENTRY", "OPEN"))
+            shadow = record.get("capacity_virtual")
+            paper = (isinstance(shadow, dict)
+                     and shadow.get("tracking_status") in ("WAIT_ENTRY", "OPEN"))
+            if not primary and not paper:
+                continue
+            transition = None
+            paper_transition = None
+            if primary:
+                if force_gap:
+                    record["ws_last_event_at"] = observed_at - 60
+                    record["coverage_gaps"] = record.get("coverage_gaps", 0) + 1
+                transition = advance_trade(record, price, observed_at, trade_id)
+                if transition:
+                    changed.append((record, transition))
+            if paper:
+                paper_transition = advance_paper(record, price, observed_at,
+                                                 trade_id, force_gap=force_gap)
+                if paper_transition:
+                    paper_changed.append((record, paper_transition))
+            if transition or paper_transition:
                 latest = state["symbols"].get(symbol)
                 if latest and latest.get("signal_id") == record.get("signal_id"):
                     latest.update(record)
-        if changed:
+        if changed or paper_changed:
             _crash_save_state(state)
             for record, transition in changed:
                 if transition == 'OPEN':
                     _crash_risk_observe('entry', record)
-                _crash_append_data({"type":"ws_trade_transition","observed_at":observed_at,
-                                    "transition":transition,"record":record},observed_at)
+                _crash_append_data({"type":"ws_trade_transition",
+                                    "observed_at":observed_at,
+                                    "transition":transition,"record":record}, observed_at)
+            for record, transition in paper_changed:
+                shadow = record['capacity_virtual']
+                _crash_append_data({"type":"capacity_virtual_transition",
+                                    "observed_at":observed_at,
+                                    "signal_id":record.get("signal_id"),
+                                    "symbol":symbol,"transition":transition,
+                                    "paper":dict(shadow)}, observed_at)
+                log(f'[CRASH CAPACITY PAPER RESULT] {symbol}; '
+                    f'reason={shadow.get("reason")}; transition={transition}; '
+                    f'max_drawdown_pct={shadow.get("max_adverse_pct", 0):.3f}')
 
 
 _CRASH_WS_CACHE = CrashBounceWebSocketCache()
@@ -8170,9 +8245,11 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     selected.extend((change, sym, ticker) for change, sym, ticker in ranked
                     if sym in watching and sym not in selected_symbols)
     trade_watching = {r["symbol"] for r in state["history"] if
-                      r.get("tracking_model")=="ws_aggtrade_upcross_v3"
-                      and r.get("v2_status")=="STRONG_V2"
-                      and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
+                      (r.get("tracking_model")=="ws_aggtrade_upcross_v3"
+                       and r.get("v2_status")=="STRONG_V2"
+                       and r.get("tracking_status") in ("WAIT_ENTRY","OPEN"))
+                      or (isinstance(r.get("capacity_virtual"), dict)
+                          and r["capacity_virtual"].get("tracking_status") in ("WAIT_ENTRY","OPEN"))}
     # Shadow uses different 24h top-GAINER rank bands, leaving the V2 loser
     # selection and order-watching streams completely unchanged.
     research_symbols = set()
@@ -8259,7 +8336,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
             state["symbols"][symbol] = record
             state["history"].append(dict(record))
             state["history"] = [r for r in state["history"]
-                                if now - r["created_at"] < 24 * 3600]
+                                if is_active_candidate(r, now)]
             _crash_save_state(state)
             _crash_append_data({"type":"signal", "observed_at":now, "record":record}, now)
             scan_metrics["candidates"] += 1
@@ -8283,9 +8360,11 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
                 break
     # New candidates are eligible for live trade events right away.
     trade_watching = {r["symbol"] for r in state["history"] if
-                      r.get("tracking_model")=="ws_aggtrade_upcross_v3"
-                      and r.get("v2_status")=="STRONG_V2"
-                      and r.get("tracking_status") in ("WAIT_ENTRY","OPEN")}
+                      (r.get("tracking_model")=="ws_aggtrade_upcross_v3"
+                       and r.get("v2_status")=="STRONG_V2"
+                       and r.get("tracking_status") in ("WAIT_ENTRY","OPEN"))
+                      or (isinstance(r.get("capacity_virtual"), dict)
+                          and r["capacity_virtual"].get("tracking_status") in ("WAIT_ENTRY","OPEN"))}
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
                               trade_watching)
 
@@ -8578,6 +8657,11 @@ def _crash_start_services():
             executor = NightExecutor(directory, broker,
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 20), manual_tp=bool(repair_flag))
+            # Tests and isolated startup contexts may omit the paper handler.
+            # Never interrupt real executor startup if optional research is unavailable.
+            paper_callback = globals().get('_crash_capacity_virtual_skip')
+            if callable(paper_callback):
+                executor.capacity_virtual_callback = paper_callback
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler (Python varsayılanı): {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
                 f'24 saat | {executor.position_usdt} USDT pozisyon | 10x | aynı anda en fazla {executor.max_symbols} sembol\n'

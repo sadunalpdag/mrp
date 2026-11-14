@@ -45,6 +45,26 @@ class SheetDashboardTests(unittest.TestCase):
         self.assertEqual(status[3][1], "BAĞLI")
         self.assertEqual(previous["TESTUSDT"]["score"], 55)
 
+    def test_capacity_paper_metrics_are_separate_from_real_orders(self):
+        rec = dict(self.record)
+        rec["capacity_virtual"] = {
+            "reason": "OPEN_LIMIT_REACHED", "tracking_status": "TP",
+            "entry": 1.0, "tp": 1.005,
+            "created_at": self.now - 600, "entered_at": self.now - 300,
+            "finished_at": self.now - 240,
+            "max_adverse_pct": -0.85,
+        }
+        status, _, _, _ = dash.build_rows(
+            {"symbols": {"TESTUSDT": rec}, "history": [rec]},
+            self.tickers, {"open": 10}, {"connected": True}, self.now)
+        values = dict(status[1:])
+        self.assertEqual(values["Açık / bekleyen gerçek işlemler (yerel kayıt)"], 10)
+        self.assertEqual(values["Limitten sanal (10g toplam)"], 1)
+        self.assertEqual(values["Açık pozisyon limiti sanal (10g)"], 1)
+        self.assertEqual(values["Sanal TP (10g)"], 1)
+        self.assertEqual(values["Sanal TP başarı (sonuçlanan, 10g)"], "100.0%")
+        self.assertEqual(values["Sanal en kötü MAE % (10g)"], -0.85)
+
     def test_risk_zero_green_and_four_blocked(self):
         keys = dash.FLAGS
         _, table, colors, _ = self.data({k: False for k in keys})
@@ -494,7 +514,7 @@ class SheetDashboardTests(unittest.TestCase):
                 self.now, "/tmp/test-dashboard"))
         batch = book.values_batch_update.call_args.args[0]["data"]
         self.assertEqual(len(batch), 2)
-        self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B26")
+        self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B40")
         self.assertEqual(batch[1]["range"], "'Sinyal'!A1:AO61")
 
     def test_update_uses_existing_tabs_and_does_not_reset(self):
@@ -514,7 +534,7 @@ class SheetDashboardTests(unittest.TestCase):
                     self.tickers, {}, {}, self.now, "/tmp/test-dashboard"))
         batch = book.values_batch_update.call_args.args[0]
         self.assertEqual(len(batch["data"]), 2)
-        self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B26")
+        self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B40")
         self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:AO61")
         self.assertEqual(len(batch["data"][1]["values"]), 61)
         self.assertTrue(state_store.called)

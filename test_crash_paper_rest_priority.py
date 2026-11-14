@@ -66,7 +66,7 @@ class BudgetPriorityTests(unittest.TestCase):
             result = gate.paper_get(http, "https://fapi.binance.com/fapi/v1/klines",
                                     {"symbol":"BTCUSDT", "interval":"5m", "limit":200})
         self.assertEqual(result.status_code, 429)
-        budget.reserve.assert_called_once_with("paper", 2)
+        budget.reserve.assert_called_once_with("paper", 2, endpoint="GET:/fapi/v1/klines")
         budget.observe.assert_called_once_with(http.get.return_value.headers, 429, "120")
 
     def test_paper_precheck_avoids_paid_scans_when_weight_full(self):
