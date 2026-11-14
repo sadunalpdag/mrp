@@ -16,6 +16,14 @@ def is_active_candidate(record, now):
     if (not isinstance(created, (int, float)) or isinstance(created, bool)
             or not math.isfinite(created) or created > now):
         return False
+    capacity = record.get("capacity_virtual")
+    if isinstance(capacity, dict):
+        status = capacity.get("tracking_status")
+        # Paper TP may take up to 150h; retain the outcome for 10 days.
+        if status in ("WAIT_ENTRY", "OPEN"):
+            return True
+        if 0 <= now-created < 10 * 86400:
+            return True
     if record.get("tracking_status") == "OPEN":
         # Keep even older OPEN records until the tracking loop confirms their
         # post-entry timeout, never pruning them before timeout assessment.
