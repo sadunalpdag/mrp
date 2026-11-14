@@ -8657,7 +8657,11 @@ def _crash_start_services():
             executor = NightExecutor(directory, broker,
                 _crash_telegram_receipt, log, enabled=bool(auto_flag),
                 max_daily=globals().get('AUTO_MAX_DAILY_ENTRIES', 20), manual_tp=bool(repair_flag))
-            executor.capacity_virtual_callback = _crash_capacity_virtual_skip
+            # Tests and isolated startup contexts may omit the paper handler.
+            # Never interrupt real executor startup if optional research is unavailable.
+            paper_callback = globals().get('_crash_capacity_virtual_skip')
+            if callable(paper_callback):
+                executor.capacity_virtual_callback = paper_callback
             executor.alert(f'ℹ️ PYTHON İŞLEM AYARLARI\nOtomatik girişler (Python varsayılanı): {"AÇIK" if auto_flag else "KAPALI"}\n'
                 f'Elle açılan long için TP kontrolü/denemesi: {"AÇIK" if repair_flag else "KAPALI"}\n'
                 f'24 saat | {executor.position_usdt} USDT pozisyon | 10x | aynı anda en fazla {executor.max_symbols} sembol\n'
