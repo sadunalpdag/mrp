@@ -146,6 +146,7 @@ def update(directory, tickers, executor, now):
     stamp = observed.isoformat()
     current = days.get(today)
     changed = False
+    just_created = current is None
     if current is None:
         current = {
             "first_equity": str(equity), "peak": str(equity),
@@ -154,8 +155,9 @@ def update(directory, tickers, executor, now):
         }
         days[today] = current
         changed = True
-    if instant >= float(current.get("last_ts", 0)):
-        if instant > float(current.get("last_ts", 0)):
+    new_observation = instant > float(current.get("last_ts", 0))
+    if just_created or new_observation:
+        if new_observation:
             changed = True
         current["last_ts"] = instant
         current["last_at"] = stamp
