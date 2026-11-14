@@ -133,9 +133,10 @@ class DailyPerformanceTests(unittest.TestCase):
         info = book.add_worksheet.call_args.kwargs
         self.assertEqual(info["title"], "Günlük Performans")
         data = book.values_batch_update.call_args.args[0]["data"]
-        self.assertEqual(len(data), 3)
+        self.assertEqual(len(data), 4)
         self.assertEqual(data[2]["range"], "'Günlük Performans'!A1:T100")
         self.assertEqual(data[2]["values"][1][0], "2026-11-14")
+        self.assertEqual(data[3]["range"], "'Bot Status'!A40:P40")
 
     def test_publish_keeps_existing_tabs_when_no_observation(self):
         now = timestamp(14, 16)
@@ -155,7 +156,8 @@ class DailyPerformanceTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertFalse(book.add_worksheet.called)
         data = book.values_batch_update.call_args.args[0]["data"]
-        self.assertEqual(len(data), 2)
+        self.assertEqual(len(data), 3)
+        self.assertEqual(data[2]["range"], "'Bot Status'!A40:P40")
 
 
 if __name__ == "__main__":
