@@ -382,7 +382,7 @@ class SheetDashboardTests(unittest.TestCase):
                 book.values_batch_update.assert_called_once()
                 data = book.values_batch_update.call_args.args[0]["data"]
                 self.assertEqual([d["range"].split("'!")[0] for d in data],
-                                 ["'Bot Status", "'Sinyal", "'BOT_STATUS"])
+                                 ["'Bot Status", "'Sinyal", "'BOT_STATUS", "'Bot Status"])
                 self.assertEqual(data[0]["values"][1][0],
                                  "Son güncelleme (Paris)")
                 self.assertEqual(data[2]["range"], "'BOT_STATUS'!A1:B32")
@@ -459,7 +459,7 @@ class SheetDashboardTests(unittest.TestCase):
                 {"connected": True}, self.now, "/tmp/test-dashboard",
                 logger=logs.append))
         self.assertEqual(modern.values_batch_update.call_count, 1)
-        self.assertEqual(len(modern.values_batch_update.call_args.args[0]["data"]), 3)
+        self.assertEqual(len(modern.values_batch_update.call_args.args[0]["data"]), 4)
         self.assertEqual(old.values_batch_update.call_count, 1)
         self.assertEqual(old.values_batch_update.call_args.args[0]["data"][0]["range"],
                          "'BOT_STATUS'!A1:B32")
@@ -514,7 +514,7 @@ class SheetDashboardTests(unittest.TestCase):
                 self.now, "/tmp/test-dashboard"))
         batch = book.values_batch_update.call_args.args[0]["data"]
         self.assertEqual(len(batch), 2)
-        self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B40")
+        self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B39")
         self.assertEqual(batch[1]["range"], "'Sinyal'!A1:AO61")
 
     def test_update_uses_existing_tabs_and_does_not_reset(self):
@@ -533,9 +533,10 @@ class SheetDashboardTests(unittest.TestCase):
                     {"symbols": {"TESTUSDT": self.record}, "history": []},
                     self.tickers, {}, {}, self.now, "/tmp/test-dashboard"))
         batch = book.values_batch_update.call_args.args[0]
-        self.assertEqual(len(batch["data"]), 2)
-        self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B40")
+        self.assertEqual(len(batch["data"]), 3)
+        self.assertEqual(batch["data"][0]["range"], "'Bot Status'!A1:B39")
         self.assertEqual(batch["data"][1]["range"], "'Sinyal'!A1:AO61")
+        self.assertEqual(batch["data"][2]["range"], "'Bot Status'!A40:P40")
         self.assertEqual(len(batch["data"][1]["values"]), 61)
         self.assertTrue(state_store.called)
         self.assertFalse(book.add_worksheet.called)
