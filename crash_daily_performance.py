@@ -149,7 +149,7 @@ def update(directory, tickers, executor, now):
     just_created = current is None
     if current is None:
         current = {
-            "first_equity": str(equity), "peak": str(equity),
+            "first_equity": str(equity), "peak": str(equity), "low": str(equity),
             "last_equity": str(equity), "first_at": stamp, "last_at": stamp,
             "last_ts": instant,
         }
@@ -164,6 +164,11 @@ def update(directory, tickers, executor, now):
         current["last_equity"] = str(equity)
         peak = _decimal(current.get("peak"))
         current["peak"] = str(max(peak or equity, equity))
+        low = _decimal(current.get("low"))
+        # Old persisted days have no reliable historical minimum: do not
+        # invent it from the last observation. New days collect it from start.
+        if low is not None:
+            current["low"] = str(min(low, equity))
         price = _btc_price(tickers)
         if price is not None:
             if not current.get("btc_first"):
