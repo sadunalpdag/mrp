@@ -672,7 +672,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     try:
         from crash_status_daily_history import report as daily_status_report
         from crash_status_daily_history import HEADERS as HISTORY_HEADERS, START_ROW
-        if status.title == "Bot Status":
+        if status.title in ("Bot Status", "BOT_STATUS"):
             historical_rows = daily_status_report(directory, now, executor)
             last_row = START_ROW + len(historical_rows) - 1
             requests = []
@@ -689,7 +689,7 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
             if requests:
                 sheet.batch_update({"requests": requests})
             data.append({
-                "range": "'Bot Status'!A" + str(START_ROW) + ":" +
+                "range": "'" + status.title.replace("'", "''") + "'!A" + str(START_ROW) + ":" +
                          column_letter(len(HISTORY_HEADERS)) + str(last_row),
                 "values": historical_rows,
             })
