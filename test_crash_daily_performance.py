@@ -118,9 +118,9 @@ class DailyPerformanceTests(unittest.TestCase):
             row_count=100, col_count=len(perf.HEADERS))
         client = Mock()
         client.open_by_key.return_value = book
-        with patch.object(dash, "_credentials", return_value=(client, "my-test-id")), \\
-             patch.object(dash, "_ensure_four_risk_columns"), \\
-             patch.object(dash, "_format"), \\
+        with patch.object(dash, "_credentials", return_value=(client, "my-test-id")), \
+             patch.object(dash, "_ensure_four_risk_columns"), \
+             patch.object(dash, "_format"), \
              patch.object(dash, "_sync_external_legacy_status"):
             ok = dash.publish({"symbols": {}, "history": []},
                               [{"symbol": "BTCUSDT", "priceChangePercent": "1",
@@ -145,9 +145,9 @@ class DailyPerformanceTests(unittest.TestCase):
             SimpleNamespace(title="Sinyal", id=2, col_count=len(dash.HEADERS))]
         client = Mock()
         client.open_by_key.return_value = book
-        with patch.object(dash, "_credentials", return_value=(client, "my-test-id")), \\
-             patch.object(dash, "_ensure_four_risk_columns"), \\
-             patch.object(dash, "_format"), \\
+        with patch.object(dash, "_credentials", return_value=(client, "my-test-id")), \
+             patch.object(dash, "_ensure_four_risk_columns"), \
+             patch.object(dash, "_format"), \
              patch.object(dash, "_sync_external_legacy_status"):
             ok = dash.publish({"symbols": {}, "history": []}, [], {},
                               {"connected": True}, now.timestamp(),
