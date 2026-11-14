@@ -513,9 +513,11 @@ class SheetDashboardTests(unittest.TestCase):
                 self.tickers, {}, {"connected": True},
                 self.now, "/tmp/test-dashboard"))
         batch = book.values_batch_update.call_args.args[0]["data"]
-        self.assertEqual(len(batch), 2)
+        self.assertEqual(len(batch), 3)
         self.assertEqual(batch[0]["range"], "'BOT_STATUS'!A1:B39")
         self.assertEqual(batch[1]["range"], "'Sinyal'!A1:AO61")
+        self.assertEqual(batch[2]["range"], "'BOT_STATUS'!A40:P40")
+        self.assertEqual(batch[2]["values"][0][0], "Tarih (Fransa)")
 
     def test_update_uses_existing_tabs_and_does_not_reset(self):
         book = Mock()
