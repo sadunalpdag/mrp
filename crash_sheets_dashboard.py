@@ -632,6 +632,39 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
         })
     # A single existing Sheets values batch updates all matching dashboard
     # tabs; no extra API round trip or legacy scanner.
+    # A separate, explicitly requested daily report. It uses only existing
+    # read-only account observations + WS BTC and confirmed executor statuses.
+    # Errors cannot interrupt the Bot Status / Sinyal update or trading.
+    try:
+        from crash_daily_performance import update as daily_performance_update
+        from crash_daily_performance import HEADERS as DAILY_HEADERS
+        daily_rows = daily_performance_update(directory, tickers, executor, now)
+        if daily_rows is not None:
+            daily_tab = next((tab for tab in sheet.worksheets()
+                              if tab.title == "Günlük Performans"), None)
+            if daily_tab is None:
+                daily_tab = sheet.add_worksheet(
+                    title="Günlük Performans", rows=100,
+                    cols=len(DAILY_HEADERS))
+            if getattr(daily_tab, "row_count", 100) < 100:
+                sheet.batch_update({"requests": [{"updateSheetProperties": {
+                    "properties": {"sheetId": daily_tab.id,
+                                   "gridProperties": {"rowCount": 100}},
+                    "fields": "gridProperties.rowCount"}}]})
+            if getattr(daily_tab, "col_count", len(DAILY_HEADERS)) < len(DAILY_HEADERS):
+                sheet.batch_update({"requests": [{"updateSheetProperties": {
+                    "properties": {"sheetId": daily_tab.id,
+                                   "gridProperties": {"columnCount": len(DAILY_HEADERS)}},
+                    "fields": "gridProperties.columnCount"}}]})
+            data.append({
+                "range": "'Günlük Performans'!A1:" +
+                         column_letter(len(DAILY_HEADERS)) + "100",
+                "values": daily_rows + [
+                    [""] * len(DAILY_HEADERS) for _ in range(100 - len(daily_rows))],
+            })
+    except Exception as exc:
+        if logger:
+            logger("[CRASH DAILY SHEETS] skipped: " + type(exc).__name__)
     sheet.values_batch_update({"valueInputOption": "RAW", "data": data})
     _format(sheet, status, signal, colors, signal_rows)
     # D:I is a separate user-controlled parameter area. A:B and Sinyal remain
