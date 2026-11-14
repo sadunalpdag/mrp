@@ -39,7 +39,18 @@ def prune_active_state(state, now):
     old_history = state.get("history") or []
     old_symbols = state.get("symbols") or {}
     state["history"] = [rec for rec in old_history if is_active_candidate(rec, now)]
-    state["symbols"] = {s: rec for s, rec in old_symbols.items() if is_active_candidate(rec, now)}
+    # Keep completed capacity research in history only. A finished paper
+    # record must not keep a stale symbol-level V2 candidate alive for 10 days.
+    def keep_recent_symbol(rec):
+        if not isinstance(rec, dict):
+            return False
+        created = rec.get("created_at")
+        if not isinstance(created, (int, float)) or not math.isfinite(created):
+            return False
+        return (rec.get("tracking_status") == "OPEN" or
+                0 <= now - created < TRACKING_SECONDS)
+    state["symbols"] = {s: rec for s, rec in old_symbols.items()
+                        if keep_recent_symbol(rec)}
     return (len(old_history)-len(state["history"]) +
             len(old_symbols)-len(state["symbols"]))
 
