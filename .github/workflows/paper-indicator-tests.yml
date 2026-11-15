@@ -1,0 +1,25 @@
+name: Paper archive indicator tests
+on:
+  pull_request:
+    paths:
+      - "paper_tp_analysis.py"
+      - "test_paper_tp_analysis.py"
+      - "paper_archive_15m.py"
+      - ".github/workflows/paper-indicator-tests.yml"
+  push:
+    branches: [master]
+    paths:
+      - "paper_tp_analysis.py"
+      - "test_paper_tp_analysis.py"
+      - ".github/workflows/paper-indicator-tests.yml"
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install requests
+      - run: python -m unittest -v test_paper_tp_analysis
