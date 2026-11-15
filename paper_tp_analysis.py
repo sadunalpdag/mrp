@@ -1,4 +1,4 @@
-"""Read-only, incremental 3-day TP-only indicator archive for CB2/HBREAK.
+"""Read-only, cumulative TP and non-TP indicator archive for CB2/HBREAK.
 
 Binance PUBLIC daily 15m ZIPs only; never Binance REST, never broker/orders.
 Each result's technical indicators use CLOSED candles preceding the signal.
@@ -23,7 +23,8 @@ HEADERS=["Sistem","Tarih Paris","Strateji","Coin","Sinyal UTC",
          "MACD histogram","Bollinger band genisligi %",
          "1s degisim %","4s degisim %","24s degisim %",
          "15m mum sayisi","Kapsam","Intrabar belirsizlik","Kaynak ID"]
-MAX_PER_CYCLE=16
+MAX_PER_CYCLE=0  # 0 = no fixed signal-count cap; use elapsed-time budget instead.
+MAX_WORK_SECONDS=480  # Cap each background pass so paper monitoring is never monopolized.
 LOOKBACK_BARS=480
 WINDOW_DAYS=3
 
@@ -124,14 +125,20 @@ def indicators(candles, signal_ms):
         return {"coverage":len(rows),"status":"INVALID_CANDLE"}
     atr,adx=_atr_adx(rows)
     ema20=_ema(close,20);ema50=_ema(close,50);ema200=_ema(close,200)
-    fast=_ema(close,12);slow=_ema(close,26)
+    # O(N) seeded EMA recurrence: identical to recomputing all prefixes,
+    # but avoids a quadratic MACD calculation across thousands of signals.
     hist=None
-    if fast is not None and slow is not None:
-        # MACD 9-signal EMA computed from fully-seeded MACD sequence.
-        macds=[]
-        for idx in range(26,len(close)+1):
-            ef=_ema(close[:idx],12)
-            es=_ema(close[:idx],26)
+    if len(close)>=34:
+        a12=2/13
+        a26=2/27
+        ef=sum(close[:12])/12
+        for price in close[12:26]:
+            ef=(price-ef)*a12+ef
+        es=sum(close[:26])/26
+        macds=[ef-es]
+        for price in close[26:]:
+            ef=(price-ef)*a12+ef
+            es=(price-es)*a26+es
             macds.append(ef-es)
         signal=_ema(macds,9)
         hist=macds[-1]-signal if signal is not None else None
@@ -155,14 +162,13 @@ def indicators(candles, signal_ms):
     return {k:(round(v,7) if isinstance(v,float) else v) for k,v in output.items()}
 
 
-def candidates(system, records, now=None):
+def candidates(system, records, now=None, days=WINDOW_DAYS):
     current=now or datetime.now(PARIS)
-    cutoff=current.astimezone(PARIS).date()-timedelta(days=WINDOW_DAYS-1)
+    cutoff=(current.astimezone(PARIS).date()-timedelta(days=days-1)
+            if days and days>0 else None)
     items=[]
     for item in records:
         if system=="hbreak":
-            if item.get("status") not in ("TP_1_PERCENT","OPEN"):
-                continue
             raw_date=item.get("opened_at")
             tp=item.get("tp_at")
             entry=item.get("entry")
@@ -179,36 +185,60 @@ def candidates(system, records, now=None):
             if not str(item.get("source") or "").startswith("coinbeacon-api2"):
                 continue
             family=item.get("strategy") or item.get("family")
-            if (str(family).endswith("_watch") or item.get("status") in
-                    ("WATCH","WATCH_EXPIRED","UNCONFIRMED_OI")):
-                continue
+            # Include watch and incomplete observations as separate categories.
+            # Never mark them as failed fills: some had no executable entry.
             details=(item.get("entry_scenarios") or {}).get("next_15m_open") or {}
-            if details.get("status") not in (None,"TP_1_PERCENT","OPEN_IN_OBSERVED_WINDOW"):
-                continue
             raw_date=item.get("observed_at")
             entry_at=raw_date
             entry=details.get("entry_price")
             tp=details.get("tp_at_candle_close")
             symbol=item.get("symbol")
         started=_date(raw_date)
-        if not started or started.astimezone(PARIS).date()<cutoff:
+        if not started or (cutoff and started.astimezone(PARIS).date()<cutoff):
             continue
         if started.astimezone(PARIS).date()>current.astimezone(PARIS).date():
             continue
         if not symbol:
             continue
-        if _number(entry) is None and system=="cb2":
-            entry=item.get("reference_price")
-        if _number(entry) is None:
+        observed_entry=_number(entry)
+        if observed_entry is None and system=="cb2":
+            observed_entry=_number(item.get("reference_price"))
+        status=details.get("status")
+        if system=="cb2" and (str(family).endswith("_watch") or
+                              item.get("status") in ("WATCH","WATCH_EXPIRED","UNCONFIRMED_OI")):
+            outcome="WATCH_ONLY"
+        elif status:
+            outcome=status
+        elif system=="hbreak":
+            outcome=item.get("status") or "PENDING_ARCHIVE"
+        else:
+            outcome="PENDING_ARCHIVE"
+        identifier=str(item.get("id") or "")
+        if not identifier:
             continue
-        items.append({"id":str(item.get("id")),"system":system,
+        scenario_map={name:case.get("status")
+                      for name,case in (item.get("entry_scenarios") or {}).items()
+                      if isinstance(case,dict)}
+        items.append({"id":identifier,"system":system,
                       "strategy":family,"symbol":symbol,
-                      "outcome_status":details.get("status") or item.get("status") or "PENDING_ARCHIVE",
-                      "signal_at":entry_at,"entry_price":float(entry),
-                      "tp_at":tp,"tp_price":item.get("tp") if system=="hbreak" else float(entry)*1.01,
-                      "result":details,"date_paris":started.astimezone(PARIS).date().isoformat()})
-    # Prioritize confirmed hypothetical TP cases for the user-visible sheet;
-    # retain ALL open/pending comparison cases in the JSON.
+                      "outcome_status":outcome,
+                      "source_status":item.get("status"),
+                      "source_data_status":item.get("data_status"),
+                      "reference_price":_number(item.get("reference_price")),
+                      "reference_status":item.get("reference_status"),
+                      "source_id":item.get("source_id"),
+                      "source_signal_at":item.get("source_signal_at") or item.get("triggered_at"),
+                      "source_sqs":item.get("sqs"),"source_rvol":item.get("rvol"),
+                      "source_archetype":item.get("archetype"),
+                      "scenario_statuses":scenario_map,
+                      "signal_at":entry_at,"entry_price":observed_entry,
+                      "tp_at":tp,
+                      "tp_price":(item.get("tp") if system=="hbreak" else
+                                  observed_entry*1.01 if observed_entry is not None else None),
+                      "result":details,
+                      "date_paris":started.astimezone(PARIS).date().isoformat()})
+    # TP comes first to fill the existing TP-only tab as quickly as possible.
+    # OPEN / PENDING / WATCH remain in the same cumulative JSON.
     return sorted(items,key=lambda x:(x["outcome_status"]!="TP_1_PERCENT",
                                      x["signal_at"],x["id"]))
 
