@@ -59,7 +59,7 @@ INTERVALS = {"trend": 3600, "squeeze": 3600, "volume": 1800,
 RESERVE = 400
 MAX_OI_PER_UTC_DAY = 24
 MAX_NEW_SYMBOLS_PER_CYCLE = 8
-MAX_TRACK_SYMBOLS_PER_CYCLE = 12
+MAX_TRACK_SYMBOLS_PER_CYCLE = 48
 MAX_SHEET_ROWS = 8000
 
 
@@ -638,6 +638,43 @@ def sheet_sync(db):
         values.append([readable[strategy]] + metrics(items))
     values.append(["TOPLAM"] + metrics(all_rows))
     values.append([])
+    # Independent observations are NOT included in the legacy paper-trade
+    # rollup above. Their next-day OHLC scenarios have an explicit daily table.
+    observations = signal_research.export(db)["signals"]
+    signal_rows = [s for s in observations
+                   if (s.get("strategy") or s.get("family") or "").removesuffix("_watch") in SHEETS
+                   and str(s.get("source") or "").startswith("coinbeacon-api2")
+                   and not (s.get("family") or "").endswith("_watch")]
+    by_day = defaultdict(list)
+    for entry in signal_rows:
+        try:
+            date = datetime.fromisoformat(
+                entry["observed_at"].replace("Z","+00:00")).astimezone(PARIS).date().isoformat()
+        except (KeyError,ValueError,TypeError):
+            continue
+        by_day[date].append(entry)
+    values.append(["CB2 BAGIMSIZ SINYALLER | GUNLUK ARSIV PERFORMANSI | SANAL EMIR YOK"])
+    values.append(["Tarih (Fransa)","Sinyal","48s tamam","Kismi arsiv",
+                   "Arsiv bekleyen","Sonraki 15M TP","Sonraki 15M acik",
+                   "Sonraki 15M veri yok","TP / incelenen %",
+                   "Not"])
+    for date in sorted(by_day,reverse=True)[:30]:
+        entries=by_day[date]
+        scenarios=[(s.get("entry_scenarios") or {}).get("next_15m_open") or {}
+                   for s in entries]
+        tp_count=sum(x.get("status")=="TP_1_PERCENT" for x in scenarios)
+        open_count=sum(x.get("status")=="OPEN_IN_OBSERVED_WINDOW" for x in scenarios)
+        observed=sum(bool(x) for x in scenarios)
+        values.append([date,len(entries),
+            sum(s.get("status")=="COMPLETE_48H" for s in entries),
+            sum(s.get("status")=="PARTIAL_ARCHIVE" for s in entries),
+            sum(s.get("status") in ("WAITING_ARCHIVE","PENDING_ARCHIVE") for s in entries),
+            tp_count,open_count,len(entries)-observed,
+            round(tp_count*100/observed,2) if observed else "VERI YOK",
+            "Sonraki 15M giris senaryosu; OHLC sirasi belirsiz"])
+    LOG.info("[CB2 DAILY SHEET] signals=%d dates=%d",
+             len(signal_rows),len(by_day))
+    values.append([])
     # Independent source signals are not filled trades. Display them first,
     # separate from historic hypothetical fills, with all six strategy labels.
     observations = signal_research.export(db)["signals"]
@@ -706,10 +743,10 @@ def sheet_sync(db):
     # Applied once on creation/first rollout; failures here are cosmetic only.
     try:
         if meta(db, "combined_sheet_formatted") != "1":
-            ws.freeze(rows=14)
+            ws.freeze(rows=4)
             ws.format("A4:I4", {"textFormat":{"bold":True},
                                  "backgroundColor":{"red":0.86,"green":0.91,"blue":0.97}})
-            ws.format("A14:AA14", {"textFormat":{"bold":True},
+            ws.format("A4:AA4", {"textFormat":{"bold":True},
                                     "backgroundColor":{"red":0.86,"green":0.91,"blue":0.97}})
             ws.format("A1", {"textFormat":{"bold":True,"fontSize":14}})
             put_meta(db, "combined_sheet_formatted", "1")
