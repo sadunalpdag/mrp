@@ -194,7 +194,7 @@ def sheet_sync(db):
         ["Toplam sinyal",len(trades),"Sanal TP",len(tp),
          "Sanal acik",len(opened),"Arsiv bekleyen",len(awaiting)],
         ["TP / tum sinyal %",round(len(tp)*100/len(trades),2) if trades else "",
-         "TP / sonuclanan %",100 if tp else "VERI YOK",
+         "TP sayisi (dogrulanan)",len(tp),
          "En kotu gorulen dusus %",round(min(dips),4) if dips else "VERI YOK"],
         ["UYARI: Acik islemler TP/Tum oraninin paydasinda; TP/sonuclanan sadece dogrulanan TP'dir."],
         ["GUNLUK DURUM | Fransa tarihi | dunden gelen aciklar takip edilmeye devam eder"],
