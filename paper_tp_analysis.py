@@ -181,9 +181,9 @@ def candidates(system, records, now=None, days=WINDOW_DAYS):
             family=item.get("archetype")
             symbol=item.get("coin")
         else:
-            # CB2 observational backtest, not the older 'legacy' paper trades.
-            if not str(item.get("source") or "").startswith("coinbeacon-api2"):
-                continue
+            # This input is exclusively the independent CB2 signal journal.
+            # Source labels were absent in some historical records; don't drop
+            # those observations (including watches and no-entry outcomes).
             family=item.get("strategy") or item.get("family")
             # Include watch and incomplete observations as separate categories.
             # Never mark them as failed fills: some had no executable entry.
