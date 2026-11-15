@@ -219,7 +219,9 @@ def sheet_sync(db):
     summary.extend([[],["TUM SANAL SINYALLER | ESKIDEN YENIYE"],FIELDS])
     vals=summary+[[str(x.get(k) if x.get(k) is not None else "") for k in FIELDS] for x in trades]
     if len(vals)>ws.row_count:ws.add_rows(len(vals)-ws.row_count+100)
-    ws.update(range_name="A1",values=vals)\n    LOG.info("[HBREAK DAILY SHEET] rows=%d tp=%d open=%d awaiting=%d days=%d",\n             len(trades),len(tp),len(opened),len(awaiting),len(grouped))
+    ws.update(range_name="A1",values=vals)
+    LOG.info("[HBREAK DAILY SHEET] rows=%d tp=%d open=%d awaiting=%d days=%d",
+             len(trades),len(tp),len(opened),len(awaiting),len(grouped))
     # Clear stale trailing rows after deletions (none expected in normal operation).
 def archive(db):
     local=utc().astimezone(PARIS)
