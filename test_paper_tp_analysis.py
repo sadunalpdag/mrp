@@ -51,7 +51,7 @@ class TPAnalysisTests(unittest.TestCase):
         watch=dict(tp,id="c",family="trend_watch",strategy="trend_watch")
         old=dict(tp,id="d",observed_at="2026-11-01T00:00:00+00:00")
         output=subject.candidates("cb2",[tp,open_trade,watch,old],date)
-        self.assertEqual([x["id"] for x in output],["a"])
+        self.assertEqual([x["id"] for x in output],["a","b"])
 
     def test_missing_archive_does_not_create_false_indicators(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -65,7 +65,7 @@ class TPAnalysisTests(unittest.TestCase):
                  patch.object(subject,"klines",return_value=[]), \
                  patch.object(subject,"_upload",return_value=None):
                 result=subject.run("cb2",[signal],None,None,now=today)
-            self.assertEqual(result["totals"]["tp_records"],1)
+            self.assertEqual(result["totals"]["tp_records"],1)\n            self.assertEqual(result["totals"]["comparison_records"],0)
             self.assertEqual(result["totals"]["indicator_complete"],0)
             self.assertEqual(result["records"][0]["indicators"]["status"],
                              "PENDING_480_CLOSED_BARS")
