@@ -272,8 +272,8 @@ def step(db,http):
     # Optional, isolated 3-day TP-only technical research. Failures never stop
     # signal collection, TP tracking, or normal monitoring sheets.
     try:
-        from paper_tp_analysis import run as _tp_research
-        _tp_research("hbreak",rows(db),http,
+        from paper_tp_analysis import launch as _tp_research
+        _tp_research("hbreak",rows(db),
                      os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID"),
                      logger=lambda message:LOG.info("%s",message))
     except Exception as exc:
