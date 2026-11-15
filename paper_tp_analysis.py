@@ -469,7 +469,7 @@ def run(system,records,http,book_id=None,now=None,logger=None):
         except Exception as error:
             if logger:
                 logger("["+system.upper()+" TP ANALYSIS SHEETS ERR] "+type(error).__name__)
-    marker=directory/(system+"_last_r2_at.json")
+    marker=directory/(system+"_last_r2_at_full_v2.json")  # Initial full snapshot uploads immediately.
     previous=_load_upload(marker)
     if time.time()-previous>=3600:
         try:
