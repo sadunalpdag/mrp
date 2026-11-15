@@ -155,13 +155,14 @@ def candidates(system, records, now=None):
     items=[]
     for item in records:
         if system=="hbreak":
-            if item.get("status")!="TP_1_PERCENT":
+            if item.get("status") not in ("TP_1_PERCENT","OPEN"):
                 continue
             raw_date=item.get("opened_at")
             tp=item.get("tp_at")
             entry=item.get("entry")
             entry_at=item.get("opened_at")
-            details={"entry_price":entry,"tp_at_candle_close":tp,
+            details={"status":item.get("status"),"entry_price":entry,
+                     "tp_at_candle_close":tp,
                      "tp_minutes_upper_bound":None,
                      "max_drawdown_pct_observed":item.get("max_drawdown_pct"),
                      "intrabar_order_uncertain":True}
@@ -172,10 +173,11 @@ def candidates(system, records, now=None):
             if not str(item.get("source") or "").startswith("coinbeacon-api2"):
                 continue
             family=item.get("strategy") or item.get("family")
-            if str(family).endswith("_watch"):
+            if (str(family).endswith("_watch") or item.get("status") in
+                    ("WATCH","WATCH_EXPIRED","UNCONFIRMED_OI")):
                 continue
             details=(item.get("entry_scenarios") or {}).get("next_15m_open") or {}
-            if details.get("status")!="TP_1_PERCENT":
+            if details.get("status") not in (None,"TP_1_PERCENT","OPEN_IN_OBSERVED_WINDOW"):
                 continue
             raw_date=item.get("observed_at")
             entry_at=raw_date
@@ -187,14 +189,22 @@ def candidates(system, records, now=None):
             continue
         if started.astimezone(PARIS).date()>current.astimezone(PARIS).date():
             continue
-        if not symbol or _number(entry) is None:
+        if not symbol:
+            continue
+        if _number(entry) is None and system=="cb2":
+            entry=item.get("reference_price")
+        if _number(entry) is None:
             continue
         items.append({"id":str(item.get("id")),"system":system,
                       "strategy":family,"symbol":symbol,
+                      "outcome_status":details.get("status") or item.get("status") or "PENDING_ARCHIVE",
                       "signal_at":entry_at,"entry_price":float(entry),
                       "tp_at":tp,"tp_price":item.get("tp") if system=="hbreak" else float(entry)*1.01,
                       "result":details,"date_paris":started.astimezone(PARIS).date().isoformat()})
-    return sorted(items,key=lambda x:(x["signal_at"],x["id"]))
+    # Prioritize confirmed hypothetical TP cases for the user-visible sheet;
+    # retain ALL open/pending comparison cases in the JSON.
+    return sorted(items,key=lambda x:(x["outcome_status"]!="TP_1_PERCENT",
+                                     x["signal_at"],x["id"]))
 
 
 def _cache_path(system):
@@ -315,12 +325,17 @@ def run(system,records,http,book_id=None,now=None,logger=None):
             cache[signal["id"]]["signal"]=signal
     _save(_cache_path(system),cache)
     enriched_rows=[cache[s["id"]] for s in selected]
+    tp_only=[x for x in enriched_rows
+             if x["signal"]["outcome_status"]=="TP_1_PERCENT"]
     complete=sum(x["indicators"].get("status")=="READY" for x in enriched_rows)
     by_date={}
     for item in enriched_rows:
         day=item["signal"]["date_paris"]
-        stats=by_date.setdefault(day,{"tp_observed":0,"indicators_ready":0})
-        stats["tp_observed"]+=1
+        stats=by_date.setdefault(day,{"signals":0,"tp_observed":0,
+                                      "open_or_pending":0,"indicators_ready":0})
+        stats["signals"]+=1
+        stats["tp_observed"]+=item["signal"]["outcome_status"]=="TP_1_PERCENT"
+        stats["open_or_pending"]+=item["signal"]["outcome_status"]!="TP_1_PERCENT"
         stats["indicators_ready"]+=item["indicators"].get("status")=="READY"
     payload={"schema_version":"paper_tp_indicators_v1","system":system,
              "generated_at_utc":at.astimezone(timezone.utc).isoformat(),
@@ -331,7 +346,9 @@ def run(system,records,http,book_id=None,now=None,logger=None):
              "warnings":["A TP on the entry candle is ambiguous about intrabar order.",
                          "Indicator coverage requires 480 contiguous PRE-signal candles.",
                          "Published daily archives may be delayed; missing values never guessed."],
-             "totals":{"tp_records":len(selected),"indicator_complete":complete},
+             "totals":{"signal_records":len(selected),"tp_records":len(tp_only),
+                       "comparison_records":len(selected)-len(tp_only),
+                       "indicator_complete":complete},
              "daily":by_date,"records":enriched_rows}
     directory=ROOT/"paper_tp_analysis"
     directory.mkdir(parents=True,exist_ok=True)
@@ -340,9 +357,9 @@ def run(system,records,http,book_id=None,now=None,logger=None):
     creds=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
     if creds and book_id:
         try:
-            title=_sheet(system,enriched_rows,creds,book_id)
+            title=_sheet(system,tp_only,creds,book_id)
             if logger: logger("["+system.upper()+" TP ANALYSIS SHEETS] tab="+title+
-                              " tp="+str(len(selected))+" ready="+str(complete))
+                              " tp="+str(len(tp_only))+" ready="+str(complete))
         except Exception as error:
             if logger: logger("["+system.upper()+" TP ANALYSIS SHEETS ERR] "+type(error).__name__)
     marker=directory/(system+"_last_r2_at.json")
@@ -356,7 +373,8 @@ def run(system,records,http,book_id=None,now=None,logger=None):
         except Exception as error:
             if logger: logger("["+system.upper()+" TP ANALYSIS R2 ERR] "+type(error).__name__)
     if logger:
-        logger("["+system.upper()+" TP ANALYSIS] total="+str(len(selected))+
+        logger("["+system.upper()+" TP ANALYSIS] signals="+str(len(selected))+
+               " tp="+str(len(tp_only))+
                " ready="+str(complete)+" checked="+str(attempted))
     return payload
 
