@@ -15926,6 +15926,17 @@ def main():
     except Exception as exc:
         log("[CRASH REST PRIORITY ERROR] " + type(exc).__name__
             + "; paper Binance calls retain independent low budget")
+    # BTC hourly direction observer: read-only research, not part of trading decisions.
+    # Feature is opt-in (BTC_DIRECTION_OBSERVER_ENABLED=1) and yields to live TP/entry.
+    try:
+        from btc_hourly_direction import start as _btc_direction_start
+        _btc_direction_start(priority_checker=lambda: (
+            _crash_live_entry_priority_active()
+            or BinanceRateLimiter.is_banned()
+            or time.time() < _crash_cooldown_until))
+        log("[BTC DIRECTION] optional hourly read-only observer initialized")
+    except Exception as exc:
+        log(f"[BTC DIRECTION START ERR] {type(exc).__name__}: {str(exc)[:160]}")
     # Telegram-only daily R2 signed links (no Binance calls or order changes).
     try:
         from r2_archive_link_notifier import start as _r2_archive_links_start
