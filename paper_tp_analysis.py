@@ -7,6 +7,7 @@ import json
 import math
 import os
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -150,7 +151,7 @@ def indicators(candles, signal_ms):
 
 def candidates(system, records, now=None):
     current=now or datetime.now(PARIS)
-    cutoff=current.date()-timedelta(days=WINDOW_DAYS-1)
+    cutoff=current.astimezone(PARIS).date()-timedelta(days=WINDOW_DAYS-1)
     items=[]
     for item in records:
         if system=="hbreak":
@@ -184,7 +185,7 @@ def candidates(system, records, now=None):
         started=_date(raw_date)
         if not started or started.astimezone(PARIS).date()<cutoff:
             continue
-        if started.astimezone(PARIS).date()>current.date():
+        if started.astimezone(PARIS).date()>current.astimezone(PARIS).date():
             continue
         if not symbol or _number(entry) is None:
             continue
@@ -365,3 +366,30 @@ def _load_upload(marker):
         return float(json.loads(marker.read_text(encoding="utf-8")).get("at",0))
     except (OSError,ValueError,TypeError):
         return 0
+
+# Research must never block the signal-capture thread or live executor.
+_WORKERS={"hbreak":threading.Lock(),"cb2":threading.Lock()}
+
+
+def launch(system,records,book_id=None,logger=None):
+    lock=_WORKERS[system]
+    if not lock.acquire(blocking=False):
+        return False
+    snapshot=list(records)
+    def worker():
+        import requests
+        try:
+            with requests.Session() as session:
+                run(system,snapshot,session,book_id=book_id,logger=logger)
+        except Exception as error:
+            if logger:
+                logger("["+system.upper()+" TP ANALYSIS WORKER ERR] "+type(error).__name__)
+        finally:
+            lock.release()
+    try:
+        threading.Thread(target=worker,name=system+"-tp-research",
+                         daemon=True).start()
+    except Exception:
+        lock.release()
+        raise
+    return True
