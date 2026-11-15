@@ -269,6 +269,15 @@ def step(db,http):
     try:track(db,http)
     except Exception as exc:LOG.warning("HBREAK tracking failed %s: %s",type(exc).__name__,str(exc)[:140])
     LOG.info("HBREAK archive-only mode: Binance REST disabled; daily 15m ZIP backfill")
+    # Optional, isolated 3-day TP-only technical research. Failures never stop
+    # signal collection, TP tracking, or normal monitoring sheets.
+    try:
+        from paper_tp_analysis import launch as _tp_research
+        _tp_research("hbreak",rows(db),
+                     os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID"),
+                     logger=lambda message:LOG.info("%s",message))
+    except Exception as exc:
+        LOG.warning("[HBREAK TP ANALYSIS ERR] %s",type(exc).__name__)
     try:sheet_sync(db)
     except Exception as e:LOG.warning("HBREAK sheet %s",str(e)[:180])
     try:archive(db)
