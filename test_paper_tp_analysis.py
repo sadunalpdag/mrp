@@ -65,7 +65,8 @@ class TPAnalysisTests(unittest.TestCase):
                  patch.object(subject,"klines",return_value=[]), \
                  patch.object(subject,"_upload",return_value=None):
                 result=subject.run("cb2",[signal],None,None,now=today)
-            self.assertEqual(result["totals"]["tp_records"],1)\n            self.assertEqual(result["totals"]["comparison_records"],0)
+            self.assertEqual(result["totals"]["tp_records"],1)
+            self.assertEqual(result["totals"]["comparison_records"],0)
             self.assertEqual(result["totals"]["indicator_complete"],0)
             self.assertEqual(result["records"][0]["indicators"]["status"],
                              "PENDING_480_CLOSED_BARS")
