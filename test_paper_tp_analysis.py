@@ -57,7 +57,10 @@ class TPAnalysisTests(unittest.TestCase):
         watch=dict(tp,id="c",family="trend_watch",strategy="trend_watch")
         old=dict(tp,id="d",observed_at="2026-11-01T00:00:00+00:00")
         output=subject.candidates("cb2",[tp,open_trade,watch,old],date)
-        self.assertEqual([x["id"] for x in output],["a","b"])
+        self.assertEqual([x["id"] for x in output],["a","b","c"])
+        self.assertEqual(output[-1]["outcome_status"],"WATCH_ONLY")
+        full=subject.candidates("cb2",[tp,open_trade,watch,old],date,days=0)
+        self.assertEqual(len(full),4)
 
     def test_missing_archive_does_not_create_false_indicators(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -78,6 +81,78 @@ class TPAnalysisTests(unittest.TestCase):
                              "PENDING_480_CLOSED_BARS")
             path=Path(directory)/"paper_tp_analysis"/"cb2_3day_latest.json"
             self.assertTrue(path.exists())
+
+    def test_all_25_signals_enriched_in_one_pass_with_single_archive_window(self):
+        from unittest.mock import Mock
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            current=datetime(2026,11,15,14,0,tzinfo=timezone.utc)
+            date=datetime(2026,11,13,18,0,tzinfo=timezone.utc)
+            base=int(datetime(2026,11,7,0,0,tzinfo=timezone.utc).timestamp()*1000)
+            records=[]
+            for i in range(25):
+                when=(date+timedelta(minutes=i)).isoformat()
+                kind="TP_1_PERCENT" if i<13 else "OPEN_IN_OBSERVED_WINDOW"
+                records.append({
+                    "id":"signal-"+str(i),"source":"coinbeacon-api2",
+                    "symbol":"FOOUSDT","strategy":"rvol","observed_at":when,
+                    "status":"COMPLETE_48H",
+                    "entry_scenarios":{"next_15m_open":{
+                        "status":kind,"entry_price":2.0}}
+                })
+            with patch.object(subject,"ROOT",Path(directory)), \
+                 patch.object(subject,"klines",return_value=bars(base,680)) as loader, \
+                 patch.object(subject,"_upload",return_value=None), \
+                 patch.dict(subject.os.environ,{"GOOGLE_SERVICE_ACCOUNT_JSON":""}):
+                report=subject.run("cb2",records,None,None,now=current)
+            self.assertEqual(report["totals"]["signal_records"],25)
+            self.assertEqual(report["totals"]["tp_records"],13)
+            self.assertEqual(report["totals"]["comparison_records"],12)
+            self.assertEqual(report["totals"]["indicator_complete"],25)
+            self.assertEqual(loader.call_count,1)
+            cumulative=json.loads((Path(directory)/"paper_tp_analysis"/
+                                  "cb2_all_signals_latest.json").read_text())
+            self.assertEqual(cumulative["outcome_counts"]["TP_1_PERCENT"],13)
+            self.assertEqual(cumulative["outcome_counts"]["OPEN_IN_OBSERVED_WINDOW"],12)
+            self.assertEqual(len(cumulative["records"]),25)
+
+    def test_missing_price_and_watch_are_included_not_counted_as_tp(self):
+        now=datetime(2026,11,15,15,0,tzinfo=timezone.utc)
+        record={"id":"watch","source":"coinbeacon-api2","symbol":"BARUSDT",
+                "strategy":"volume_watch","family":"volume_watch",
+                "status":"WATCH","reference_price":None,
+                "observed_at":"2026-11-14T13:30:00+00:00",
+                "entry_scenarios":{}}
+        selected=subject.candidates("cb2",[record],now,days=0)
+        self.assertEqual(len(selected),1)
+        self.assertIsNone(selected[0]["entry_price"])
+        self.assertEqual(selected[0]["outcome_status"],"WATCH_ONLY")
+        report=subject._report("cb2",[{"signal":selected[0],
+                             "indicators":{"status":"PENDING_480_CLOSED_BARS"}}],now,None)
+        self.assertEqual(report["totals"]["tp_records"],0)
+        self.assertEqual(report["outcome_counts"]["WATCH_ONLY"],1)
+
+    def test_cumulative_json_retains_old_days_after_three_day_rollover(self):
+        import json
+        with tempfile.TemporaryDirectory() as directory:
+            date=datetime(2026,11,15,14,0,tzinfo=timezone.utc)
+            record={"id":"a","source":"coinbeacon-api2","symbol":"FOOUSDT",
+                    "strategy":"retest","observed_at":"2026-11-13T13:00:00+00:00",
+                    "entry_scenarios":{"next_15m_open":{
+                        "status":"TP_1_PERCENT","entry_price":2}}}
+            with patch.object(subject,"ROOT",Path(directory)), \
+                 patch.object(subject,"klines",return_value=[]), \
+                 patch.object(subject,"_upload",return_value=None), \
+                 patch.dict(subject.os.environ,{"GOOGLE_SERVICE_ACCOUNT_JSON":""}):
+                before=subject.run("cb2",[record],None,None,now=date)
+                after=subject.run("cb2",[],None,None,now=date+timedelta(days=5))
+            self.assertEqual(before["totals"]["signal_records"],1)
+            self.assertEqual(after["totals"]["signal_records"],0)
+            cumulative=json.loads((Path(directory)/"paper_tp_analysis"/
+                                  "cb2_all_signals_latest.json").read_text())
+            self.assertEqual(cumulative["totals"]["signal_records"],1)
+
+
 
 if __name__=="__main__":
     unittest.main()

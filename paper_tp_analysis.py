@@ -1,4 +1,4 @@
-"""Read-only, incremental 3-day TP-only indicator archive for CB2/HBREAK.
+"""Read-only, cumulative TP and non-TP indicator archive for CB2/HBREAK.
 
 Binance PUBLIC daily 15m ZIPs only; never Binance REST, never broker/orders.
 Each result's technical indicators use CLOSED candles preceding the signal.
@@ -23,7 +23,8 @@ HEADERS=["Sistem","Tarih Paris","Strateji","Coin","Sinyal UTC",
          "MACD histogram","Bollinger band genisligi %",
          "1s degisim %","4s degisim %","24s degisim %",
          "15m mum sayisi","Kapsam","Intrabar belirsizlik","Kaynak ID"]
-MAX_PER_CYCLE=16
+MAX_PER_CYCLE=0  # 0 = no fixed signal-count cap; use elapsed-time budget instead.
+MAX_WORK_SECONDS=480  # Cap each background pass so paper monitoring is never monopolized.
 LOOKBACK_BARS=480
 WINDOW_DAYS=3
 
@@ -124,14 +125,20 @@ def indicators(candles, signal_ms):
         return {"coverage":len(rows),"status":"INVALID_CANDLE"}
     atr,adx=_atr_adx(rows)
     ema20=_ema(close,20);ema50=_ema(close,50);ema200=_ema(close,200)
-    fast=_ema(close,12);slow=_ema(close,26)
+    # O(N) seeded EMA recurrence: identical to recomputing all prefixes,
+    # but avoids a quadratic MACD calculation across thousands of signals.
     hist=None
-    if fast is not None and slow is not None:
-        # MACD 9-signal EMA computed from fully-seeded MACD sequence.
-        macds=[]
-        for idx in range(26,len(close)+1):
-            ef=_ema(close[:idx],12)
-            es=_ema(close[:idx],26)
+    if len(close)>=34:
+        a12=2/13
+        a26=2/27
+        ef=sum(close[:12])/12
+        for price in close[12:26]:
+            ef=(price-ef)*a12+ef
+        es=sum(close[:26])/26
+        macds=[ef-es]
+        for price in close[26:]:
+            ef=(price-ef)*a12+ef
+            es=(price-es)*a26+es
             macds.append(ef-es)
         signal=_ema(macds,9)
         hist=macds[-1]-signal if signal is not None else None
@@ -155,14 +162,13 @@ def indicators(candles, signal_ms):
     return {k:(round(v,7) if isinstance(v,float) else v) for k,v in output.items()}
 
 
-def candidates(system, records, now=None):
+def candidates(system, records, now=None, days=WINDOW_DAYS):
     current=now or datetime.now(PARIS)
-    cutoff=current.astimezone(PARIS).date()-timedelta(days=WINDOW_DAYS-1)
+    cutoff=(current.astimezone(PARIS).date()-timedelta(days=days-1)
+            if days and days>0 else None)
     items=[]
     for item in records:
         if system=="hbreak":
-            if item.get("status") not in ("TP_1_PERCENT","OPEN"):
-                continue
             raw_date=item.get("opened_at")
             tp=item.get("tp_at")
             entry=item.get("entry")
@@ -179,36 +185,60 @@ def candidates(system, records, now=None):
             if not str(item.get("source") or "").startswith("coinbeacon-api2"):
                 continue
             family=item.get("strategy") or item.get("family")
-            if (str(family).endswith("_watch") or item.get("status") in
-                    ("WATCH","WATCH_EXPIRED","UNCONFIRMED_OI")):
-                continue
+            # Include watch and incomplete observations as separate categories.
+            # Never mark them as failed fills: some had no executable entry.
             details=(item.get("entry_scenarios") or {}).get("next_15m_open") or {}
-            if details.get("status") not in (None,"TP_1_PERCENT","OPEN_IN_OBSERVED_WINDOW"):
-                continue
             raw_date=item.get("observed_at")
             entry_at=raw_date
             entry=details.get("entry_price")
             tp=details.get("tp_at_candle_close")
             symbol=item.get("symbol")
         started=_date(raw_date)
-        if not started or started.astimezone(PARIS).date()<cutoff:
+        if not started or (cutoff and started.astimezone(PARIS).date()<cutoff):
             continue
         if started.astimezone(PARIS).date()>current.astimezone(PARIS).date():
             continue
         if not symbol:
             continue
-        if _number(entry) is None and system=="cb2":
-            entry=item.get("reference_price")
-        if _number(entry) is None:
+        observed_entry=_number(entry)
+        if observed_entry is None and system=="cb2":
+            observed_entry=_number(item.get("reference_price"))
+        status=details.get("status")
+        if system=="cb2" and (str(family).endswith("_watch") or
+                              item.get("status") in ("WATCH","WATCH_EXPIRED","UNCONFIRMED_OI")):
+            outcome="WATCH_ONLY"
+        elif status:
+            outcome=status
+        elif system=="hbreak":
+            outcome=item.get("status") or "PENDING_ARCHIVE"
+        else:
+            outcome="PENDING_ARCHIVE"
+        identifier=str(item.get("id") or "")
+        if not identifier:
             continue
-        items.append({"id":str(item.get("id")),"system":system,
+        scenario_map={name:case.get("status")
+                      for name,case in (item.get("entry_scenarios") or {}).items()
+                      if isinstance(case,dict)}
+        items.append({"id":identifier,"system":system,
                       "strategy":family,"symbol":symbol,
-                      "outcome_status":details.get("status") or item.get("status") or "PENDING_ARCHIVE",
-                      "signal_at":entry_at,"entry_price":float(entry),
-                      "tp_at":tp,"tp_price":item.get("tp") if system=="hbreak" else float(entry)*1.01,
-                      "result":details,"date_paris":started.astimezone(PARIS).date().isoformat()})
-    # Prioritize confirmed hypothetical TP cases for the user-visible sheet;
-    # retain ALL open/pending comparison cases in the JSON.
+                      "outcome_status":outcome,
+                      "source_status":item.get("status"),
+                      "source_data_status":item.get("data_status"),
+                      "reference_price":_number(item.get("reference_price")),
+                      "reference_status":item.get("reference_status"),
+                      "source_id":item.get("source_id"),
+                      "source_signal_at":item.get("source_signal_at") or item.get("triggered_at"),
+                      "source_sqs":item.get("sqs"),"source_rvol":item.get("rvol"),
+                      "source_archetype":item.get("archetype"),
+                      "scenario_statuses":scenario_map,
+                      "signal_at":entry_at,"entry_price":observed_entry,
+                      "tp_at":tp,
+                      "tp_price":(item.get("tp") if system=="hbreak" else
+                                  observed_entry*1.01 if observed_entry is not None else None),
+                      "result":details,
+                      "date_paris":started.astimezone(PARIS).date().isoformat()})
+    # TP comes first to fill the existing TP-only tab as quickly as possible.
+    # OPEN / PENDING / WATCH remain in the same cumulative JSON.
     return sorted(items,key=lambda x:(x["outcome_status"]!="TP_1_PERCENT",
                                      x["signal_at"],x["id"]))
 
@@ -232,7 +262,7 @@ def _save(path,data):
     os.replace(temp,path)
 
 
-def _upload(system,payload,at):
+def _upload(system,payload,at,kind="3day"):
     """Private R2 JSON. Failed uploads remain local, to retry next cycle."""
     from crash_report_storage import r2_configured,R2_ENV_NAMES
     if not r2_configured():
@@ -241,7 +271,12 @@ def _upload(system,payload,at):
     account,bucket,key,secret=(os.environ[n].strip() for n in R2_ENV_NAMES)
     stamp=at.astimezone(PARIS).strftime("%Y/%m/%d")
     name=at.astimezone(PARIS).strftime("%Y-%m-%d")
-    path=system+"/tp-analysis/"+stamp+"/"+system+"_3day_tp_indicators_"+name+".json"
+    if kind=="3day":
+        path=system+"/tp-analysis/"+stamp+"/"+system+"_3day_tp_indicators_"+name+".json"
+    elif kind=="all":
+        path=system+"/analysis/"+stamp+"/"+system+"_all_signals_indicators_"+name+".json"
+    else:
+        raise ValueError("INVALID_REPORT_KIND")
     body=json.dumps(payload,ensure_ascii=False,allow_nan=False,separators=(",",":")).encode()
     client=boto3.client("s3",endpoint_url="https://"+account+".r2.cloudflarestorage.com",
                         aws_access_key_id=key,aws_secret_access_key=secret,region_name="auto")
@@ -293,96 +328,169 @@ def _sheet(system,results,auth,book_id):
     return title
 
 
+def _report(system,entries,at,period):
+    status_counts={}
+    indicator_counts={}
+    by_date={}
+    tp=0
+    for item in entries:
+        sig=item.get("signal") or {}
+        ind=item.get("indicators") or {}
+        outcome=str(sig.get("outcome_status") or "PENDING_ARCHIVE")
+        readiness=str(ind.get("status") or "PENDING_ENRICHMENT")
+        status_counts[outcome]=status_counts.get(outcome,0)+1
+        indicator_counts[readiness]=indicator_counts.get(readiness,0)+1
+        tp+=outcome=="TP_1_PERCENT"
+        day=sig.get("date_paris")
+        if not day: continue
+        group=by_date.setdefault(day,{"signals":0,"tp_observed":0,
+                                       "open_or_pending":0,"watch_only":0,
+                                       "indicators_ready":0})
+        group["signals"]+=1
+        group["tp_observed"]+=outcome=="TP_1_PERCENT"
+        group["open_or_pending"]+=outcome not in ("TP_1_PERCENT","WATCH_ONLY")
+        group["watch_only"]+=outcome=="WATCH_ONLY"
+        group["indicators_ready"]+=readiness=="READY"
+    return {
+        "schema_version":"paper_signal_indicators_v2","system":system,
+        "generated_at_utc":at.astimezone(timezone.utc).isoformat(),
+        "period_days":period,"mode":"PAPER_ONLY",
+        "source":"Binance futures public 15m daily ZIP",
+        "no_binance_rest":True,"signal_time_no_lookahead":True,
+        "tp_label":"15m OHLC hypothetical TP, not exchange fill",
+        "warnings":[
+            "TP/OPEN/PENDING are distinct results; missing archives are NOT failed trades.",
+            "WATCH_ONLY is not a filled trade; exclude it from TP success denominators.",
+            "A TP on the entry candle may have ambiguous intrabar order.",
+            "480 contiguous PRE-signal bars are required for READY indicators.",
+            "Published daily archives may be delayed; missing values are never guessed.",
+            "Some strategies duplicate the same coin/signal opportunity."
+        ],
+        "totals":{"signal_records":len(entries),"tp_records":tp,
+                  "comparison_records":len(entries)-tp,
+                  "indicator_complete":indicator_counts.get("READY",0),
+                  "indicator_pending":len(entries)-indicator_counts.get("READY",0)},
+        "outcome_counts":status_counts,
+        "indicator_status_counts":indicator_counts,
+        "daily":dict(sorted(by_date.items())),
+        "records":entries,
+    }
+
+
 def run(system,records,http,book_id=None,now=None,logger=None):
-    """Bounded archive enrichment. Call once per 15m paper cycle."""
+    """Process ALL recorded signals cumulatively, not just 16 TP cases.
+
+    Public archives are cached by coin/day and shared on disk across CB2/HBREAK.
+    The independent research worker stops after a time budget; remaining items
+    stay in the JSON with explicit PENDING status and resume on next cycle.
+    """
     at=now or datetime.now(timezone.utc)
-    selected=candidates(system,records,at)
-    cache=_load(system)
-    keep={x["id"] for x in selected}
-    cache={k:v for k,v in cache.items() if k in keep}
-    attempted=0
+    selected=candidates(system,records,at,days=0)
+    cache=_load(system)  # Never prune earlier observations: cumulative research.
     for signal in selected:
         sid=signal["id"]
-        old=cache.get(sid) or {}
-        if old.get("indicators",{}).get("status")=="READY":
+        if sid not in cache or not isinstance(cache[sid],dict):
+            cache[sid]={"signal":signal,
+                        "indicators":{"status":"PENDING_ENRICHMENT"}}
+        else:
+            cache[sid]["signal"]=signal
+    _save(_cache_path(system),cache)  # Persist complete outcome cohort first.
+    clock_start=time.monotonic()
+    last_attempted=0
+    attempted=0
+    archive_cache={}  # One public ZIP window per (symbol, UTC signal date).
+    for signal in selected:
+        sid=signal["id"]
+        old=cache[sid]
+        if (old.get("indicators") or {}).get("status")=="READY":
             continue
-        if attempted>=MAX_PER_CYCLE:
+        if MAX_PER_CYCLE and attempted>=MAX_PER_CYCLE:
+            break
+        if time.monotonic()-clock_start>=MAX_WORK_SECONDS:
             break
         if time.time()-float(old.get("last_attempt",0))<3600:
             continue
         observed=_date(signal["signal_at"])
-        if observed is None:
-            continue
+        if observed is None: continue
         attempted+=1
-        # Fetch 5+ days BEFORE the event. Published public ZIP only.
-        start_ms=int((observed-timedelta(days=6)).timestamp()*1000)
+        key=(signal["symbol"],observed.astimezone(timezone.utc).date().isoformat())
+        if key not in archive_cache:
+            # Begin six full UTC days before the signal day. 1000 bars cover
+            # all six historical days plus the entire signal day.
+            utc_day=observed.astimezone(timezone.utc).date()
+            start_day=datetime(utc_day.year,utc_day.month,utc_day.day,
+                               tzinfo=timezone.utc)-timedelta(days=6)
+            start_ms=int(start_day.timestamp()*1000)
+            try:
+                archive_cache[key]=klines(signal["symbol"],"15m",
+                                          start=start_ms,limit=1000,http=http)
+            except Exception as error:
+                archive_cache[key]=error
         try:
-            bars=klines(signal["symbol"],"15m",start=start_ms,
-                        limit=800,http=http)
+            bars=archive_cache[key]
+            if isinstance(bars,Exception):
+                raise bars
             enriched=indicators(bars,int(observed.timestamp()*1000))
         except Exception as error:
             enriched={"status":"ARCHIVE_READ_ERROR","reason":type(error).__name__}
-        cache[sid]={"signal":signal,"indicators":enriched,
-                    "last_attempt":time.time()}
-    for signal in selected:
-        if signal["id"] not in cache:
-            cache[signal["id"]]={"signal":signal,"indicators":{"status":"PENDING_ENRICHMENT"}}
-        else:
-            cache[signal["id"]]["signal"]=signal
+        old["indicators"]=enriched
+        old["last_attempt"]=time.time()
+        last_attempted+=enriched.get("status")=="READY"
+        if attempted%40==0:
+            _save(_cache_path(system),cache)  # Protect completed backfill on restart.
     _save(_cache_path(system),cache)
-    enriched_rows=[cache[s["id"]] for s in selected]
-    tp_only=[x for x in enriched_rows
-             if x["signal"]["outcome_status"]=="TP_1_PERCENT"]
-    complete=sum(x["indicators"].get("status")=="READY" for x in enriched_rows)
-    by_date={}
-    for item in enriched_rows:
-        day=item["signal"]["date_paris"]
-        stats=by_date.setdefault(day,{"signals":0,"tp_observed":0,
-                                      "open_or_pending":0,"indicators_ready":0})
-        stats["signals"]+=1
-        stats["tp_observed"]+=item["signal"]["outcome_status"]=="TP_1_PERCENT"
-        stats["open_or_pending"]+=item["signal"]["outcome_status"]!="TP_1_PERCENT"
-        stats["indicators_ready"]+=item["indicators"].get("status")=="READY"
-    payload={"schema_version":"paper_tp_indicators_v1","system":system,
-             "generated_at_utc":at.astimezone(timezone.utc).isoformat(),
-             "period_days":WINDOW_DAYS,"mode":"PAPER_ONLY",
-             "source":"Binance futures public 15m daily ZIP",
-             "no_binance_rest":True,"signal_time_no_lookahead":True,
-             "tp_label":"15m OHLC hypothetical TP, not exchange fill",
-             "warnings":["A TP on the entry candle is ambiguous about intrabar order.",
-                         "Indicator coverage requires 480 contiguous PRE-signal candles.",
-                         "Published daily archives may be delayed; missing values never guessed."],
-             "totals":{"signal_records":len(selected),"tp_records":len(tp_only),
-                       "comparison_records":len(selected)-len(tp_only),
-                       "indicator_complete":complete},
-             "daily":by_date,"records":enriched_rows}
+    # Keep historic records no longer emitted by the source export as last
+    # observed; never make them disappear from the cumulative research file.
+    full_rows=[v for v in cache.values()
+               if isinstance(v,dict) and isinstance(v.get("signal"),dict)]
+    full_rows.sort(key=lambda v:(v["signal"].get("date_paris") or "",
+                                v["signal"].get("signal_at") or "",
+                                v["signal"].get("id") or ""))
+    cutoff=(at.astimezone(PARIS).date()-timedelta(days=WINDOW_DAYS-1)).isoformat()
+    recent_rows=[r for r in full_rows
+                 if (r["signal"].get("date_paris") or "")>=cutoff]
+    recent=_report(system,recent_rows,at,WINDOW_DAYS)
+    cumulative=_report(system,full_rows,at,None)
     directory=ROOT/"paper_tp_analysis"
     directory.mkdir(parents=True,exist_ok=True)
-    local=directory/(system+"_3day_latest.json")
-    _save(local,payload)
+    _save(directory/(system+"_3day_latest.json"),recent)
+    _save(directory/(system+"_all_signals_latest.json"),cumulative)
     creds=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","").strip()
+    tp_only=[x for x in full_rows
+             if x["signal"].get("outcome_status")=="TP_1_PERCENT"]
     if creds and book_id:
         try:
             title=_sheet(system,tp_only,creds,book_id)
-            if logger: logger("["+system.upper()+" TP ANALYSIS SHEETS] tab="+title+
-                              " tp="+str(len(tp_only))+" ready="+str(complete))
+            if logger:
+                logger("["+system.upper()+" TP ANALYSIS SHEETS] tab="+title+
+                       " tp="+str(len(tp_only))+
+                       " ready="+str(sum((x.get("indicators") or {}).get("status")=="READY"
+                                        for x in tp_only)))
         except Exception as error:
-            if logger: logger("["+system.upper()+" TP ANALYSIS SHEETS ERR] "+type(error).__name__)
-    marker=directory/(system+"_last_r2_at.json")
+            if logger:
+                logger("["+system.upper()+" TP ANALYSIS SHEETS ERR] "+type(error).__name__)
+    marker=directory/(system+"_last_r2_at_full_v2.json")  # Initial full snapshot uploads immediately.
     previous=_load_upload(marker)
     if time.time()-previous>=3600:
         try:
-            key=_upload(system,payload,at)
-            if key:
+            daily_key=_upload(system,recent,at,"3day")
+            all_key=_upload(system,cumulative,at,"all")
+            if daily_key and all_key:
                 _save(marker,{"at":time.time()})
-                if logger: logger("["+system.upper()+" TP ANALYSIS R2] "+key)
+                if logger:
+                    logger("["+system.upper()+" ANALYSIS R2] 3day="+daily_key+
+                           " cumulative="+all_key)
         except Exception as error:
-            if logger: logger("["+system.upper()+" TP ANALYSIS R2 ERR] "+type(error).__name__)
+            if logger:
+                logger("["+system.upper()+" ANALYSIS R2 ERR] "+type(error).__name__)
     if logger:
-        logger("["+system.upper()+" TP ANALYSIS] signals="+str(len(selected))+
-               " tp="+str(len(tp_only))+
-               " ready="+str(complete)+" checked="+str(attempted))
-    return payload
+        logger("["+system.upper()+" ALL SIGNAL ANALYSIS] signals="+
+               str(len(full_rows))+" tp="+str(len(tp_only))+
+               " ready="+str(cumulative["totals"]["indicator_complete"])+
+               " checked="+str(attempted)+" newly_ready="+str(last_attempted)+
+               " elapsed_s="+str(int(time.monotonic()-clock_start))+
+               " unique_symbol_days="+str(len(archive_cache)))
+    return recent
 
 
 def _load_upload(marker):
