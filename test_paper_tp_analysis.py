@@ -100,9 +100,9 @@ class TPAnalysisTests(unittest.TestCase):
                     "entry_scenarios":{"next_15m_open":{
                         "status":kind,"entry_price":2.0}}
                 })
-            with patch.object(subject,"ROOT",Path(directory)), \\
-                 patch.object(subject,"klines",return_value=bars(base,680)) as loader, \\
-                 patch.object(subject,"_upload",return_value=None), \\
+            with patch.object(subject,"ROOT",Path(directory)), \
+                 patch.object(subject,"klines",return_value=bars(base,680)) as loader, \
+                 patch.object(subject,"_upload",return_value=None), \
                  patch.dict(subject.os.environ,{"GOOGLE_SERVICE_ACCOUNT_JSON":""}):
                 report=subject.run("cb2",records,None,None,now=current)
             self.assertEqual(report["totals"]["signal_records"],25)
@@ -140,9 +140,9 @@ class TPAnalysisTests(unittest.TestCase):
                     "strategy":"retest","observed_at":"2026-11-13T13:00:00+00:00",
                     "entry_scenarios":{"next_15m_open":{
                         "status":"TP_1_PERCENT","entry_price":2}}}
-            with patch.object(subject,"ROOT",Path(directory)), \\
-                 patch.object(subject,"klines",return_value=[]), \\
-                 patch.object(subject,"_upload",return_value=None), \\
+            with patch.object(subject,"ROOT",Path(directory)), \
+                 patch.object(subject,"klines",return_value=[]), \
+                 patch.object(subject,"_upload",return_value=None), \
                  patch.dict(subject.os.environ,{"GOOGLE_SERVICE_ACCOUNT_JSON":""}):
                 before=subject.run("cb2",[record],None,None,now=date)
                 after=subject.run("cb2",[],None,None,now=date+timedelta(days=5))
