@@ -13,7 +13,7 @@ from pathlib import Path
 
 LOG = logging.getLogger("cb2_signal_research")
 MAX_SIGNALS = 5000
-MAX_CHECK_PER_CYCLE = 12
+MAX_CHECK_PER_CYCLE = 80
 FIFTEEN = 900000
 
 
