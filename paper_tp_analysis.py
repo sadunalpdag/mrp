@@ -417,7 +417,8 @@ def run(system,records,http,book_id=None,now=None,logger=None):
         if key not in archive_cache:
             # Begin six full UTC days before the signal day. 1000 bars cover
             # all six historical days plus the entire signal day.
-            start_day=datetime(observed.year,observed.month,observed.day,
+            utc_day=observed.astimezone(timezone.utc).date()
+            start_day=datetime(utc_day.year,utc_day.month,utc_day.day,
                                tzinfo=timezone.utc)-timedelta(days=6)
             start_ms=int(start_day.timestamp()*1000)
             try:
