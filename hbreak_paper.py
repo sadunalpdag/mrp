@@ -109,7 +109,7 @@ def track(db,http):
     # Pending/error backfills have priority, while reserving at least 25% of
     # the budget for previously verified OPEN trades (ongoing TP monitoring).
     # All lists use oldest checked_at first to avoid starving any one trade.
-    batch=max(1,min(24,int(os.getenv("HBREAK_TRACK_BATCH","16"))))
+    batch=max(1,min(96,int(os.getenv("HBREAK_TRACK_BATCH","64"))))
     open_trades=[x for x in rows(db) if x["status"]=="OPEN"]
     needs_data=sorted((x for x in open_trades if x.get("data_status")!="OK"),
                       key=lambda v:v.get("checked_at",""))
@@ -181,9 +181,45 @@ def sheet_sync(db):
     sh=gspread.authorize(auth).open_by_key(sheet)
     try:ws=sh.worksheet(SHEET)
     except gspread.WorksheetNotFound:ws=sh.add_worksheet(title=SHEET,rows=1000,cols=len(FIELDS))
-    vals=[FIELDS]+[[str(x.get(k) if x.get(k) is not None else "") for k in FIELDS] for x in sorted(rows(db),key=lambda r:r["opened_at"])]
+    trades=sorted(rows(db),key=lambda r:r["opened_at"])
+    tp=[x for x in trades if x.get("status")=="TP_1_PERCENT"]
+    opened=[x for x in trades if x.get("status")=="OPEN"]
+    awaiting=[x for x in opened if x.get("data_status")!="OK"]
+    dips=[float(x["max_drawdown_pct"]) for x in trades
+          if x.get("max_drawdown_pct") is not None]
+    # Historical counts are from archived candles, not real executed orders.
+    summary=[
+        ["HBREAK | 15M LONG | SANAL PERFORMANS (BINANCE DAILY ZIP)"],
+        ["Guncelleme UTC",stamp(),"Gercek emir","YOK","TP hedefi","%1","SL","YOK"],
+        ["Toplam sinyal",len(trades),"Sanal TP",len(tp),
+         "Sanal acik",len(opened),"Arsiv bekleyen",len(awaiting)],
+        ["TP / tum sinyal %",round(len(tp)*100/len(trades),2) if trades else "",
+         "TP / sonuclanan %",100 if tp else "VERI YOK",
+         "En kotu gorulen dusus %",round(min(dips),4) if dips else "VERI YOK"],
+        ["UYARI: Acik islemler TP/Tum oraninin paydasinda; TP/sonuclanan sadece dogrulanan TP'dir."],
+        ["GUNLUK DURUM | Fransa tarihi | dunden gelen aciklar takip edilmeye devam eder"],
+        ["Tarih (Fransa)","Yeni sinyal","TP sonucuna ulasan","Halen acik",
+         "Veri bekleyen","TP / sinyal %"],
+    ]
+    grouped={}
+    for trade in trades:
+        try:
+            key=datetime.fromisoformat(trade["opened_at"]).astimezone(PARIS).date().isoformat()
+        except (TypeError,ValueError,KeyError):
+            continue
+        bucket=grouped.setdefault(key,[])
+        bucket.append(trade)
+    for key in sorted(grouped,reverse=True)[:30]:
+        items=grouped[key]
+        successes=sum(x.get("status")=="TP_1_PERCENT" for x in items)
+        pending=sum(x.get("status")=="OPEN" and x.get("data_status")!="OK" for x in items)
+        summary.append([key,len(items),successes,
+                        sum(x.get("status")=="OPEN" for x in items),pending,
+                        round(successes*100/len(items),2)])
+    summary.extend([[],["TUM SANAL SINYALLER | ESKIDEN YENIYE"],FIELDS])
+    vals=summary+[[str(x.get(k) if x.get(k) is not None else "") for k in FIELDS] for x in trades]
     if len(vals)>ws.row_count:ws.add_rows(len(vals)-ws.row_count+100)
-    ws.update(range_name="A1",values=vals)
+    ws.update(range_name="A1",values=vals)\n    LOG.info("[HBREAK DAILY SHEET] rows=%d tp=%d open=%d awaiting=%d days=%d",\n             len(trades),len(tp),len(opened),len(awaiting),len(grouped))
     # Clear stale trailing rows after deletions (none expected in normal operation).
 def archive(db):
     local=utc().astimezone(PARIS)
