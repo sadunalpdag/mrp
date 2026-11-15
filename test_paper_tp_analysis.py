@@ -118,7 +118,7 @@ class TPAnalysisTests(unittest.TestCase):
 
     def test_missing_price_and_watch_are_included_not_counted_as_tp(self):
         now=datetime(2026,11,15,15,0,tzinfo=timezone.utc)
-        record={"id":"watch","source":"coinbeacon-api2","symbol":"BARUSDT",
+        record={"id":"watch","symbol":"BARUSDT",
                 "strategy":"volume_watch","family":"volume_watch",
                 "status":"WATCH","reference_price":None,
                 "observed_at":"2026-11-14T13:30:00+00:00",
