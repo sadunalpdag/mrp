@@ -32,6 +32,12 @@ class TPAnalysisTests(unittest.TestCase):
         self.assertIsNotNone(calculated["adx14"])
         self.assertIsNotNone(calculated["rvol20"])
 
+    def test_stale_prior_day_bar_is_not_reported_as_signal_time(self):
+        b=bars(1760000000000,480)
+        event=int(b[-1][6])+12*3600000
+        output=subject.indicators(b,event)
+        self.assertEqual(output["status"],"LATEST_SIGNAL_CANDLE_NOT_PUBLISHED")
+
     def test_archive_gap_never_returns_ready(self):
         b=bars(1760000000000,480)
         b[200][0]=str(int(b[200][0])+120000)
