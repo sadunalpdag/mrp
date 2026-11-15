@@ -107,6 +107,12 @@ def indicators(candles, signal_ms):
     if len(rows)<LOOKBACK_BARS:
         return {"coverage":len(rows),"status":"PENDING_480_CLOSED_BARS"}
     rows=rows[-LOOKBACK_BARS:]
+    # Yesterday's last candle must not be mistaken for a fresh signal-time
+    # indicator when today's Binance daily ZIP has not been published.
+    if signal_ms-int(rows[-1][6])>1800000:
+        return {"coverage":len(rows),"status":"LATEST_SIGNAL_CANDLE_NOT_PUBLISHED",
+                "last_closed_candle_utc":datetime.fromtimestamp(
+                    int(rows[-1][6])/1000,timezone.utc).isoformat()}
     # Stop on any archive gap: never stitch unknown time into technical indicators.
     if any(int(b[0])-int(a[0])!=900000 for a,b in zip(rows,rows[1:])):
         return {"coverage":len(rows),"status":"ARCHIVE_GAP"}
