@@ -934,11 +934,11 @@ def cycle(db, market):
     # Enrich only hypothetical TP observations from the last three Paris days.
     # Binance published ZIPs only; the real Crash executor is never touched.
     try:
-        from paper_tp_analysis import run as _tp_research
+        from paper_tp_analysis import launch as _tp_research
         book_id=(os.getenv("COINBEACON_SIX_SHEET_ID") or
                  os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID"))
         _tp_research("cb2",signal_research.export(db)["signals"],
-                     market.http,book_id,logger=lambda message:LOG.info("%s",message))
+                     book_id,logger=lambda message:LOG.info("%s",message))
     except Exception as exc:
         LOG.warning("[CB2 TP ANALYSIS ERR] %s",type(exc).__name__)
     observation_count = signal_research.export(db)["count"]
