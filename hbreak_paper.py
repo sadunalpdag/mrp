@@ -269,6 +269,13 @@ def step(db,http):
     try:track(db,http)
     except Exception as exc:LOG.warning("HBREAK tracking failed %s: %s",type(exc).__name__,str(exc)[:140])
     LOG.info("HBREAK archive-only mode: Binance REST disabled; daily 15m ZIP backfill")
+    # Paris-local 18:45 catch-up, including previously missed archive days.
+    # Runs on this paper-only SQLite connection; never touches real orders.
+    try:
+        from paper_daily_revision import revise_hbreak
+        revise_hbreak(db, http)
+    except Exception as exc:
+        LOG.warning("[HBREAK DAILY 18:45 ERR] %s: %s", type(exc).__name__, str(exc)[:140])
     # Optional, isolated 3-day TP-only technical research. Failures never stop
     # signal collection, TP tracking, or normal monitoring sheets.
     try:
