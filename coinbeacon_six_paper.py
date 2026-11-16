@@ -931,6 +931,13 @@ def cycle(db, market):
         LOG.warning("[CB2 INDEPENDENT] archive outcome error %s: %s",
                     type(exc).__name__, str(exc)[:120])
         studied = 0
+    # The 18:45 Paris daily pass rechecks missing archives and refreshes Sheets.
+    # No broker or trading changes; snapshots remain paper-only.
+    try:
+        from paper_daily_revision import revise_cb2
+        revise_cb2(db, market)
+    except Exception as exc:
+        LOG.warning("[CB2 DAILY 18:45 ERR] %s: %s", type(exc).__name__, str(exc)[:140])
     # Enrich only hypothetical TP observations from the last three Paris days.
     # Binance published ZIPs only; the real Crash executor is never touched.
     try:
