@@ -176,24 +176,30 @@ def _scenario(candles, trigger_ms, delay_minutes, reference_price=None, pullback
     }
 
 
-def analyze(db, archive_klines, http, now_iso):
-    """Only archived 15m candles; never use present-day unavailable candles."""
+def analyze(db, archive_klines, http, now_iso, *, force=False,
+            max_checks=None, since_ms=None, max_seconds=None):
+    """Only published 15m archives. Force mode is for daily historical catch-up."""
     now = _ms(now_iso)
+    started = time.monotonic()
+    check_limit = MAX_CHECK_PER_CYCLE if max_checks is None else max(1, int(max_checks))
     records = db.execute("SELECT id,payload FROM signal_observations ORDER BY rowid DESC LIMIT ?",
                          (MAX_SIGNALS,)).fetchall()
     count = 0
     for sid, raw in sorted(records, key=lambda x: json.loads(x[1])["observed_at"]):
-        if count >= MAX_CHECK_PER_CYCLE:
+        if count >= check_limit or (max_seconds is not None and
+                                     time.monotonic() - started >= max_seconds):
             break
         record = json.loads(raw)
         if record.get("status") in ("COMPLETE_48H", "WATCH", "WATCH_EXPIRED", "UNCONFIRMED_OI"):
             continue
         seen_ms = _ms(record["observed_at"])
+        if since_ms is not None and seen_ms < since_ms:
+            continue
         # First next-day public ZIP may be available before 24h has elapsed.
         # Only completed archive bars are evaluated; no future candle is assumed.
         if now - seen_ms < 12 * 3600000:
             continue
-        if record.get("last_check") and now - _ms(record["last_check"]) < 2 * 3600000:
+        if not force and record.get("last_check") and now - _ms(record["last_check"]) < 2 * 3600000:
             continue
         # Only include complete bars after signal. A missing middle archive day
         # causes archive_klines to return an incomplete prefix.
