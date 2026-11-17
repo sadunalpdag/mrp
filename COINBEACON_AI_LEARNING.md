@@ -67,3 +67,28 @@ This feature stores AI output, market data and timing; no API keys in archives.
   offline evaluation and comparisons against a rule-only baseline.
 
 Run tests offline: python -m unittest -v test_coinbeacon_ai_learning.py
+
+## Bot Status Dashboard (J:O)
+
+The existing EMA Filter workbook **Bot Status** tab retains A:B reports and
+Crash D:I controls; AI Learning uses **J:O only**, without resetting existing
+Crash approvals. J=label, K=current, L=new value, M=description,
+N=result, O=approval. Set L and enter **UYGULA** in O; the sheet publisher
+checks roughly every five minutes. It persists changes in
+`DATA_DIR/coinbeacon_ai_settings.json` and starts the independent paper
+observer when enabled and prerequisites are present. Never put API credentials
+in the sheet; GEMINI_API_KEY stays in Render Environment.
+
+| Dashboard setting | Default | Options |
+| --- | --- | --- |
+| AI Learning | OFF | AÇIK / KAPALI |
+| Gemini calls/day | 100 | 1-200 |
+| Max active cases | 30 | 1-100 |
+| Tracking horizon | 8 hours | 1-24 hours, applied to new cases |
+| Review cadence | 15 minutes | 15/30/60; every 15m candle still archived |
+| AI stages | Initial + final | Initial + final or initial only |
+
+OFF prevents new AI cases. Existing 8-hour WS observations/reviews are
+allowed to finish when the worker is already running, so their labels are not
+silently lost. The on/off setting does not affect any real Binance orders.
+The 15-minute data collection granularity remains fixed for comparability.
