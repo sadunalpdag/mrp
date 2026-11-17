@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import coinbeacon_ai_learning as ai
+import coinbeacon_ai_daily_archive as archive
 
 
 class LearningTests(unittest.TestCase):
@@ -148,6 +149,84 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(saved["state"], "COMPLETE")
         self.assertEqual(saved["initial_plan"]["direction"], "WAIT")
         self.assertEqual(saved["final_review"]["learning_tags"], ["low_volume"])
+
+
+    def test_one_daily_archive_preserves_480_candles_and_late_result(self):
+        rec = self.insert()
+        day = archive.research_day(rec["observed_ms"])
+        with ai._database() as db:
+            first = archive.build_payload(db, day)
+            revision_before = db.execute(
+                "SELECT revision FROM daily_archives WHERE research_day=?", (day,)).fetchone()[0]
+        self.assertEqual(first["summary"]["signals"], 1)
+        self.assertEqual(first["summary"]["unique_coins"], 1)
+        self.assertEqual(len(first["cases"][0]["initial_candles"]), 480)
+        self.assertEqual(first["summary"]["gemini_decisions"]["NO_RESPONSE"], 1)
+        expected_key = archive.archive_key(day)
+        rec["state"] = "COMPLETE"
+        rec["initial_plan"] = {"direction": "LONG", "entry_price": 100, "tp_pct": 1}
+        rec["outcome"] = {"label": "TP_OBSERVED", "coverage_complete": True,
+                          "tp_observed": True, "mae_pct": -0.4, "mfe_pct": 1.1}
+        rec["future_candles"] = [{"t": self.now + ai.INTERVAL, "o": 100,
+                                  "h": 101.1, "l": 99.6, "c": 101}]
+        rec["final_review"] = {"learning_tags": ["breakout_retest"],
+                                "suggested_filter_changes": ["look at retest"]}
+        ai._save(rec)
+        with ai._database() as db:
+            updated = archive.build_payload(db, day)
+            revision_after = db.execute(
+                "SELECT revision FROM daily_archives WHERE research_day=?", (day,)).fetchone()[0]
+        self.assertEqual(archive.archive_key(day), expected_key)
+        self.assertGreater(revision_after, revision_before)
+        self.assertEqual(updated["summary"]["outcome_labels"]["TP_OBSERVED"], 1)
+        self.assertEqual(updated["summary"]["learning_tags"]["breakout_retest"], 1)
+        self.assertEqual(updated["cases"][0]["outcome"]["mae_pct"], -0.4)
+        self.assertEqual(len(updated["cases"][0]["future_candles"]), 1)
+
+    def test_day_boundary_uses_paris_01_00_even_on_dst_transition(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        p = ZoneInfo("Europe/Paris")
+        before = datetime(2026, 11, 18, 0, 59, tzinfo=p)
+        after = datetime(2026, 11, 18, 1, 0, tzinfo=p)
+        self.assertEqual(archive.research_day(int(before.timestamp()*1000)), "2026-11-17")
+        self.assertEqual(archive.research_day(int(after.timestamp()*1000)), "2026-11-18")
+        s, e = archive.bounds("2026-10-24")
+        self.assertEqual((e.timestamp() - s.timestamp()) / 3600, 25)
+
+    def test_archive_reuploads_same_key_after_late_update(self):
+        rec = self.insert()
+        captured = []
+        now = int(time.time()*1000)
+        def send(key, body):
+            import json
+            captured.append((key, json.loads(body)))
+        with patch("crash_report_storage.r2_configured", return_value=True), \
+             patch.object(archive, "_put_r2", side_effect=send):
+            self.assertTrue(archive.sync_due(ai._database, now_ms=now))
+            self.assertFalse(archive.sync_due(ai._database, now_ms=now+1000))
+            rec["state"] = "COMPLETE"
+            rec["outcome"] = {"label": "NO_TP_8H", "coverage_complete": True}
+            ai._save(rec)
+            self.assertTrue(archive.sync_due(ai._database,
+                                             now_ms=now+archive.MIN_REUPLOAD_MS+1))
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0][0], captured[1][0])
+        self.assertEqual(captured[0][1]["summary"]["states"], {"QUEUED": 1})
+        self.assertEqual(captured[1][1]["summary"]["states"], {"COMPLETE": 1})
+
+    def test_failed_daily_upload_retries_without_data_loss(self):
+        self.insert()
+        now = int(time.time()*1000)
+        with patch("crash_report_storage.r2_configured", return_value=True):
+            with patch.object(archive, "_put_r2", side_effect=OSError("offline")):
+                self.assertFalse(archive.sync_due(ai._database, now_ms=now))
+            with ai._database() as db:
+                self.assertEqual(db.execute(
+                    "SELECT uploaded_revision FROM daily_archives").fetchone()[0], 0)
+            with patch.object(archive, "_put_r2", return_value=None):
+                self.assertTrue(archive.sync_due(
+                    ai._database, now_ms=now+archive.MIN_REUPLOAD_MS+1))
 
     def test_r2_missing_does_not_fake_uploaded_success(self):
         rec = self.insert()
