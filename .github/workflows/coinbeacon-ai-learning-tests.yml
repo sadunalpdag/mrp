@@ -3,6 +3,9 @@ on:
   pull_request:
     paths:
       - 'coinbeacon_ai_learning.py'
+      - 'coinbeacon_ai_settings.py'
+      - 'coinbeacon_ai_dashboard.py'
+      - 'test_coinbeacon_ai_dashboard.py'
       - 'test_coinbeacon_ai_learning.py'
       - 'cb2_live_momentum.py'
       - 'coinbeacon_six_paper.py'
@@ -24,4 +27,4 @@ jobs:
       - name: Install test dependencies
         run: pip install requests
       - name: Verify isolated observer without cloud credentials
-        run: python -m unittest -v test_coinbeacon_ai_learning.py
+        run: python -m unittest -v test_coinbeacon_ai_learning.py test_coinbeacon_ai_dashboard.py
