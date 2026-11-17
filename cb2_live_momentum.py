@@ -467,10 +467,18 @@ def sheet_sync(db):
         if raw.startswith("{") else Credentials.from_service_account_file(raw,scopes=scopes)
     workbook=gspread.authorize(creds).open_by_key(sheet_id)
     data=export(db)
+    real_phases = {}
+    if os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1":
+        try:
+            from cb2_real_executor import snapshot_phases
+            real_phases = snapshot_phases()
+        except Exception:
+            LOG.warning("[CB2 MOMENTUM REAL SHEET] status snapshot unavailable")
     fields=["Gün (Paris)","Coin","Formasyon","Durum","Sinyal UTC","SQS",
             "ADX14","24s %","MACD histogram","Filtre","Sanal Giriş",
             "TP +%1","TP zamanı","Maks. düşüş %","Alış limiti gölge",
-            "Crash kullanılan/limit","Telegram","Veri durumu","Kaynak ID"]
+            "Crash kullanılan/limit","Telegram","Veri durumu","Kaynak ID",
+            "Gerçek Emir (Binance)"]
     values=[["CB2 CANLI ÜÇLÜ FİLTRE | SADECE SANAL TAKİP | GERÇEK EMİR YOK"],
             ["Veri UTC: "+data["generated_at_utc"]],
             ["Tarih","Aday","Geçen","TP","Sanal açık/bekleyen","Crash günlük limite takılan","İndikatör bekleyen"]]
@@ -488,7 +496,8 @@ def sheet_sync(db):
                        x.get("filters_passed"),x.get("entry_price"),x.get("tp_price"),
                        x.get("tp_at_candle_close"),x.get("max_drawdown_pct"),
                        cap.get("status"),str(cap.get("used",""))+"/"+str(cap.get("limit","")),
-                       x.get("notified",False),x.get("data_note"),x["id"]])
+                       x.get("notified",False),x.get("data_note"),x["id"],
+                       real_phases.get(x["id"], x.get("real_order_request", "PAPER_ONLY"))])
     try:
         ws=workbook.worksheet(SHEET)
     except gspread.WorksheetNotFound:
