@@ -994,6 +994,13 @@ def run():
     with sqlite3.connect(DB, timeout=10) as db, requests.Session() as http:
         initialize(db)
         client = MarketClient(http)
+        # Optional isolated AI-Learning worker resumes WS follow-ups on restart.
+        if os.getenv("CB_AI_LEARNING_ENABLED", "0") == "1":
+            try:
+                import coinbeacon_ai_learning
+                coinbeacon_ai_learning.start()
+            except Exception as exc:
+                LOG.warning("[CB AI STARTUP] %s", type(exc).__name__)
         LOG.info("6 paper strategies started; api2_configured=%s, orders=DISABLED",
                  bool(client.key))
         while True:
