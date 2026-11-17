@@ -504,7 +504,20 @@ def sheet_sync(db):
         ws=workbook.add_worksheet(title=SHEET,rows=max(1000,len(values)+100),cols=len(fields))
     if ws.row_count<len(values):
         ws.add_rows(len(values)-ws.row_count+100)
-    ws.update(range_name="A1",values=values,value_input_option="RAW")
+    # Sheets values.update only overwrites cells included in each row.
+    # A short REJECTED_FILTER row previously left another coin's entry/TP
+    # values in trailing cells of the SAME visible row.
+    width = len(fields)
+    rectangular = [
+        [(value if value is not None else "") for value in row] +
+        [""] * (width - len(row))
+        for row in values
+    ]
+    ws.update(range_name="A1", values=rectangular, value_input_option="RAW")
+    # When the signal list shrinks, remove rows left from the earlier export.
+    # This worksheet is dedicated exclusively to CB2_MOMENTUM_CANLI.
+    if ws.row_count > len(rectangular):
+        ws.batch_clear([f"A{len(rectangular)+1}:T{ws.row_count}"])
     LOG.info("[CB2 MOMENTUM SHEETS] rows=%d tab=%s",len(values),SHEET)
 
 
