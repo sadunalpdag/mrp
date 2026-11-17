@@ -4,7 +4,7 @@ This module deliberately NEVER imports or mutates the Crash executor.
 It validates a fresh 15m three-filter signal and computes a marketable
 LIMIT BUY at the current Binance best ask (rounded UP to tick size).
 A future independent executor must own durable idempotent BUY/TP and
-a truly shared daily entry reservation before live activation.
+independent durable BUY/TP reconciliation before live activation.
 """
 import json
 import math
@@ -126,8 +126,9 @@ def gate_shared_capacity(snapshot, cb2_orders, active_positions, opening_orders,
     own = [o for o in cb2_orders if isinstance(o, dict)
            and o.get("day") == snapshot["day"]
            and o.get("entry_never_sent") is not True]
-    if snapshot["crash_used"] + len(own) >= snapshot["max_daily"]:
-        raise PreflightBlocked("SHARED_DAILY_LIMIT")
+    # Operator explicitly permitted CB2 to exceed the Crash-only daily 50
+    # counter; retain aggregate usage for visibility, not an entry gate.
+    # Crash's own limit remains unchanged.
     if len(active) >= snapshot["max_open_positions"]:
         raise PreflightBlocked("MAX_OPEN_POSITIONS")
     if len(pending) >= snapshot["max_pending_entries"]:
