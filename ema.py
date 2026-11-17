@@ -15902,12 +15902,16 @@ def main():
     _crash_start_services()
     # Separate CB2 real executor. NO modification to Crash Bounce entry/TP logic.
     # Starts only with explicit opt-in. Holds its own ledger, lock and order IDs.
-    if os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1":
+    _cb2_real_dir = os.path.join(DATA_DIR, "cb2_real_execution")
+    # Existing CB2 positions must still be protected after disabling new BUYs.
+    if (os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1"
+            or os.path.exists(os.path.join(_cb2_real_dir, "cb2_real_orders.json"))
+            or os.path.exists(os.path.join(_cb2_real_dir, "cb2_real_orders.initialized"))):
         try:
             from crash_night import BinanceBroker as _CB2BinanceBroker
             from cb2_real_executor import start_executor as _start_cb2_real
             _cb2_real = _start_cb2_real(
-                os.path.join(DATA_DIR, "cb2_real_execution"),
+                _cb2_real_dir,
                 os.path.abspath(os.getenv("CRASH_NIGHT_STATE_DIR", "").strip()
                                 or os.path.join(DATA_DIR, "night_execution")),
                 _CB2BinanceBroker(BINANCE_KEY, BINANCE_SECRET),
