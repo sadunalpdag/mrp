@@ -421,3 +421,12 @@ def enqueue_signal(item):
     if _ACTIVE is None:
         return False
     return _ACTIVE.enqueue(item)
+
+
+def snapshot_phases():
+    """Read-only current real order status for the separate CB2 paper Sheet."""
+    if _ACTIVE is None:
+        return {}
+    with _ACTIVE.lock:
+        return {key: order.get("phase", "UNKNOWN")
+                for key, order in _ACTIVE.state["orders"].items()}
