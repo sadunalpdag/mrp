@@ -151,6 +151,16 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(saved["final_review"]["learning_tags"], ["low_volume"])
 
 
+    def test_optional_volume_and_setup_metadata_preserved_for_learning(self):
+        bars = [dict(x) for x in self.bars]
+        bars[-1]["volume"] = 12345.5
+        item = dict(self.item, source_setup={"tf": "15m", "bias": "bearish"})
+        self.assertTrue(ai._ingest(item, bars, self.now))
+        rec = ai._get(item["id"])
+        self.assertEqual(rec["initial_candles"][-1]["v"], 12345.5)
+        self.assertEqual(rec["source_setup"]["bias"], "bearish")
+        self.assertNotIn("v", rec["initial_candles"][0])
+
     def test_one_daily_archive_preserves_480_candles_and_late_result(self):
         rec = self.insert()
         day = archive.research_day(rec["observed_ms"])
