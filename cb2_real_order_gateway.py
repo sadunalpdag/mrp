@@ -108,7 +108,11 @@ def read_crash_snapshot(root, now):
             used = max(0, int(override["count"]) + used - int(override["raw_at_set"]))
         except (ValueError, TypeError, KeyError):
             raise PreflightBlocked("CRASH_COUNTER_INVALID") from None
-    values.update(crash_used=used, day=date, amount_usdt=amount)
+    quarantined = state.get("symbol_quarantine") or {}
+    if not isinstance(quarantined, dict):
+        raise PreflightBlocked("CRASH_QUARANTINE_INVALID")
+    values.update(crash_used=used, day=date, amount_usdt=amount,
+                  quarantined_symbols=list(quarantined))
     return values
 
 
