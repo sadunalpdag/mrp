@@ -363,6 +363,15 @@ def cycle(db, market, setups, observed_iso):
         item["status"]="PENDING_PRICE" if item["filters_passed"] else "REJECTED_FILTER"
         passed+=int(item["filters_passed"])
         _save(db,item)
+        # Give Gemini the SAME already-fetched CoinBeacon closed 15m bars.
+        # Research-only: never interacts with the CB2 real-order executor.
+        from coinbeacon_ai_settings import load_settings
+        if load_settings()["enabled"]:
+            try:
+                from coinbeacon_ai_learning import submit_candidate
+                submit_candidate(item, bars)
+            except Exception as exc:
+                LOG.warning("[CB AI ENQUEUE] %s", type(exc).__name__)
     # Capture a current quote immediately after indicator approval.
     # No 0.5%/1% pullback and no fabricated next-15m-open entry.
     for item in [x for x in records(db) if x["status"] == "PENDING_PRICE"]:
@@ -453,6 +462,14 @@ def export(db):
             "count":len(items),"signals":items}
 
 
+def _rectangular_sheet_values(values, width):
+    """Explicit blanks overwrite stale cells from an earlier coin/row."""
+    if any(len(row) > width for row in values):
+        raise ValueError("CB2_MOMENTUM_SHEET_ROW_TOO_WIDE")
+    return [[(value if value is not None else "") for value in row] +
+            [""] * (width - len(row)) for row in values]
+
+
 def sheet_sync(db):
     """Standalone tab; existing CB2 and Crash Sheets tabs are unchanged."""
     import gspread
@@ -504,7 +521,10 @@ def sheet_sync(db):
         ws=workbook.add_worksheet(title=SHEET,rows=max(1000,len(values)+100),cols=len(fields))
     if ws.row_count<len(values):
         ws.add_rows(len(values)-ws.row_count+100)
-    ws.update(range_name="A1",values=values,value_input_option="RAW")
+    rectangular = _rectangular_sheet_values(values, len(fields))
+    ws.update(range_name="A1", values=rectangular, value_input_option="RAW")
+    if ws.row_count > len(rectangular):
+        ws.batch_clear([f"A{len(rectangular)+1}:T{ws.row_count}"])
     LOG.info("[CB2 MOMENTUM SHEETS] rows=%d tab=%s",len(values),SHEET)
 
 

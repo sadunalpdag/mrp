@@ -1,0 +1,30 @@
+name: CoinBeacon AI Learning offline tests
+on:
+  pull_request:
+    paths:
+      - 'coinbeacon_ai_learning.py'
+      - 'coinbeacon_ai_settings.py'
+      - 'coinbeacon_ai_dashboard.py'
+      - 'test_coinbeacon_ai_dashboard.py'
+      - 'test_coinbeacon_ai_learning.py'
+      - 'cb2_live_momentum.py'
+      - 'coinbeacon_six_paper.py'
+      - '.github/workflows/coinbeacon-ai-learning-tests.yml'
+  push:
+    paths:
+      - 'coinbeacon_ai_learning.py'
+      - 'test_coinbeacon_ai_learning.py'
+      - 'cb2_live_momentum.py'
+      - 'coinbeacon_six_paper.py'
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: pip install requests
+      - name: Verify isolated observer without cloud credentials
+        run: python -m unittest -v test_coinbeacon_ai_learning.py test_coinbeacon_ai_dashboard.py

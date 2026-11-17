@@ -62,6 +62,15 @@ class MomentumTest(unittest.TestCase):
         self.now=int(time.time()*1000)
     def tearDown(self):
         self.db.close()
+    def test_rejected_rows_blank_old_eva_trade_cells(self):
+        data = [["2026-11-17", "EVAUSDT", "TP_1_PERCENT", 4.0344],
+                ["2026-11-17", "FHEUSDT", "REJECTED_FILTER"]]
+        clean = m._rectangular_sheet_values(data, 20)
+        self.assertEqual(len(clean[1]), 20)
+        self.assertEqual(clean[1][3:], [""] * 17)
+        with self.assertRaises(ValueError):
+            m._rectangular_sheet_values([[1, 2, 3]], 2)
+
     def test_indicators_use_closed_history(self):
         parsed=m._closed_bars(response(self.rows),self.now)
         result,reason=m.indicators(parsed,self.now)
