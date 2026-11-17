@@ -15902,7 +15902,9 @@ def main():
     _crash_start_services()
     # Separate CB2 real executor. NO modification to Crash Bounce entry/TP logic.
     # Starts only with explicit opt-in. Holds its own ledger, lock and order IDs.
-    _cb2_real_dir = os.path.join(DATA_DIR, "cb2_real_execution")
+    _cb2_real_dir = os.path.join(
+        globals().get("DATA_DIR") or os.getenv("DATA_DIR", "/data"),
+        "cb2_real_execution")
     # Existing CB2 positions must still be protected after disabling new BUYs.
     if (os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1"
             or os.path.exists(os.path.join(_cb2_real_dir, "cb2_real_orders.json"))
