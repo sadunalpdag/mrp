@@ -119,6 +119,8 @@ class Executor:
         snapshot = read_crash_snapshot(self.crash_directory, now)
         if self.state["halt"] or any(x.get("blocking") for x in self.state["outbox"]):
             raise PreflightBlocked("CB2_SAFETY_ALERT_PENDING")
+        if rec["symbol"] in snapshot["quarantined_symbols"]:
+            raise PreflightBlocked("CRASH_SYMBOL_QUARANTINED")
         if not os.getenv("BOT_TOKEN") or not os.getenv("CHAT_ID"):
             raise PreflightBlocked("TELEGRAM_NOT_CONFIGURED")
         if any(o is not rec and o["symbol"] == rec["symbol"]
