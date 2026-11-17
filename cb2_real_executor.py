@@ -107,6 +107,8 @@ class Executor:
             return True
 
     def _halt(self, rec, reason):
+        if self.state["halt"]:
+            return  # Never flood or reset an existing protective halt.
         self.state["halt"] = reason
         self._save()
         self._alert("⚠️ CB2 GERÇEK İŞLEM KORUMA | " + rec["symbol"] +
@@ -182,9 +184,7 @@ class Executor:
             # Timeout/unknown POST: NEVER submit again; exact-ID query only.
             rec["reason"] = "BUY_RESPONSE_UNCERTAIN_" + type(exc).__name__
             self._save()
-            self._alert("⚠️ CB2 ALIŞ SONUCU BELİRSİZ | " + symbol +
-                        "\nAynı BUY tekrar gönderilmeyecek; Binance emir kimliği sorgulanacak.",
-                        blocking=True)
+            self._halt(rec, "CB2_BUY_RESPONSE_UNCERTAIN")
             return
         LOG.info("[CB2 REAL BUY POST] %s client=%s", symbol, rec["entry_id"])
         self._reconcile_entry(rec)
@@ -247,10 +247,7 @@ class Executor:
                     if qty > 0 and not rec.get("partial_fill_warned"):
                         rec["partial_fill_warned"] = True
                         self._save()
-                        self._alert("⚠️ CB2 KISMİ DOLUM | " + symbol +
-                                    "\nBUY iptal sonucu henüz kesinleşmedi; "
-                                    "TP koruması doğrulanana kadar CB2 yeni girişleri bekletildi.",
-                                    blocking=True)
+                        self._halt(rec, "CB2_PARTIAL_FILL_NOT_PROTECTED")
                     return
                 if status in ("NEW", "PARTIALLY_FILLED"):
                     rec["next_check"] = self.clock() + 15
@@ -258,10 +255,7 @@ class Executor:
                     if qty > 0 and not rec.get("partial_fill_warned"):
                         rec["partial_fill_warned"] = True
                         self._save()
-                        self._alert("⚠️ CB2 KISMİ DOLUM | " + symbol +
-                                    "\nEmir kısmen dolmuş, kalan miktarın iptali doğrulanamadı. "
-                                    "TP henüz aktif değil; Binance emirlerini kontrol edin.",
-                                    blocking=True)
+                        self._halt(rec, "CB2_PARTIAL_FILL_CANCEL_UNCONFIRMED")
                     return
                 # On CANCELED/FILLED/EXPIRED with nonzero quantity below,
                 # place TP immediately using the final exact-ID fill details.
