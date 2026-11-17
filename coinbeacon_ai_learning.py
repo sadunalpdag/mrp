@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from coinbeacon_ai_settings import load_settings
 
 LOG = logging.getLogger("coinbeacon_ai_learning")
 INTERVAL = 900_000
@@ -40,7 +41,7 @@ SYSTEM = (
 
 
 def enabled():
-    return os.getenv("CB_AI_LEARNING_ENABLED", "0") == "1"
+    return load_settings()["enabled"]
 
 
 def _dbfile():
@@ -133,7 +134,7 @@ def _ingest(item, bars, when_ms=None):
     }
     with _LOCK, _database() as db:
         active = db.execute("SELECT COUNT(*) FROM cases WHERE state IN ('QUEUED','TRACKING','REVIEW_PENDING')").fetchone()[0]
-        if active >= int(os.getenv("CB_AI_MAX_ACTIVE", "20")):
+        if active >= load_settings()["max_active"]:
             return False
         exists = db.execute("SELECT 1 FROM cases WHERE id=?", (snap["id"],)).fetchone()
         if exists:
@@ -156,7 +157,7 @@ def submit_candidate(item, closed_bars):
 def _reserve_gemini_call():
     """Local safety budget; model quotas remain enforced by Google's API."""
     day = datetime.now(timezone.utc).date().isoformat()
-    cap = max(0, int(os.getenv("CB_AI_DAILY_GEMINI_CALL_CAP", "50")))
+    cap = load_settings()["daily_call_cap"]
     with _LOCK, _database() as db:
         current = db.execute("SELECT count FROM quotas WHERE day=?", (day,)).fetchone()
         count = current[0] if current else 0
@@ -260,7 +261,10 @@ def _initial(record):
     record["initial_raw"] = raw
     record["planned_ms"] = now
     record["first_full_open_ms"] = ((now + INTERVAL - 1) // INTERVAL) * INTERVAL
-    record["deadline_ms"] = now + HORIZON
+    config = load_settings()
+    record["deadline_ms"] = now + config["track_hours"] * 3_600_000
+    record["check_minutes"] = config["check_minutes"]
+    record["analysis_phase"] = config["analysis_phase"]
     record["state"] = "TRACKING"
     _save(record)
 
@@ -340,7 +344,11 @@ def _on_kline(symbol, raw):
                 continue
             rec["future_candles"].append(bar)
             rec["future_candles"] = sorted(rec["future_candles"], key=lambda x: x["t"])[-40:]
-            rec["outcome"] = _update_outcome(rec)
+            # Persist every 15m candle; optionally recalculate only every
+            # 15/30/60 minutes. No tick data or extra REST calls are needed.
+            cadence = rec.get("check_minutes", 15) * 60000
+            if (bar["t"] + INTERVAL) % cadence == 0:
+                rec["outcome"] = _update_outcome(rec)
             _save(rec)
 
 
@@ -387,6 +395,15 @@ def _expiry(record):
 
 
 def _final(record):
+    if record.get("analysis_phase", "both") == "initial":
+        record["final_review"] = {"result_summary": "AI final review disabled by Dashboard",
+                                  "initial_thesis_correct": None,
+                                  "failure_modes": [], "learning_tags": [],
+                                  "suggested_filter_changes": []}
+        record["state"] = "COMPLETE"
+        record["finished_at_ms"] = int(time.time() * 1000)
+        _save(record)
+        return
     frozen = {"initial": {k: record[k] for k in
               ("symbol", "archetype", "sqs", "observed_ms", "initial_plan", "indicators")},
               "future_candles": record["future_candles"],
