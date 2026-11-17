@@ -391,7 +391,22 @@ def cycle(db, market, setups, observed_iso):
         item["status"]="PAPER_OPEN"
         item["data_note"]="LIVE_QUOTE_ENTRY_FIRST_PARTIAL_BAR_EXCLUDED"
         _save(db,item)
-        item["notified"]=bool(_notify(item))
+        real_queued = False
+        if os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1":
+            try:
+                # The separate signed Binance executor owns actual LIMIT,
+                # fill, TP and Telegram reconciliation; no broker call here.
+                from cb2_real_executor import enqueue_signal
+                real_queued = bool(enqueue_signal(item))
+            except Exception as exc:
+                LOG.warning("[CB2 REAL QUEUE ERR] %s", type(exc).__name__)
+        if real_queued:
+            item["real_order_request"] = "QUEUED_SEPARATE_EXECUTOR"
+            # The real executor will send exchange-confirmed messages.
+            item["notified"] = False
+        else:
+            item["real_order_request"] = "NONE_PAPER_ONLY"
+            item["notified"] = bool(_notify(item))
         _save(db,item)
     # Intraday follow-up uses budgeted closed OHLCV; late/missing bars remain
     # eligible for the existing next-day published Binance ZIP archive analysis.
