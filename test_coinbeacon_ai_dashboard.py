@@ -17,7 +17,7 @@ class MockTab:
         self.rows = rows or []
 
     def get(self, area):
-        assert area == "J1:O7"
+        assert area == "J1:O8"
         return self.rows
 
 
@@ -48,7 +48,18 @@ class GeminiDashboardTest(unittest.TestCase):
     def rows(self):
         return [dashboard.HEADER] + [
             [label, "", "", "", "", ""] for _, label, _ in dashboard.ROWS
-        ]
+        ] + [[dashboard.DAILY_LABEL, "", "", "", "", ""]]
+
+    def test_daily_counter_is_read_only(self):
+        tab = MockTab(self.rows())
+        sheet = MockWorkbook()
+        with patch("coinbeacon_ai_learning.daily_dispatch_stats", return_value={
+                "coins": 3, "signals": 5, "start": "2026-11-17 01:00",
+                "end": "2026-11-18 01:00"}):
+            self.assertEqual(dashboard.sync_panel(sheet, tab), 0)
+        left = next(x for x in sheet.writes if x["range"].endswith("J1:K8"))
+        self.assertEqual(left["values"][-1], [dashboard.DAILY_LABEL, "3 coin / 5 sinyal"])
+        self.assertEqual(config.load_settings()["enabled"],False)
 
     def test_initialization_only_j_to_o_does_not_toggle(self):
         sheet = MockWorkbook()
