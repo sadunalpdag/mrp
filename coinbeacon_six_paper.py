@@ -856,6 +856,13 @@ def json_archive(db, current=None):
         raise ValueError("R2_ANALYSIS_JSON_SIZE_MISMATCH")
     LOG.info("[CB2 INDEPENDENT] previous-day analysis saved key=%s signals=%d",
              analysis_key, len(daily_signals))
+    if os.getenv("CB2_LIVE_MOMENTUM_ENABLED", "0") == "1":
+        try:
+            import cb2_live_momentum as live_momentum
+            live_momentum.r2_upload(db, client, bucket, current)
+        except Exception as exc:
+            LOG.warning("[CB2 MOMENTUM R2 ERR] %s: %s",
+                        type(exc).__name__, str(exc)[:140])
     put_meta(db, "cb2_analysis_json_enabled", "1")
     put_meta(db, "json_day", date)
     put_meta(db, "json_upload_at", time.time())
@@ -912,6 +919,16 @@ def cycle(db, market):
         new_signals, fresh_count = cb2_independent.capture_setups(
             db, setups, current, trend)
 
+    # Additional read-only CB2 live momentum observer. Reuses EXACTLY the
+    # same already-paid /public/setups response; legacy studies remain intact.
+    if os.getenv("CB2_LIVE_MOMENTUM_ENABLED", "0") == "1":
+        try:
+            import cb2_live_momentum as live_momentum
+            live_momentum.cycle(db, market, setups, current)
+        except Exception as exc:
+            LOG.warning("[CB2 MOMENTUM ERR] %s: %s",
+                        type(exc).__name__, str(exc)[:140])
+
     liq = run_paid_board(db, market, "liquidations",
                          "/public/liquidations/board")
     if liq:
@@ -959,6 +976,13 @@ def cycle(db, market):
         sheet_sync(db)
     except Exception as exc:
         LOG.warning("Sheets sync failed (%s): %s", type(exc).__name__, str(exc)[:140])
+    if os.getenv("CB2_LIVE_MOMENTUM_ENABLED", "0") == "1":
+        try:
+            import cb2_live_momentum as live_momentum
+            live_momentum.sheet_sync(db)
+        except Exception as exc:
+            LOG.warning("[CB2 MOMENTUM SHEETS ERR] %s: %s",
+                        type(exc).__name__, str(exc)[:140])
     try:
         json_archive(db)
     except Exception as exc:
