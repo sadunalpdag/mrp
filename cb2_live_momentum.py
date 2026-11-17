@@ -300,6 +300,78 @@ def _update_paper(item, bars, now_ms):
     return changed
 
 
+def _ai_unfiltered_cycle(db, market, setups, observed_iso, candle_cache):
+    """Independent paper-only intake. No real-order eligibility changes."""
+    from coinbeacon_ai_settings import load_settings
+    if not load_settings()["enabled"] or not isinstance(setups, dict):
+        return
+    from coinbeacon_ai_learning import submit_candidate
+    now = int(datetime.fromisoformat(observed_iso.replace("Z","+00:00")).timestamp()*1000)
+    utc_day = datetime.fromtimestamp(now/1000, timezone.utc).date().isoformat()
+    db.execute("""CREATE TABLE IF NOT EXISTS cb_ai_intake
+                  (id TEXT PRIMARY KEY, payload TEXT NOT NULL, status TEXT NOT NULL)""")
+    # Intake uses the existing /public/setups result, even if SQS, bias,
+    # archetype and technical indicators would reject it for CB2 trading.
+    for row in setups.get("setups") or []:
+        if not isinstance(row, dict):
+            continue
+        symbol = row.get("symbol")
+        if not isinstance(symbol, str) or not symbol.endswith("USDT"):
+            continue
+        if row.get("tf") != "15m":
+            continue
+        try:
+            computed = int(float(row.get("computedAt")))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if computed > now + 10*60000 or now - computed > 50*60000:
+            continue
+        arch = row.get("archetype") or {}
+        kind = arch.get("key", "unknown") if isinstance(arch, dict) else "unknown"
+        try:
+            age = max(0, int(arch.get("barsSinceTrigger", 0))) if isinstance(arch, dict) else 0
+        except (TypeError, ValueError):
+            age = 0
+        signal_ms = computed - age*FIFTEEN_MS
+        identifier = hashlib.sha256((symbol+"|"+str(kind)+"|"+str(signal_ms)).encode()).hexdigest()[:24]
+        item = {"id":identifier, "symbol":symbol, "archetype":kind,
+                "sqs":_number(row.get("sqs")), "observed_ms":now,
+                "source_signal_at":_iso(signal_ms),
+                "reference_price":_number(row.get("price")),
+                "indicators":{}}
+        db.execute("INSERT OR IGNORE INTO cb_ai_intake(id,payload,status) VALUES (?,?,?)",
+                   (identifier,json.dumps(item),"PENDING_CANDLES"))
+    db.commit()
+    queued = 0
+    for identifier, payload in db.execute(
+            "SELECT id,payload FROM cb_ai_intake WHERE status='PENDING_CANDLES' "
+            "ORDER BY rowid LIMIT ?", (MAX_NEW_CANDLES_PER_CYCLE,)).fetchall():
+        item = json.loads(payload)
+        if now - item["observed_ms"] > 6*3600000:
+            db.execute("UPDATE cb_ai_intake SET status='EXPIRED_DATA' WHERE id=?", (identifier,))
+            continue
+        result, reason = _api_bars(db, market, item["symbol"], utc_day, candle_cache)
+        if result is None:
+            LOG.info("[CB AI INTAKE] symbol=%s deferred=%s",item["symbol"],reason)
+            if "BUDGET" in reason or "QUOTA" in reason:
+                break
+            continue
+        bars = _closed_bars(result, item["observed_ms"])
+        if len(bars) < 480 or any(b["open_ms"]-a["open_ms"] != FIFTEEN_MS
+                                  for a,b in zip(bars[-480:],bars[-479:])):
+            LOG.info("[CB AI INTAKE] symbol=%s deferred=INCOMPLETE_480_BARS",item["symbol"])
+            continue
+        if submit_candidate(item, bars[-480:]):
+            queued += 1
+            db.execute("UPDATE cb_ai_intake SET status='QUEUED' WHERE id=?", (identifier,))
+        else:
+            # Retain pending state for capacity retries, but avoid hot-loop churn.
+            LOG.info("[CB AI INTAKE] symbol=%s deferred=QUEUE_CAP_OR_DUPLICATE",item["symbol"])
+    db.commit()
+    LOG.info("[CB AI INTAKE] queued=%d pending=%d", queued, db.execute(
+        "SELECT COUNT(*) FROM cb_ai_intake WHERE status='PENDING_CANDLES'").fetchone()[0])
+
+
 def cycle(db, market, setups, observed_iso):
     """Store all candidates, evaluate three filters, track filtered paper outcomes.
 
@@ -363,15 +435,6 @@ def cycle(db, market, setups, observed_iso):
         item["status"]="PENDING_PRICE" if item["filters_passed"] else "REJECTED_FILTER"
         passed+=int(item["filters_passed"])
         _save(db,item)
-        # Give Gemini the SAME already-fetched CoinBeacon closed 15m bars.
-        # Research-only: never interacts with the CB2 real-order executor.
-        from coinbeacon_ai_settings import load_settings
-        if load_settings()["enabled"]:
-            try:
-                from coinbeacon_ai_learning import submit_candidate
-                submit_candidate(item, bars)
-            except Exception as exc:
-                LOG.warning("[CB AI ENQUEUE] %s", type(exc).__name__)
     # Capture a current quote immediately after indicator approval.
     # No 0.5%/1% pullback and no fabricated next-15m-open entry.
     for item in [x for x in records(db) if x["status"] == "PENDING_PRICE"]:
@@ -434,6 +497,10 @@ def cycle(db, market, setups, observed_iso):
         bars=_closed_bars(result,now)
         updates+=int(_update_paper(item,bars,now))
         _save(db,item)
+    try:
+        _ai_unfiltered_cycle(db, market, setups, observed_iso, candle_cache)
+    except Exception as exc:
+        LOG.warning("[CB AI INTAKE ERR] %s", type(exc).__name__)
     LOG.info("[CB2 MOMENTUM] new=%d pass=%d updated=%d tracked=%d",
              new,passed,updates,len(records(db)))
     return {"new":new,"passed":passed,"updates":updates}
