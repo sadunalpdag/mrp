@@ -21,7 +21,8 @@ ALLOWED = {"pattern_breakout", "trendline_break", "breakout_retest"}
 SHEET = "CB2_MOMENTUM_CANLI"
 MAX_NEW_CANDLES_PER_CYCLE = 12
 MAX_TRACK_CANDLES_PER_CYCLE = 8
-MAX_EXTRA_CREDITS_PER_UTC_DAY = 250
+MAX_EXTRA_CREDITS_PER_UTC_DAY = 350
+MAX_QUOTES_PER_UTC_DAY = 90
 MAX_ROWS = 3000
 
 
@@ -188,21 +189,53 @@ def _capacity_shadow(at_ms):
                 "note": "Crash local counter unavailable; Binance capacity not queried"}
 
 
-def _api_bars(db, market, symbol, day):
+def _api_bars(db, market, symbol, day, cache=None):
+    # Reuse a single call when the same symbol has several CB2 setups.
+    if cache is not None and symbol in cache:
+        return cache[symbol]
     key = "credits_" + day
     used = int(_read(db,key,"0"))
     if used >= MAX_EXTRA_CREDITS_PER_UTC_DAY:
         return None, "CB2_DAILY_BUDGET_EXHAUSTED"
-    # MarketClient.cb itself checks shared account daily/minute quota and
-    # maintains its 400-credit reserve for existing scanners.
+    # MarketClient.cb checks shared-account quota and preserves 400 credits
+    # for the existing CoinBeacon scanners. Never bypass that protection.
     result = market.cb("/public/ohlcv/binance-futures/" + symbol + "/15m",
                        1, {"limit": 500})
     if result is None:
         return None, "COINBEACON_QUOTA_OR_REQUEST_UNAVAILABLE"
     _write(db,key,used+1)
-    if result.get("symbol") != symbol:
+    if result.get("symbol") != symbol or result.get("exchange") != "binance-futures":
         return None, "OHLCV_WRONG_SYMBOL"
-    return result, "OK"
+    output = result, "OK"
+    if cache is not None:
+        cache[symbol] = output
+    return output
+
+
+def _quote_now(db, market, symbol, utc_day):
+    """Fresh CoinBeacon batch quote. Never substitute stale setup snapshot."""
+    key = "quotes_" + utc_day
+    used = int(_read(db, key, "0"))
+    if used >= MAX_QUOTES_PER_UTC_DAY:
+        return None, "QUOTE_BUDGET_EXHAUSTED"
+    pair = "binance-futures:" + symbol
+    response = market.cb("/public/market/quotes/batch", 5, {"m": pair})
+    if response is None:
+        return None, "QUOTE_QUOTA_OR_REQUEST_UNAVAILABLE"
+    _write(db, key, used+1)
+    if not isinstance(response, dict):
+        return None, "QUOTE_BAD_RESPONSE"
+    for row in response.get("quotes") or []:
+        if row.get("m") == pair and row.get("venueId") == "binance-futures":
+            p = _number(row.get("price"))
+            if p is None or p <= 0:
+                return None, "QUOTE_NO_PRICE"
+            # Batch quotes are live/cache snapshots; age is recorded, not guessed.
+            asof = _number(response.get("asOf"))
+            if asof is None or abs(_now_ms() - asof) > 60 * 1000:
+                return None, "QUOTE_STALE"
+            return (p, int(asof)), "OK"
+    return None, "QUOTE_SYMBOL_MISSING"
 
 
 def _notify(item):
@@ -242,14 +275,10 @@ def _update_paper(item, bars, now_ms):
         if bar["open_ms"] > expected:
             item["data_gap"] = True
         if item.get("entry_price") is None:
-            if bar["open_ms"] != entry_ms:
-                item["data_gap"]=True
-                item["status"]="DATA_GAP"
-                break
-            item["entry_price"]=bar["open"]
-            item["tp_price"]=round(bar["open"]*1.01,12)
-            item["entered_at"]=_iso(entry_ms)
-            item["lowest_price"]=bar["open"]
+            # No paper fill unless a real-time quote was captured at approval.
+            item["status"]="PENDING_PRICE"
+            item["data_note"]="MISSING_LIVE_ENTRY_QUOTE"
+            break
         item["lowest_price"]=min(item["lowest_price"],bar["low"])
         item["max_drawdown_pct"]=round(100*(item["lowest_price"]/item["entry_price"]-1),4)
         item["last_bar_ms"]=bar["open_ms"]
@@ -279,6 +308,7 @@ def cycle(db, market, setups, observed_iso):
     now = int(datetime.fromisoformat(observed_iso.replace("Z","+00:00")).timestamp()*1000)
     utc_day = datetime.fromtimestamp(now/1000,timezone.utc).date().isoformat()
     new, passed, updates = 0, 0, 0
+    candle_cache = {}
     if isinstance(setups,dict):
         for row, kind, event_ms in _fresh_setups(setups, observed_iso):
             sqs = _number(row.get("sqs"))
@@ -295,7 +325,7 @@ def cycle(db, market, setups, observed_iso):
                 "source_signal_at":_iso(event_ms),"reference_price":_number(row.get("price")),
                 "status":"PENDING_CANDLES","filters_passed":None,
                 "indicators":None,"data_note":"WAITING_COINBEACON_OHLCV",
-                "capacity":None,"entry_bar_ms":((now+FIFTEEN_MS-1)//FIFTEEN_MS)*FIFTEEN_MS,
+                "capacity":None,"entry_bar_ms":None,
                 "entry_price":None,"tp_price":None,"data_gap":False,
                 "last_bar_ms":None,"last_candle_request_ms":0,
             }
@@ -311,7 +341,7 @@ def cycle(db, market, setups, observed_iso):
             item["data_note"]="SIGNAL_TIME_CANDLE_HISTORY_EXPIRED"
             _save(db,item)
             continue
-        result, reason = _api_bars(db,market,item["symbol"],utc_day)
+        result, reason = _api_bars(db,market,item["symbol"],utc_day,candle_cache)
         if result is None:
             item["data_note"]=reason
             _save(db,item)
@@ -328,19 +358,46 @@ def cycle(db, market, setups, observed_iso):
         item["data_note"]="OK"
         item["filters_passed"]=(ind["adx14"]>=20
              and ind["change24_pct"]>=10 and ind["macd_histogram"]>0)
-        item["status"]="PAPER_PENDING" if item["filters_passed"] else "REJECTED_FILTER"
-        if item["filters_passed"]:
-            item["capacity"]=_capacity_shadow(item["observed_ms"])
-            item["notified"]=bool(_notify(item))
-            passed+=1
+        item["status"]="PENDING_PRICE" if item["filters_passed"] else "REJECTED_FILTER"
+        passed+=int(item["filters_passed"])
+        _save(db,item)
+    # Capture a current quote immediately after indicator approval.
+    # No 0.5%/1% pullback and no fabricated next-15m-open entry.
+    for item in [x for x in records(db) if x["status"] == "PENDING_PRICE"]:
+        if now - item["observed_ms"] >= FIFTEEN_MS:
+            item["status"]="QUOTE_EXPIRED_NO_ENTRY"
+            item["data_note"]="QUOTE_NOT_AVAILABLE_WITHIN_15M_OF_FIRST_OBSERVATION"
+            _save(db,item)
+            continue
+        quote, reason = _quote_now(db,market,item["symbol"],utc_day)
+        if quote is None:
+            item["data_note"]=reason
+            _save(db,item)
+            if "QUOTA" in reason or "BUDGET" in reason:
+                break
+            continue
+        price, price_ms=quote
+        item["entry_price"]=price
+        item["tp_price"]=round(price*1.01,12)
+        item["entered_at"]=_iso(price_ms)
+        # The entry candle is only partly observable using 15m OHLCV.
+        # Begin TP analysis at the first FULL candle after quote time;
+        # never claim a TP occurred before the paper entry.
+        item["entry_bar_ms"]=((price_ms//FIFTEEN_MS)+1)*FIFTEEN_MS
+        item["lowest_price"]=price
+        item["capacity"]=_capacity_shadow(price_ms)
+        item["status"]="PAPER_OPEN"
+        item["data_note"]="LIVE_QUOTE_ENTRY_FIRST_PARTIAL_BAR_EXCLUDED"
+        _save(db,item)
+        item["notified"]=bool(_notify(item))
         _save(db,item)
     # Intraday follow-up uses budgeted closed OHLCV; late/missing bars remain
     # eligible for the existing next-day published Binance ZIP archive analysis.
     pending=[x for x in records(db)
-             if x["status"] in ("PAPER_PENDING","PAPER_OPEN","DATA_GAP")
+             if x["status"] in ("PAPER_OPEN","DATA_GAP")
              and now-x.get("last_candle_request_ms",0)>=FIFTEEN_MS]
     for item in sorted(pending,key=lambda x:x.get("last_candle_request_ms",0))[:MAX_TRACK_CANDLES_PER_CYCLE]:
-        result,reason=_api_bars(db,market,item["symbol"],utc_day)
+        result,reason=_api_bars(db,market,item["symbol"],utc_day,candle_cache)
         item["last_candle_request_ms"]=now
         if result is None:
             item["data_note"]=reason
@@ -368,7 +425,7 @@ def export(db):
         d["candidates"]+=1
         d["passed"]+=int(x.get("filters_passed") is True)
         d["tp"]+=int(x["status"]=="TP_1_PERCENT")
-        d["paper_open"]+=int(x["status"] in ("PAPER_PENDING","PAPER_OPEN","DATA_GAP"))
+        d["paper_open"]+=int(x["status"] in ("PENDING_PRICE","PAPER_OPEN","DATA_GAP"))
         d["blocked_daily"]+=int((x.get("capacity") or {}).get("status")=="DAILY_LIMIT_REACHED")
         d["missing_indicators"]+=int(x["status"] in ("PENDING_CANDLES","INDICATORS_UNAVAILABLE"))
     return {"generated_at_utc":_iso(now),"mode":"LIVE_SIGNAL_PAPER_ONLY_NO_BINANCE_ORDERS",
