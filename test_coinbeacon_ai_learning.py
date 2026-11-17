@@ -17,8 +17,8 @@ class LearningTests(unittest.TestCase):
         self.now = (int(time.time() * 1000) // ai.INTERVAL) * ai.INTERVAL - 1
         last_open = self.now - ai.INTERVAL + 1
         self.bars = []
-        for index in range(96):
-            opened = last_open - (95 - index) * ai.INTERVAL
+        for index in range(480):
+            opened = last_open - (479 - index) * ai.INTERVAL
             self.bars.append({"open_ms": opened, "close_ms": opened+ai.INTERVAL-1,
                               "open": 100.0, "high": 100.6, "low": 99.5, "close": 100.2})
         self.item = {"id": "0123456789abcdef01234567", "symbol": "TESTUSDT",
@@ -32,7 +32,26 @@ class LearningTests(unittest.TestCase):
 
     def insert(self):
         self.assertTrue(ai._ingest(self.item, self.bars, self.now))
-        return ai._get(self.item["id"])
+        rec = ai._get(self.item["id"])
+        self.assertEqual(len(rec["initial_candles"]), 480)
+        return rec
+
+    def test_paris_01_to_01_dispatch_counts_unique_symbols(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        paris = ZoneInfo("Europe/Paris")
+        now = int(datetime(2026, 11, 18, 0, 30, tzinfo=paris).timestamp()*1000)
+        previous = int(datetime(2026, 11, 17, 0, 30, tzinfo=paris).timestamp()*1000)
+        with ai._database() as db:
+            for ident, symbol, when in (("a","BTCUSDT",now),("b","BTCUSDT",now),
+                                         ("c","ETHUSDT",now),("old","SOLUSDT",previous)):
+                db.execute("INSERT INTO gemini_dispatches(case_id,symbol,phase,sent_ms) VALUES(?,?,?,?)",
+                           (ident,symbol,"initial",when))
+            db.commit()
+        result = ai.daily_dispatch_stats(now)
+        self.assertEqual(result["signals"],3)
+        self.assertEqual(result["coins"],2)
+        self.assertEqual(result["start"],"2026-11-17 01:00")
 
     def test_duplicate_is_not_queued_again(self):
         self.insert()
