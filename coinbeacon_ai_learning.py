@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
+import coinbeacon_ai_daily_archive as daily_archive
 from coinbeacon_ai_settings import load_settings
 
 LOG = logging.getLogger("coinbeacon_ai_learning")
@@ -61,6 +62,7 @@ def _database():
     db.execute("""CREATE TABLE IF NOT EXISTS gemini_dispatches
                (case_id TEXT NOT NULL, symbol TEXT NOT NULL, phase TEXT NOT NULL,
                 sent_ms INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT 'SENT')""")
+    daily_archive.ensure_schema(db)
     db.commit()
     return db
 
@@ -81,8 +83,10 @@ def _get(identifier):
 
 def _save(record):
     with _LOCK, _database() as db:
-        db.execute("UPDATE cases SET state=?, payload=? WHERE id=?",
-                   (record["state"], json.dumps(record, allow_nan=False), record["id"]))
+        db.execute("UPDATE cases SET state=?, payload=?, research_day=? WHERE id=?",
+                   (record["state"], json.dumps(record, allow_nan=False),
+                    daily_archive.research_day(record["observed_ms"]), record["id"]))
+        daily_archive.mark_dirty(db, record["observed_ms"])
         db.commit()
 
 
@@ -145,8 +149,10 @@ def _ingest(item, bars, when_ms=None):
         exists = db.execute("SELECT 1 FROM cases WHERE id=?", (snap["id"],)).fetchone()
         if exists:
             return False
-        db.execute("INSERT INTO cases (id,state,payload) VALUES (?,?,?)",
-                   (snap["id"], "QUEUED", json.dumps(snap, allow_nan=False)))
+        db.execute("INSERT INTO cases (id,state,payload,research_day) VALUES (?,?,?,?)",
+                   (snap["id"], "QUEUED", json.dumps(snap, allow_nan=False),
+                    daily_archive.research_day(snap["observed_ms"])))
+        daily_archive.mark_dirty(db, snap["observed_ms"])
         db.commit()
     return True
 
@@ -454,23 +460,8 @@ def _final(record):
 
 
 def _r2_upload(record):
-    from crash_report_storage import R2_ENV_NAMES, r2_configured
-    if not r2_configured():
-        return False
-    import boto3
-    names = [os.environ[n].strip() for n in R2_ENV_NAMES]
-    stamp = datetime.fromtimestamp(record["observed_ms"]/1000, timezone.utc).strftime("%Y/%m/%d")
-    key = "coinbeacon-ai-learning/{0}/{1}.json".format(stamp, record["id"])
-    client = boto3.client("s3", endpoint_url="https://{0}.r2.cloudflarestorage.com".format(names[0]),
-                          aws_access_key_id=names[2], aws_secret_access_key=names[3],
-                          region_name="auto")
-    body = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-    client.put_object(Bucket=names[1], Key=key, Body=body,
-                      ContentType="application/json")
-    with _LOCK, _database() as db:
-        db.execute("UPDATE cases SET uploaded=1 WHERE id=?", (record["id"],))
-        db.commit()
-    return True
+    """Compatibility wrapper: archive the WHOLE Paris reporting day, not one signal."""
+    return daily_archive.upload_day(_database, daily_archive.research_day(record["observed_ms"]))
 
 
 def _tick():
@@ -498,14 +489,7 @@ def _tick():
                 record["state"] = "AI_ERROR"
             _save(record)
             LOG.warning("[CB AI FINAL] %s %s", record["id"], type(exc).__name__)
-    with _LOCK, _database() as db:
-        rows = db.execute("SELECT payload FROM cases WHERE state IN ('COMPLETE','AI_ERROR') AND uploaded=0 LIMIT 2").fetchall()
-    for row in rows:
-        rec = json.loads(row[0])
-        try:
-            _r2_upload(rec)
-        except Exception as exc:
-            LOG.warning("[CB AI R2] %s %s", rec["id"], type(exc).__name__)
+    daily_archive.sync_due(_database, LOG)
 
 
 def _sync(ws):
@@ -566,7 +550,11 @@ def start():
     with _LOCK:
         if _THREAD and _THREAD.is_alive():
             return True
-        _database().close()
+        db = _database()
+        try:
+            daily_archive.backfill(db)
+        finally:
+            db.close()
         _RUNNING = True
         _THREAD = threading.Thread(target=_run, daemon=True, name="cb-ai-learning-worker")
         _WS_THREAD = threading.Thread(target=_ws_run, daemon=True, name="cb-ai-learning-ws")
