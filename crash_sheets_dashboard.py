@@ -706,6 +706,14 @@ def publish(state, tickers, trading, ws, now, directory, rescore=None, candle_ge
     except Exception as exc:
         if logger:
             logger('[CRASH SHEETS CONTROL] skipped: ' + type(exc).__name__)
+    # Independent Gemini controls occupy J:O in this existing Bot Status tab.
+    # They never overlap Crash's D:I approvals, report A:B or history A40+.
+    try:
+        from coinbeacon_ai_dashboard import sync_panel as ai_panel
+        ai_panel(sheet, status, logger=logger)
+    except Exception as exc:
+        if logger:
+            logger("[CB AI DASHBOARD] skipped: " + type(exc).__name__)
     _write_previous(prev_path, previous)
     if logger:
         try:
