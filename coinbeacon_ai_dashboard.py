@@ -12,7 +12,8 @@ ROWS = [
     ("check_minutes", "Kontrol araligi (dk)", "15/30/60. Mum verisi her 15dk saklanir."),
     ("analysis_phase", "Gemini analizi", "BASLANGIC+SONUC veya YALNIZ BASLANGIC."),
 ]
-COUNT = len(ROWS) + 1
+COUNT = len(ROWS) + 2
+DAILY_LABEL = "Gunluk Gemini gonderimi (01-01)"
 
 
 def _display(key, value):
@@ -55,7 +56,7 @@ def sync_panel(sheet, tab, logger=None):
     rows = [(r + [""] * 6)[:6] for r in rows[:COUNT]]
     rows += [[""] * 6 for _ in range(COUNT - len(rows))]
     ready = rows[0] == HEADER and all(
-        rows[i + 1][0] == item[1] for i, item in enumerate(ROWS))
+        rows[i + 1][0] == item[1] for i, item in enumerate(ROWS)) and rows[-1][0] == DAILY_LABEL
     settings = load_settings()
     left = [HEADER[:2]]
     right = [[HEADER[3], HEADER[4]]]
@@ -95,6 +96,16 @@ def sync_panel(sheet, tab, logger=None):
             result = "⏳ Onay bekliyor (O)"
         left.append([label, _display(key, settings[key])])
         right.append([description, result])
+    from coinbeacon_ai_learning import daily_dispatch_stats
+    try:
+        stats = daily_dispatch_stats()
+        daily_value = f"{stats['coins']} coin / {stats['signals']} sinyal"
+        daily_note = f"{stats['start']} - {stats['end']} Paris; HTTP gonderim denemeleri"
+    except Exception as error:
+        daily_value = "VERI YOK"
+        daily_note = "Sayac okunamadi: " + type(error).__name__
+    left.append([DAILY_LABEL, daily_value])
+    right.append([daily_note, "Salt okunur"])
     prefix = "'" + tab.title.replace("'", "''") + "'!"
     data = [
         {"range": prefix + f"J1:K{COUNT}", "values": left},
@@ -104,8 +115,8 @@ def sync_panel(sheet, tab, logger=None):
         data += [
             {"range": prefix + "L1", "values": [[HEADER[2]]]},
             {"range": prefix + "O1", "values": [[HEADER[5]]]},
-            {"range": prefix + f"L2:L{COUNT}", "values": [[""] for _ in ROWS]},
-            {"range": prefix + f"O2:O{COUNT}", "values": [[""] for _ in ROWS]},
+            {"range": prefix + f"L2:L{COUNT}", "values": [[""] for _ in range(COUNT - 1)]},
+            {"range": prefix + f"O2:O{COUNT}", "values": [[""] for _ in range(COUNT - 1)]},
         ]
     else:
         for index, success in changes:
