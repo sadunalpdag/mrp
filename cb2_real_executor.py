@@ -222,23 +222,57 @@ class Executor:
         if status in ("NEW", "PARTIALLY_FILLED"):
             age = self.clock() - rec["submitted_at"]
             if qty > 0 or age >= PENDING_TTL:
-                # Cancel ONLY CB2's exact owned entry, confirm final filled quantity.
+                # Cancel ONLY the CB2-owned exact BUY ID. For a partial fill
+                # requery immediately to protect any confirmed filled amount.
                 try:
                     self.broker.cancel_entry(symbol, rec["entry_id"])
                 except Exception:
                     pass
-                rec["next_check"] = self.clock() + 15
-                self._save()
+                try:
+                    final = self.broker.order(symbol, rec["entry_id"])
+                    if not self._verify(final, rec):
+                        self._halt(rec, "CB2_ENTRY_IDENTITY_AFTER_CANCEL")
+                        return
+                    after_qty = D(str(final["executedQty"]))
+                    if (not after_qty.is_finite() or after_qty < 0
+                            or after_qty > D(rec["quantity"])):
+                        self._halt(rec, "CB2_CANCEL_FILLED_QTY_INVALID")
+                        return
+                    entry, qty, status = final, after_qty, final.get("status")
+                except Exception:
+                    rec["next_check"] = self.clock() + 15
+                    self._save()
+                    if qty > 0 and not rec.get("partial_fill_warned"):
+                        rec["partial_fill_warned"] = True
+                        self._save()
+                        self._alert("⚠️ CB2 KISMİ DOLUM | " + symbol +
+                                    "\nBUY iptal sonucu henüz kesinleşmedi; "
+                                    "TP koruması doğrulanana kadar CB2 yeni girişleri bekletildi.",
+                                    blocking=True)
+                    return
+                if status in ("NEW", "PARTIALLY_FILLED"):
+                    rec["next_check"] = self.clock() + 15
+                    self._save()
+                    if qty > 0 and not rec.get("partial_fill_warned"):
+                        rec["partial_fill_warned"] = True
+                        self._save()
+                        self._alert("⚠️ CB2 KISMİ DOLUM | " + symbol +
+                                    "\nEmir kısmen dolmuş, kalan miktarın iptali doğrulanamadı. "
+                                    "TP henüz aktif değil; Binance emirlerini kontrol edin.",
+                                    blocking=True)
+                    return
+                # On CANCELED/FILLED/EXPIRED with nonzero quantity below,
+                # place TP immediately using the final exact-ID fill details.
+            else:
+                rec["next_check"] = self.clock() + 45
+                if not rec.get("pending_notified"):
+                    rec["pending_notified"] = True
+                    self._save()
+                    self._alert("⏳ CB2 GERÇEK LIMIT BUY BEKLİYOR | " + symbol +
+                                "\nAlış: " + rec["price"] +
+                                " | Miktar: " + rec["quantity"] +
+                                "\nHenüz dolum doğrulanmadı; %1 TP ancak dolumdan sonra kurulacak.")
                 return
-            rec["next_check"] = self.clock() + 45
-            if not rec.get("pending_notified"):
-                rec["pending_notified"] = True
-                self._save()
-                self._alert("⏳ CB2 GERÇEK LIMIT BUY BEKLİYOR | " + symbol +
-                            "\nAlış: " + rec["price"] +
-                            " | Miktar: " + rec["quantity"] +
-                            "\nHenüz dolum doğrulanmadı; %1 TP ancak dolumdan sonra kurulacak.")
-            return
         if status not in ("FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
             self._halt(rec, "CB2_ENTRY_STATUS_UNEXPECTED")
             return
