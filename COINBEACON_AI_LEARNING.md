@@ -7,12 +7,12 @@ a separate reviewed implementation, exchange tests and explicit authorization.
 
 ## Data path
 
-1. Existing /public/setups and CoinBeacon /public/ohlcv/binance-futures/SYMBOL/15m
-   are reused by cb2_live_momentum; **no extra CoinBeacon request** is made by
-   AI Learning. Candidates are SQS>=70, supported breakout archetypes, with a
-   valid, fresh set of CLOSED 15m candles. They are included regardless of CB2
-   momentum's separate ADX/MACD acceptance criteria.
-2. Original input (at most last 96 closed bars, setup metadata and indicators)
+1. The AI intake uses the same CoinBeacon /public/setups data as CB2 but applies
+   NO SQS, bias, archetype, ADX, ATR or MACD filtering. A candidate still needs
+   a recent 15m timestamp and 480 consecutive CLOSED 15m CoinBeacon OHLC bars.
+   No additional CoinBeacon /public/setups request is made; upstream API
+   selection limits and candle-credit protection are still in effect.
+2. Original input (the last 480 closed 15m OHLC bars, setup metadata and indicators)
    is durably inserted in a separate SQLite database and Gemini is called
    asynchronously. The first prediction is immutable after saving. Gemini may
    suggest a hypothetical LONG/SHORT/WAIT with LIMIT/STOP price, or WAIT.
@@ -28,10 +28,14 @@ a separate reviewed implementation, exchange tests and explicit authorization.
    expiry. WebSocket is primary; REST is used only if gaps exist. The actual
    8h candles, immutable prediction and measured outcome go to Gemini for
    a distinct final review. This does not train Gemini's weights.
-6. The case is saved to the local isolated SQLite journal and uploaded to the
-   existing private Cloudflare R2 bucket under:
-   coinbeacon-ai-learning/YYYY/MM/DD/<signal-id>.json
-   Failed upload remains queued locally for retries.
+6. Every accepted candidate and every state update is stored in persistent SQLite.
+   A **single JSON per Paris-local reporting day (01:00–01:00)** is uploaded
+   to the existing private Cloudflare R2 bucket at:
+   coinbeacon-ai-learning/daily/YYYY/MM/gemini_learning_YYYY-MM-DD.json
+   The file is refreshed when a late 8h result, AI review, or error arrives;
+   a revision journal retries cloud failures without pretending a failed upload
+   succeeded. Older per-case JSON objects remain historical, but no new ones
+   are created by this version.
 
 ### Environment (Render)
 
@@ -92,3 +96,17 @@ OFF prevents new AI cases. Existing 8-hour WS observations/reviews are
 allowed to finish when the worker is already running, so their labels are not
 silently lost. The on/off setting does not affect any real Binance orders.
 The 15-minute data collection granularity remains fixed for comparability.
+
+## Daily JSON for later pattern/model research
+
+The daily archive contains `schema`, Paris window bounds and `finalized`, a
+`summary` (signal/coin counts, AI decisions, observed TP and failure labels,
+coverage warnings, Gemini request attempts, usage metadata and learning tags),
+`gemini_dispatches` and full `cases`. Each case retains its **480 pre-signal
+closed 15m candles**, original CoinBeacon time, price, pattern, initial raw Gemini
+response and immutable planned entry, post-prediction 8h candles, TP/MAE/MFE
+and ambiguity/missing-bar flags, plus final Gemini review and errors. These
+are training/evaluation *data*, not an automatically trained model. Do not
+count `WAIT`, ambiguous candles, incomplete coverage or missing entry triggers
+as successful TP trades. A late result updates the SAME day's object rather
+than opening an additional JSON file.
