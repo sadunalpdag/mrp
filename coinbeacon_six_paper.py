@@ -995,7 +995,8 @@ def run():
         initialize(db)
         client = MarketClient(http)
         # Optional isolated AI-Learning worker resumes WS follow-ups on restart.
-        if os.getenv("CB_AI_LEARNING_ENABLED", "0") == "1":
+        from coinbeacon_ai_settings import load_settings
+        if load_settings()["enabled"]:
             try:
                 import coinbeacon_ai_learning
                 coinbeacon_ai_learning.start()
