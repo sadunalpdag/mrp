@@ -238,28 +238,72 @@ def _quote_now(db, market, symbol, utc_day):
     return None, "QUOTE_SYMBOL_MISSING"
 
 
-def _notify(item):
-    """Alerts mean observed paper candidates, NEVER a submitted Binance BUY."""
+def _telegram_send(msg):
+    """Send explicitly virtual trade-style alerts; never touch Binance."""
     import requests
-    token = os.getenv("BOT_TOKEN","").strip()
-    chat = os.getenv("CHAT_ID","").strip()
+    token = os.getenv("BOT_TOKEN", "").strip()
+    chat = os.getenv("CHAT_ID", "").strip()
     if not token or not chat:
+        LOG.warning("[CB2 MOMENTUM TELEGRAM] credentials not configured")
         return False
-    data = item["indicators"]
-    msg = ("📣 CB2 ÜÇLÜ FİLTRE | SANAL LONG\n"
-           + item["symbol"] + " | " + item["archetype"] + "\n"
-           + "SQS " + str(item["sqs"]) + " | ADX14 " + str(data["adx14"]) + "\n"
-           + "24s %" + str(data["change24_pct"]) + " | MACD " + str(data["macd_histogram"]) + "\n"
-           + "Saat (Fransa): " + datetime.fromtimestamp(
-               item["observed_ms"]/1000,PARIS).strftime("%d.%m %H:%M") + "\n"
-           + "Durum: " + item["capacity"]["status"] + " | %1 TP sanal izleme\n"
-           + "Binance'e GERÇEK EMİR GÖNDERİLMEDİ.")
     try:
-        response=requests.post("https://api.telegram.org/bot"+token+"/sendMessage",
-                               data={"chat_id":chat,"text":msg},timeout=10)
-        return bool(response.ok and response.json().get("ok"))
-    except (requests.RequestException,ValueError):
+        response = requests.post(
+            "https://api.telegram.org/bot" + token + "/sendMessage",
+            data={"chat_id": chat, "text": msg}, timeout=10)
+        ok = bool(response.ok and response.json().get("ok"))
+        if not ok:
+            LOG.warning("[CB2 MOMENTUM TELEGRAM] sendMessage was not confirmed")
+        return ok
+    except (requests.RequestException, ValueError):
+        LOG.warning("[CB2 MOMENTUM TELEGRAM] sendMessage failed")
         return False
+
+
+def _price_text(value):
+    return format(float(value), ".10g")
+
+
+def _notify(item):
+    """Trade-like OPEN alert, marked SANAL; no Binance order has been sent."""
+    data = item["indicators"]
+    cap = item.get("capacity") or {}
+    entered = datetime.fromisoformat(item["entered_at"]).astimezone(PARIS)
+    cap_info = cap.get("status", "CAPACITY_UNKNOWN")
+    if cap.get("used") is not None and cap.get("limit") is not None:
+        cap_info += " (" + str(cap["used"]) + "/" + str(cap["limit"]) + ")"
+    msg = (
+        "🟢 CB2 LONG AÇILDI | SANAL İŞLEM\n"
+        + "🪙 " + item["symbol"] + " | " + item["archetype"] + "\n"
+        + "💰 Alış: " + _price_text(item["entry_price"]) + "\n"
+        + "🎯 TP (+%1): " + _price_text(item["tp_price"]) + "\n"
+        + "📊 ADX14: " + str(data["adx14"])
+        + " | 24s: %" + str(data["change24_pct"]) + "\n"
+        + "📈 MACD histogram: " + str(data["macd_histogram"])
+        + " | SQS: " + str(item["sqs"]) + "\n"
+        + "🕒 Giriş (Fransa): " + entered.strftime("%d.%m.%Y %H:%M:%S") + "\n"
+        + "📌 Crash günlük limit (bilgi): " + cap_info + "\n"
+        + "🧪 SADECE SANAL TAKİP — Binance'e gerçek emir gönderilmedi."
+    )
+    return _telegram_send(msg)
+
+
+def _notify_tp(item):
+    """Alert only for TP seen in fully closed post-entry 15m OHLCV."""
+    timestamp = datetime.fromisoformat(
+        item["tp_at_candle_close"]).astimezone(PARIS)
+    uncertainty = (" | Mum içi fiyat sırası belirsiz"
+                   if item.get("ohlc_intrabar_order_uncertain") else "")
+    msg = (
+        "🎯 CB2 %1 TP GÖRÜLDÜ | SANAL İŞLEM\n"
+        + "🪙 " + item["symbol"] + " | " + item["archetype"] + "\n"
+        + "💰 Sanal alış: " + _price_text(item["entry_price"]) + "\n"
+        + "✅ TP seviyesi: " + _price_text(item["tp_price"]) + "\n"
+        + "🕒 15m mum kapanışı (Fransa): "
+        + timestamp.strftime("%d.%m.%Y %H:%M:%S") + "\n"
+        + "📊 %1 hedef fiyat mum içinde görüldü" + uncertainty + "\n"
+        + "🧪 SANAL SONUÇ — Binance'de gerçek pozisyon kapanmadı."
+    )
+    return _telegram_send(msg)
 
 
 def _update_paper(item, bars, now_ms):
@@ -409,6 +453,8 @@ def cycle(db, market, setups, observed_iso):
             continue
         bars=_closed_bars(result,now)
         updates+=int(_update_paper(item,bars,now))
+        if item["status"] == "TP_1_PERCENT" and not item.get("tp_notified", False):
+            item["tp_notified"] = bool(_notify_tp(item))
         _save(db,item)
     LOG.info("[CB2 MOMENTUM] new=%d pass=%d updated=%d tracked=%d",
              new,passed,updates,len(records(db)))
