@@ -363,6 +363,14 @@ def cycle(db, market, setups, observed_iso):
         item["status"]="PENDING_PRICE" if item["filters_passed"] else "REJECTED_FILTER"
         passed+=int(item["filters_passed"])
         _save(db,item)
+        # Give Gemini the SAME already-fetched CoinBeacon closed 15m bars.
+        # Research-only: never interacts with the CB2 real-order executor.
+        if os.getenv("CB_AI_LEARNING_ENABLED", "0") == "1":
+            try:
+                from coinbeacon_ai_learning import submit_candidate
+                submit_candidate(item, bars)
+            except Exception as exc:
+                LOG.warning("[CB AI ENQUEUE] %s", type(exc).__name__)
     # Capture a current quote immediately after indicator approval.
     # No 0.5%/1% pullback and no fabricated next-15m-open entry.
     for item in [x for x in records(db) if x["status"] == "PENDING_PRICE"]:
