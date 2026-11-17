@@ -83,6 +83,13 @@ def read_crash_snapshot(root, now):
         raise PreflightBlocked("CRASH_HALTED")
     if state.get("paused") is not False:
         raise PreflightBlocked("CRASH_AUTO_PAUSED")
+    outbox = state.get("outbox") or []
+    if not isinstance(outbox, list):
+        raise PreflightBlocked("CRASH_OUTBOX_INVALID")
+    if any(not isinstance(msg, dict) or msg.get("blocks_entries", True)
+           for msg in outbox):
+        # Honor the existing Crash protection gate without editing Crash.
+        raise PreflightBlocked("CRASH_SAFETY_ALERT_PENDING")
     settings = state.get("trade_settings")
     if not isinstance(settings, dict):
         raise PreflightBlocked("CRASH_SETTINGS_MISSING")

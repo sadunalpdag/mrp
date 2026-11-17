@@ -80,6 +80,16 @@ class CB2OrderGatewayTest(unittest.TestCase):
                                  set("P"+str(i) for i in range(14)), "TESTUSDT")
         with self.assertRaisesRegex(PreflightBlocked, "SYMBOL_ALREADY_ACTIVE"):
             gate_shared_capacity(snap, [], {"TESTUSDT"}, set(), "TESTUSDT")
+    def test_crash_blocking_safety_alert_pauses_cb2_buy(self):
+        self.state["outbox"] = [{"text": "TP unknown", "retry_at": 0,
+                                 "blocks_entries": True}]
+        self._write_state()
+        with self.assertRaisesRegex(PreflightBlocked, "CRASH_SAFETY_ALERT_PENDING"):
+            read_crash_snapshot(self.root, self.now)
+        self.state["outbox"][0]["blocks_entries"] = False
+        self._write_state()
+        self.assertEqual(read_crash_snapshot(self.root, self.now)["max_open_positions"], 11)
+
     def test_fail_closed_when_crash_paused_or_missing(self):
         self.state["paused"] = True
         self._write_state()
