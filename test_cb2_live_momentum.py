@@ -2,13 +2,14 @@
 import json
 import sqlite3
 import unittest
+import time
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 import cb2_live_momentum as m
 
 
-BASE = 1800000000000 // m.FIFTEEN_MS * m.FIFTEEN_MS
+BASE = ((int(time.time()*1000)//m.FIFTEEN_MS)-501)*m.FIFTEEN_MS
 
 
 def candles(n=501, growth=.0018):
@@ -58,7 +59,7 @@ class MomentumTest(unittest.TestCase):
         self.db=sqlite3.connect(":memory:")
         m.initialize(self.db)
         self.rows=candles()
-        self.now=BASE+501*m.FIFTEEN_MS
+        self.now=int(time.time()*1000)
     def tearDown(self):
         self.db.close()
     def test_indicators_use_closed_history(self):
@@ -81,7 +82,7 @@ class MomentumTest(unittest.TestCase):
         self.assertEqual(signal["status"],"PAPER_OPEN")
         self.assertEqual(signal["entry_price"],self.rows[-1]["close"])
         self.assertEqual(signal["entered_at"],m._iso(self.now))
-        self.assertEqual(signal["entry_bar_ms"],self.now)
+        self.assertEqual(signal["entry_bar_ms"],((self.now//m.FIFTEEN_MS)+1)*m.FIFTEEN_MS)
         self.assertAlmostEqual(signal["tp_price"],self.rows[-1]["close"]*1.01,places=10)
         self.assertTrue(signal["notified"])
         self.assertEqual(len([x for x in market.calls if "/public/setups" in x[0]]),0)
@@ -92,11 +93,14 @@ class MomentumTest(unittest.TestCase):
         market=Market(self.rows,self.now)
         with patch.object(m,"_notify",return_value=True):
             m.cycle(self.db,market,source(self.now),m._iso(self.now))
-        next_bar=dict(candles(502)[-1])
-        next_bar["high"]=self.rows[-1]["close"]*1.015
-        next_bar["low"]=self.rows[-1]["close"]*.998
-        market.rows=self.rows+[next_bar]
-        market.now=self.now+m.FIFTEEN_MS
+        first_full_open = ((self.now//m.FIFTEEN_MS)+1)*m.FIFTEEN_MS
+        first_full=dict(candles(502)[-1])
+        first_full["openTime"]=first_full_open
+        first_full["closeTime"]=first_full_open+m.FIFTEEN_MS-1
+        first_full["high"]=self.rows[-1]["close"]*1.015
+        first_full["low"]=self.rows[-1]["close"]*.998
+        market.rows=self.rows+[first_full]
+        market.now=first_full["closeTime"]+1
         m.cycle(self.db,market,None,m._iso(market.now))
         self.assertEqual(m.records(self.db)[0]["status"],"TP_1_PERCENT")
     def test_snapshot_is_not_used_for_price_if_quote_fails(self):
