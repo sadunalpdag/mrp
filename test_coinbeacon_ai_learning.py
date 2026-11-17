@@ -191,7 +191,7 @@ class LearningTests(unittest.TestCase):
         after = datetime(2026, 11, 18, 1, 0, tzinfo=p)
         self.assertEqual(archive.research_day(int(before.timestamp()*1000)), "2026-11-17")
         self.assertEqual(archive.research_day(int(after.timestamp()*1000)), "2026-11-18")
-        s, e = archive.bounds("2026-10-24")
+        s, e = archive.bounds("2026-10-25")
         self.assertEqual((e.timestamp() - s.timestamp()) / 3600, 25)
 
     def test_archive_reuploads_same_key_after_late_update(self):
