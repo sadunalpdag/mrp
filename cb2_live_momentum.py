@@ -338,6 +338,8 @@ def _ai_unfiltered_cycle(db, market, setups, observed_iso, candle_cache):
                 "sqs":_number(row.get("sqs")), "observed_ms":now,
                 "source_signal_at":_iso(signal_ms),
                 "reference_price":_number(row.get("price")),
+                "source_setup":{"tf":row.get("tf"), "bias":row.get("bias"),
+                                "archetype":arch, "computedAt":row.get("computedAt")},
                 "indicators":{}}
         db.execute("INSERT OR IGNORE INTO cb_ai_intake(id,payload,status) VALUES (?,?,?)",
                    (identifier,json.dumps(item),"PENDING_CANDLES"))
@@ -361,7 +363,22 @@ def _ai_unfiltered_cycle(db, market, setups, observed_iso, candle_cache):
                                   for a,b in zip(bars[-480:],bars[-479:])):
             LOG.info("[CB AI INTAKE] symbol=%s deferred=INCOMPLETE_480_BARS",item["symbol"])
             continue
-        if submit_candidate(item, bars[-480:]):
+        # Preserve available OHLCV for AI research only; leave CB2 trade inputs unchanged.
+        volumes = {}
+        for raw_bar in result.get("bars") or []:
+            if not isinstance(raw_bar, dict):
+                continue
+            try:
+                volume = float(raw_bar.get("volume"))
+                opened = int(raw_bar["openTime"])
+                if 0 <= volume < 1e100:
+                    volumes[opened] = volume
+            except (TypeError, ValueError, OverflowError, KeyError):
+                pass
+        ai_bars = [dict(bar, volume=volumes[bar["open_ms"]])
+                   if bar["open_ms"] in volumes else bar
+                   for bar in bars[-480:]]
+        if submit_candidate(item, ai_bars):
             queued += 1
             db.execute("UPDATE cb_ai_intake SET status='QUEUED' WHERE id=?", (identifier,))
         else:
