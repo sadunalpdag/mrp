@@ -147,6 +147,55 @@ class ExecutorTest(unittest.TestCase):
         self.executor.step()
         self.assertEqual(self.executor.state["orders"]["signal-1"]["phase"], "BLOCKED")
         self.assertEqual(self.broker.buy_calls, [])
+    def test_partial_fill_protected_after_owned_cancel(self):
+        self.assertTrue(self.executor.enqueue(self.candidate))
+        self.broker.buy = self._partial_buy
+        self.executor.step()
+        rec = self.executor.state["orders"]["signal-1"]
+        self.assertEqual(len(self.broker.cancel_calls), 1)
+        self.assertEqual(rec["phase"], "PROTECTED")
+        self.assertEqual(rec["filled_qty"], "1")
+        self.assertEqual(len(self.broker.tp_calls), 1)
+        self.assertEqual(self.broker.tp_calls[0][1], "1")
+
+    def _partial_buy(self, symbol, p, client_id):
+        self.broker.buy_calls.append((symbol, p, client_id))
+        self.broker.entry = {
+            "symbol": symbol, "clientOrderId": client_id,
+            "side": "BUY", "type": "LIMIT", "status": "PARTIALLY_FILLED",
+            "executedQty": "1", "avgPrice": "123.45",
+            "cumQuote": "123.45"
+        }
+        return {"status": "PARTIALLY_FILLED"}
+
+    def test_daily_fifty_not_an_entry_blocker(self):
+        self.snapshot["trade_settings"]["max_daily"] = 1
+        self.snapshot["orders"] = {"one": {
+            "symbol": "OTHERUSDT", "day": "2026-11-17",
+            "phase": "PROTECTED"
+        }}
+        self._save_crash()
+        self.assertTrue(self.executor.enqueue(self.candidate))
+        self.executor.step()
+        self.assertEqual(len(self.broker.buy_calls), 1)
+
+    def test_quarantine_symbol_blocks_cb2(self):
+        self.snapshot["symbol_quarantine"] = {"TESTUSDT": {"until": self.now[0]+1000}}
+        self._save_crash()
+        self.assertTrue(self.executor.enqueue(self.candidate))
+        self.executor.step()
+        self.assertEqual(self.broker.buy_calls, [])
+        self.assertEqual(
+            self.executor.state["orders"]["signal-1"]["reason"],
+            "CRASH_SYMBOL_QUARANTINED")
+
+    def test_tp_absence_halts_new_cb2_entries(self):
+        self.assertTrue(self.executor.enqueue(self.candidate))
+        self.broker.tp = lambda *a, **kw: {"status": "NEW"}
+        self.executor.step()
+        self.assertEqual(self.executor.state["halt"], "CB2_TP_NOT_VERIFIED")
+        self.assertEqual(self.executor.state["orders"]["signal-1"]["phase"], "TP_UNKNOWN")
+
     def test_uncertain_buy_never_resubmitted(self):
         self.broker.fail_buy = True
         self.assertTrue(self.executor.enqueue(self.candidate))
