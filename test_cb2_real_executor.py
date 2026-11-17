@@ -229,6 +229,19 @@ class ExecutorTest(unittest.TestCase):
             "executedQty": "0", "avgPrice": "0"
         }
         return {"status": "NEW"}
+    def test_disabled_new_entries_still_reconciles_existing_tp(self):
+        self.assertTrue(self.executor.enqueue(self.candidate))
+        self.executor.step()
+        rec = self.executor.state["orders"]["signal-1"]
+        self.assertEqual(rec["phase"], "PROTECTED")
+        with patch.dict(os.environ, {"CB2_REAL_TRADING_ENABLED": "0"}):
+            self.assertFalse(self.executor.enqueue(dict(self.candidate, id="signal-new")))
+            self.broker.tp_order["status"] = "FILLED"
+            self.now[0] += 50
+            self.executor.step()
+        self.assertEqual(rec["phase"], "DONE")
+        self.assertEqual(len(self.broker.buy_calls), 1)
+
     def test_persistent_ledger_survives_executor_restart(self):
         self.assertTrue(self.executor.enqueue(self.candidate))
         self.executor.step()
