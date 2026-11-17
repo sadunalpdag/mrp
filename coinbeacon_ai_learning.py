@@ -212,6 +212,7 @@ def _ask_gemini(phase, payload):
     parsed = json.loads(raw)
     if not isinstance(parsed, dict):
         raise ValueError("GEMINI_JSON_NOT_OBJECT")
+    parsed["_gemini_usage"] = result.get("usageMetadata") or {}
     return parsed
 
 
@@ -242,6 +243,11 @@ def _validate_plan(raw, last):
 
 
 def _initial(record):
+    if int(time.time()*1000) - record["observed_ms"] > 15 * 60_000:
+        record["warnings"].append("INITIAL_SIGNAL_TOO_OLD_FOR_FORWARD_PLAN")
+        record["state"] = "AI_ERROR"
+        _save(record)
+        return
     payload = {k: record[k] for k in ("symbol", "archetype", "sqs",
                "coinbeacon_signal_at", "observed_ms", "indicators",
                "coinbeacon_reference_price", "initial_candles")}
@@ -325,15 +331,17 @@ def _on_kline(symbol, raw):
                 "low": raw.get("l"), "close": raw.get("c"), "origin": "ws"})
     if not bar or bar["t"] + INTERVAL - 1 > int(time.time() * 1000):
         return
-    for rec in _all("TRACKING"):
-        if rec["symbol"] != symbol or bar["t"] < rec["first_full_open_ms"] or bar["t"] >= rec["deadline_ms"]:
-            continue
-        if bar["t"] in {x["t"] for x in rec["future_candles"]}:
-            continue
-        rec["future_candles"].append(bar)
-        rec["future_candles"] = sorted(rec["future_candles"], key=lambda x: x["t"])[-40:]
-        rec["outcome"] = _update_outcome(rec)
-        _save(rec)
+    # Keep the read-modify-write atomic with the 8h expiry transition.
+    with _LOCK:
+        for rec in _all("TRACKING"):
+            if rec["symbol"] != symbol or bar["t"] < rec["first_full_open_ms"] or bar["t"] >= rec["deadline_ms"]:
+                continue
+            if bar["t"] in {x["t"] for x in rec["future_candles"]}:
+                continue
+            rec["future_candles"].append(bar)
+            rec["future_candles"] = sorted(rec["future_candles"], key=lambda x: x["t"])[-40:]
+            rec["outcome"] = _update_outcome(rec)
+            _save(rec)
 
 
 def _rest_gap_fill(record):
@@ -366,8 +374,13 @@ def _rest_gap_fill(record):
 
 
 def _expiry(record):
-    record["state"] = "REVIEW_PENDING"
-    _save(record)
+    with _LOCK:
+        latest = _get(record["id"])
+        if not latest or latest["state"] != "TRACKING":
+            return
+        record = latest
+        record["state"] = "REVIEW_PENDING"
+        _save(record)
     _rest_gap_fill(record)
     record["outcome"] = _update_outcome(record)
     _save(record)
