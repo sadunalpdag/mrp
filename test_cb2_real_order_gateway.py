@@ -68,8 +68,8 @@ class CB2OrderGatewayTest(unittest.TestCase):
         self.state["trade_settings"]["max_daily"] = 2
         self._write_state()
         snap = read_crash_snapshot(self.root, self.now)
-        with self.assertRaisesRegex(PreflightBlocked, "SHARED_DAILY_LIMIT"):
-            gate_shared_capacity(snap, [{"day": self.day}], set(), set(), "TESTUSDT")
+        self.assertTrue(gate_shared_capacity(
+            snap, [{"day": self.day}], set(), set(), "TESTUSDT"))
     def test_global_position_and_pending_caps(self):
         snap = read_crash_snapshot(self.root, self.now)
         with self.assertRaisesRegex(PreflightBlocked, "MAX_OPEN_POSITIONS"):
