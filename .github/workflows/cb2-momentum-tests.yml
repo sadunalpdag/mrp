@@ -1,0 +1,31 @@
+name: CB2 momentum paper regression
+on:
+  pull_request:
+    paths:
+      - 'cb2_live_momentum.py'
+      - 'coinbeacon_six_paper.py'
+      - 'test_cb2_live_momentum.py'
+      - '.github/workflows/cb2-momentum-tests.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'cb2_live_momentum.py'
+      - 'coinbeacon_six_paper.py'
+      - 'test_cb2_live_momentum.py'
+      - '.github/workflows/cb2-momentum-tests.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  paper-only-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax check
+        run: python -m py_compile cb2_live_momentum.py coinbeacon_six_paper.py test_cb2_live_momentum.py
+      - name: Run CB2 paper tests
+        run: python -m unittest -v test_cb2_live_momentum
