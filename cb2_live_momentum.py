@@ -391,7 +391,22 @@ def cycle(db, market, setups, observed_iso):
         item["status"]="PAPER_OPEN"
         item["data_note"]="LIVE_QUOTE_ENTRY_FIRST_PARTIAL_BAR_EXCLUDED"
         _save(db,item)
-        item["notified"]=bool(_notify(item))
+        real_queued = False
+        if os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1":
+            try:
+                # The separate signed Binance executor owns actual LIMIT,
+                # fill, TP and Telegram reconciliation; no broker call here.
+                from cb2_real_executor import enqueue_signal
+                real_queued = bool(enqueue_signal(item))
+            except Exception as exc:
+                LOG.warning("[CB2 REAL QUEUE ERR] %s", type(exc).__name__)
+        if real_queued:
+            item["real_order_request"] = "QUEUED_SEPARATE_EXECUTOR"
+            # The real executor will send exchange-confirmed messages.
+            item["notified"] = False
+        else:
+            item["real_order_request"] = "NONE_PAPER_ONLY"
+            item["notified"] = bool(_notify(item))
         _save(db,item)
     # Intraday follow-up uses budgeted closed OHLCV; late/missing bars remain
     # eligible for the existing next-day published Binance ZIP archive analysis.
@@ -452,10 +467,18 @@ def sheet_sync(db):
         if raw.startswith("{") else Credentials.from_service_account_file(raw,scopes=scopes)
     workbook=gspread.authorize(creds).open_by_key(sheet_id)
     data=export(db)
+    real_phases = {}
+    if os.getenv("CB2_REAL_TRADING_ENABLED", "0") == "1":
+        try:
+            from cb2_real_executor import snapshot_phases
+            real_phases = snapshot_phases()
+        except Exception:
+            LOG.warning("[CB2 MOMENTUM REAL SHEET] status snapshot unavailable")
     fields=["Gün (Paris)","Coin","Formasyon","Durum","Sinyal UTC","SQS",
             "ADX14","24s %","MACD histogram","Filtre","Sanal Giriş",
             "TP +%1","TP zamanı","Maks. düşüş %","Alış limiti gölge",
-            "Crash kullanılan/limit","Telegram","Veri durumu","Kaynak ID"]
+            "Crash kullanılan/limit","Telegram","Veri durumu","Kaynak ID",
+            "Gerçek Emir (Binance)"]
     values=[["CB2 CANLI ÜÇLÜ FİLTRE | SADECE SANAL TAKİP | GERÇEK EMİR YOK"],
             ["Veri UTC: "+data["generated_at_utc"]],
             ["Tarih","Aday","Geçen","TP","Sanal açık/bekleyen","Crash günlük limite takılan","İndikatör bekleyen"]]
@@ -473,7 +496,8 @@ def sheet_sync(db):
                        x.get("filters_passed"),x.get("entry_price"),x.get("tp_price"),
                        x.get("tp_at_candle_close"),x.get("max_drawdown_pct"),
                        cap.get("status"),str(cap.get("used",""))+"/"+str(cap.get("limit","")),
-                       x.get("notified",False),x.get("data_note"),x["id"]])
+                       x.get("notified",False),x.get("data_note"),x["id"],
+                       real_phases.get(x["id"], x.get("real_order_request", "PAPER_ONLY"))])
     try:
         ws=workbook.worksheet(SHEET)
     except gspread.WorksheetNotFound:
