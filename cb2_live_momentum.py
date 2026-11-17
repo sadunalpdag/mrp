@@ -453,6 +453,14 @@ def export(db):
             "count":len(items),"signals":items}
 
 
+def _rectangular_sheet_values(values, width):
+    """Explicit blanks overwrite stale cells from an earlier coin/row."""
+    if any(len(row) > width for row in values):
+        raise ValueError("CB2_MOMENTUM_SHEET_ROW_TOO_WIDE")
+    return [[(value if value is not None else "") for value in row] +
+            [""] * (width - len(row)) for row in values]
+
+
 def sheet_sync(db):
     """Standalone tab; existing CB2 and Crash Sheets tabs are unchanged."""
     import gspread
@@ -508,11 +516,7 @@ def sheet_sync(db):
     # A short REJECTED_FILTER row previously left another coin's entry/TP
     # values in trailing cells of the SAME visible row.
     width = len(fields)
-    rectangular = [
-        [(value if value is not None else "") for value in row] +
-        [""] * (width - len(row))
-        for row in values
-    ]
+    rectangular = _rectangular_sheet_values(values, width)
     ws.update(range_name="A1", values=rectangular, value_input_option="RAW")
     # When the signal list shrinks, remove rows left from the earlier export.
     # This worksheet is dedicated exclusively to CB2_MOMENTUM_CANLI.
