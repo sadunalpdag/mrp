@@ -407,7 +407,12 @@ class Executor:
 
 def start_executor(base_dir, crash_dir, broker, deliver):
     global _ACTIVE
-    if os.getenv("CB2_REAL_TRADING_ENABLED", "0") != "1":
+    base = Path(base_dir)
+    ledger = base / "cb2_real_orders.json"
+    marker = base / "cb2_real_orders.initialized"
+    # Disabling NEW CB2 entries never stops management of existing live BUY/TP.
+    if (os.getenv("CB2_REAL_TRADING_ENABLED", "0") != "1"
+            and not ledger.exists() and not marker.exists()):
         return None
     if _ACTIVE is not None:
         return _ACTIVE
