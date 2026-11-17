@@ -202,6 +202,7 @@ class ExecutorTest(unittest.TestCase):
         self.executor.step()
         rec = self.executor.state["orders"]["signal-1"]
         self.assertEqual(rec["phase"], "ENTRY_UNKNOWN")
+        self.assertEqual(self.executor.state["halt"], "CB2_BUY_RESPONSE_UNCERTAIN")
         self.assertEqual(len(self.broker.buy_calls), 1)
         self.now[0] += 40
         self.executor.step()
