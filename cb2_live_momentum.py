@@ -266,9 +266,11 @@ def _update_paper(item, bars, now_ms):
     if item["status"] not in ("PAPER_PENDING","PAPER_OPEN","DATA_GAP"):
         return False
     entry_ms = item["entry_bar_ms"]
+    previous = item.get("last_bar_ms")
+    if previous is None:
+        previous = entry_ms - FIFTEEN_MS
     eligible = [x for x in bars if x["open_ms"] >= entry_ms and
-                x["close_ms"] <= now_ms and
-                x["open_ms"] > item.get("last_bar_ms",entry_ms-FIFTEEN_MS)]
+                x["close_ms"] <= now_ms and x["open_ms"] > previous]
     changed=False
     for bar in eligible:
         expected = (item.get("last_bar_ms") or (entry_ms-FIFTEEN_MS)) + FIFTEEN_MS
