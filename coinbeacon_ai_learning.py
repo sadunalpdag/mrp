@@ -109,8 +109,18 @@ def _bar(raw):
         op, hi, lo, cl = values
         if hi < max(op, cl) or lo > min(op, cl):
             return None
-        return {"t": t, "o": op, "h": hi, "l": lo, "c": cl,
-                "origin": raw.get("origin", "coinbeacon")}
+        out = {"t": t, "o": op, "h": hi, "l": lo, "c": cl,
+               "origin": raw.get("origin", "coinbeacon")}
+        # Volume is optional because upstream CoinBeacon may omit it.
+        try:
+            v = raw.get("volume", raw.get("v"))
+            if v is not None:
+                v = float(v)
+                if math.isfinite(v) and v >= 0:
+                    out["v"] = v
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return out
     except (ValueError, TypeError, KeyError):
         return None
 
@@ -135,6 +145,7 @@ def _ingest(item, bars, when_ms=None):
         "observed_ms": int(item.get("observed_ms", now)),
         "indicators": item.get("indicators") or {},
         "coinbeacon_reference_price": item.get("reference_price"),
+        "source_setup": item.get("source_setup") or {},
         "initial_candles": clean[-480:], "state": "QUEUED",
         "attempts": 0, "initial_plan": None, "initial_raw": None,
         "planned_ms": None, "first_full_open_ms": None, "deadline_ms": None,
@@ -286,7 +297,7 @@ def _initial(record):
         return
     payload = {k: record[k] for k in ("id", "symbol", "archetype", "sqs",
                "coinbeacon_signal_at", "observed_ms", "indicators",
-               "coinbeacon_reference_price", "initial_candles")}
+               "coinbeacon_reference_price", "source_setup", "initial_candles")}
     raw = _ask_gemini("initial", payload)
     now = int(time.time() * 1000)
     plan = _validate_plan(raw, record["initial_candles"][-1]["c"])
