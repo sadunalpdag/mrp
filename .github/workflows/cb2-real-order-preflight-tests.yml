@@ -1,4 +1,4 @@
-name: CB2 independent LIMIT preflight regression
+name: CB2 independent LIMIT executor regression
 on:
   push:
     branches:
@@ -6,27 +6,27 @@ on:
       - master
     paths:
       - cb2_real_order_gateway.py
-    - cb2_real_executor.py
-    - cb2_live_momentum.py
-    - ema.py
-    - test_cb2_real_executor.py
       - cb2_real_executor.py
       - cb2_live_momentum.py
       - ema.py
-      - test_cb2_real_executor.py
       - test_cb2_real_order_gateway.py
+      - test_cb2_real_executor.py
       - .github/workflows/cb2-real-order-preflight-tests.yml
   pull_request:
     paths:
       - cb2_real_order_gateway.py
+      - cb2_real_executor.py
+      - cb2_live_momentum.py
+      - ema.py
       - test_cb2_real_order_gateway.py
+      - test_cb2_real_executor.py
       - .github/workflows/cb2-real-order-preflight-tests.yml
 permissions:
   contents: read
 jobs:
   offline-preflight:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
