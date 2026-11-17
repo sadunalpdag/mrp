@@ -365,7 +365,8 @@ def cycle(db, market, setups, observed_iso):
         _save(db,item)
         # Give Gemini the SAME already-fetched CoinBeacon closed 15m bars.
         # Research-only: never interacts with the CB2 real-order executor.
-        if os.getenv("CB_AI_LEARNING_ENABLED", "0") == "1":
+        from coinbeacon_ai_settings import load_settings
+        if load_settings()["enabled"]:
             try:
                 from coinbeacon_ai_learning import submit_candidate
                 submit_candidate(item, bars)
