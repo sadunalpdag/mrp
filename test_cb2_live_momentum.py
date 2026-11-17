@@ -62,6 +62,24 @@ class MomentumTest(unittest.TestCase):
         self.now=int(time.time()*1000)
     def tearDown(self):
         self.db.close()
+    def test_sheet_rows_clear_old_trade_cells(self):
+        # A rejected FHE row must overwrite EVA's prior entry/TP/drawdown.
+        old = ["2026-11-17", "EVAUSDT", "breakout_retest",
+               "TP_1_PERCENT"] + [None] * 6 + [4.0344, 4.074744,
+               "2026-11-17T08:59:59+00:00", -9.7759]
+        rejected = ["2026-11-17", "FHEUSDT", "breakout_retest",
+                    "REJECTED_FILTER", "2026-11-17T09:30:00+00:00",
+                    81.4, 32.3379, 2.6277, 0.000000193314, False]
+        full = m._rectangular_sheet_values([old, rejected], 20)
+        self.assertTrue(all(len(row) == 20 for row in full))
+        self.assertEqual(full[1][10:14], ["", "", "", ""])
+        self.assertFalse(full[1][9])
+        self.assertEqual(full[1][1], "FHEUSDT")
+
+    def test_sheet_rejects_width_mismatch(self):
+        with self.assertRaises(ValueError):
+            m._rectangular_sheet_values([[1, 2, 3]], 2)
+
     def test_indicators_use_closed_history(self):
         parsed=m._closed_bars(response(self.rows),self.now)
         result,reason=m.indicators(parsed,self.now)
