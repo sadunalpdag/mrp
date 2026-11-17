@@ -12,7 +12,7 @@ a separate reviewed implementation, exchange tests and explicit authorization.
    a recent 15m timestamp and 480 consecutive CLOSED 15m CoinBeacon OHLC bars.
    No additional CoinBeacon /public/setups request is made; upstream API
    selection limits and candle-credit protection are still in effect.
-2. Original input (the last 480 closed 15m OHLC bars, setup metadata and indicators)
+2. Original input (the last 480 closed 15m OHLC bars (including volume when provided), setup metadata and indicators)
    is durably inserted in a separate SQLite database and Gemini is called
    asynchronously. The first prediction is immutable after saving. Gemini may
    suggest a hypothetical LONG/SHORT/WAIT with LIMIT/STOP price, or WAIT.
@@ -103,7 +103,7 @@ The daily archive contains `schema`, Paris window bounds and `finalized`, a
 `summary` (signal/coin counts, AI decisions, observed TP and failure labels,
 coverage warnings, Gemini request attempts, usage metadata and learning tags),
 `gemini_dispatches` and full `cases`. Each case retains its **480 pre-signal
-closed 15m candles**, original CoinBeacon time, price, pattern, initial raw Gemini
+closed 15m candles** (OHLC and optional volume), original CoinBeacon time, price, pattern, initial raw Gemini
 response and immutable planned entry, post-prediction 8h candles, TP/MAE/MFE
 and ambiguity/missing-bar flags, plus final Gemini review and errors. These
 are training/evaluation *data*, not an automatically trained model. Do not
