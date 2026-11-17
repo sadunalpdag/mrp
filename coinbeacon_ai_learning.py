@@ -13,7 +13,8 @@ import re
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -57,6 +58,9 @@ def _database():
                 uploaded INTEGER NOT NULL DEFAULT 0)""")
     db.execute("""CREATE TABLE IF NOT EXISTS quotas
                (day TEXT PRIMARY KEY, count INTEGER NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS gemini_dispatches
+               (case_id TEXT NOT NULL, symbol TEXT NOT NULL, phase TEXT NOT NULL,
+                sent_ms INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT 'SENT')""")
     db.commit()
     return db
 
@@ -116,7 +120,9 @@ def _ingest(item, bars, when_ms=None):
     clean = [_bar(x) for x in bars]
     clean = sorted({b["t"]: b for b in clean if b and b["t"] + INTERVAL - 1 <=
                     int(item.get("observed_ms", now))}.values(), key=lambda x: x["t"])
-    if len(clean) < 40 or clean[-1]["t"] + INTERVAL - 1 < now - 30 * 60000:
+    if (len(clean) < 480 or any(b["t"] - a["t"] != INTERVAL
+                                 for a,b in zip(clean[-480:],clean[-479:]))
+            or clean[-1]["t"] + INTERVAL - 1 < now - 30 * 60000):
         return False
     snap = {
         "schema": SCHEMA, "id": str(item["id"]), "symbol": sym,
@@ -125,7 +131,7 @@ def _ingest(item, bars, when_ms=None):
         "observed_ms": int(item.get("observed_ms", now)),
         "indicators": item.get("indicators") or {},
         "coinbeacon_reference_price": item.get("reference_price"),
-        "initial_candles": clean[-96:], "state": "QUEUED",
+        "initial_candles": clean[-480:], "state": "QUEUED",
         "attempts": 0, "initial_plan": None, "initial_raw": None,
         "planned_ms": None, "first_full_open_ms": None, "deadline_ms": None,
         "future_candles": [], "outcome": None, "final_review": None,
@@ -168,6 +174,21 @@ def _reserve_gemini_call():
         return True
 
 
+def daily_dispatch_stats(now_ms=None):
+    """Initial Gemini HTTP sends for Paris-local 01:00-to-01:00 reporting day."""
+    now = datetime.fromtimestamp((now_ms if now_ms is not None else time.time()*1000)/1000, ZoneInfo("Europe/Paris"))
+    start = (now - timedelta(days=1) if now.hour < 1 else now).replace(hour=1, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    with _LOCK, _database() as db:
+        count, symbols = db.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT symbol) FROM gemini_dispatches "
+            "WHERE phase='initial' AND sent_ms >= ? AND sent_ms < ?",
+            (int(start.timestamp()*1000), int(end.timestamp()*1000))
+        ).fetchone()
+    return {"signals":count, "coins":symbols, "start":start.strftime("%Y-%m-%d %H:%M"),
+            "end":end.strftime("%Y-%m-%d %H:%M"), "timezone":"Europe/Paris"}
+
+
 def _ask_gemini(phase, payload):
     key = os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
@@ -193,6 +214,12 @@ def _ask_gemini(phase, payload):
             "Do not claim the model has been retrained."
         )
     }[phase]
+    if phase == "initial":
+        with _LOCK, _database() as db:
+            db.execute("INSERT INTO gemini_dispatches(case_id,symbol,phase,sent_ms) VALUES (?,?,?,?)",
+                       (str(payload.get("id","")), str(payload.get("symbol","")), phase, int(time.time()*1000)))
+            db.commit()
+    LOG.info("[CB AI GEMINI SEND] phase=%s symbol=%s", phase, payload.get("symbol", ""))
     response = requests.post(
         "https://generativelanguage.googleapis.com/v1beta/models/{0}:generateContent".format(model),
         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
@@ -214,6 +241,8 @@ def _ask_gemini(phase, payload):
     if not isinstance(parsed, dict):
         raise ValueError("GEMINI_JSON_NOT_OBJECT")
     parsed["_gemini_usage"] = result.get("usageMetadata") or {}
+    LOG.info("[CB AI GEMINI RESPONSE] phase=%s symbol=%s usage=%s",
+             phase, payload.get("symbol", ""), parsed["_gemini_usage"])
     return parsed
 
 
@@ -249,7 +278,7 @@ def _initial(record):
         record["state"] = "AI_ERROR"
         _save(record)
         return
-    payload = {k: record[k] for k in ("symbol", "archetype", "sqs",
+    payload = {k: record[k] for k in ("id", "symbol", "archetype", "sqs",
                "coinbeacon_signal_at", "observed_ms", "indicators",
                "coinbeacon_reference_price", "initial_candles")}
     raw = _ask_gemini("initial", payload)
