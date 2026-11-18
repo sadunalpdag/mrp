@@ -98,7 +98,7 @@ class RangePaperTests(unittest.TestCase):
                  "created_ms": 0, "gemini": {"status": "DISABLED"}}):
             m.step(records, now, lambda: False, record_now)
         self.assertEqual(record_now["range_paper"]["status"], "PENDING")
-        self.assertEqual(record_now["range_paper"]["source"], "CLOSED_15M_AND_1H")
+        self.assertEqual(record_now["range_paper"]["source"], "BINANCE_CLOSED_CANDLES")
         self.assertEqual(record_now["range_observation"]["virtual_action"],
                          "PAPER_LIMIT_BUY")
 
