@@ -87,10 +87,16 @@ def _check(bars):
         frames = traceback.extract_tb(exc.__traceback__)
         last = frames[-1] if frames else None
         location = (last.filename.rsplit("/", 1)[-1] + ":" + str(last.lineno)) if last else "unknown"
-        LOG.warning("[GEMINI BTC STARTUP] status=FAILED model=%s stage=%s error=%s location=%s",
-                    model, stage, type(exc).__name__, location)
+        # Log only safe structured status fields, never exception text (may include secrets).
+        http_code = getattr(exc, "code", None)
+        if http_code is None:
+            http_code = getattr(exc, "status_code", None)
+        safe_code = str(http_code) if isinstance(http_code, int) and 100 <= http_code <= 599 else "unknown"
+        LOG.warning("[GEMINI BTC STARTUP] status=FAILED model=%s stage=%s error=%s http_code=%s location=%s",
+                    model, stage, type(exc).__name__, safe_code, location)
         message = ("❌ GEMINI BTC BAGLANTI TESTI BASARISIZ\n"
                    "Model: " + model + "\nHata: " + type(exc).__name__ +
+                   "\nHTTP: " + safe_code +
                    "\nDiger analizler calismaya devam eder.")
     _telegram(message)
 
