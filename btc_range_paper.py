@@ -397,6 +397,19 @@ def step(records, hour_ms, priority_checker, hourly_bar_record):
     # visible evidence warning. No invented Gemini verdict.
     reference = ensure_reference(hour_ms, priority_checker)
     snapshot = detect_range(candles, current["indicators"]["adx_1h"])
+    # Optional CoinBeacon detector: read-only, isolated and safely degrades to
+    # Binance closed-candle levels when BTC is absent from its capped board.
+    if os.getenv("BTC_RANGE_COINBEACON_ENABLED", "0") == "1":
+        try:
+            from btc_coinbeacon_levels import apply as coinbeacon_apply
+            snapshot = coinbeacon_apply(snapshot, candles, hour_ms, priority_checker)
+        except Exception as exc:
+            LOG.warning("[BTC RANGE COINBEACON] %s", type(exc).__name__)
+            snapshot["coinbeacon"] = {"status": "ERROR_" + type(exc).__name__}
+            snapshot["level_source"] = "BINANCE_CLOSED_CANDLES"
+    else:
+        snapshot["coinbeacon"] = {"status": "DISABLED"}
+        snapshot["level_source"] = "BINANCE_CLOSED_CANDLES"
     snapshot["reference_created_ms"] = reference["created_ms"]
     snapshot["reference_gemini_status"] = reference.get("gemini", {}).get("status")
     snapshot["ai"] = _hourly_ai(candles, snapshot, reference, priority_checker)
