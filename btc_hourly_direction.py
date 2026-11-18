@@ -94,29 +94,11 @@ def _adx(candles, n=14):
 
 
 def _fetch_closed_bars(interval, limit, last_open_ms, priority_checker):
-    # Public MARKET ONLY. Explicitly yield to live Crash BUY/TP workload.
-    if priority_checker():
-        raise RuntimeError("LIVE_CRASH_PRIORITY")
-    from crash_rest_budget import BUDGET, estimated_weight
-    params = {"symbol": "BTCUSDT", "interval": interval, "limit": limit}
-    path = "/fapi/v1/klines"
-    BUDGET.reserve("research", estimated_weight(path, params))
-    response = None
-    try:
-        response = requests.get("https://fapi.binance.com" + path,
-                                params=params, timeout=12)
-        BUDGET.observe(response.headers, response.status_code,
-                       response.headers.get("Retry-After", 0))
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
-        if response is None:
-            LOG.warning("[BTC DIRECTION] Binance data request failed (no response)")
-        raise
-    # Keep only completely closed candles; never use an in-progress future candle.
-    return [[int(b[0]), float(b[1]), float(b[2]), float(b[3]),
-             float(b[4]), float(b[5])] for b in data
-            if int(b[0]) + (3600000 if interval == "1h" else 14400000) <= last_open_ms]
+    """Compatibility helper: all BTC research klines come from CoinBeacon."""
+    from btc_coinbeacon_ohlcv import fetch_closed_15m, aggregate, RECENT_REQUIRED
+    needed = (4 if interval == "1h" else 16) * (limit + 2)
+    candles = fetch_closed_15m(last_open_ms, max(RECENT_REQUIRED, needed), priority_checker)
+    return aggregate(candles, interval, last_open_ms)[-limit:]
 
 
 def _predict(bars, bars4, hour_ms):
@@ -347,11 +329,16 @@ def _run(priority_checker):
             hour_ms = int(now.replace(minute=0, second=0, microsecond=0).timestamp() * 1000)
             key = datetime.fromtimestamp(hour_ms / 1000, timezone.utc).isoformat()
             # 1h history also settles older pending predictions.
-            bars = _fetch_closed_bars("1h", 100, hour_ms, priority_checker)
+            # ONE CoinBeacon 15m snapshot supplies all BTC price/volume
+            # analyses. No Binance OHLCV REST calls or fallback.
+            from btc_coinbeacon_ohlcv import fetch_closed_15m, aggregate, RECENT_REQUIRED
+            market_15m = fetch_closed_15m(hour_ms, RECENT_REQUIRED, priority_checker)
+            bars = aggregate(market_15m, "1h", hour_ms)[-100:]
             changed_days = _evaluate(records, bars)
             if key not in records:
-                bars4 = _fetch_closed_bars("4h", 100, hour_ms, priority_checker)
+                bars4 = aggregate(market_15m, "4h", hour_ms)[-100:]
                 records[key] = _predict(bars, bars4, hour_ms)
+                records[key]["market_data_source"] = "COINBEACON_BINANCE_FUTURES_OHLCV"
                 changed_days.add(records[key]["timestamp_paris"][:10])
             # Fully isolated paper observer. Failures cannot prevent the base
             # direction signal, real trading, or its ordinary R2/Sheets updates.
@@ -359,7 +346,8 @@ def _run(priority_checker):
                 try:
                     from btc_range_paper import step as btc_range_paper_step
                     changed_days.update(btc_range_paper_step(
-                        records, hour_ms, priority_checker, records[key]))
+                        records, hour_ms, priority_checker, records[key],
+                        candles=market_15m[-192:]))
                 except Exception as exc:
                     LOG.warning("[BTC RANGE PAPER] %s: %s",
                                 type(exc).__name__, str(exc)[:160])
@@ -382,7 +370,7 @@ def _run(priority_checker):
                     _sync_sheet(records)
                 except Exception as exc:
                     LOG.warning("[BTC DIRECTION SHEETS] %s", type(exc).__name__)
-            # No second Binance request in the same wall-clock hour.
+            # One shared CoinBeacon OHLCV request per hour; no Binance REST.
             time.sleep(3600 - (time.time() % 3600))
         except Exception as exc:
             LOG.warning("[BTC DIRECTION] %s: %s", type(exc).__name__, str(exc)[:200])

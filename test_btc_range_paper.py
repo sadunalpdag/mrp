@@ -86,8 +86,9 @@ class RangePaperTests(unittest.TestCase):
 
     def test_hourly_step_never_accesses_private_order_api(self):
         # Only public 15m candles can produce a paper plan.
-        now = 96 * m.FIFTEEN
-        bars = oscillating_window()
+        now = 192 * m.FIFTEEN
+        prior = oscillating_window()
+        bars = [[i * m.FIFTEEN] + prior[i % 96][1:] for i in range(192)]
         record_now = {
             "timestamp_paris": "2026-11-18T12:00:00+01:00",
             "indicators": {"adx_1h": 12},
