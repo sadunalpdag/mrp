@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import traceback
 
 LOG = logging.getLogger("gemini_btc_startup")
 _LOCK = threading.Lock()
@@ -78,8 +79,11 @@ def _check(bars):
                    "Kaynak: CoinBeacon | 16 x 15m (4 saat)\n"
                    "Model: " + model + "\n" + answer[:2800])
     except Exception as exc:
-        LOG.warning("[GEMINI BTC STARTUP] status=FAILED model=%s stage=%s error=%s",
-                    model, stage, type(exc).__name__)
+        frames = traceback.extract_tb(exc.__traceback__)
+        last = frames[-1] if frames else None
+        location = (last.filename.rsplit("/", 1)[-1] + ":" + str(last.lineno)) if last else "unknown"
+        LOG.warning("[GEMINI BTC STARTUP] status=FAILED model=%s stage=%s error=%s location=%s",
+                    model, stage, type(exc).__name__, location)
         message = ("❌ GEMINI BTC BAGLANTI TESTI BASARISIZ\n"
                    "Model: " + model + "\nHata: " + type(exc).__name__ +
                    "\nDiger analizler calismaya devam eder.")
