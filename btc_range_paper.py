@@ -32,38 +32,12 @@ def _folder():
 
 
 def _fetch_15m(end_ms, count, priority_checker):
-    """Contiguous closed 15m candles ending at end_ms (the exclusive time bound)."""
-    from crash_rest_budget import BUDGET, estimated_weight
-    first = end_ms - count * FIFTEEN
-    bars = {}
-    cursor = first
-    while cursor < end_ms:
-        if priority_checker():
-            raise RuntimeError("LIVE_CRASH_PRIORITY")
-        limit = min(1000, math.ceil((end_ms - cursor) / FIFTEEN))
-        params = {"symbol": "BTCUSDT", "interval": "15m", "startTime": cursor,
-                  "endTime": end_ms - 1, "limit": limit}
-        path = "/fapi/v1/klines"
-        BUDGET.reserve("research", estimated_weight(path, params))
-        response = requests.get("https://fapi.binance.com" + path, params=params, timeout=15)
-        BUDGET.observe(response.headers, response.status_code,
-                       response.headers.get("Retry-After", 0))
-        response.raise_for_status()
-        received = response.json()
-        if not received:
-            raise RuntimeError("BTC_15M_EMPTY_HISTORY")
-        for b in received:
-            opened = int(b[0])
-            if cursor <= opened < end_ms and opened + FIFTEEN <= end_ms:
-                bars[opened] = [opened] + [float(b[i]) for i in (1, 2, 3, 4, 5)]
-        new_cursor = int(received[-1][0]) + FIFTEEN
-        if new_cursor <= cursor:
-            raise RuntimeError("BTC_15M_CURSOR_NOT_ADVANCING")
-        cursor = new_cursor
-    expected = list(range(first, end_ms, FIFTEEN))
-    if any(x not in bars for x in expected):
-        raise RuntimeError("BTC_15M_HISTORY_GAP")
-    return [bars[x] for x in expected]
+    """CoinBeacon 15m only, backward paginated when 30d history is needed.
+
+    Missing CoinBeacon cache is explicitly unavailable. Never use Binance REST.
+    """
+    from btc_coinbeacon_ohlcv import fetch_closed_15m
+    return fetch_closed_15m(end_ms, count, priority_checker)
 
 
 def _percentile(values, q):
@@ -386,16 +360,28 @@ def _hourly_ai(bars, snapshot, reference, priority_checker):
         return {"status": "ERROR", "error": type(exc).__name__}
 
 
-def step(records, hour_ms, priority_checker, hourly_bar_record):
-    """Called by BTC direction observer after its own new hourly record exists."""
-    candles = _fetch_15m(hour_ms, RECENT_BARS, priority_checker)
+def step(records, hour_ms, priority_checker, hourly_bar_record, candles=None):
+    """Share the hourly CoinBeacon snapshot; never duplicate the 15m API call."""
+    if candles is None:
+        candles = _fetch_15m(hour_ms, RECENT_BARS, priority_checker)
+    candles = candles[-RECENT_BARS:]
+    if (len(candles) != RECENT_BARS
+            or candles[-1][0] != hour_ms - FIFTEEN
+            or any(b[0] - a[0] != FIFTEEN for a, b in zip(candles, candles[1:]))):
+        raise RuntimeError("BTC_COINBEACON_RECENT_CANDLES_INCOMPLETE")
     changed = evaluate_positions(records, candles)
     current = hourly_bar_record
     if "range_observation" in current:
         return changed
-    # If reference is unavailable, paper range is still calculated with a
-    # visible evidence warning. No invented Gemini verdict.
-    reference = ensure_reference(hour_ms, priority_checker)
+    # 30-day reference is best-effort. A missing cache does not suppress
+    # conservative current-hour paper tracking or fabricate historical patterns.
+    try:
+        reference = ensure_reference(hour_ms, priority_checker)
+    except Exception as exc:
+        LOG.warning("[BTC RANGE REFERENCE] %s", type(exc).__name__)
+        reference = {"created_ms": None,
+                     "gemini": {"status": "UNAVAILABLE", "error": type(exc).__name__},
+                     "historical_patterns": {}}
     snapshot = detect_range(candles, current["indicators"]["adx_1h"])
     # Optional CoinBeacon detector: read-only, isolated and safely degrades to
     # Binance closed-candle levels when BTC is absent from its capped board.
@@ -412,6 +398,7 @@ def step(records, hour_ms, priority_checker, hourly_bar_record):
         snapshot["level_source"] = "BINANCE_CLOSED_CANDLES"
     snapshot["reference_created_ms"] = reference["created_ms"]
     snapshot["reference_gemini_status"] = reference.get("gemini", {}).get("status")
+    snapshot["market_data_source"] = "COINBEACON_BINANCE_FUTURES_OHLCV"
     snapshot["ai"] = _hourly_ai(candles, snapshot, reference, priority_checker)
     current["range_observation"] = snapshot
     changed.add(current["timestamp_paris"][:10])
