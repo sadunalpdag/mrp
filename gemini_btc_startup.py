@@ -34,7 +34,7 @@ def _telegram(message):
 
 
 def _check(bars):
-    model = os.getenv("GEMINI_SMOKE_MODEL", "gemini-2.5-flash").strip()
+    model = os.getenv("GEMINI_SMOKE_MODEL", "gemini-3.5-flash-lite").strip()
     message = None
     stage = "init"
     try:
@@ -80,7 +80,7 @@ def _check(bars):
             preferred = [x for x in listed if "flash" in x and "preview" not in x]
             if not preferred:
                 raise RuntimeError("NO_AVAILABLE_FLASH_MODEL")
-            selected = next((x for x in preferred if x == "gemini-2.5-flash"), preferred[0])
+            selected = next((x for x in preferred if x == "gemini-3.5-flash-lite"), preferred[0])
             LOG.warning("[GEMINI BTC STARTUP] requested_model_unavailable=%s selected=%s", model, selected)
             model = selected
         stage = "sdk_generate_content"
