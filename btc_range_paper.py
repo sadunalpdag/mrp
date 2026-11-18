@@ -309,6 +309,7 @@ def ensure_reference(hour_ms, priority_checker, existing=None):
         "end_exclusive_utc": datetime.fromtimestamp(hour_ms / 1000, timezone.utc).isoformat(),
         "anchor_price": candles[0][4],
         "interval": "15m", "bar_count": len(candles),
+        "market_data_source": "COINBEACON_BINANCE_FUTURES_OHLCV",
         "compact_candles": _compact(candles),
         "historical_patterns": historical_patterns(candles),
         "gemini": {"status": "DISABLED"},
