@@ -38,8 +38,8 @@ class GeminiAccessProbeTests(unittest.TestCase):
             "candidates": [{"content": {"parts": [{"text": "OK SECRET"}]}}],
             "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 2}
         })
-        with patch.object(probe.requests, "get", return_value=listed) as get, \\
-             patch.object(probe.requests, "post", return_value=completed) as post, \\
+        with patch.object(probe.requests, "get", return_value=listed) as get, \
+             patch.object(probe.requests, "post", return_value=completed) as post, \
              patch("builtins.print") as printed:
             out = probe.probe_once()
             self.assertEqual(out["probe_status"], "SUCCESS")
@@ -59,8 +59,8 @@ class GeminiAccessProbeTests(unittest.TestCase):
     def test_list_failure_does_not_send_prompt(self):
         listed = reply(403, {"error": {"status": "PERMISSION_DENIED",
                                       "message": "secret text"}})
-        with patch.object(probe.requests, "get", return_value=listed), \\
-             patch.object(probe.requests, "post") as post, \\
+        with patch.object(probe.requests, "get", return_value=listed), \
+             patch.object(probe.requests, "post") as post, \
              patch("builtins.print") as printed:
             result = probe.probe_once()
         self.assertEqual(result["probe_status"], "LIST_FAILED")
@@ -73,15 +73,15 @@ class GeminiAccessProbeTests(unittest.TestCase):
             {"name": "models/gemini-2.5-flash-lite",
              "supportedGenerationMethods": ["generateContent"]}
         ]})
-        with patch.object(probe.requests, "get", return_value=listed), \\
+        with patch.object(probe.requests, "get", return_value=listed), \
              patch.object(probe.requests, "post") as post:
             result = probe.probe_once()
         self.assertEqual(result["probe_status"], "NO_SUPPORTED_CANDIDATE")
         post.assert_not_called()
 
     def test_missing_key_fails_without_http(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}), \\
-             patch.object(probe.requests, "get") as get, \\
+        with patch.dict(os.environ, {"GEMINI_API_KEY": ""}), \
+             patch.object(probe.requests, "get") as get, \
              patch.object(probe.requests, "post") as post:
             result = probe.probe_once()
         self.assertEqual(result["probe_status"], "KEY_MISSING")
