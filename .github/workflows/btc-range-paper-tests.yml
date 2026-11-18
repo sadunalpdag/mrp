@@ -3,19 +3,23 @@ on:
   pull_request:
     paths:
       - "btc_range_paper.py"
+      - "btc_coinbeacon_ohlcv.py"
       - "btc_coinbeacon_levels.py"
       - "test_btc_coinbeacon_levels.py"
       - "btc_hourly_direction.py"
       - "test_btc_range_paper.py"
+      - "test_btc_coinbeacon_ohlcv.py"
       - ".github/workflows/btc-range-paper-tests.yml"
   push:
     branches: [master]
     paths:
       - "btc_range_paper.py"
+      - "btc_coinbeacon_ohlcv.py"
       - "btc_coinbeacon_levels.py"
       - "test_btc_coinbeacon_levels.py"
       - "btc_hourly_direction.py"
       - "test_btc_range_paper.py"
+      - "test_btc_coinbeacon_ohlcv.py"
       - ".github/workflows/btc-range-paper-tests.yml"
 permissions:
   contents: read
@@ -29,5 +33,5 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install requests
-      - run: python -m py_compile btc_range_paper.py btc_coinbeacon_levels.py btc_hourly_direction.py
-      - run: python -m unittest -v test_btc_range_paper test_btc_coinbeacon_levels
+      - run: python -m py_compile btc_range_paper.py btc_coinbeacon_levels.py btc_coinbeacon_ohlcv.py btc_hourly_direction.py
+      - run: python -m unittest -v test_btc_range_paper test_btc_coinbeacon_levels test_btc_coinbeacon_ohlcv
