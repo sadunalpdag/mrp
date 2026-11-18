@@ -56,7 +56,7 @@ FIELDS = (
 COSTS = {"trend": 5, "squeeze": 5, "volume": 5, "liquidations": 1, "oi": 10}
 INTERVALS = {"trend": 3600, "squeeze": 3600, "volume": 1800,
              "liquidations": 1200}
-RESERVE = 400
+RESERVE = 0
 MAX_OI_PER_UTC_DAY = 24
 MAX_NEW_SYMBOLS_PER_CYCLE = 8
 MAX_TRACK_SYMBOLS_PER_CYCLE = 48
@@ -213,7 +213,7 @@ class MarketClient:
     def cb(self, path, cost, params=None):
         if not self.usage() or self.daily_left is None:
             return None
-        # Spend conservatively: preserve HBREAK's 5-credit /10m budget.
+        # Spend available daily credits without a reserved balance; keep per-minute headroom.
         if self.daily_left < RESERVE + cost or self.minute_left is None or self.minute_left < cost + 5:
             return None
         try:
@@ -453,7 +453,7 @@ def evaluate_oi(db, market, board):
         candles = market.klines(symbol, "15m", limit=50)
         if not close_higher(candles):
             continue
-        if not market.usage() or market.daily_left is None or market.daily_left < RESERVE + 10:
+        if not market.usage() or market.daily_left is None or market.daily_left < 10:
             return 0
         # One OI lookup per hour and never more than 24 per UTC day.
         data = market.cb("/public/open-interest/" + symbol + "/history", 10,
