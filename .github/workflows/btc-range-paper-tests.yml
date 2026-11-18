@@ -3,6 +3,8 @@ on:
   pull_request:
     paths:
       - "btc_range_paper.py"
+      - "btc_coinbeacon_levels.py"
+      - "test_btc_coinbeacon_levels.py"
       - "btc_hourly_direction.py"
       - "test_btc_range_paper.py"
       - ".github/workflows/btc-range-paper-tests.yml"
@@ -10,6 +12,8 @@ on:
     branches: [master]
     paths:
       - "btc_range_paper.py"
+      - "btc_coinbeacon_levels.py"
+      - "test_btc_coinbeacon_levels.py"
       - "btc_hourly_direction.py"
       - "test_btc_range_paper.py"
       - ".github/workflows/btc-range-paper-tests.yml"
@@ -25,5 +29,5 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install requests
-      - run: python -m py_compile btc_range_paper.py btc_hourly_direction.py
-      - run: python -m unittest -v test_btc_range_paper
+      - run: python -m py_compile btc_range_paper.py btc_coinbeacon_levels.py btc_hourly_direction.py
+      - run: python -m unittest -v test_btc_range_paper test_btc_coinbeacon_levels
