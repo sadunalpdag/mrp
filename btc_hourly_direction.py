@@ -23,7 +23,7 @@ HEADER = ["Saat (Paris)", "UTC saat", "BTC fiyat", "Tahmin", "Puan (-100..100)",
           "RVOL 1H", "4H yon", "Funding", "OI", "Spot CVD",
           "1H %", "1H dogru", "3H %", "3H dogru",
           "6H %", "6H dogru", "12H %", "12H dogru",
-          "24H %", "24H dogru", "Degerlendirme", "Yatay rejim", "Destek", "Direnc", "Sanal durum", "Sanal net %"]
+          "24H %", "24H dogru", "Degerlendirme", "Yatay rejim", "Destek", "Direnc", "Sanal durum", "Sanal net %", "CoinBeacon destek", "CoinBeacon direnc", "Seviye kaynagi"]
 _STARTED = False
 _LOCK = threading.Lock()
 
@@ -293,13 +293,16 @@ def _sync_sheet(records):
         row.extend([observation.get("regime", ""),
                     observation.get("support", ""), observation.get("resistance", ""),
                     (plan.get("status", "") + (" / " + plan.get("result", "") if plan.get("result") else "")),
-                    plan.get("net_pct", "")])
+                    plan.get("net_pct", ""),
+                    (observation.get("coinbeacon") or {}).get("support") or "",
+                    (observation.get("coinbeacon") or {}).get("resistance") or "",
+                    observation.get("level_source", "")])
         values.append(row)
     if len(values) > ws.row_count:
         ws.add_rows(len(values) - ws.row_count + 100)
     if ws.col_count < len(HEADER):
         ws.add_cols(len(HEADER) - ws.col_count)
-    ws.update(range_name=f"A1:AE{len(values)}", values=values, value_input_option="RAW")
+    ws.update(range_name=f"A1:AH{len(values)}", values=values, value_input_option="RAW")
 
 
 def _telegram(record):
@@ -322,6 +325,7 @@ def _telegram(record):
                  f" | DIRENC {observation.get('resistance')}\n"
                  f"Sanal limit alis: {plan['entry']:,.2f} | Sanal hedef satis: {plan['target']:,.2f}"
                  f" | Iptal seviyesi: {plan['invalidation']:,.2f} USDT\n"
+                 f"Seviye kaynagi: {observation.get('level_source', 'UNKNOWN')}\\n"
                  "Sinyal performansi Sheets / R2 uzerinden izlenecek.")
     r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                       data={"chat_id": chat_id, "text": text}, timeout=12)
