@@ -69,7 +69,9 @@ def _check(bars):
                     system_instruction="Sen ihtiyatli, sadece veri odakli BTC piyasa gozlemcisisin.",
                     temperature=0.1))
         finally:
-            client.close()
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
         stage = "parse_response"
         answer = (response.text or "").strip()
         if not answer:
