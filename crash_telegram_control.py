@@ -126,6 +126,13 @@ class TelegramControl:
             return {'/limit':'limit:', '/tutar':'amount:', '/sembol':'symbols:',
                     '/acik':'open_limit:', '/pozisyon':'open_limit:',
                     '/bekleyen':'pending_limit:'}[parts[0]] + parts[1]
+        # Read-only symbol queries are deliberately separate from trading commands.
+        # Require verified owner even if legacy counter commands allow other senders.
+        if not text.startswith('/') and self._authorized_paper_sender(sender.get('id')):
+            from telegram_coin_analysis import normalize
+            symbol = normalize(text)
+            if symbol:
+                return 'coin_analysis:' + symbol
         if self.counter_only:
             if text in ('/sayac', '/otomatik_durum'):
                 return 'status'
@@ -156,7 +163,11 @@ class TelegramControl:
             if command is None:
                 continue
             try:
-                reply = self.action(command)
+                if isinstance(command, str) and command.startswith('coin_analysis:'):
+                    from telegram_coin_analysis import analyze
+                    reply = analyze(command.split(':', 1)[1])
+                else:
+                    reply = self.action(command)
             except Exception as error:
                 self.log(f'[CRASH CONTROL ACTION ERR] {type(error).__name__}')
                 reply = '⚠️ Komut tamamlanamadı. /otomatik_durum ile kontrol edin; Render ayarlarını inceleyin.'
