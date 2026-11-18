@@ -421,7 +421,8 @@ def step(records, hour_ms, priority_checker, hourly_bar_record):
         plan = dict(snapshot["candidate"])
         plan.update({"created_ms": hour_ms, "status": "PENDING",
                      "model": "btc_range_paper_v1", "fees_roundtrip_pct": FEE_ROUNDTRIP_PCT,
-                     "source": "CLOSED_15M_AND_1H", "last_checked_open_ms": hour_ms - 1})
+                     "source": snapshot.get("level_source", "BINANCE_CLOSED_CANDLES"),
+                     "last_checked_open_ms": hour_ms - 1})
         current["range_paper"] = plan
         current["range_observation"]["virtual_action"] = "PAPER_LIMIT_BUY"
     else:
