@@ -389,3 +389,11 @@ def start(priority_checker=None):
         threading.Thread(target=_run, args=(checker,), daemon=True,
                          name="btc-hourly-direction").start()
         _STARTED = True
+        # One-time, isolated API key/model-access smoke test. No model change,
+        # broker APIs, extra market data or trading parameter changes.
+        try:
+            from btc_gemini_access_probe import probe_once
+            threading.Thread(target=probe_once, daemon=True,
+                             name="btc-gemini-model-probe").start()
+        except ImportError as exc:
+            LOG.warning("[BTC GEMINI PROBE] unavailable=%s", type(exc).__name__)
