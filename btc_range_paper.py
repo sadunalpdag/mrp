@@ -24,6 +24,30 @@ RECENT_BARS = 48 * 4
 FEE_ROUNDTRIP_PCT = 0.08  # Conservative assumed fees; no slippage guarantee.
 REFERENCE_KEY = "btc-range/reference_latest.json"
 
+class GeminiHTTPFailure(RuntimeError):
+    """Safe Google API error metadata; never carries keys or request bodies."""
+
+    def __init__(self, code, reason, retry_after_s=0):
+        self.code = code
+        self.reason = reason
+        self.retry_after_s = retry_after_s
+        super().__init__(f"Gemini HTTP {code}: {reason}")
+
+
+def _gemini_error_record(exc):
+    record = {"status": "ERROR", "error": type(exc).__name__}
+    if isinstance(exc, GeminiHTTPFailure):
+        record["http_code"] = exc.code
+        record["http_reason"] = exc.reason
+        # 429/5xx are retried after a pause. 4xx need operator inspection.
+        wait = (max(3600, exc.retry_after_s)
+                if exc.code == 429 or exc.code >= 500 else 6 * 3600)
+        record["retry_after_ms"] = int(time.time() * 1000) + wait * 1000
+    else:
+        record["retry_after_ms"] = int(time.time() * 1000) + 3600 * 1000
+    return record
+
+
 
 def _folder():
     folder = Path(os.getenv("DATA_DIR") or (Path(__file__).parent / "data"))
@@ -271,19 +295,44 @@ def _gemini(payload, instruction):
                   "responseMimeType": "application/json",
                   "temperature": .1, "maxOutputTokens": 1300}},
         timeout=35)
+    # Do not log the response body: it may contain project identifiers or
+    # untrusted text. Only code, machine status and model ID are safe here.
+    if response.status_code >= 400:
+        reason = "UNKNOWN"
+        try:
+            reason = str((response.json().get("error") or {}).get("status")
+                         or "UNKNOWN")[:48]
+        except (ValueError, TypeError, AttributeError):
+            pass
+        reason = re.sub(r"[^A-Z0-9_]", "", reason.upper()) or "UNKNOWN"
+        try:
+            retry_after = max(0, min(21600, int(response.headers.get("Retry-After", "0"))))
+        except (TypeError, ValueError):
+            retry_after = 0
+        LOG.warning("[BTC RANGE GEMINI HTTP] code=%d reason=%s model=%s retry_after=%ds",
+                    response.status_code, reason, model, retry_after)
+        raise GeminiHTTPFailure(response.status_code, reason, retry_after)
     response.raise_for_status()
-    parts = ((response.json().get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+    reply = response.json()
+    parts = ((reply.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
     parsed = json.loads("".join(p.get("text", "") for p in parts))
     if not isinstance(parsed, dict):
         raise ValueError("BTC_RANGE_GEMINI_INVALID_JSON")
-    return {"status": "COMPLETE", "analysis": parsed}
+    usage = reply.get("usageMetadata") or {}
+    LOG.info("[BTC RANGE GEMINI SUCCESS] model=%s input_tokens=%s output_tokens=%s",
+             model, usage.get("promptTokenCount"), usage.get("candidatesTokenCount"))
+    return {"status": "COMPLETE", "analysis": parsed, "usage": {
+        "prompt_tokens": usage.get("promptTokenCount"),
+        "output_tokens": usage.get("candidatesTokenCount")}}
 
 
 def ensure_reference(hour_ms, priority_checker, existing=None):
     reference = existing if existing is not None else _read_reference()
     if reference and hour_ms - reference["created_ms"] < 30 * DAY:
         if (os.getenv("BTC_RANGE_AI_ENABLED") == "1" and
-                reference.get("gemini", {}).get("status") == "DISABLED"):
+                reference.get("gemini", {}).get("status") in ("DISABLED", "ERROR")
+                and int(time.time()*1000) >=
+                reference.get("gemini", {}).get("retry_after_ms", 0)):
             # Reference is already stored with all candles; no Binance re-download.
             if not priority_checker():
                 try:
@@ -299,7 +348,7 @@ def ensure_reference(hour_ms, priority_checker, existing=None):
                        "evidence, invalidation, uncertainty, and risks; no future predictions.")
                 except Exception as exc:
                     LOG.warning("[BTC RANGE GEMINI REF] %s", type(exc).__name__)
-                    reference["gemini"] = {"status": "ERROR", "error": type(exc).__name__}
+                    reference["gemini"] = _gemini_error_record(exc)
                 _save_reference(reference)
         return reference
     candles = _fetch_15m(hour_ms, REFERENCE_BARS, priority_checker)
@@ -331,7 +380,7 @@ def ensure_reference(hour_ms, priority_checker, existing=None):
                "Do not use nonexistent future outcomes for a live prediction.")
         except Exception as exc:
             LOG.warning("[BTC RANGE GEMINI REF] %s", type(exc).__name__)
-            reference["gemini"] = {"status": "ERROR", "error": type(exc).__name__}
+            reference["gemini"] = _gemini_error_record(exc)
         _save_reference(reference)
     return reference
 
@@ -358,7 +407,7 @@ def _hourly_ai(bars, snapshot, reference, priority_checker):
            "reason (string). This is observation only; no order instruction.")
     except Exception as exc:
         LOG.warning("[BTC RANGE GEMINI HOURLY] %s", type(exc).__name__)
-        return {"status": "ERROR", "error": type(exc).__name__}
+        return _gemini_error_record(exc)
 
 
 def step(records, hour_ms, priority_checker, hourly_bar_record, candles=None):
