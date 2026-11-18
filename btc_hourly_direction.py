@@ -333,6 +333,13 @@ def _run(priority_checker):
             # analyses. No Binance OHLCV REST calls or fallback.
             from btc_coinbeacon_ohlcv import fetch_closed_15m, aggregate, RECENT_REQUIRED
             market_15m = fetch_closed_15m(hour_ms, RECENT_REQUIRED, priority_checker)
+            # One isolated startup Gemini check; reuses the already-fetched CoinBeacon bars.
+            # It cannot block the hourly observer or the real trading engine.
+            try:
+                from gemini_btc_startup import schedule_once
+                schedule_once(market_15m[-16:])
+            except Exception as exc:
+                LOG.warning("[GEMINI BTC STARTUP] scheduling_error=%s", type(exc).__name__)
             bars = aggregate(market_15m, "1h", hour_ms)[-100:]
             changed_days = _evaluate(records, bars)
             if key not in records:
