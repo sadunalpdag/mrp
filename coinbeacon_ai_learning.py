@@ -289,6 +289,43 @@ def _validate_plan(raw, last):
             "tp_pct": 1.0}
 
 
+def _telegram_paper(record, event):
+    """Best-effort Telegram notice, never affecting simulated or real execution."""
+    token = os.getenv("BOT_TOKEN", "").strip()
+    chat = os.getenv("CHAT_ID", "").strip()
+    if not token or not chat:
+        LOG.warning("[CB AI TELEGRAM] NOT_CONFIGURED")
+        return False
+    plan = record.get("initial_plan") or {}
+    outcome = record.get("outcome") or {}
+    entry = plan.get("entry_price")
+    tp = (entry * (1.01 if plan.get("direction") == "LONG" else .99)
+          if entry and plan.get("direction") in ("LONG", "SHORT") else None)
+    lines = ["🤖 COINBEACON GEMINI | SANAL ANALİZ",
+             "Coin: " + record["symbol"],
+             "Formasyon: " + str(record.get("archetype") or "unknown"),
+             "Olay: " + event,
+             "Yön: " + str(plan.get("direction") or "WAIT"),
+             "Giriş: " + (format(entry, ".8g") if entry else "Bekleniyor"),
+             "TP (%1): " + (format(tp, ".8g") if tp else "-"),
+             "Gemini: " + str(plan.get("rationale") or "")[:450]]
+    if event == "8H_SONUC":
+        lines.extend(["Sonuç: " + str(outcome.get("label") or "UNKNOWN"),
+                      "İnceleme: " + str((record.get("final_review") or {}).get("result_summary") or "")[:450]])
+    lines.append("Gerçek emir gönderilmez.")
+    try:
+        response = requests.post(
+            "https://api.telegram.org/bot" + token + "/sendMessage",
+            data={"chat_id": chat, "text": "\n".join(lines)}, timeout=10)
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            raise ValueError("TELEGRAM_NOT_OK")
+        return True
+    except (requests.RequestException, ValueError) as exc:
+        LOG.warning("[CB AI TELEGRAM] event=%s error=%s", event, type(exc).__name__)
+        return False
+
+
 def _initial(record):
     if int(time.time()*1000) - record["observed_ms"] > 15 * 60_000:
         record["warnings"].append("INITIAL_SIGNAL_TOO_OLD_FOR_FORWARD_PLAN")
@@ -313,6 +350,7 @@ def _initial(record):
     record["analysis_phase"] = config["analysis_phase"]
     record["state"] = "TRACKING"
     _save(record)
+    _telegram_paper(record, "GEMINI_ANALIZI")
 
 
 def _update_outcome(record):
@@ -449,6 +487,7 @@ def _final(record):
         record["state"] = "COMPLETE"
         record["finished_at_ms"] = int(time.time() * 1000)
         _save(record)
+        _telegram_paper(record, "8H_SONUC")
         return
     frozen = {"initial": {k: record[k] for k in
               ("symbol", "archetype", "sqs", "observed_ms", "initial_plan", "indicators")},
@@ -468,6 +507,7 @@ def _final(record):
     record["state"] = "COMPLETE"
     record["finished_at_ms"] = int(time.time()*1000)
     _save(record)
+    _telegram_paper(record, "8H_SONUC")
 
 
 def _r2_upload(record):
