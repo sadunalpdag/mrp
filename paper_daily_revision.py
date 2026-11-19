@@ -1,4 +1,4 @@
-"""Daily 18:45 Europe/Paris archival reconciliation for PAPER HBREAK and CB2.
+"""Daily 18:45 Europe/Paris archival reconciliation for PAPER CB2.
 
 Runs inside each existing paper monitor (using its SQLite connection). Public
 Binance daily ZIPs only, no exchange REST, no orders and no real-trade changes.
@@ -63,7 +63,7 @@ def _daily_sheet(system, totals, days, book_id):
     auth = (Credentials.from_service_account_info(json.loads(cred), scopes=scopes)
             if cred.startswith("{") else Credentials.from_service_account_file(cred, scopes=scopes))
     book = gspread.authorize(auth).open_by_key(book_id)
-    title = "HBREAK_REVIZYON_1845" if system == "hbreak" else "CB2_REVIZYON_1845"
+    title = "CB2_REVIZYON_1845"
     try:
         ws = book.worksheet(title)
     except gspread.WorksheetNotFound:
@@ -117,41 +117,6 @@ def _day_group(rows, *, cb2=False):
             bucket["pending"] += int(status == "OPEN" and (
                 row.get("data_status") != "OK" or _stale_open(row)))
     return dict(grouped)
-
-
-def revise_hbreak(db, http):
-    import hbreak_paper as h
-    today = datetime.now(PARIS).date().isoformat()
-    if not due(h.mget(db, "paper_revision_1845_day")):
-        return False
-    before = sum(int(x.get("observed_candles") or 0) for x in h.rows(db))
-    start = time.monotonic()
-    passes = 0
-    for _ in range(MAX_TRACK_PASSES):
-        if time.monotonic() - start >= MAX_REVISIT_SECONDS:
-            break
-        prev = sum(int(x.get("observed_candles") or 0) for x in h.rows(db))
-        h.track(db, http)
-        passes += 1
-        after = sum(int(x.get("observed_candles") or 0) for x in h.rows(db))
-        if after == prev:
-            break
-    trades = h.rows(db)
-    totals = {
-        "total": len(trades),
-        "tp": sum(x.get("status") == "TP_1_PERCENT" for x in trades),
-        "open": sum(x.get("status") == "OPEN" for x in trades),
-        "pending": sum(x.get("status") == "OPEN" and
-                       (x.get("data_status") != "OK" or _stale_open(x)) for x in trades),
-        "new_bars": sum(int(x.get("observed_candles") or 0) for x in trades) - before,
-        "passes": passes,
-    }
-    h.sheet_sync(db)
-    book_id = os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID")
-    _daily_sheet("hbreak", totals, _day_group(trades), book_id)
-    h.mset(db, "paper_revision_1845_day", today)
-    LOG.info("[HBREAK REVISION 18:45] day=%s totals=%s", today, totals)
-    return True
 
 
 def revise_cb2(db, market):

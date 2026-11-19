@@ -72,34 +72,6 @@ def _insert(db, *, symbol, family, source_id, seen_at, reference_price=None,
     return True
 
 
-def capture_hbreak(db, source_rows, now_iso):
-    """Capture observed HBREAK triggers even when CB2's 20m fill gate rejects them."""
-    added = 0
-    now = _ms(now_iso)
-    for row in source_rows:
-        source_id = row.get("id")
-        when = row.get("opened_at")
-        if not source_id or not when:
-            continue
-        try:
-            age = now - _ms(when)
-        except (ValueError, TypeError):
-            continue
-        # Existing DB contains older historical signals; never relabel them as
-        # a newly observed real-time signal when the journal is first enabled.
-        if not (0 <= age <= 90 * 60 * 1000):
-            continue
-        added += int(_insert(
-            db, symbol=row.get("coin"), family="hbreak_breakout",
-            source_id=source_id, seen_at=when,
-            source_signal_at=row.get("triggered_at") or when,
-            reference_price=row.get("entry"),
-            archetype=row.get("archetype"), sqs=row.get("sqs"),
-            rvol=row.get("rvol"),
-        ))
-    return added
-
-
 def capture_board(db, name, result, now_iso):
     """Journal the existing paid scanner response; never call an extra API."""
     if not isinstance(result, dict) or (result.get("meta") or {}).get("stale"):
