@@ -215,7 +215,10 @@ def run():
         signal_ms = int(datetime.fromisoformat(r[0]).timestamp() * 1000)
         entry_ms = (int(datetime.fromisoformat(r[3]).timestamp() * 1000)
                     if r[3] else 0)
-        side, tp, sl = r[1], float(r[5]), float(r[6])
+        side, tp, sl = r[1], numeric(r[5], float('nan')), numeric(r[6], float('nan'))
+        if not (math.isfinite(tp) and math.isfinite(sl) and tp > 0 and sl > 0):
+            LOG.error("BTC paper row %s invalid TP/SL; skipping without altering position", idx)
+            continue
         for bar in bars:
             open_ms = int(bar[0])
             if open_ms < signal_ms or (status == "OPEN" and open_ms < entry_ms):
@@ -242,9 +245,9 @@ def run():
                 continue
             # If both touched in a candle, assume SL first.
             exit_price = sl if hit_sl else tp
-            qty = float(r[7])
-            gross = (exit_price - float(r[4])) * qty * (1 if side == "LONG" else -1)
-            fees = float(r[4]) * qty * cost_pct / 100
+            qty = numeric(r[7], 0)
+            gross = (exit_price - numeric(r[4], exit_price)) * qty * (1 if side == "LONG" else -1)
+            fees = numeric(r[4], exit_price) * qty * cost_pct / 100
             r[8], r[9], r[10], r[11], r[12] = (
                 "SL" if hit_sl else "TP",
                 datetime.fromtimestamp((open_ms+FIFTEEN)/1000, timezone.utc).isoformat(),
