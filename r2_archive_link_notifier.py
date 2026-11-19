@@ -87,19 +87,12 @@ def _notify_once(now):
         ("CoinBeacon SINYAL JSON", f"coinbeacon-api2/{stamp}/coinbeacon_six_{date}.json"),
         ("CoinBeacon ERTESİ GÜN ANALİZ JSON",
          f"coinbeacon-api2/analysis/{stamp}/coinbeacon_six_analysis_{date}.json"),
-        ("HBREAK ZIP", f"hbreak/{stamp}/hbreak_15m_long_{date}.zip"),
         ("CB2 SON 3 GUN TP INDIKATOR JSON",
          "cb2/tp-analysis/"+now.strftime("%Y/%m/%d")+
          "/cb2_3day_tp_indicators_"+current_day+".json"),
-        ("HBREAK SON 3 GUN TP INDIKATOR JSON",
-         "hbreak/tp-analysis/"+now.strftime("%Y/%m/%d")+
-         "/hbreak_3day_tp_indicators_"+current_day+".json"),
         ("CB2 TUM SINYALLER (TP / ACIK / BEKLEYEN) JSON",
          "cb2/analysis/"+now.strftime("%Y/%m/%d")+
          "/cb2_all_signals_indicators_"+current_day+".json"),
-        ("HBREAK TUM SINYALLER (TP / ACIK / BEKLEYEN) JSON",
-         "hbreak/analysis/"+now.strftime("%Y/%m/%d")+
-         "/hbreak_all_signals_indicators_"+current_day+".json"),
     ]
     sections = [f"📦 R2 GÜNLÜK ARŞİV LİNKLERİ | {date}", "ChatGPT analiz ajanına iletebilirsin.", ""]
     available = 0
