@@ -2,7 +2,7 @@
 
 Uses CoinBeacon key in Render env 'api2'. Read-only public market endpoints only:
 CoinBeacon GET, Binance futures public GET. No trading/broker imports or POSTs.
-HBREAK's SQLite DB is opened read-only. All experiment outputs isolated.
+All experiment outputs are isolated.
 """
 import csv
 import hashlib
@@ -31,7 +31,6 @@ LOG.propagate = False
 PARIS = ZoneInfo("Europe/Paris")
 BASE = Path(os.getenv("DATA_DIR", "/data"))
 DB = BASE / "coinbeacon_six_paper.sqlite3"
-HBREAK_DB = BASE / "hbreak_paper.sqlite3"
 API = "https://api.coinbeacon.io"
 BINANCE = "https://fapi.binance.com"
 from paper_archive_15m import klines as archive_klines
@@ -99,7 +98,7 @@ def initialize(db):
     signal_research.initialize(db)
     if not meta(db, "start_ms"):
         put_meta(db, "start_ms", str(now_ms()))
-        LOG.info("Forward-only paper experiments initialized; no historic HBREAK fills imported")
+        LOG.info("Forward-only paper experiments initialized")
 
 
 def meta(db, k, default=""):
@@ -128,22 +127,6 @@ def save(db, trade):
 
 def first_full_5m(opened):
     return ((iso_to_ms(opened) + 899999) // 900000) * 900000
-
-
-def read_hbreak_new(db):
-    """Read HBREAK trades without ever writing to the original DB."""
-    if not HBREAK_DB.exists():
-        return []
-    since = int(meta(db, "start_ms"))
-    try:
-        with sqlite3.connect("file:" + str(HBREAK_DB) + "?mode=ro", uri=True, timeout=2) as source:
-            items = [json.loads(row[0]) for row in source.execute("SELECT data FROM trades")]
-        return sorted((x for x in items if iso_to_ms(x["opened_at"]) >= since
-                       and x.get("archetype") in ("pattern_breakout", "trendline_break", "breakout_retest")),
-                      key=lambda x: x["opened_at"])
-    except (sqlite3.Error, ValueError, KeyError) as exc:
-        LOG.warning("Read-only HBREAK source unavailable (%s)", type(exc).__name__)
-        return []
 
 
 def new_trade(db, strategy, symbol, source_id, signal_at, price, *, watch=False, **extra):
@@ -275,50 +258,6 @@ def recent_duplicate(db, strategy, symbol, seconds):
     cutoff = now_ms() - seconds * 1000
     return any(x["symbol"] == symbol and iso_to_ms(x["opened_at"]) > cutoff
                for x in all_trades(db, strategy))
-
-
-def evaluate_hbreak(db, market, trend_data):
-    candidates = read_hbreak_new(db)
-    matrix = {x.get("symbol"): x.get("scores") or {} for x in
-              ((trend_data or {}).get("items") or []) if isinstance(x, dict)}
-    counts = defaultdict(int)
-    for row in candidates:
-        symbol = row.get("coin") or ""
-        rvol = num(row.get("rvol"))
-        sqs = num(row.get("sqs"))
-        if not symbol.endswith("USDT") or sqs is None or sqs < 50:
-            continue
-        source_id = row["id"]
-        # Paper entry = current public futures ticker, never historical HBREAK entry.
-        eligible = []
-        if rvol is not None and rvol >= 1.5:
-            eligible.append(("rvol", {}))
-        if row.get("archetype") == "breakout_retest":
-            eligible.append(("retest", {}))
-        scores = matrix.get(symbol) or {}
-        h1 = num((scores.get("1h") or {}).get("score"))
-        h4 = num((scores.get("4h") or {}).get("score"))
-        if h1 is not None and h4 is not None and h1 > 0 and h4 > 0:
-            eligible.append(("trend", {"trend_1h": h1, "trend_4h": h4}))
-        if not eligible:
-            continue
-        # Do not read a stale signal hours later and enter at a new price.
-        signal_age = now_ms() - iso_to_ms(row["opened_at"])
-        if signal_age < 0 or signal_age > 20 * 60 * 1000:
-            continue
-        fresh = [p for p in eligible if not db.execute(
-            "SELECT 1 FROM trades WHERE id=?", (key_for("CB2", p[0], source_id),)
-        ).fetchone()]
-        if not fresh:
-            continue
-        price = num(row.get("entry"))  # CoinBeacon HBREAK signal-time entry, not stale ZIP close.
-        if not price:
-            continue
-        for strategy, extra in fresh:
-            if new_trade(db, strategy, symbol, source_id, row["opened_at"], price,
-                         source_archetype=row["archetype"], sqs=sqs, rvol=rvol, **extra):
-                counts[strategy] += 1
-    return dict(counts)
 
 
 def due(db, name, interval):
@@ -562,7 +501,7 @@ def sheet_sync(db):
     """One combined monitoring tab with six-strategy rollup and all paper trades.
 
     Old CB2_0x tabs are intentionally not deleted (historic copies), but this
-    function no longer writes to them. Existing HBREAK sheet is untouched.
+    function no longer writes to them. Other strategy sheets are untouched.
     """
     import gspread
     from google.oauth2.service_account import Credentials
@@ -875,8 +814,7 @@ def cycle(db, market):
     current = now_iso()
     market.usage()
 
-    # Reuse existing paid CoinBeacon boards. Never read HBREAK's SQLite DB
-    # for NEW CB2 setups; neither Binance REST nor a live paper fill is needed.
+    # Reuse existing paid CoinBeacon boards for independent CB2 setups.
     trend = run_paid_board(db, market, "trend", "/public/trend-scanner",
                            {"exchange": "binance-futures", "sort": "1h",
                             "dir": "desc", "quote": "USDT"})
