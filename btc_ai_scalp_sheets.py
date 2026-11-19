@@ -1,6 +1,6 @@
-"""BTC AI scalp: independent 15-minute paper-only research, Google Sheets output.
+"""BTC AI scalp: 10-minute paper-only research, Google Sheets output.
 
-Run as a dedicated Render cron job at 2,17,32,47 minutes past each hour (UTC).
+Runs inside the existing worker every 10 minutes with closed 15m BTC data.
 Never imports/exposes broker order APIs. Does not send Telegram messages.
 Requires COINBEACON_API_KEY, GEMINI_API_KEY, GOOGLE_SERVICE_ACCOUNT_JSON,
 and GOOGLE_SHEETS_ID (or GOOGLE_SHEET_ID). Times use Europe/Paris.
@@ -16,6 +16,9 @@ from zoneinfo import ZoneInfo
 LOG = logging.getLogger("btc_ai_scalp_sheets")
 PARIS = ZoneInfo("Europe/Paris")
 FIFTEEN = 900_000
+TEN = 600_000
+MAX_OPEN_TRADES = 4
+STOP_PRICE_FRACTION = 0.10
 SIGNALS = "BTC_AI_SINYALLER"
 TRADES = "BTC_AI_SANAL"
 DAILY = "BTC_AI_GUNLUK"
@@ -123,6 +126,7 @@ def gemini_decision(bars, ind):
         "hedefi yakalamak icin zorlama sinyal verme. Gelecek fiyatini uydurma. "
         "JSON alanlari: action (LONG/SHORT/BEKLE), entry (sayi), tp (sayi), "
         "sl (sayi), reason (Turkce kisa cumle). BEKLE icin seviyeler 0 olabilir. "
+        "Sistem stopu giris fiyatina gore %10 ters harekete sabitler. "
         "Gercek islem veya emir uretme. VERI: " + json.dumps(payload, ensure_ascii=False)
     )
     client = genai.Client(api_key=api_key)
@@ -147,12 +151,11 @@ def validated_decision(decision, close, atr):
     reason = str(decision.get("reason", ""))[:400]
     # A frozen close reference is the quote at signal creation, not a guaranteed fill.
     if action != "BEKLE":
-        valid = (entry > 0 and tp > 0 and sl > 0 and abs(entry / close - 1) <= 0.002
+        valid = (entry > 0 and tp > 0 and abs(entry / close - 1) <= 0.002
                  and atr > 0)
-        valid &= (sl < entry < tp if action == "LONG" else tp < entry < sl)
-        reward = abs(tp - entry)
-        risk = abs(entry - sl)
-        valid &= risk > 0 and reward / risk >= 1.2 and risk / entry <= 0.015
+        valid &= (tp > entry if action == "LONG" else tp < entry)
+        # Enforce user-defined stop: BTC price moves 10% against entry.
+        sl = entry * (1 - STOP_PRICE_FRACTION if action == "LONG" else 1 + STOP_PRICE_FRACTION)
         if not valid:
             reason = "RISK_VALIDATION_FAILED: " + reason
             action = "BEKLE"
@@ -194,10 +197,11 @@ def run():
     from btc_coinbeacon_ohlcv import fetch_closed_15m
     bars = fetch_closed_15m(end_ms, 128)
     last_close_ms = end_ms
-    stamp = datetime.fromtimestamp(last_close_ms / 1000, timezone.utc).isoformat()
-    paris_now = datetime.fromtimestamp(last_close_ms / 1000, PARIS).isoformat()
+    scan_ms = now_ms // TEN * TEN
+    stamp = datetime.fromtimestamp(scan_ms / 1000, timezone.utc).isoformat()
+    paris_now = datetime.fromtimestamp(scan_ms / 1000, PARIS).isoformat()
     today = paris_now[:10]
-    # Stop duplicate signals after cron retries; all state lives in Sheets.
+    # Deduplicate per 10-minute scan slot, not per 15-minute candle.
     signal_exists = any(str(r.get("Kapanis UTC", "")) == stamp for r in sig)
 
     # Only candles after a frozen signal may create fills. A pending signal
@@ -225,6 +229,9 @@ def run():
                     datetime.fromtimestamp(entry_ms/1000, timezone.utc).isoformat(),
                     str(price), str(qty), "OPEN")
                 status = "OPEN"
+                # Stop is based on the actual simulated fill price.
+                sl = price * (1 - STOP_PRICE_FRACTION if side == "LONG" else 1 + STOP_PRICE_FRACTION)
+                r[6] = str(sl)
                 # Do not evaluate TP/SL on the same entry candle:
                 # fill and intrabar ordering cannot be proven.
                 continue
@@ -280,7 +287,7 @@ def run():
     if not signal_exists:
         close = float(bars[-1][4])
         ind = indicators(bars)
-        if enabled and not halt and not live:
+        if enabled and not halt and len(live) < MAX_OPEN_TRADES:
             try:
                 decision, model = gemini_decision(bars, ind)
                 action, entry, tp, sl, reason = validated_decision(decision, close, ind["atr14"])
@@ -291,7 +298,15 @@ def run():
         else:
             action, entry, tp, sl, model = "BEKLE", 0, 0, 0, "SKIPPED"
             reason = ("DISABLED" if not enabled else
-                      "DAILY_LIMIT_REACHED" if halt else "POSITION_ALREADY_ACTIVE")
+                      "DAILY_LIMIT_REACHED" if halt else "MAX_OPEN_TRADES_REACHED")
+        # Do not open an indistinguishable same-side signal twice.
+        if action in ("LONG", "SHORT") and any(
+            len(r) > 2 and r[1] == action and
+            abs(numeric(r[2], 0) / entry - 1) < 0.001
+            for r in live
+        ):
+            action, reason = "BEKLE", "DUPLICATE_ACTIVE_SIGNAL: " + reason
+            entry = tp = sl = 0
         sw.append_row([stamp, paris_now, close, action, entry, tp, sl, reason,
                        model, ind["rsi14"], ind["ema9"], ind["ema21"], ind["atr14"],
                        "PAPER_ONLY"], value_input_option="RAW")
