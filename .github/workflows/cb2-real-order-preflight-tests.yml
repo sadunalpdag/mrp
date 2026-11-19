@@ -1,4 +1,4 @@
-name: CB2 independent LIMIT executor regression
+name: CB2 legacy order protection regression
 on:
   push:
     branches:
@@ -7,7 +7,6 @@ on:
     paths:
       - cb2_real_order_gateway.py
       - cb2_real_executor.py
-      - cb2_live_momentum.py
       - ema.py
       - test_cb2_real_order_gateway.py
       - test_cb2_real_executor.py
@@ -16,7 +15,6 @@ on:
     paths:
       - cb2_real_order_gateway.py
       - cb2_real_executor.py
-      - cb2_live_momentum.py
       - ema.py
       - test_cb2_real_order_gateway.py
       - test_cb2_real_executor.py
@@ -32,5 +30,4 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m py_compile cb2_real_order_gateway.py cb2_real_executor.py cb2_live_momentum.py ema.py test_cb2_real_order_gateway.py test_cb2_real_executor.py
       - run: python -m unittest -v test_cb2_real_order_gateway test_cb2_real_executor

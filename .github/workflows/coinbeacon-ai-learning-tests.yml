@@ -7,15 +7,11 @@ on:
       - 'coinbeacon_ai_dashboard.py'
       - 'test_coinbeacon_ai_dashboard.py'
       - 'test_coinbeacon_ai_learning.py'
-      - 'cb2_live_momentum.py'
-      - 'coinbeacon_six_paper.py'
       - '.github/workflows/coinbeacon-ai-learning-tests.yml'
   push:
     paths:
       - 'coinbeacon_ai_learning.py'
       - 'test_coinbeacon_ai_learning.py'
-      - 'cb2_live_momentum.py'
-      - 'coinbeacon_six_paper.py'
 jobs:
   offline:
     runs-on: ubuntu-latest

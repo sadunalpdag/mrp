@@ -13,7 +13,7 @@ import time
 # Leave generous headroom for other clients on a shared Render egress IP.
 # These are conservative software caps, NOT exchange guarantees.
 RESEARCH_CEILING = 180
-# PAPER-ONLY HBREAK/API2 is strictly lower than Crash V2 research.
+# low-priority paper research is strictly lower than Crash V2 research.
 PAPER_CEILING = 120
 ACCOUNT_CEILING = 1400
 PROTECT_CEILING = 1750

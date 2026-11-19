@@ -15969,13 +15969,6 @@ def main():
             log("[BTC AI SCALP SHEETS] optional paper scheduler initialized")
         except Exception as exc:
             log(f"[BTC AI SCALP SHEETS START ERR] {type(exc).__name__}: {str(exc)[:160]}")
-    # Telegram-only daily R2 signed links (no Binance calls or order changes).
-    try:
-        from r2_archive_link_notifier import start as _r2_archive_links_start
-        _r2_archive_links_start()
-        log("[R2 LINK] daily Telegram read-only links enabled for 21:30 Europe/Paris")
-    except Exception as exc:
-        log(f"[R2 LINK START ERR] {type(exc).__name__}: {str(exc)[:140]}")
     # Daily profit high-water paper OBSERVER: only signed account/position GET
     # and public orderbook GET. No real buy/TP/cancel actions or trading locks.
     if os.getenv("DAILY_PROFIT_PAPER_ENABLED", "0") == "1":

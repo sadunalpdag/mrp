@@ -21,7 +21,6 @@ ROWS = [
     ("COUNTER", "Bugunku kullanilan giris", "Sadece bilgi; sayac sifirlama guvenlik icin kilitli.", False),
     ("MANUAL_TP", "Elle acilan pozisyona TP", "Yalniz Render baslangic ayari; bu panelden degismez.", False),
     ("LEVERAGE", "Kaldirac", "10x, kodda sabit. Bu panelden degismez.", False),
-    ("API2", "CoinBeacon API2 sanal test", "Alti strateji. Bu panelden acilip kapatilmaz.", False),
     ("REAL_PROFIT", "Gunluk karla GERCEK kapanis", "GELISTIRILMEDI: Yalniz sanal fotoğraf; GERCEK TP YOK.", False),
     ("AUTO_SIZE", "Sermayeye gore gunluk pozisyon tutari",
      "AÇIK/KAPALI; Fransa 00:00 sonrasi ozsermaye degisimine gore tam USDT. Yalniz yeni alis.", True),
@@ -137,7 +136,6 @@ def _values(executor):
     result = {
         "PAPER": "AÇIK" if settings["enabled"] and os.getenv("DAILY_PROFIT_PAPER_ENABLED", "0") == "1" else "KAPALI",
         "TARGET": str(settings["target_pct"]),
-        "API2": "AKTIF (sanal)" if os.getenv("COINBEACON_SIX_PAPER_ENABLED") == "1" else "KAPALI",
         "LEVERAGE": "10x", "REAL_PROFIT": "SANAL / GERCEK EMIR YOK",
     }
     if executor is None:
