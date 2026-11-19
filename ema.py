@@ -8710,7 +8710,7 @@ def _crash_bounce_worker():
     from crash_policy import supported_symbol, prune_active_state, TRACKING_SECONDS
     # Operator disabled risk_v1 shadow strategy on 2026-11-12 to prevent
     # large raw quote JSONL files. Other Crash services, real orders and
-    # independent HBREAK/API2 paper tests continue unchanged.
+    # independent API2 paper tests continue unchanged.
     _CRASH_RISK_RESEARCH = None
     if os.getenv("CRASH_RISK_V1_ENABLED", "0") == "1":
         try:
@@ -15944,7 +15944,7 @@ def main():
                     if isinstance(job, dict))
         set_crash_priority_checker(_paper_must_yield_to_crash)
         log("[CRASH REST PRIORITY] live TP/account > Crash V2 signal/history > "
-            "HBREAK/API2 paper; paper budget 120 weight/min; "
+            "API2 paper; paper budget 120 weight/min; "
             "paper requests deferred on fresh Crash signals")
     except Exception as exc:
         log("[CRASH REST PRIORITY ERROR] " + type(exc).__name__
@@ -15976,14 +15976,6 @@ def main():
         log("[R2 LINK] daily Telegram read-only links enabled for 21:30 Europe/Paris")
     except Exception as exc:
         log(f"[R2 LINK START ERR] {type(exc).__name__}: {str(exc)[:140]}")
-    # HBREAK 4H LONG: isolated read-only paper monitor; never submits orders.
-    if os.getenv("HBREAK_PAPER_ENABLED", "0") == "1":
-        try:
-            from hbreak_paper import start as _hbreak_paper_start
-            _hbreak_paper_start()
-            log("[HBREAK] paper-only 4H breakout monitor started")
-        except Exception as exc:
-            log(f"[HBREAK START ERR] {type(exc).__name__}: {str(exc)[:180]}")
     # Daily profit high-water paper OBSERVER: only signed account/position GET
     # and public orderbook GET. No real buy/TP/cancel actions or trading locks.
     if os.getenv("DAILY_PROFIT_PAPER_ENABLED", "0") == "1":
@@ -15994,7 +15986,7 @@ def main():
         except Exception as exc:
             log(f"[PROFIT-PAPER START ERR] {type(exc).__name__}: {str(exc)[:160]}")
     # CoinBeacon API2: six isolated PAPER-ONLY strategies. Never imports or
-    # calls the real Binance broker; HBREAK SQLite accessed read-only.
+    # calls the real Binance broker; No HBREAK data source required.
     # An import check is useful even when the monitor is disabled.
     try:
         import coinbeacon_six_paper as _cb2_paper
