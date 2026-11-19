@@ -28,7 +28,7 @@ class CandleUnavailable(RuntimeError):
 def _client():
     global _CLIENT
     if _CLIENT is None:
-        from coinbeacon_six_paper import MarketClient
+        from btc_coinbeacon_client import MarketClient
         _CLIENT = MarketClient(requests)
         if not _CLIENT.key:
             _CLIENT.key = os.getenv("COINBEACON_API_KEY", "").strip()

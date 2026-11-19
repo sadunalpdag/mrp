@@ -2,7 +2,7 @@
 
 Feature flag CB_AI_LEARNING_ENABLED=1, paper-only and isolated.
 No broker imports, signed Binance endpoints, or real order placement.
-The existing CB2 momentum observer passes CLOSED 15m CoinBeacon candles.
+A separate optional signal source may pass CLOSED 15m CoinBeacon candles.
 """
 import hashlib
 import json

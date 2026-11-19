@@ -42,7 +42,7 @@ Sanal gunluk kar % hedefi gercek pozisyon kapatmaz, TP koymaz, emir
 silmez. Gercek kar-kilidi kapanis islemi henüz uygulanmamistir.
 
 Read-only satirlar: bugunku kullanilan sayac (sifirlayarak limit atlamayi
-engellemek icin kilitli), 10x kaldirac, manuel TP acilis ayari, CoinBeacon API2 ve gercek gunluk kar kapanisi.
+engellemek icin kilitli), 10x kaldirac, manuel TP acilis ayari ve gercek gunluk kar kapanisi.
 
 ## Guvenlik
 
