@@ -15960,6 +15960,15 @@ def main():
         log("[BTC DIRECTION] optional hourly read-only observer initialized")
     except Exception as exc:
         log(f"[BTC DIRECTION START ERR] {type(exc).__name__}: {str(exc)[:160]}")
+    # BTC AI SCALP SHEETS: read-only Gemini paper research, no orders/Telegram.
+    # Isolated daemon is opt-in and errors never propagate into Crash/CB2.
+    if os.getenv("BTC_AI_SCALP_SHEETS_ENABLED", "0") == "1":
+        try:
+            from btc_ai_scalp_scheduler import start as _btc_ai_scalp_start
+            _btc_ai_scalp_start()
+            log("[BTC AI SCALP SHEETS] optional paper scheduler initialized")
+        except Exception as exc:
+            log(f"[BTC AI SCALP SHEETS START ERR] {type(exc).__name__}: {str(exc)[:160]}")
     # Telegram-only daily R2 signed links (no Binance calls or order changes).
     try:
         from r2_archive_link_notifier import start as _r2_archive_links_start
