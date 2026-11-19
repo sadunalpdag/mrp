@@ -84,12 +84,14 @@ def _check(bars):
             LOG.warning("[GEMINI BTC STARTUP] requested_model_unavailable=%s selected=%s", model, selected)
             model = selected
         stage = "sdk_generate_content"
+        from btc_ai_scalp_sheets import generate_with_fallback
         try:
-            response = client.models.generate_content(
-                model=model, contents=prompt,
-                config=types.GenerateContentConfig(
+            response, model = generate_with_fallback(
+                client, model, prompt,
+                types.GenerateContentConfig(
                     system_instruction="Sen ihtiyatli, sadece veri odakli BTC piyasa gozlemcisisin.",
-                    temperature=0.1))
+                    temperature=0.1),
+                log_prefix="GEMINI BTC STARTUP")
         finally:
             close = getattr(client, "close", None)
             if callable(close):

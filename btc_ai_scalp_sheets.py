@@ -109,6 +109,47 @@ def indicators(bars):
             "ema21": round(ema(closes, 21), 2), "atr14": round(atr, 2)}
 
 
+
+def generate_with_fallback(client, model, prompt, config, log_prefix="BTC GEMINI"):
+    """Retry only transient 503s, then use an API-key-visible Flash fallback.
+
+    Raises on persistent failure. Caller must record BEKLE, not fabricate a trade.
+    """
+    primary_error = None
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(
+                model=model, contents=prompt, config=config), model
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            if code is None:
+                code = getattr(exc, "status_code", None)
+            if str(code) != "503":
+                raise
+            primary_error = exc
+            LOG.warning("[%s] primary model=%s HTTP 503 attempt=%s/3",
+                        log_prefix, model, attempt + 1)
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    # Select only a model actually advertised for generateContent on this key.
+    available = []
+    for entry in client.models.list():
+        name = str(getattr(entry, "name", "") or "").removeprefix("models/")
+        actions = (getattr(entry, "supported_actions", None) or
+                   getattr(entry, "supported_generation_methods", None) or [])
+        if name != model and "flash" in name and "generateContent" in actions:
+            available.append(name)
+    preferred = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+    fallback = next((m for m in preferred if m in available),
+                    next((m for m in available if "preview" not in m), None))
+    if not fallback:
+        raise primary_error
+    LOG.warning("[%s] primary HTTP 503 exhausted, trying fallback=%s",
+                log_prefix, fallback)
+    return client.models.generate_content(
+        model=fallback, contents=prompt, config=config), fallback
+
+
 def gemini_decision(bars, ind):
     from google import genai
     from google.genai import types
@@ -131,10 +172,11 @@ def gemini_decision(bars, ind):
     )
     client = genai.Client(api_key=api_key)
     try:
-        response = client.models.generate_content(
-            model=model, contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1, response_mime_type="application/json"))
+        response, model = generate_with_fallback(
+            client, model, prompt,
+            types.GenerateContentConfig(
+                temperature=0.1, response_mime_type="application/json"),
+            log_prefix="BTC AI SCALP")
         decision = json.loads(response.text or "{}")
         return decision, model
     finally:
