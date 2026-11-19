@@ -1,6 +1,6 @@
-"""15-minute BTC paper-only Sheets scheduler for existing ema.py worker.
+"""10-minute BTC paper-only Sheets scheduler for existing ema.py worker.
 
-Runs at minute 2, 17, 32, 47 UTC to allow closed CoinBeacon candles.
+Runs at minute 2, 12, 22, 32, 42, 52 UTC using closed 15m candles.
 No broker, Telegram, or TradingView imports. Disabled unless explicitly enabled
 by BTC_AI_SCALP_SHEETS_ENABLED=1 in the existing Render worker environment.
 """
@@ -18,8 +18,8 @@ def _loop():
     from btc_ai_scalp_sheets import run
     while True:
         now = time.time()
-        # Every 900 seconds, 120 seconds after the corresponding candle close.
-        next_run = (int((now - 120) // 900) + 1) * 900 + 120
+        # Every 600 seconds, 120 seconds after the ten-minute boundary.
+        next_run = (int((now - 120) // 600) + 1) * 600 + 120
         time.sleep(max(1, next_run - now))
         try:
             run()
