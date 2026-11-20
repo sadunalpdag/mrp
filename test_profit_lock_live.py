@@ -131,6 +131,46 @@ class LiveLockTests(unittest.TestCase):
         self.assertEqual(len(self.ex.broker.writes), 1)  # never duplicate
         self.assertTrue(self.ctrl.entries_blocked())
 
+
+    def test_two_positions_submit_two_limit_exits_exactly_once(self):
+        self.ex.broker.positions_data = [
+            {"symbol": "ETHUSDT", "positionSide": "BOTH",
+             "positionAmt": "1", "markPrice": "100.01"},
+            {"symbol": "BTCUSDT", "positionSide": "BOTH",
+             "positionAmt": "-0.05", "markPrice": "60000.00"},
+        ]
+        self.ctrl.step()
+        self.advance()
+        self.ex.broker.balance = Decimal("880")
+        self.ctrl.step()
+        self.advance()
+        self.ctrl.step()
+        self.assertEqual(len(self.ex.broker.writes), 2)
+        self.assertEqual({x[2]["side"] for x in self.ex.broker.writes},
+                         {"SELL", "BUY"})
+        self.advance()
+        self.ctrl.step()
+        self.assertEqual(len(self.ex.broker.writes), 2)
+        self.assertTrue(self.ctrl.entries_blocked())
+
+    def test_partial_fill_retains_lock(self):
+        self.ex.broker.positions_data = [{
+            "symbol": "ETHUSDT", "positionSide": "BOTH",
+            "positionAmt": "1", "markPrice": "100"
+        }]
+        self.ctrl.step()
+        self.advance()
+        self.ex.broker.balance = Decimal("880")
+        self.ctrl.step()
+        self.advance()
+        self.ctrl.step()
+        self.ex.broker.positions_data[0]["positionAmt"] = "0.5"
+        self.advance()
+        self.ctrl.step()
+        self.assertEqual(self.ctrl.state["phase"], "CLOSING")
+        self.assertTrue(self.ctrl.entries_blocked())
+        self.assertEqual(len(self.ex.broker.writes), 1)
+
     def test_untracked_manual_buy_blocks_close(self):
         self.ex.broker.regular = [{
             "symbol": "ETHUSDT", "side": "BUY", "type": "LIMIT", "clientOrderId": "manual"
