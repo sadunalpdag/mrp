@@ -470,6 +470,9 @@ class NightExecutor:
         self.account_resync_after = 0
         self.ws_manual_symbols = set()
         self.ws_manual_after = 0
+        # Optional fixed target live coordinator; no orders on construction.
+        from profit_lock_live import LiveProfitLock
+        self.profit_lock = LiveProfitLock(self)
 
     def save(self):
         with open(self.path+'.tmp', 'w', encoding='utf-8') as handle:
@@ -667,6 +670,8 @@ class NightExecutor:
             return (f'✅ Günlük kullanılan giriş sayısı: {before} → {int(value)} / {self.max_daily}\n'
                     f'Paris 00:00 itibarıyla yeni gün sayacı 0 olur. Açık/bekleyen emirler değişmedi; aynı anda sembol sınırı: {self.max_symbols}.')
         if action == 'on':
+            if self.profit_lock.entries_blocked():
+                return '⚠️ Sabit kâr kilidi etkin veya başlangıç verisi doğrulanmadı; yeni alış açılamaz.'
             if self.state['halt']:
                 return '⚠️ Açılamadı: '+self.state['halt']+'. Binance pozisyonları ve TP emirleri kontrol edilmeli. Komut hata kilidini kaldırmaz.'
             self.enabled.clear()
@@ -1509,6 +1514,9 @@ class NightExecutor:
 
     def submit(self, record, observed_at):
         symbol = record.get('symbol', 'UNKNOWN')
+        if self.profit_lock.entries_blocked():
+            self.entry_skip(symbol, 'PROFIT_TARGET_LOCK')
+            return
         if not self.enabled.is_set():
             self.entry_skip(symbol, 'AUTO_OFF')
             return
@@ -1531,6 +1539,7 @@ class NightExecutor:
         now = self.clock()
         sid, symbol = record.get('signal_id'), record.get('symbol')
         reason = (
+            'PROFIT_TARGET_LOCK' if self.profit_lock.entries_blocked() else
             'AUTO_OFF' if not self.enabled.is_set() else
             'SIGNAL_BEFORE_ARM' if observed_at < self.armed_at else
             'INVALID_SIGNAL' if not sid or not supported_symbol(symbol) else
@@ -1661,7 +1670,7 @@ class NightExecutor:
                  f'target_usdt={target_usdt}; tp_pct={tp_pct}; tp_price={p["tp"]}; '
                  f'quantity={p["quantity"]}; '
                  f'estimated_notional_usdt={order["risk_effective_notional_usdt"]}')
-        if not self.enabled.is_set():
+        if self.profit_lock.entries_blocked() or not self.enabled.is_set():
             order['phase'] = 'NO_FILL'
             self.save()
             return
@@ -2079,6 +2088,8 @@ class NightExecutor:
                 raise
             finally:
                 done.set()
+        # Resolve persisted live profit locks BEFORE processing any new BUY.
+        self.profit_lock.step()
         # Same serialized executor thread as BUY/TP decisions. The paper
         # observer performs its own independent GET requests; none added here.
         self._daily_size_update()
@@ -2156,7 +2167,7 @@ class NightExecutor:
         # protective polls while waiting for a safe next-minute preflight.
         # A still-pending midnight equity sample temporarily defers NEW BUYs
         # only; existing TP protection and housekeeping above already ran.
-        if self.auto_sizing_pending:
+        if self.auto_sizing_pending or self.profit_lock.entries_blocked():
             return
         now = self.clock()
         due = [(sid, retry) for sid, retry in self.preflight_retries.items()
