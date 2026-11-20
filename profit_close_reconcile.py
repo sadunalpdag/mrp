@@ -67,6 +67,7 @@ def reconcile_close(snapshot, current_positions, normal_orders, algo_orders,
     remaining = {str(k): str(v) for k, v in positions.items()}
     owned_pending = []
     unknown_open = []
+    unknown_closing = []
     pending_exits = []
     for o in normal_orders + algo_orders:
         if not isinstance(o, dict) or "symbol" not in o:
@@ -78,14 +79,17 @@ def reconcile_close(snapshot, current_positions, normal_orders, algo_orders,
             pending_exits.append((o["symbol"], str(client_id)))
         elif opening_order(o):
             unknown_open.append((o["symbol"], str(client_id or "UNKNOWN")))
+        else:
+            unknown_closing.append((o["symbol"], str(client_id or "UNKNOWN")))
     return {
         "positions_flat": not positions,
         "owned_entries_cleared": not owned_pending,
         "closing_orders_cleared": not pending_exits,
-        "all_clear": not positions and not owned_pending and not pending_exits and not unknown_open,
+        "all_clear": not positions and not owned_pending and not pending_exits and not unknown_open and not unknown_closing,
         "remaining_positions": remaining,
         "owned_pending_entries": owned_pending,
         "pending_exits": pending_exits,
         "unknown_opening_orders": unknown_open,
+        "unknown_closing_orders": unknown_closing,
         "expected_symbols": sorted(expected),
     }
