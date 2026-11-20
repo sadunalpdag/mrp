@@ -2090,6 +2090,13 @@ class NightExecutor:
                 done.set()
         # Resolve persisted live profit locks BEFORE processing any new BUY.
         self.profit_lock.step()
+        if self.profit_lock.locked():
+            # The close coordinator exclusively owns exchange TP orders now.
+            # Legacy TP repair would resurrect orders intentionally replaced
+            # by frozen LIMIT exits, causing duplicate/conflicting closures.
+            # Fresh Binance positions/orders are polled by profit_lock.step().
+            self.deliver_pending()
+            return
         # Same serialized executor thread as BUY/TP decisions. The paper
         # observer performs its own independent GET requests; none added here.
         self._daily_size_update()
