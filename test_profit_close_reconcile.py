@@ -34,6 +34,12 @@ class ReconcileTests(unittest.TestCase):
         self.assertTrue(result["positions_flat"])
         self.assertFalse(result["all_clear"])
 
+    def test_unknown_manual_close_prevents_unlock(self):
+        result = reconcile_close([], [], [order("manual_tp", side="SELL", reduceOnly=True)],
+                                 [], set(), set())
+        self.assertFalse(result["all_clear"])
+        self.assertEqual(len(result["unknown_closing_orders"]), 1)
+
     def test_verified_clear(self):
         result = reconcile_close([], [], [], [], {"entry"}, {"exit"})
         self.assertTrue(result["all_clear"])
