@@ -104,7 +104,7 @@ def _flag(row, tf):
     item = row.get("item")
     if not isinstance(item, dict):
         return None
-    name = str(item.get("name") or item.get("type") or item.get("pattern") or "")
+    name = str(item.get("name") or item.get("type") or item.get("pattern") or item.get("patternType") or "")
     if re.sub(r"[^a-z]", "", name.lower()) != "bullflag":
         return None
     sym = str(row.get("symbol") or "")
@@ -192,11 +192,14 @@ def _sheet(db):
 
 def _later(db, now_ms):
     db.row_factory = sqlite3.Row
-    records = db.execute("SELECT * FROM flags WHERE first_ms>? AND archived=0 LIMIT 40",
-                         (now_ms - 10*3600000,)).fetchall()
+    records = db.execute("SELECT * FROM flags WHERE archived=0 LIMIT 40").fetchall()
     for rec in records:
         obj = dict(rec)
         payload = json.loads(obj["payload"])
+        # Completed cases can retry R2 upload after temporary outages.
+        if obj["status"] == "COMPLETE":
+            _archive(obj, db)
+            continue
         # Fetch future only at the end of 8h; compact 32 closed 15m candles.
         if now_ms < obj["first_ms"] + HORIZON_MS + BAR_MS:
             continue
@@ -285,6 +288,16 @@ def step():
                                "levels_source":source, "history":bars,
                                "history_complete":complete, "future":[],
                                "future_complete":False}
+                    # Without CoinBeacon geometric levels, use an explicit candle-derived
+                    # range estimate (never label it as a CoinBeacon detector level).
+                    if source == "UNAVAILABLE" and complete and len(bars) >= 32:
+                        support = min(b[3] for b in bars[-32:])
+                        resistance = max(b[2] for b in bars[-32:])
+                        if support > 0 and resistance > support * 1.009:
+                            source = "CANDLE_RANGE_ESTIMATE"
+                            payload["support"] = support
+                            payload["resistance"] = resistance
+                            payload["levels_source"] = source
                     status = "WATCH" if source != "UNAVAILABLE" and complete else "DATA_PENDING"
                     db.execute("INSERT INTO flags(id,symbol,tf,first_ms,last_ms,status,"
                                "support,resistance,source,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
