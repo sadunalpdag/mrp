@@ -291,21 +291,31 @@ class LiveProfitLock:
             self._save(closing_verified(st, True, True, True, now))
             return
         # First reconcile and cancel exact bot-owned entries and TP. Never
-        # indiscriminately cancel all account orders.
-        if st.get("exit_plan"):
-            # Exits were attempted; check partial fills and keep the lock.
-            # Unfilled exits retain their frozen prices; no MARKET fallback.
-            return
+        # indiscriminately cancel all account orders. Existing frozen LIMIT
+        # exits are left intact while missing ones are submitted only once.
         self._prepare_exits(positions, normal, algo)
         verified, positions, normal, algo = self._verify()
         if verified["owned_pending_entries"] or verified["unknown_opening_orders"]:
             return
-        # All surviving order conflicts need verification on next tick.
+        # Wait for any legacy TP cancellation to be exchange-confirmed.
         _, exits = self._tracked_ids()
         if any((o.get("clientOrderId") or o.get("clientAlgoId")) in exits
+               and str(o.get("clientOrderId") or "").startswith("cbn")
                for o in normal + algo):
             return
         current = normalize_positions(positions)
+        snap_keys = {(x["symbol"], x["position_side"])
+                     for x in st["position_snapshot"]}
+        # Late entry fills may appear after an acknowledged cancellation.
+        # Freeze each newly discovered position once, before any exit POST.
+        for row in positions:
+            qty = D(str(row["positionAmt"]))
+            key = (row["symbol"], row.get("positionSide", "BOTH"))
+            if qty and key not in snap_keys:
+                added = self._build_snapshot([row])[0]
+                st["position_snapshot"].append(added)
+                snap_keys.add(key)
+                self._save(st)
         for item in st["position_snapshot"]:
             live_amount = current.get((item["symbol"], item["position_side"]))
             if live_amount is None:
