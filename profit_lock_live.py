@@ -287,6 +287,17 @@ class LiveProfitLock:
         self._block()
         st = self.state
         verified, positions, normal, algo = self._verify()
+        # A missing previously-submitted exit is not proof of completion.
+        # If a position remains, halt retries and alert for manual review.
+        live_keys = normalize_positions(positions)
+        open_ids = {str(o.get("clientOrderId") or o.get("clientAlgoId") or "")
+                    for o in normal + algo}
+        for key, attempt in (st.get("exit_plan") or {}).items():
+            symbol, position_side = key.split("|", 1)
+            if (symbol, position_side) in live_keys and attempt["id"] not in open_ids:
+                self._alert("LIMIT kapanış emri Binance açık emirlerinde görülmüyor: "
+                            + symbol + " " + position_side + "; pozisyon hâlâ açık. "
+                            "Otomatik tekrar yok; manuel kontrol gerekiyor.")
         if verified["all_clear"]:
             now = datetime.fromtimestamp(self.ex.clock(), timezone.utc)
             self._save(closing_verified(st, True, True, True, now))
