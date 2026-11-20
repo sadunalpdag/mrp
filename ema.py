@@ -15949,6 +15949,13 @@ def main():
     except Exception as exc:
         log("[CRASH REST PRIORITY ERROR] " + type(exc).__name__
             + "; paper Binance calls retain independent low budget")
+    # Bull Flag paper-only research; no broker imports or real orders.
+    if os.getenv("BULL_FLAG_PAPER_ENABLED", "0") == "1":
+        try:
+            from bull_flag_paper import start as _bull_flag_paper_start
+            log("[BULL FLAG PAPER] started=%s" % _bull_flag_paper_start())
+        except Exception as exc:
+            log("[BULL FLAG PAPER START ERR] " + type(exc).__name__)
     # BTC hourly direction observer: read-only research, not part of trading decisions.
     # Feature is opt-in (BTC_DIRECTION_OBSERVER_ENABLED=1) and yields to live TP/entry.
     try:
