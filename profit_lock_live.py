@@ -36,7 +36,8 @@ class LiveProfitLock:
     def entries_blocked(self):
         # Until the first validated account sample, fail closed rather than
         # opening a BUY during an uninitialized profit-lock deployment.
-        return self.active() and (not self.state or self.locked())
+        return self.active() and (not self.state or self.locked()
+                                  or bool(self.state.get("monitor_error")))
 
     def _save(self, state):
         self.ex.state["profit_lock_live"] = state
@@ -334,6 +335,10 @@ class LiveProfitLock:
         try:
             equity, pct, imported_target, instant = self._sample()
             st = self.state
+            if st and st.pop("monitor_error", None):
+                self._save(st)
+                if st.get("phase") == "WAIT_TARGET" and not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                    self.ex.enabled.set()
             if not st:
                 st = initial_state(equity, pct, instant)
                 # Retain the existing frozen target rather than using a
@@ -366,13 +371,15 @@ class LiveProfitLock:
                 new = roll_after_midnight(
                     st, equity, pct, instant, verify["positions_flat"],
                     verify["owned_entries_cleared"] and not verify["unknown_opening_orders"],
-                    verify["closing_orders_cleared"])
+                    verify["closing_orders_cleared"] and not verify["unknown_closing_orders"])
                 if new != st:
                     self._save(new)
                     if new["phase"] == "WAIT_TARGET" and not self.ex.state.get("paused") and not self.ex.state.get("halt"):
                         self.ex.enabled.set()
         except Exception as err:
-            if self.locked():
-                self._block()
+            self._block()
+            st = self.state or {"phase": "ERROR_LOCK", "target": None}
+            st["monitor_error"] = type(err).__name__ + ": " + str(err)[:120]
+            self._save(st)
             self._alert(type(err).__name__ + ": " + str(err)[:120] +
                         " | Kontrol gerekli, otomatik MARKET emri yok.")
