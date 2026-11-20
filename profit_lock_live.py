@@ -57,9 +57,8 @@ class LiveProfitLock:
         thereafter our durable target is never updated by its daily peak.
         """
         data_dir = os.getenv("DATA_DIR", "/data")
-        with open(os.path.join(data_dir, "daily_profit_lock_paper_settings.json"),
-                  encoding="utf-8") as handle:
-            config = json.load(handle)
+        from daily_profit_lock_paper import load_settings
+        config = load_settings()
         pct = D(str(config["target_pct"]))
         if not D("0.5") <= pct <= D("20"):
             raise ValueError("INVALID_USER_CONFIGURED_PERCENT")
