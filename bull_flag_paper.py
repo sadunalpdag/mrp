@@ -1,0 +1,320 @@
+"""Isolated Bull Flag paper observer. No broker/order imports. Opt-in only."""
+import gzip
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+LOG = logging.getLogger("bull_flag_paper")
+API = "https://api.coinbeacon.io"
+FRAMES = ("15m", "1h", "4h", "1d")
+BAR_MS = 900000
+HORIZON_MS = 8 * 3600000
+_MAX_NEW = 8
+_STARTED = False
+
+
+def _db():
+    root = Path(os.getenv("DATA_DIR", "/data"))
+    root.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(root / "bull_flag_paper.sqlite3", timeout=15)
+    db.execute("""CREATE TABLE IF NOT EXISTS flags(
+        id TEXT PRIMARY KEY, symbol TEXT, tf TEXT, first_ms INTEGER,
+        last_ms INTEGER, status TEXT, support REAL, resistance REAL,
+        source TEXT, paper_entry REAL, paper_target REAL, paper_ms INTEGER,
+        result TEXT, payload TEXT, archived INTEGER DEFAULT 0)""")
+    db.commit()
+    return db
+
+
+def _number(value):
+    try:
+        x = float(value)
+        return x if math.isfinite(x) and x > 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _api(path, params=None):
+    key = (os.getenv("api2") or os.getenv("API2") or
+           os.getenv("COINBEACON_API_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("COINBEACON_KEY_MISSING")
+    r = requests.get(API + path, params=params, headers={"X-API-Key": key}, timeout=35)
+    if r.status_code == 429:
+        raise RuntimeError("COINBEACON_RATE_LIMIT")
+    r.raise_for_status()
+    return r.json()
+
+
+def _bars(symbol, before_ms, count=480):
+    # Explicit 'to' freezes the observation. Do not include a developing bar.
+    data = _api("/public/ohlcv/binance-futures/%s/15m" % symbol,
+                {"to": before_ms - 1, "limit": count})
+    if data.get("exchange") != "binance-futures" or data.get("symbol") != symbol:
+        raise ValueError("OHLCV_WRONG_MARKET")
+    out = []
+    for row in data.get("bars", []):
+        try:
+            t = int(row["openTime"])
+            end = int(row["closeTime"])
+            vals = [float(row[k]) for k in ("open", "high", "low", "close", "volume")]
+            if (t % BAR_MS or end != t + BAR_MS - 1 or end >= before_ms or
+                any(not math.isfinite(x) for x in vals) or min(vals[:4]) <= 0
+                or vals[4] < 0 or vals[1] < max(vals[0], vals[3])
+                or vals[2] > min(vals[0], vals[3])):
+                continue
+            out.append([t] + vals)
+        except (KeyError, TypeError, ValueError):
+            continue
+    out = sorted({x[0]: x for x in out}.values())
+    if len(out) > count:
+        out = out[-count:]
+    complete = (len(out) == count and
+                all(b[0] - a[0] == BAR_MS for a, b in zip(out, out[1:])))
+    return out, complete
+
+
+def _telegram(message):
+    token, chat = os.getenv("BOT_TOKEN"), os.getenv("CHAT_ID")
+    if not token or not chat:
+        LOG.warning("Bull Flag Telegram not configured")
+        return False
+    try:
+        r = requests.post("https://api.telegram.org/bot%s/sendMessage" % token,
+                          data={"chat_id": chat, "text": message[:2000]}, timeout=12)
+        r.raise_for_status()
+        return bool(r.json().get("ok"))
+    except (requests.RequestException, ValueError):
+        LOG.warning("Bull Flag Telegram delivery failed")
+        return False
+
+
+def _flag(row, tf):
+    item = row.get("item")
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name") or item.get("type") or item.get("pattern") or "")
+    if re.sub(r"[^a-z]", "", name.lower()) != "bullflag":
+        return None
+    sym = str(row.get("symbol") or "")
+    if (not re.fullmatch(r"[A-Z0-9]{2,30}USDT", sym) or
+        row.get("exchange") != "binance-futures" or row.get("tf") != tf):
+        return None
+    # Pattern geometry is preferred. If absent, no fabricated API level.
+    support = _number(item.get("support") or item.get("supportPrice"))
+    resistance = _number(item.get("resistance") or item.get("resistancePrice"))
+    source = "COINBEACON_PATTERN" if support and resistance and support < resistance else "UNAVAILABLE"
+    if source == "UNAVAILABLE":
+        support = resistance = None
+    return sym, support, resistance, source, item
+
+
+def _identity(sym, tf, item, db):
+    # Stable detector pivot geometry, if published. Never hash changing score/price.
+    pivots = item.get("pivots") or item.get("points")
+    if isinstance(pivots, list) and pivots:
+        anchor = json.dumps(pivots, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256((sym + tf + "BullFlag" + anchor).encode()).hexdigest()[:24]
+    # Without stable pivot metadata, retain one observational instance for 48h.
+    cutoff = int(time.time() * 1000) - 48 * 3600000
+    old = db.execute("SELECT id FROM flags WHERE symbol=? AND tf=? AND first_ms>? "
+                     "ORDER BY first_ms DESC LIMIT 1", (sym, tf, cutoff)).fetchone()
+    if old:
+        return old[0]
+    return hashlib.sha256((sym + tf + str(int(time.time() // 172800))).encode()).hexdigest()[:24]
+
+
+def _archive(record, db):
+    if record["archived"]:
+        return
+    try:
+        from btc_hourly_direction import _r2_client
+        client, bucket = _r2_client()
+        if client is None:
+            return
+        payload = json.loads(record["payload"])
+        key = "bull-flag-paper/%s/%s.json.gz" % (
+            datetime.fromtimestamp(record["first_ms"]/1000, timezone.utc).strftime("%Y-%m"),
+            record["id"])
+        packed = gzip.compress(json.dumps(payload, separators=(",", ":"), allow_nan=False).encode())
+        client.put_object(Bucket=bucket, Key=key, Body=packed,
+                          ContentType="application/json", ContentEncoding="gzip")
+        db.execute("UPDATE flags SET archived=1 WHERE id=?", (record["id"],))
+        db.commit()
+    except Exception as exc:
+        LOG.warning("Bull Flag R2 archive failed: %s", type(exc).__name__)
+
+
+def _sheet(db):
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    sid = (os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID") or "").strip()
+    if not raw or not sid:
+        LOG.warning("Bull Flag Sheets not configured")
+        return
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_info(
+            json.loads(raw), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        book = gspread.authorize(creds).open_by_key(sid)
+        try:
+            tab = book.worksheet("BULL_FLAG_PAPER")
+        except gspread.WorksheetNotFound:
+            tab = book.add_worksheet(title="BULL_FLAG_PAPER", rows=1500, cols=15)
+        rows = [["ID", "Coin", "TF", "First UTC", "Last UTC", "Support", "Resistance",
+                 "Level source", "Paper entry", "Paper target", "Status", "Result",
+                 "History bars", "Future bars"]]
+        for rec in db.execute("SELECT * FROM flags ORDER BY first_ms DESC LIMIT 1000"):
+            record = dict(zip([c[0] for c in db.execute("SELECT * FROM flags LIMIT 0").description], rec))
+            p = json.loads(record["payload"])
+            rows.append([record["id"], record["symbol"], record["tf"],
+                         datetime.fromtimestamp(record["first_ms"]/1000, timezone.utc).isoformat(),
+                         datetime.fromtimestamp(record["last_ms"]/1000, timezone.utc).isoformat(),
+                         record["support"] or "", record["resistance"] or "",
+                         record["source"], record["paper_entry"] or "", record["paper_target"] or "",
+                         record["status"], record["result"] or "",
+                         len(p.get("history", [])), len(p.get("future", []))])
+        tab.update(range_name="A1", values=rows)
+    except Exception as exc:
+        LOG.warning("Bull Flag Sheets update failed: %s", type(exc).__name__)
+
+
+def _later(db, now_ms):
+    db.row_factory = sqlite3.Row
+    records = db.execute("SELECT * FROM flags WHERE first_ms>? AND archived=0 LIMIT 40",
+                         (now_ms - 10*3600000,)).fetchall()
+    for rec in records:
+        obj = dict(rec)
+        payload = json.loads(obj["payload"])
+        # Fetch future only at the end of 8h; compact 32 closed 15m candles.
+        if now_ms < obj["first_ms"] + HORIZON_MS + BAR_MS:
+            continue
+        try:
+            future, _ = _bars(obj["symbol"], obj["first_ms"] + HORIZON_MS + BAR_MS, 40)
+            future = [x for x in future if obj["first_ms"] <= x[0] <
+                      obj["first_ms"] + HORIZON_MS][:32]
+            payload["future"] = future
+            payload["future_complete"] = len(future) == 32 and all(
+                b[0] - a[0] == BAR_MS for a, b in zip(future, future[1:]))
+            # Resolve paper outcome conservatively from future closed bars only.
+            result = obj["result"]
+            entry, target = obj["paper_entry"], obj["paper_target"]
+            if entry and target and obj["support"]:
+                for bar in future:
+                    if bar[0] < (obj["paper_ms"] or 0):
+                        continue
+                    if bar[2] >= target and bar[3] < obj["support"] * .997:
+                        result = "AMBIGUOUS_INVALIDATED"
+                        break
+                    if bar[3] < obj["support"] * .997:
+                        result = "INVALIDATED"
+                        break
+                    if bar[2] >= target:
+                        result = "TARGET"
+                        break
+                result = result or "TIMEOUT"
+            else:
+                result = result or "NO_ENTRY"
+            payload["result"] = result
+            db.execute("UPDATE flags SET result=?,status=?,payload=? WHERE id=?",
+                       (result, "COMPLETE", json.dumps(payload, separators=(",", ":")), obj["id"]))
+            db.commit()
+            _telegram("📊 BULL FLAG SANAL SONUÇ\n%s %s: %s" %
+                      (obj["symbol"], obj["tf"], result))
+            _archive({**obj, "payload": json.dumps(payload), "archived": 0}, db)
+        except Exception as exc:
+            LOG.warning("Bull Flag 8h followup unavailable: %s", type(exc).__name__)
+
+
+def step():
+    now_ms = int(time.time()*1000)
+    with _db() as db:
+        # Existing paper cases are processed even if a detector snapshot is truncated.
+        _later(db, now_ms)
+        new_count = 0
+        for tf in FRAMES:
+            try:
+                data = _api("/public/detectors/patterns",
+                            {"exchange": "binance-futures", "timeframe": tf, "quote": "USDT"})
+                if data.get("kind") != "patterns" or data.get("timeframe") != tf:
+                    raise ValueError("PATTERN_BOARD_WRONG_MARKET")
+                for row in data.get("items", [])[:150]:
+                    hit = _flag(row, tf)
+                    if hit is None:
+                        continue
+                    sym, support, resistance, source, item = hit
+                    ident = _identity(sym, tf, item, db)
+                    old = db.execute("SELECT id,status FROM flags WHERE id=?", (ident,)).fetchone()
+                    if old:
+                        db.execute("UPDATE flags SET last_ms=? WHERE id=?", (now_ms, ident))
+                        # A new paper entry needs valid levels, and another closed-bar observation.
+                        if old[1] == "WATCH" and support and resistance:
+                            bars, ok = _bars(sym, (now_ms // BAR_MS)*BAR_MS, 2)
+                            if ok and len(bars) >= 2:
+                                prev, cur = bars[-2:]
+                                close = cur[4]
+                                if (support <= cur[3] <= support*1.003 and
+                                    close > prev[4] and close > support and
+                                    resistance*.999 > close*1.005):
+                                    db.execute("UPDATE flags SET status=?,paper_entry=?,"
+                                               "paper_target=?,paper_ms=? WHERE id=?",
+                                               ("PAPER_LONG", close, resistance*.999, now_ms, ident))
+                                    _telegram("🟢 BULL FLAG SANAL LONG\n%s %s\n"
+                                              "Giriş: %.8g | Destek: %.8g | Direnç: %.8g" %
+                                              (sym, tf, close, support, resistance))
+                        continue
+                    if new_count >= _MAX_NEW:
+                        continue
+                    # Archive the actual context as of first detection, before any outcome.
+                    end = (now_ms // BAR_MS)*BAR_MS
+                    bars, complete = _bars(sym, end, 480)
+                    payload = {"schema":"bull_flag_paper_v1", "id":ident, "symbol":sym,
+                               "tf":tf, "observed_ms":now_ms, "pattern":item,
+                               "support":support, "resistance":resistance,
+                               "levels_source":source, "history":bars,
+                               "history_complete":complete, "future":[],
+                               "future_complete":False}
+                    status = "WATCH" if source != "UNAVAILABLE" and complete else "DATA_PENDING"
+                    db.execute("INSERT INTO flags(id,symbol,tf,first_ms,last_ms,status,"
+                               "support,resistance,source,payload) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                               (ident,sym,tf,now_ms,now_ms,status,support,resistance,source,
+                                json.dumps(payload, separators=(",", ":"))))
+                    db.commit()
+                    new_count += 1
+                    _telegram("🚩 YENİ BULL FLAG (SANAL)\n%s %s\n"
+                              "Destek: %s | Direnç: %s\nVeri: %s" %
+                              (sym, tf, support, resistance, status))
+            except Exception as exc:
+                LOG.warning("Bull Flag scan %s unavailable: %s", tf, type(exc).__name__)
+        _sheet(db)
+        LOG.info("Bull Flag cycle complete new=%s", new_count)
+
+
+def start():
+    global _STARTED
+    if _STARTED or os.getenv("BULL_FLAG_PAPER_ENABLED", "0") != "1":
+        return False
+    if not (os.getenv("api2") or os.getenv("API2") or os.getenv("COINBEACON_API_KEY")):
+        LOG.warning("Bull Flag disabled: missing CoinBeacon key")
+        return False
+    _STARTED = True
+    def loop():
+        while True:
+            try:
+                step()
+            except Exception as exc:
+                LOG.warning("Bull Flag worker error: %s", type(exc).__name__)
+            time.sleep(max(30, 1800 - (time.time() % 1800)))
+    threading.Thread(target=loop, name="bull-flag-paper", daemon=True).start()
+    return True
