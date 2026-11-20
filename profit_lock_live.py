@@ -33,6 +33,11 @@ class LiveProfitLock:
         # A triggered lock is not dismissible by disabling the feature.
         return self.locked() or os.getenv("CRASH_FIXED_PROFIT_LOCK_ENABLED", "0") == "1"
 
+    def entries_blocked(self):
+        # Until the first validated account sample, fail closed rather than
+        # opening a BUY during an uninitialized profit-lock deployment.
+        return self.active() and (not self.state or self.locked())
+
     def _save(self, state):
         self.ex.state["profit_lock_live"] = state
         self.ex.save()
