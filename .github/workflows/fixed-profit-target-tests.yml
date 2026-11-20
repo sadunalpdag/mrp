@@ -1,0 +1,18 @@
+name: Fixed profit target safety checks
+on:
+  push:
+    branches:
+      - feature/fixed-profit-target-lock-20261120
+  workflow_dispatch:
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax check
+        run: python -m py_compile fixed_profit_target.py profit_close_reconcile.py test_fixed_profit_target.py test_profit_close_reconcile.py
+      - name: Unit tests
+        run: python -m unittest -v test_fixed_profit_target test_profit_close_reconcile
