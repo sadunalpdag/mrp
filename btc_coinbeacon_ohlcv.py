@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import threading
+import time
 
 import requests
 
@@ -19,6 +20,57 @@ RECENT_REQUIRED = 1000  # 1h ADX and 4h EMA history, plus paper 15m monitoring.
 _LOCK = threading.RLock()
 _CLIENT = None
 _CACHE = {}
+_ALERT_LOCK = threading.Lock()
+_ALERT_ACTIVE = False
+_LAST_ALERT_TS = 0.0
+_ALERT_INTERVAL_SECONDS = 3600
+
+
+def _telegram_status(message):
+    """Send only operational status; never include credentials or request URLs."""
+    token = os.getenv("BOT_TOKEN", "").strip()
+    chat = os.getenv("CHAT_ID", "").strip()
+    if not token or not chat:
+        LOG.warning("[BTC COINBEACON ALERT] Telegram is not configured")
+        return
+    try:
+        response = requests.post(
+            "https://api.telegram.org/bot" + token + "/sendMessage",
+            data={"chat_id": chat, "text": message[:1500]}, timeout=10)
+        response.raise_for_status()
+        if not response.json().get("ok"):
+            raise RuntimeError("TELEGRAM_NOT_OK")
+    except Exception as exc:
+        LOG.warning("[BTC COINBEACON ALERT] send failed type=%s", type(exc).__name__)
+
+
+def _report_failure(reason):
+    global _ALERT_ACTIVE, _LAST_ALERT_TS
+    now = time.time()
+    with _ALERT_LOCK:
+        should_send = not _ALERT_ACTIVE or now - _LAST_ALERT_TS >= _ALERT_INTERVAL_SECONDS
+        _ALERT_ACTIVE = True
+        if should_send:
+            _LAST_ALERT_TS = now
+    if should_send:
+        _telegram_status(
+            "❌ BTC COINBEACON VERİ HATASI\n"
+            "Kaynak: CoinBeacon BTCUSDT 15m\n"
+            "Neden: " + str(reason)[:100] + "\n"
+            "Gemini BTC analizi bu çevrimde güncellenemeyebilir.\n"
+            "Crash Bounce işlemleri etkilenmez.\n"
+            "Tekrar eden hatalar için uyarı en fazla saatte bir gönderilir.")
+
+
+def _report_recovered():
+    global _ALERT_ACTIVE
+    with _ALERT_LOCK:
+        was_active = _ALERT_ACTIVE
+        _ALERT_ACTIVE = False
+    if was_active:
+        _telegram_status("✅ BTC COINBEACON BAĞLANTISI DÜZELDİ\n"
+                         "BTCUSDT 15m mum verisi yeniden başarıyla alındı.")
+
 
 
 class CandleUnavailable(RuntimeError):
@@ -55,7 +107,7 @@ def _validate_bar(raw, before_ms):
         return None
 
 
-def fetch_closed_15m(end_ms, count, priority_checker=lambda: False):
+def _fetch_closed_15m_unmonitored(end_ms, count, priority_checker=lambda: False):
     """Fetch exactly count consecutive closed candles up to exclusive end_ms.
 
     If CoinBeacon's historical cache cannot supply enough candles, return an
@@ -118,6 +170,23 @@ def fetch_closed_15m(end_ms, count, priority_checker=lambda: False):
         LOG.info("[BTC COINBEACON OHLCV] closed_15m=%d pages=%d last_close=%d",
                  len(output), pages, end_ms)
         return [list(b) for b in output]
+
+
+
+def fetch_closed_15m(end_ms, count, priority_checker=lambda: False):
+    """Notify Telegram on actual CoinBeacon/data failures, not Crash priority waits."""
+    try:
+        bars = _fetch_closed_15m_unmonitored(end_ms, count, priority_checker)
+    except CandleUnavailable as exc:
+        reason = str(exc)
+        if reason != "LIVE_CRASH_PRIORITY":
+            _report_failure(reason)
+        raise
+    except Exception as exc:
+        _report_failure("UNEXPECTED_" + type(exc).__name__)
+        raise
+    _report_recovered()
+    return bars
 
 
 def aggregate(bars, timeframe, before_ms):
