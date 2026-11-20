@@ -51,29 +51,101 @@ class LiveProfitLock:
         self.ex.alert("⚠️ SABİT KÂR HEDEFİ | " + msg)
 
     def _sample(self):
-        # Use the existing independent USD-M income/transfer validator for the
-        # cashflow-adjusted equity and for the operator's configured percentage.
-        # Never guess a historical peak or silently interpret a deposit as profit.
-        path = os.path.join(os.getenv("DATA_DIR", "/data"),
-                            "daily_profit_paper_state.json")
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-        latest = data.get("last") or {}
-        updated = datetime.fromisoformat(latest["at"].replace("Z", "+00:00"))
+        """Validated single-asset Binance equity, adjusted for cash transfers.
+
+        Only the INITIAL reference is imported from the old paper monitor;
+        thereafter our durable target is never updated by its daily peak.
+        """
+        data_dir = os.getenv("DATA_DIR", "/data")
+        with open(os.path.join(data_dir, "daily_profit_lock_paper_settings.json"),
+                  encoding="utf-8") as handle:
+            config = json.load(handle)
+        pct = D(str(config["target_pct"]))
+        if not D("0.5") <= pct <= D("20"):
+            raise ValueError("INVALID_USER_CONFIGURED_PERCENT")
         now = datetime.fromtimestamp(self.ex.clock(), timezone.utc)
-        if abs((now - updated).total_seconds()) > 900:
-            raise ValueError("STALE_ACCOUNT_EQUITY_OBSERVER")
-        if latest.get("data_quality") != "USDT_TRANSFER_INCOME_ADJUSTED_PAPER_ESTIMATE":
-            raise ValueError("EQUITY_NOT_TRANSFER_VALIDATED")
-        checked = int(data.get("transfer_checked_ms") or 0) / 1000
-        if abs(self.ex.clock() - checked) > 900:
-            raise ValueError("STALE_TRANSFER_RECONCILIATION")
-        pct = D(str(data["target_pct"]))
-        equity = D(str(latest["adjusted_equity"]))
-        target = D(str(data["target"]))
-        if not (D("0.5") <= pct <= D("20")) or equity <= 0 or target <= 0:
-            raise ValueError("INVALID_FIXED_GOAL_SOURCE")
-        return equity, pct, target, now
+        acc = self.ex.broker.request("GET", "/fapi/v3/account")
+        if not isinstance(acc, dict) or acc.get("multiAssetsMargin") is not False:
+            raise ValueError("UNSUPPORTED_MULTI_ASSET_MARGIN")
+        assets = acc.get("assets")
+        if not isinstance(assets, list):
+            raise ValueError("INVALID_ACCOUNT_ASSETS")
+        for asset in assets:
+            if asset.get("asset") != "USDT" and abs(D(str(asset.get("marginBalance", "0")))) > D("0.01"):
+                raise ValueError("UNSUPPORTED_NON_USDT_COLLATERAL")
+        wallet = D(str(acc["totalWalletBalance"]))
+        unreal = D(str(acc["totalUnrealizedProfit"]))
+        raw = D(str(acc["totalMarginBalance"]))
+        if raw <= 0 or abs(raw - wallet - unreal) > D("0.1"):
+            raise ValueError("INCONSISTENT_ACCOUNT_EQUITY")
+
+        # On activation, import the already-published current fixed target.
+        # No historical target reconstruction and no silent %1 substitution.
+        if self.state is None:
+            with open(os.path.join(data_dir, "daily_profit_lock_paper.json"),
+                      encoding="utf-8") as handle:
+                paper = json.load(handle)
+            if paper.get("mode") != "PAPER_ONLY":
+                raise ValueError("INVALID_PAPER_REFERENCE")
+            target = D(str(paper["target"]))
+            if target <= 0:
+                raise ValueError("NO_VALID_PAPER_TARGET")
+            return raw, pct, target, now
+
+        st = self.state
+        target = D(str(st["target"]))
+        now_ms = int(self.ex.clock() * 1000)
+        base = int(st.get("cashflow_from_ms") or 0)
+        if base == 0:
+            # First authenticated observation of a newly initialized lock.
+            st["cashflow_from_ms"] = now_ms
+            st["cashflow_checked_ms"] = now_ms
+            st["cashflow_seen"] = []
+            st["cashflow_total"] = "0"
+            self._save(st)
+            return raw, pct, target, now
+        previous = int(st.get("cashflow_checked_ms") or 0)
+        if previous < base or now_ms - previous > 6 * 24 * 3600 * 1000:
+            raise ValueError("CASHFLOW_HISTORY_GAP")
+        # Re-read five minutes to absorb late-arriving income records.
+        start = max(base + 1, previous - 300000)
+        rows = self.ex.broker.request("GET", "/fapi/v1/income",
+                         {"startTime": start, "endTime": now_ms, "limit": 1000})
+        if not isinstance(rows, list) or len(rows) >= 1000:
+            raise ValueError("CASHFLOW_HISTORY_INCOMPLETE")
+        seen = set(st.get("cashflow_seen", []))
+        total = D(str(st.get("cashflow_total", "0")))
+        transfer_types = {
+            "TRANSFER", "INTERNAL_TRANSFER", "CROSS_COLLATERAL_TRANSFER",
+            "COIN_SWAP_DEPOSIT", "COIN_SWAP_WITHDRAW",
+            "STRATEGY_UMFUTURES_TRANSFER"
+        }
+        for row in rows:
+            if row.get("incomeType") not in transfer_types:
+                continue
+            stamp = int(row["time"])
+            if stamp <= base or stamp > now_ms:
+                continue
+            if row.get("asset") != "USDT":
+                raise ValueError("NON_USDT_CASHFLOW")
+            key = str(row.get("incomeType")) + ":" + str(
+                row.get("tranId") or (
+                    str(stamp) + ":" + str(row.get("income")) + ":" +
+                    str(row.get("info"))))
+            if key in seen:
+                continue
+            total += D(str(row["income"]))
+            seen.add(key)
+        # Strictly retain deduplication history. Removing keys could double
+        # count transfers in overlapping future Binance income queries.
+        st["cashflow_seen"] = sorted(seen)
+        st["cashflow_total"] = str(total)
+        st["cashflow_checked_ms"] = now_ms
+        self._save(st)
+        adjusted = raw - total
+        if adjusted <= 0:
+            raise ValueError("INVALID_ADJUSTED_EQUITY")
+        return adjusted, pct, target, now
 
     def _positions(self):
         return self.ex.broker.positions()
