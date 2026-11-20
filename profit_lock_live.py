@@ -327,6 +327,9 @@ class LiveProfitLock:
                 # freshly computed transient intraday high.
                 st["target"] = str(imported_target)
                 st["reference"] = str(imported_target / (D("1") + pct / 100))
+                start_ms = int(self.ex.clock() * 1000)
+                st.update(cashflow_from_ms=start_ms, cashflow_checked_ms=start_ms,
+                          cashflow_seen=[], cashflow_total="0")
                 self._save(st)
             if st["phase"] == "WAIT_TARGET":
                 new, hit = observe(st, equity, instant)
