@@ -13,6 +13,6 @@ jobs:
         with:
           python-version: '3.11'
       - name: Syntax check
-        run: python -m py_compile fixed_profit_target.py profit_close_reconcile.py test_fixed_profit_target.py test_profit_close_reconcile.py
+        run: python -m py_compile fixed_profit_target.py profit_close_reconcile.py test_fixed_profit_target.py test_profit_close_reconcile.py profit_lock_live.py test_profit_lock_live.py
       - name: Unit tests
-        run: python -m unittest -v test_fixed_profit_target test_profit_close_reconcile
+        run: python -m unittest -v test_fixed_profit_target test_profit_close_reconcile test_profit_lock_live
