@@ -8709,6 +8709,12 @@ def _crash_start_services():
     def health():
         result = dict(_CRASH_WS_CACHE.health(time.time()))
         result['trading'] = _CRASH_NIGHT.summary() if _CRASH_NIGHT else trading_status
+        # Read only the persisted live %1 target; never substitute the paper target.
+        profit = (_CRASH_NIGHT.state.get('profit_lock_live') or {}) if _CRASH_NIGHT else {}
+        result['profit_target_usdt'] = profit.get('target')
+        result['profit_reference_usdt'] = profit.get('reference')
+        result['profit_phase'] = profit.get('phase', 'NOT_INITIALIZED')
+        result['profit_error'] = profit.get('monitor_error')
         ai = globals().get('_CRASH_AI')
         result['trading'] += ' | OpenAI: ' + ('AÇIK (yalnız analiz)' if ai and ai.enabled else 'KAPALI/anahtar yok')
         result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: Telegram aç/kapat; ema.py başlangıç ayarı | Telegram: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
