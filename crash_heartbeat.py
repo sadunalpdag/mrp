@@ -78,6 +78,19 @@ class Heartbeat:
         else:
             reason = 'Fiyat akışı ve tarama güncel. Sinyal olmaması tek başına arıza değildir.'
         age_text = f'{age:.0f} sn' if isinstance(age, (float, int)) else 'bilinmiyor'
+        # The executor supplies its persisted real target, not the paper target.
+        def money(value):
+            try:
+                from decimal import Decimal
+                number = Decimal(str(value))
+                return f'{number:,.2f} USDT' if number.is_finite() and number > 0 else 'doğrulanamadı'
+            except (ValueError, TypeError, ArithmeticError):
+                return 'doğrulanamadı'
+        profit_line = (f"Sabit kâr hedefi (%1): {money(health.get('profit_target_usdt'))} | "
+                       f"Başlangıç: {money(health.get('profit_reference_usdt'))} | "
+                       f"Durum: {health.get('profit_phase', 'NOT_INITIALIZED')}")
+        if health.get('profit_error'):
+            profit_line += " | Hesap kontrolü: HATA"
         return (f"{'✅' if healthy else '⚠️'} CRASH BOUNCE — 2 SAATLİK DURUM\n"
                 f"{reason}\n"
                 f"WS: {'bağlı' if health.get('connected') else 'bağlı değil'} | Son fiyat: {age_text}\n"
@@ -88,6 +101,7 @@ class Heartbeat:
                 f"Son başarılı sinyal gönderimi: {stamp(signal_at)} {m.get('last_signal_symbol', '')}\n"
                 f"Son sinyal gönderim hatası: {m.get('delivery_error', 'yok')}\n"
                 f"Otomatik işlem: {health.get('trading', 'KAPALI')}\n"
+                f"{profit_line}\n"
                 f"Saat dilimi: Europe/Paris. Bu mesaj işlem sinyali değildir.")
 
     def step(self):
