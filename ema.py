@@ -8715,6 +8715,8 @@ def _crash_start_services():
         result['profit_reference_usdt'] = profit.get('reference')
         result['profit_phase'] = profit.get('phase', 'NOT_INITIALIZED')
         result['profit_error'] = profit.get('monitor_error')
+        result['profit_lock_blocked'] = bool(_CRASH_NIGHT and _CRASH_NIGHT.profit_lock.entries_blocked()) if _CRASH_NIGHT and getattr(_CRASH_NIGHT, 'profit_lock', None) else None
+        result['profit_one_off'] = profit.get('one_off_target')
         ai = globals().get('_CRASH_AI')
         result['trading'] += ' | OpenAI: ' + ('AÇIK (yalnız analiz)' if ai and ai.enabled else 'KAPALI/anahtar yok')
         result['trading'] += f' | Manuel TP: {"AÇIK" if _CRASH_NIGHT and _CRASH_NIGHT.manual_tp_enabled else "KAPALI"} | kontrol: Telegram aç/kapat; ema.py başlangıç ayarı | Telegram: {_CRASH_CONTROL.status() if _CRASH_CONTROL else "kapalı/ayarsız"}'
