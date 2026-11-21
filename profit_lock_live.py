@@ -230,7 +230,10 @@ class LiveProfitLock:
         """
         if (self.state or {}).get("phase") != "CLOSING" or not self.state.get("cycle_id"):
             raise ValueError("CLOSE_CYCLE_NOT_CONFIRMED")
+        planned_ids = {v.get("id") for v in (self.state.get("exit_plan") or {}).values()}
         for order in normal:
+            if order.get("clientOrderId") in planned_ids:
+                continue  # Already submitted cycle close; never cancel/reissue it.
             symbol = order.get("symbol")
             order_id = order.get("orderId")
             client_id = order.get("clientOrderId")
@@ -326,10 +329,12 @@ class LiveProfitLock:
             return
         # Cancel account-wide pending orders, including manual and algo orders.
         # Do not submit a close until Binance confirms both order books empty.
-        if normal or algo:
-            self._prepare_exits(positions, normal, algo)
+        planned_ids = {v.get("id") for v in (st.get("exit_plan") or {}).values()}
+        unexpected = [o for o in normal if o.get("clientOrderId") not in planned_ids]
+        if unexpected or algo:
+            self._prepare_exits(positions, unexpected, algo)
             _, positions, normal, algo = self._verify()
-            if normal or algo:
+            if any(o.get("clientOrderId") not in planned_ids for o in normal) or algo:
                 return
         current = normalize_positions(positions)
         snap_keys = {(x["symbol"], x["position_side"])
