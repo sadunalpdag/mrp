@@ -223,23 +223,39 @@ class LiveProfitLock:
             self.ex.broker.cancel_owned_tp(item["symbol"], cid)
 
     def _prepare_exits(self, positions, normal, algo):
-        # Unknown/manual open orders need human reconciliation, not deletion.
-        entries, exits = self._tracked_ids()
-        check = reconcile_close(self.state.get("position_snapshot") or [], positions,
-                                normal, algo, entries, exits)
-        if check["unknown_opening_orders"]:
-            raise ValueError("UNKNOWN_OPENING_ORDERS_REQUIRE_REVIEW")
-        # Unknown closing orders are also left intact. Avoid duplicate TP.
-        for o in normal + algo:
-            cid = o.get("clientOrderId") or o.get("clientAlgoId")
-            if cid not in exits and not (o.get("side") == "BUY" and
-                                        o.get("type") == "LIMIT"):
-                raise ValueError("UNTRACKED_ORDER_REQUIRES_REVIEW")
-        if check["owned_pending_entries"]:
-            self._cancel_verified_entries(normal)
-            return
-        self._cancel_owned_existing_tp(normal)
-        return
+        """Cancel every account order during a verified target-close cycle.
+
+        Includes manual orders. Only invoked after a persisted CLOSING trigger.
+        Binance confirmation is checked again before any new LIMIT exit.
+        """
+        if (self.state or {}).get("phase") != "CLOSING" or not self.state.get("cycle_id"):
+            raise ValueError("CLOSE_CYCLE_NOT_CONFIRMED")
+        for order in normal:
+            symbol = order.get("symbol")
+            order_id = order.get("orderId")
+            client_id = order.get("clientOrderId")
+            if not symbol or (order_id is None and not client_id):
+                raise ValueError("UNIDENTIFIED_OPEN_ORDER")
+            payload = {"symbol": symbol}
+            if order_id is not None:
+                payload["orderId"] = order_id
+            else:
+                payload["origClientOrderId"] = client_id
+            self.ex.broker.request("DELETE", "/fapi/v1/order", payload,
+                                   budget_priority="protect")
+        for order in algo:
+            symbol = order.get("symbol")
+            algo_id = order.get("algoId")
+            client_id = order.get("clientAlgoId")
+            if not symbol or (algo_id is None and not client_id):
+                raise ValueError("UNIDENTIFIED_ALGO_ORDER")
+            payload = {"symbol": symbol}
+            if algo_id is not None:
+                payload["algoId"] = algo_id
+            else:
+                payload["clientAlgoId"] = client_id
+            self.ex.broker.request("DELETE", "/fapi/v1/algoOrder", payload,
+                                   budget_priority="protect")
 
     def _exit_one(self, item, live):
         key = item["symbol"] + "|" + item["position_side"]
@@ -257,9 +273,12 @@ class LiveProfitLock:
         from crash_night import rounded
         tick = D(str(filters["PRICE_FILTER"]["tickSize"]))
         lot = D(str(filters["LOT_SIZE"]["stepSize"]))
-        # Frozen target uses current mark price at FIRST trigger. A favorable
+        # Fresh current mark price, not a stale trigger snapshot. A favorable
         # price movement may fill immediately; it is still LIMIT, not MARKET.
-        price = rounded(item["price"], tick, up=(side == "SELL"))
+        mark = D(str(live["markPrice"]))
+        if not mark.is_finite() or mark <= 0:
+            raise ValueError("INVALID_CURRENT_MARK_PRICE")
+        price = rounded(mark, tick, up=(side == "SELL"))
         qty = rounded(abs(D(str(live["positionAmt"]))), lot)
         if price <= 0 or qty <= 0 or qty > abs(D(str(live["positionAmt"]))):
             raise ValueError("INVALID_LIMIT_CLOSE_QUANTITY")
@@ -305,19 +324,13 @@ class LiveProfitLock:
             if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
                 self.ex.enabled.set()
             return
-        # First reconcile and cancel exact bot-owned entries and TP. Never
-        # indiscriminately cancel all account orders. Existing frozen LIMIT
-        # exits are left intact while missing ones are submitted only once.
-        self._prepare_exits(positions, normal, algo)
-        verified, positions, normal, algo = self._verify()
-        if verified["owned_pending_entries"] or verified["unknown_opening_orders"]:
-            return
-        # Wait for any legacy TP cancellation to be exchange-confirmed.
-        _, exits = self._tracked_ids()
-        if any((o.get("clientOrderId") or o.get("clientAlgoId")) in exits
-               and str(o.get("clientOrderId") or "").startswith("cbn")
-               for o in normal + algo):
-            return
+        # Cancel account-wide pending orders, including manual and algo orders.
+        # Do not submit a close until Binance confirms both order books empty.
+        if normal or algo:
+            self._prepare_exits(positions, normal, algo)
+            _, positions, normal, algo = self._verify()
+            if normal or algo:
+                return
         current = normalize_positions(positions)
         snap_keys = {(x["symbol"], x["position_side"])
                      for x in st["position_snapshot"]}
