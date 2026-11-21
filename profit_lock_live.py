@@ -325,6 +325,12 @@ class LiveProfitLock:
             self._save(roll_after_midnight(completed, equity, pct, now, True, True, True))
             if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
                 self.ex.enabled.set()
+            next_phase = (self.state or {}).get("phase", "UNKNOWN")
+            self.ex.log("[PROFIT CYCLE] BINANCE VERIFIED FLAT; lock released; next_phase=%s; entries_enabled=%s" %
+                        (next_phase, self.ex.enabled.is_set()))
+            self.ex.alert("✅ SABİT KÂR HEDEFİ | Binance pozisyon ve emirleri sıfır doğrulandı; "
+                          "kapanış kilidi kaldırıldı. Yeni alış durumu: " +
+                          ("AÇIK" if self.ex.enabled.is_set() else "KAPALI (başka kontrol)"))
             return
         # Cancel account-wide pending orders, including manual and algo orders.
         # Do not submit a close until Binance confirms both order books empty.
@@ -388,6 +394,9 @@ class LiveProfitLock:
             self.ex.log("[PROFIT CYCLE] restart verified flat account; stale lock cleared; new target will initialize")
             if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
                 self.ex.enabled.set()
+            self.ex.alert("✅ SABİT KÂR HEDEFİ | Yeniden başlatmada Binance hesap boş doğrulandı; "
+                          "eski kapanış kilidi kaldırıldı. Yeni alış: " +
+                          ("AÇIK" if self.ex.enabled.is_set() else "KAPALI"))
         except Exception as exc:
             self.ex.log("[PROFIT CYCLE] restart reconciliation unavailable: %s; lock retained" %
                         type(exc).__name__)
@@ -430,17 +439,17 @@ class LiveProfitLock:
                 # One-off operator target, consumed durably before observation.
                 # Never change a triggered close cycle or reapply after restart.
                 override = os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip()
-                marker = "2026-11-21:925"
+                marker = "2026-11-21:935"
                 if (override == marker and instant.astimezone(PARIS).date().isoformat() == "2026-11-21" and
                         self.ex.state.get("profit_target_once_applied") != marker):
-                    target = D("925")
+                    target = D("935")
                     if not target.is_finite() or target <= 0:
                         raise ValueError("INVALID_ONE_OFF_TARGET")
                     st["target"] = str(target)
                     st["one_off_target"] = marker
                     self.ex.state["profit_target_once_applied"] = marker
                     self._save(st)
-                    self.ex.log("[PROFIT CYCLE] one-off target applied: 925 USDT; 2026-11-21")
+                    self.ex.log("[PROFIT CYCLE] one-off target applied: 935 USDT; 2026-11-21")
                 new, hit = observe(st, equity, instant)
                 if hit:
                     self._block()
