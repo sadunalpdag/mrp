@@ -34,10 +34,10 @@ class LiveProfitLock:
         return self.locked() or os.getenv("CRASH_FIXED_PROFIT_LOCK_ENABLED", "0") == "1"
 
     def entries_blocked(self):
-        # Until the first validated account sample, fail closed rather than
-        # opening a BUY during an uninitialized profit-lock deployment.
-        return self.active() and (not self.state or self.locked()
-                                  or bool(self.state.get("monitor_error")))
+        # Do not block BUY merely because the profit monitor is enabled,
+        # initializing, or awaiting a valid account sample. Only an actual
+        # persisted closing cycle blocks new entries until exchange verification.
+        return self.locked()
 
     def _save(self, state):
         self.ex.state["profit_lock_live"] = state
