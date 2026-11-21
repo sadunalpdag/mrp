@@ -343,7 +343,10 @@ def run():
         else:
             action, entry, tp, sl, model = "BEKLE", 0, 0, 0, "SKIPPED"
             reason = ("DISABLED" if not enabled else
-                      "DAILY_LIMIT_REACHED" if halt else "MAX_OPEN_TRADES_REACHED")
+                      "DAILY_PROFIT_TARGET_REACHED" if risk_equity >= target else
+                      "DAILY_LOSS_LIMIT_REACHED" if risk_equity <= -loss_limit else
+                      "DAY_START_CAPITAL_INVALID" if day_start <= 0 else
+                      "MAX_OPEN_TRADES_REACHED")
         # Do not open an indistinguishable same-side signal twice.
         if action in ("LONG", "SHORT") and any(
             len(r) > 2 and r[1] == action and
