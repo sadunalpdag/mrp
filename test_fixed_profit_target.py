@@ -28,15 +28,19 @@ class FixedProfitTargetTests(unittest.TestCase):
         s = roll_after_midnight(s, 890, 10, at(21), True, True, True)
         self.assertEqual(s["phase"], "CLOSING")
 
-    def test_completed_cycle_new_day_realized_reference(self):
+    def test_completed_cycle_immediate_rebase(self):
         s, _ = observe(initial_state(800, 10, at(20)), 880, at(20))
         s = closing_verified(s, True, True, True, at(20))
-        self.assertEqual(s["phase"], "WAIT_MIDNIGHT")
+        self.assertEqual(s["phase"], "WAIT_REBASE")
         s = roll_after_midnight(s, 890, 10, at(20), True, True, True)
-        self.assertEqual(s["phase"], "WAIT_MIDNIGHT")
-        s = roll_after_midnight(s, 890, 10, at(21), True, True, True)
         self.assertEqual(s["target"], "979.0")
         self.assertEqual(s["phase"], "WAIT_TARGET")
+
+    def test_rebase_requires_all_clear(self):
+        s, _ = observe(initial_state(800, 10, at(20)), 880, at(20))
+        s = closing_verified(s, True, True, True, at(20))
+        blocked = roll_after_midnight(s, 890, 10, at(20), False, True, True)
+        self.assertEqual(blocked["phase"], "WAIT_REBASE")
 
     def test_no_automatic_one_percent_rebase(self):
         s = initial_state(800, 10, at(20))

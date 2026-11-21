@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - feature/fixed-profit-target-lock-20261120
+      - fix/profit-cycle-immediate-restart-20261121
   workflow_dispatch:
 jobs:
   offline-tests:

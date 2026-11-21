@@ -266,7 +266,7 @@ class LiveProfitLock:
         if price <= 0 or qty <= 0 or qty > abs(D(str(live["positionAmt"]))):
             raise ValueError("INVALID_LIMIT_CLOSE_QUANTITY")
         cid = "plc" + hashlib.sha256(
-            (self.state["triggered_day"] + "|" + key).encode()
+            (str(self.state.get("cycle_id") or self.state["triggered_day"]) + "|" + key).encode()
         ).hexdigest()[:24]
         payload = {"symbol": item["symbol"], "side": side, "type": "LIMIT",
                    "timeInForce": "GTC", "quantity": str(qty),
@@ -368,6 +368,7 @@ class LiveProfitLock:
                     positions = self._positions()
                     new["position_snapshot"] = self._build_snapshot(positions)
                     new["exit_plan"] = {}
+                    new["cycle_id"] = str(int(self.ex.clock() * 1000))
                     self._save(new)
                     self._alert("Hedefe ulaşıldı; yalnız LIMIT kapanış başlatıldı. "
                                 "Yeni alımlar kilitlendi.")
@@ -376,7 +377,7 @@ class LiveProfitLock:
                 return
             if st["phase"] == "CLOSING":
                 self._closing_step()
-            elif st["phase"] == "WAIT_MIDNIGHT":
+            elif st["phase"] in ("WAIT_REBASE", "WAIT_MIDNIGHT"):
                 self._block()
                 verify, _, _, _ = self._verify()
                 new = roll_after_midnight(
