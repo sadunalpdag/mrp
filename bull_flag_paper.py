@@ -158,15 +158,23 @@ def _archive(record, db):
 
 def _sheet(db):
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    sid = (os.getenv("GOOGLE_SHEETS_ID") or os.getenv("GOOGLE_SHEET_ID") or "").strip()
+    # Write to the same EMA Filter workbook as the working Crash dashboard.
+    from crash_sheets_dashboard import DEFAULT_EMA_FILTER_ID
+    sid = (os.getenv("BULL_FLAG_SHEETS_ID") or os.getenv("CRASH_SHEETS_TARGET_ID") or DEFAULT_EMA_FILTER_ID).strip()
     if not raw or not sid:
-        LOG.warning("Bull Flag Sheets not configured")
+        print("[BULL FLAG SHEETS] not configured", flush=True)
         return
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-        creds = Credentials.from_service_account_info(
-            json.loads(raw), scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        try:
+            info = json.loads(raw)
+        except json.JSONDecodeError:
+            info = None
+        creds = (Credentials.from_service_account_info(info, scopes=scopes)
+                 if isinstance(info, dict)
+                 else Credentials.from_service_account_file(raw, scopes=scopes))
         book = gspread.authorize(creds).open_by_key(sid)
         try:
             tab = book.worksheet("BULL_FLAG_PAPER")
@@ -186,8 +194,9 @@ def _sheet(db):
                          record["status"], record["result"] or "",
                          len(p.get("history", [])), len(p.get("future", []))])
         tab.update(range_name="A1", values=rows)
+        print("[BULL FLAG SHEETS] updated rows=%d target_suffix=%s" % (len(rows)-1, sid[-8:]), flush=True)
     except Exception as exc:
-        LOG.warning("Bull Flag Sheets update failed: %s", type(exc).__name__)
+        print("[BULL FLAG SHEETS] update failed: %s" % type(exc).__name__, flush=True)
 
 
 def _later(db, now_ms):
@@ -309,9 +318,9 @@ def step():
                               "Destek: %s | Direnç: %s\nVeri: %s" %
                               (sym, tf, support, resistance, status))
             except Exception as exc:
-                LOG.warning("Bull Flag scan %s unavailable: %s", tf, type(exc).__name__)
+                print("[BULL FLAG SCAN] %s unavailable: %s" % (tf, type(exc).__name__), flush=True)
         _sheet(db)
-        LOG.info("Bull Flag cycle complete new=%s", new_count)
+        print("[BULL FLAG SCAN] cycle complete new=%s" % new_count, flush=True)
 
 
 def start():
@@ -327,7 +336,7 @@ def start():
             try:
                 step()
             except Exception as exc:
-                LOG.warning("Bull Flag worker error: %s", type(exc).__name__)
+                print("[BULL FLAG WORKER] error: %s" % type(exc).__name__, flush=True)
             time.sleep(max(30, 1800 - (time.time() % 1800)))
     threading.Thread(target=loop, name="bull-flag-paper", daemon=True).start()
     return True
