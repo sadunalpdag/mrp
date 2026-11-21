@@ -21,6 +21,7 @@ class LiveProfitLock:
     def __init__(self, executor):
         self.ex = executor
         self.next_poll = 0
+        self._startup_reconciled = False
 
     @property
     def state(self):
@@ -358,7 +359,43 @@ class LiveProfitLock:
                        and D(str(p["positionAmt"])) != 0)
             self._exit_one(item, row)
 
+    def _reconcile_restart(self):
+        """Clear a stale lock at process startup only when Binance is fully flat.
+
+        A persisted closing cycle with live positions/orders must be resumed,
+        never forgotten; otherwise restart could allow overlapping exposure.
+        """
+        if self._startup_reconciled:
+            return
+        self._startup_reconciled = True
+        st = self.state or {}
+        phase = st.get("phase")
+        if phase in (None, "WAIT_TARGET"):
+            return
+        if phase == "ERROR_LOCK" and not any(
+                st.get(k) for k in ("cycle_id", "position_snapshot", "exit_plan")):
+            self.ex.state.pop("profit_lock_live", None)
+            self.ex.save()
+            self.ex.log("[PROFIT CYCLE] restart cleared untriggered error lock")
+            return
+        try:
+            positions = normalize_positions(self._positions())
+            normal, algo = self._orders()
+            if positions or normal or algo:
+                self.ex.log("[PROFIT CYCLE] restart retains active closing lock: positions=%d orders=%d algo=%d" %
+                            (len(positions), len(normal), len(algo)))
+                return
+            self.ex.state.pop("profit_lock_live", None)
+            self.ex.save()
+            self.ex.log("[PROFIT CYCLE] restart verified flat account; stale lock cleared; new target will initialize")
+            if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                self.ex.enabled.set()
+        except Exception as exc:
+            self.ex.log("[PROFIT CYCLE] restart reconciliation unavailable: %s; lock retained" %
+                        type(exc).__name__)
+
     def step(self):
+        self._reconcile_restart()
         st = self.state or {}
         if st.get("phase") == "ERROR_LOCK" and not any(
                 st.get(key) for key in ("cycle_id", "position_snapshot", "exit_plan")):
