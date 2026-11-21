@@ -8667,6 +8667,18 @@ def _crash_start_services():
                 f'24 saat | {executor.position_usdt} USDT pozisyon | 10x | aynı anda en fazla {executor.max_symbols} sembol\n'
                 f'Günlük en fazla {executor.max_daily} giriş denemesi. TP +%1; SL yok. Telegram: /otomatik_ac ve /otomatik_kapat.')
             _CRASH_NIGHT = executor
+            # Re-arm real entries on every process start when the Python operator flag is ON.
+            # Clear only the persisted manual pause; never clear halt, profit-close locks,
+            # position/order records or exchange reconciliation safeguards.
+            if auto_flag:
+                executor.state['paused'] = False
+                executor.save()
+                executor.armed_at = time.time()
+                executor.enabled.set()
+            log(f'[CRASH AUTO STARTUP] configured={bool(auto_flag)}; '
+                f'paused={executor.state.get("paused")}; enabled={executor.enabled.is_set()}; '
+                f'halt={executor.state.get("halt") or "none"}; '
+                f'profit_blocked={executor.profit_lock.entries_blocked()}')
             executor.public_rest_blocked = lambda: time.time() < _crash_cooldown_until or BinanceRateLimiter.is_banned()
             executor.start()
             # Old duplicate paper monitor retired. The independent
