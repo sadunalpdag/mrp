@@ -245,8 +245,7 @@ class LiveProfitLock:
                 payload["orderId"] = order_id
             else:
                 payload["origClientOrderId"] = client_id
-            self.ex.broker.request("DELETE", "/fapi/v1/order", payload,
-                                   budget_priority="protect")
+            self.ex.broker.request("DELETE", "/fapi/v1/order", payload)
         for order in algo:
             symbol = order.get("symbol")
             algo_id = order.get("algoId")
@@ -258,8 +257,7 @@ class LiveProfitLock:
                 payload["algoId"] = algo_id
             else:
                 payload["clientAlgoId"] = client_id
-            self.ex.broker.request("DELETE", "/fapi/v1/algoOrder", payload,
-                                   budget_priority="protect")
+            self.ex.broker.request("DELETE", "/fapi/v1/algoOrder", payload)
 
     def _exit_one(self, item, live):
         key = item["symbol"] + "|" + item["position_side"]
