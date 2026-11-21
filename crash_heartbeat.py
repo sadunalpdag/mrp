@@ -35,7 +35,10 @@ class Heartbeat:
                     self.metrics = {}
             except (ValueError, OSError):
                 self.log('[CRASH HEARTBEAT] Invalid saved schedule; restarting in 180 seconds')
-        # Send a fresh startup report shortly after each process restart.\n        # The persisted 2h cadence resumes after successful delivery.\n        self.state['next_due'] = clock() + 45\n        # A previous process's successful scan is not proof this process is healthy.
+        # Send a fresh startup report after every process start/deploy.
+        # Preserve the normal two-hour cadence after successful delivery.
+        self.state['next_due'] = clock() + 45
+        # A previous process's successful scan is not proof this process is healthy.
         self.started = clock()
 
     def update(self, **values):
