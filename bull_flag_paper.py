@@ -33,6 +33,7 @@ def _db():
         last_ms INTEGER, status TEXT, support REAL, resistance REAL,
         source TEXT, paper_entry REAL, paper_target REAL, paper_ms INTEGER,
         result TEXT, payload TEXT, archived INTEGER DEFAULT 0)""")
+    db.execute("CREATE TABLE IF NOT EXISTS scan_notice(day TEXT PRIMARY KEY, message TEXT)")
     db.commit()
     return db
 
@@ -264,6 +265,27 @@ def step():
                 board = data.get("items", [])
                 if not isinstance(board, list):
                     raise ValueError("PATTERN_ITEMS_NOT_LIST")
+                # CoinBeacon detector boards are hard-capped at 150 and cannot be paged.
+                # Report truncation instead of presenting missing Bull Flags as zero signals.
+                total = data.get("total")
+                try:
+                    total_count = int(total) if total is not None else len(board)
+                except (TypeError, ValueError):
+                    total_count = len(board)
+                truncated = total_count > len(board)
+                print("[BULL FLAG COVERAGE] tf=%s returned=%d total=%d truncated=%s" %
+                      (tf, len(board), total_count, truncated), flush=True)
+                if truncated:
+                    day = datetime.now(timezone.utc).date().isoformat()
+                    notice_key = day + ":" + tf
+                    if not db.execute("SELECT 1 FROM scan_notice WHERE day=?", (notice_key,)).fetchone():
+                        message = ("⚠️ BULL FLAG API KAPSAMI\\n%s: %d/%d formasyon erişilebilir. "
+                                   "CoinBeacon API 150 kayıtla sınırlı; kalan formasyonlar bu taramada görülemiyor." %
+                                   (tf, len(board), total_count))
+                        _telegram(message)
+                        db.execute("INSERT OR IGNORE INTO scan_notice(day,message) VALUES (?,?)",
+                                   (notice_key, message))
+                        db.commit()
                 names = {}
                 for row in board:
                     if not isinstance(row, dict):
