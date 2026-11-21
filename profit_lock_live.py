@@ -433,7 +433,7 @@ class LiveProfitLock:
                 # Never change a triggered close cycle or reapply after restart.
                 override = os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip()
                 marker = "2026-11-21:910"
-                if (override == marker and
+                if (override == marker and instant.astimezone(PARIS).date().isoformat() == "2026-11-21" and
                         self.ex.state.get("profit_target_once_applied") != marker):
                     target = D("910")
                     if not target.is_finite() or target <= 0:
