@@ -34,9 +34,13 @@ class LiveProfitLock:
         return self.locked() or os.getenv("CRASH_FIXED_PROFIT_LOCK_ENABLED", "0") == "1"
 
     def entries_blocked(self):
-        # Do not block BUY merely because the profit monitor is enabled,
-        # initializing, or awaiting a valid account sample. Only an actual
-        # persisted closing cycle blocks new entries until exchange verification.
+        # Only a confirmed target-triggered close cycle can suspend new BUYs.
+        # An old ERROR_LOCK without any cycle/snapshot/exit plan is a monitor
+        # initialization failure, not evidence of a real closing operation.
+        st = self.state or {}
+        if st.get("phase") == "ERROR_LOCK" and not any(
+                st.get(key) for key in ("cycle_id", "position_snapshot", "exit_plan")):
+            return False
         return self.locked()
 
     def _save(self, state):
@@ -338,6 +342,16 @@ class LiveProfitLock:
             self._exit_one(item, row)
 
     def step(self):
+        st = self.state or {}
+        if st.get("phase") == "ERROR_LOCK" and not any(
+                st.get(key) for key in ("cycle_id", "position_snapshot", "exit_plan")):
+            # Recover only an untriggered monitor error. Never reset a real
+            # closing cycle, its exchange orders, or its persisted snapshot.
+            self.ex.state.pop("profit_lock_live", None)
+            self.ex.save()
+            self.ex.log("[PROFIT CYCLE] cleared stale untriggered ERROR_LOCK; monitoring reinitializes")
+            if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                self.ex.enabled.set()
         if not self.active() or self.ex.clock() < self.next_poll:
             return
         self.next_poll = self.ex.clock() + 120
