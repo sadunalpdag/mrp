@@ -429,6 +429,20 @@ class LiveProfitLock:
                           cashflow_seen=[], cashflow_total="0")
                 self._save(st)
             if st["phase"] == "WAIT_TARGET":
+                # One-off operator target, consumed durably before observation.
+                # Never change a triggered close cycle or reapply after restart.
+                override = os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip()
+                marker = "2026-11-21:910"
+                if (override == marker and
+                        self.ex.state.get("profit_target_once_applied") != marker):
+                    target = D("910")
+                    if not target.is_finite() or target <= 0:
+                        raise ValueError("INVALID_ONE_OFF_TARGET")
+                    st["target"] = str(target)
+                    st["one_off_target"] = marker
+                    self.ex.state["profit_target_once_applied"] = marker
+                    self._save(st)
+                    self.ex.log("[PROFIT CYCLE] one-off target applied: 910 USDT; 2026-11-21")
                 new, hit = observe(st, equity, instant)
                 if hit:
                     self._block()
