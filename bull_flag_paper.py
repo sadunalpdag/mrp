@@ -261,7 +261,21 @@ def step():
                             {"exchange": "binance-futures", "timeframe": tf, "quote": "USDT"})
                 if data.get("kind") != "patterns" or data.get("timeframe") != tf:
                     raise ValueError("PATTERN_BOARD_WRONG_MARKET")
-                for row in data.get("items", [])[:150]:
+                board = data.get("items", [])
+                if not isinstance(board, list):
+                    raise ValueError("PATTERN_ITEMS_NOT_LIST")
+                names = {}
+                for row in board:
+                    if not isinstance(row, dict):
+                        continue
+                    item = row.get("item")
+                    source = item if isinstance(item, dict) else row
+                    name = str(source.get("name") or source.get("type") or source.get("pattern") or source.get("patternType") or "UNKNOWN")
+                    names[name] = names.get(name, 0) + 1
+                print("[BULL FLAG BOARD] tf=%s total=%d kinds=%s first_keys=%s" %
+                      (tf, len(board), str(sorted(names.items(), key=lambda x: -x[1])[:8]),
+                       str(sorted(board[0].keys()) if board and isinstance(board[0], dict) else [])), flush=True)
+                for row in board:
                     hit = _flag(row, tf)
                     if hit is None:
                         continue
