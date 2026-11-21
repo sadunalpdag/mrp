@@ -89,6 +89,12 @@ class Heartbeat:
         profit_line = (f"Sabit kâr hedefi (%1): {money(health.get('profit_target_usdt'))} | "
                        f"Başlangıç: {money(health.get('profit_reference_usdt'))} | "
                        f"Durum: {health.get('profit_phase', 'NOT_INITIALIZED')}")
+        blocked = health.get('profit_lock_blocked')
+        lock_text = 'KİLİTLİ — yeni alış yok' if blocked is True else (
+            'AÇIK — yeni alış serbest' if blocked is False else 'DOĞRULANAMADI')
+        profit_line += f"\\nKâr hedefi alış kilidi: {lock_text}"
+        if health.get('profit_one_off') == '2026-11-21:910':
+            profit_line += " | Tek seferlik hedef: 910 USDT"
         if health.get('profit_error'):
             profit_line += " | Hesap kontrolü: HATA"
         return (f"{'✅' if healthy else '⚠️'} CRASH BOUNCE — 2 SAATLİK DURUM\n"
