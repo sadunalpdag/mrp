@@ -6,10 +6,10 @@ from pathlib import Path
 
 _LOCK = threading.RLock()
 DEFAULTS = {
-    "enabled": False, "daily_call_cap": 100, "max_active": 30,
+    "enabled": False, "daily_call_cap": 250, "max_active": 30,
     "track_hours": 8, "check_minutes": 15, "analysis_phase": "both",
 }
-RANGES = {"daily_call_cap": (1, 200), "max_active": (1, 100),
+RANGES = {"daily_call_cap": (1, 250), "max_active": (1, 100),
           "track_hours": (1, 24)}
 ALLOWED_PHASES = ("both", "initial")
 
@@ -60,6 +60,9 @@ def load_settings():
             raise ValueError("AI_SETTINGS_CORRUPT")
         for key, value in data.items():
             values[key] = _validate(key, value)
+        # Explicit operator environment cap overrides an older persisted dashboard value.
+        if os.getenv("CB_AI_DAILY_GEMINI_CALL_CAP"):
+            values["daily_call_cap"] = _validate("daily_call_cap", int(os.environ["CB_AI_DAILY_GEMINI_CALL_CAP"]))
         return values
 
 
