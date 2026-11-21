@@ -62,7 +62,7 @@ def observe(state, equity, instant):
             return new, True
         new["day"] = today
         return new, False
-    if new["phase"] in ("CLOSING", "WAIT_MIDNIGHT"):
+    if new["phase"] in ("CLOSING", "WAIT_REBASE", "WAIT_MIDNIGHT"):
         return new, False
     raise ValueError("INVALID_PHASE")
 
@@ -75,7 +75,7 @@ def closing_verified(state, positions_flat, owned_entries_cleared,
         return new
     if not (positions_flat and owned_entries_cleared and closing_orders_cleared):
         return new
-    new["phase"] = "WAIT_MIDNIGHT"
+    new["phase"] = "WAIT_REBASE"
     new["completed"] = True
     new["completed_day"] = _day(instant)
     return new
@@ -84,16 +84,12 @@ def closing_verified(state, positions_flat, owned_entries_cleared,
 def roll_after_midnight(state, closing_equity, percent, instant,
                         positions_flat, owned_entries_cleared,
                         closing_orders_cleared):
-    """Only a successfully completed closing cycle can advance the target.
+    """Advance immediately after broker-confirmed closure, without midnight wait.
 
-    The new reference is the observed end-of-day account equity, not a
-    transient intraday high. If completion occurs after midnight, keep
-    locked until the following Paris midnight.
+    WAIT_MIDNIGHT is accepted for migration of already completed cycles.
     """
     new = dict(state)
-    if new["phase"] != "WAIT_MIDNIGHT":
-        return new
-    if _day(instant) <= new["completed_day"]:
+    if new["phase"] not in ("WAIT_REBASE", "WAIT_MIDNIGHT"):
         return new
     if not (positions_flat and owned_entries_cleared and closing_orders_cleared):
         return new
