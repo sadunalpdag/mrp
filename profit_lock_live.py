@@ -68,19 +68,18 @@ class LiveProfitLock:
                 config = json.load(handle)
         else:
             config = {"target_pct": os.getenv("DAILY_PROFIT_PAPER_TARGET_PCT", "5")}
-        pct = D(str(config["target_pct"]))
+        pct = D("1")  # User-defined fixed live target: 1% per completed cycle
         if not D("0.5") <= pct <= D("20"):
             raise ValueError("INVALID_USER_CONFIGURED_PERCENT")
         now = datetime.fromtimestamp(self.ex.clock(), timezone.utc)
         acc = self.ex.broker.request("GET", "/fapi/v3/account")
-        if not isinstance(acc, dict) or acc.get("multiAssetsMargin") is not False:
-            raise ValueError("UNSUPPORTED_MULTI_ASSET_MARGIN")
+        if not isinstance(acc, dict) or not isinstance(acc.get("multiAssetsMargin"), bool):
+            raise ValueError("INVALID_MARGIN_MODE_RESPONSE")
         assets = acc.get("assets")
         if not isinstance(assets, list):
             raise ValueError("INVALID_ACCOUNT_ASSETS")
-        for asset in assets:
-            if asset.get("asset") != "USDT" and abs(D(str(asset.get("marginBalance", "0")))) > D("0.01"):
-                raise ValueError("UNSUPPORTED_NON_USDT_COLLATERAL")
+        # In Multi-Assets mode Binance reports account totals in USDT value.
+        # Do not reject non-USDT collateral; use validated account-wide equity.
         wallet = D(str(acc["totalWalletBalance"]))
         unreal = D(str(acc["totalUnrealizedProfit"]))
         raw = D(str(acc["totalMarginBalance"]))
@@ -90,15 +89,7 @@ class LiveProfitLock:
         # On activation, import the already-published current fixed target.
         # No historical target reconstruction and no silent %1 substitution.
         if self.state is None:
-            with open(os.path.join(data_dir, "daily_profit_lock_paper.json"),
-                      encoding="utf-8") as handle:
-                paper = json.load(handle)
-            if paper.get("mode") != "PAPER_ONLY":
-                raise ValueError("INVALID_PAPER_REFERENCE")
-            target = D(str(paper["target"]))
-            if target <= 0:
-                raise ValueError("NO_VALID_PAPER_TARGET")
-            return raw, pct, target, now
+            return raw, pct, raw * (D("1") + pct / 100), now
 
         st = self.state
         target = D(str(st["target"]))
@@ -304,7 +295,12 @@ class LiveProfitLock:
                             "Otomatik tekrar yok; manuel kontrol gerekiyor.")
         if verified["all_clear"]:
             now = datetime.fromtimestamp(self.ex.clock(), timezone.utc)
-            self._save(closing_verified(st, True, True, True, now))
+            completed = closing_verified(st, True, True, True, now)
+            # Closing is exchange-confirmed; immediately arm the next cycle.
+            equity, pct, _, _ = self._sample()
+            self._save(roll_after_midnight(completed, equity, pct, now, True, True, True))
+            if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                self.ex.enabled.set()
             return
         # First reconcile and cancel exact bot-owned entries and TP. Never
         # indiscriminately cancel all account orders. Existing frozen LIMIT
@@ -403,9 +399,14 @@ class LiveProfitLock:
                     if new["phase"] == "WAIT_TARGET" and not self.ex.state.get("paused") and not self.ex.state.get("halt"):
                         self.ex.enabled.set()
         except Exception as err:
-            self._block()
+            # Monitoring failures must not disable entries unless a genuine
+            # target-triggered closing cycle is underway.
+            if self.locked() and (self.state or {}).get("phase") != "ERROR_LOCK":
+                self._block()
             st = self.state or {"phase": "ERROR_LOCK", "target": None}
             st["monitor_error"] = type(err).__name__ + ": " + str(err)[:120]
             self._save(st)
+            if st.get("phase") == "WAIT_TARGET" and not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                self.ex.enabled.set()
             self._alert(type(err).__name__ + ": " + str(err)[:120] +
                         " | Kontrol gerekli, otomatik MARKET emri yok.")
