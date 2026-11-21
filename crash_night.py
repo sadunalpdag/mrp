@@ -392,8 +392,10 @@ class NightExecutor:
                 self.state['trade_settings_defaults_20261101'] = True
                 self.state['paused'] = not enabled
             else:
-                # Python's off switch always wins; preserve explicit Telegram /otomatik_kapat.
-                self.state['paused'] = not enabled or bool(self.state.get('paused', False))
+                # The configured live auto-trading flag is authoritative on restart.
+                # Do not carry a stale paused=True from a previous process into a new deploy.
+                # Telegram /otomatik_kapat still pauses entries for the running process.
+                self.state['paused'] = not enabled
             # One-time upgrade. Install both protection caps before expanding
             # daily orders; future Telegram modifications survive redeploys.
             if not self.state.get('entry_capacity_limits_20261112'):
