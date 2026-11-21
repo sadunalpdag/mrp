@@ -35,7 +35,7 @@ class Heartbeat:
                     self.metrics = {}
             except (ValueError, OSError):
                 self.log('[CRASH HEARTBEAT] Invalid saved schedule; restarting in 180 seconds')
-        # A previous process's successful scan is not proof this process is healthy.
+        # Send a fresh startup report shortly after each process restart.\n        # The persisted 2h cadence resumes after successful delivery.\n        self.state['next_due'] = clock() + 45\n        # A previous process's successful scan is not proof this process is healthy.
         self.started = clock()
 
     def update(self, **values):
@@ -93,8 +93,8 @@ class Heartbeat:
         lock_text = 'KİLİTLİ — yeni alış yok' if blocked is True else (
             'AÇIK — yeni alış serbest' if blocked is False else 'DOĞRULANAMADI')
         profit_line += f"\\nKâr hedefi alış kilidi: {lock_text}"
-        if health.get('profit_one_off') == '2026-11-21:910':
-            profit_line += " | Tek seferlik hedef: 910 USDT"
+        if health.get('profit_one_off') == '2026-11-21:925':
+            profit_line += " | Tek seferlik hedef: 925 USDT"
         if health.get('profit_error'):
             profit_line += " | Hesap kontrolü: HATA"
         return (f"{'✅' if healthy else '⚠️'} CRASH BOUNCE — 2 SAATLİK DURUM\n"
