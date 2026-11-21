@@ -73,8 +73,11 @@ class LiveProfitLock:
             raise ValueError("INVALID_USER_CONFIGURED_PERCENT")
         now = datetime.fromtimestamp(self.ex.clock(), timezone.utc)
         acc = self.ex.broker.request("GET", "/fapi/v3/account")
-        if not isinstance(acc, dict) or not isinstance(acc.get("multiAssetsMargin"), bool):
-            raise ValueError("INVALID_MARGIN_MODE_RESPONSE")
+        if not isinstance(acc, dict):
+            raise ValueError("INVALID_ACCOUNT_RESPONSE")
+        # Binance account responses may omit multiAssetsMargin or encode it as
+        # a string. Margin mode is not required for USDT-valued account totals.
+        # Validate equity fields below instead of rejecting valid responses.
         assets = acc.get("assets")
         if not isinstance(assets, list):
             raise ValueError("INVALID_ACCOUNT_ASSETS")
