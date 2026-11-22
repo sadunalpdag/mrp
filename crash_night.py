@@ -173,7 +173,10 @@ class BinanceBroker:
                 body = response.json()
             except ValueError:
                 body = {}
-        except Exception:
+        except Exception as exc:
+            # Never log exception text: requests may embed signed URLs or keys.
+            print(f'[CRASH BINANCE HTTP DIAG] method={method}; endpoint={path}; '
+                  f'kind=transport; exception={type(exc).__name__}; http_status=none', flush=True)
             raise BrokerError('UNKNOWN', uncertain=True) from None
         BUDGET.observe(response.headers, response.status_code,
                        response.headers.get("Retry-After", 0))
@@ -194,6 +197,9 @@ class BinanceBroker:
             raise BrokerError('-1003')
         if response.status_code >= 400:
             code = body.get('code', 'UNKNOWN') if isinstance(body, dict) else 'UNKNOWN'
+            print(f'[CRASH BINANCE HTTP DIAG] method={method}; endpoint={path}; '
+                  f'kind=http_error; http_status={response.status_code}; '
+                  f'api_code={code if str(code).lstrip("-").isdigit() else "UNKNOWN"}', flush=True)
             raise BrokerError(code, uncertain=response.status_code >= 500 or str(code) in ('-1006', '-1007'))
         return body
 
@@ -274,11 +280,24 @@ class BinanceBroker:
             raise ValueError(f'MAX_{limit}_WITH_PENDING_ORDERS | açık={len(active)} giriş={len(pending-active)} toplam={total} kapatma_hariç={len(closing)}')
 
     def preflight(self, symbol):
-        dual = self.request('GET', '/fapi/v1/positionSide/dual').get('dualSidePosition')
+        # Preserve ordering and fail-closed checks. Log only stage/endpoint/code,
+        # never raw exchange bodies, signed URLs, API keys or order IDs.
+        def checked(stage, method, endpoint, params=None):
+            try:
+                return self.request(method, endpoint, params)
+            except Exception as exc:
+                code = getattr(exc, 'code', 'LOCAL')
+                print(f'[CRASH PREFLIGHT DIAG] symbol={symbol}; stage={stage}; '
+                      f'method={method}; endpoint={endpoint}; '
+                      f'exception={type(exc).__name__}; code={code}; '
+                      f'uncertain={bool(getattr(exc, "uncertain", False))}; '
+                      f'not_sent={bool(getattr(exc, "not_sent", False))}', flush=True)
+                raise
+        dual = checked('01_position_mode', 'GET', '/fapi/v1/positionSide/dual').get('dualSidePosition')
         if type(dual) is not bool:
             raise ValueError('INVALID_POSITION_MODE')
         position_side = 'LONG' if dual else 'BOTH'
-        positions = self.request('GET', '/fapi/v3/positionRisk')
+        positions = checked('02_positions', 'GET', '/fapi/v3/positionRisk')
         active = {p['symbol'] for p in positions if D(p['positionAmt']) != 0}
         # Reject at the active-position cap before additional REST requests.
         open_cap = getattr(self, 'max_open_positions', 10)
@@ -288,7 +307,7 @@ class BinanceBroker:
             raise ValueError('MAX_OPEN_POSITIONS_REACHED')
         if symbol in active or len(active) >= getattr(self, 'max_symbols', 5):
             raise ValueError(f"POSITION_EXISTS_OR_MAX_{getattr(self, 'max_symbols', 5)}")
-        orders = self.request('GET', '/fapi/v1/openOrders')
+        orders = checked('03_normal_orders', 'GET', '/fapi/v1/openOrders')
         if not isinstance(orders, list):
             raise ValueError('INVALID_OPEN_ORDER_RESPONSE')
         if any(o['symbol'] == symbol for o in orders):
@@ -301,7 +320,7 @@ class BinanceBroker:
                                                pending_entries=normal_entry_count, at=time.time())
             raise ValueError('MAX_PENDING_ENTRY_ORDERS_REACHED')
         self.check_slots(active, orders)
-        algo_orders = self.request('GET', '/fapi/v1/openAlgoOrders')
+        algo_orders = checked('04_algo_orders', 'GET', '/fapi/v1/openAlgoOrders')
         if not isinstance(algo_orders, list):
             raise ValueError('INVALID_ALGO_ORDER_RESPONSE')
         if any(o['symbol'] == symbol for o in algo_orders):
@@ -328,7 +347,7 @@ class BinanceBroker:
               f'bot_pending_buy={len(bot_pending)}; '
               f'symbol_limit={getattr(self, "max_symbols", 5)}; '
               'no orders cancelled', flush=True)
-        result = self.request('POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': 10})
+        result = checked('05_leverage', 'POST', '/fapi/v1/leverage', {'symbol': symbol, 'leverage': 10})
         if result.get('leverage') != 10:
             raise ValueError('LEVERAGE_NOT_CONFIRMED')
         return position_side

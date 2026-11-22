@@ -1,0 +1,18 @@
+name: Crash preflight diagnostic tests
+on:
+  pull_request:
+    paths:
+      - crash_night.py
+      - test_crash_preflight_diagnostics.py
+      - .github/workflows/crash-preflight-diagnostics.yml
+jobs:
+  preflight-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile crash_night.py test_crash_preflight_diagnostics.py
+      - run: python -m pip install requests
+      - run: python -m unittest -v test_crash_preflight_diagnostics
