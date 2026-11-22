@@ -47,6 +47,41 @@ class CandlePaperTests(unittest.TestCase):
             with paper._db() as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM signals").fetchone()[0], 10)
 
+    def test_ws_tp_releases_slot_and_preserves_review(self):
+        now = int(time.time() * 1000)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"DATA_DIR": directory}), \
+             patch.object(paper, "_notify"), patch.object(paper, "_sheet"):
+            with paper._db() as db:
+                db.execute("""INSERT INTO signals
+                    (id,symbol,pattern,tf,anchor_ms,entry_ms,entry,target,deadline_ms,state)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    ("ws-test", "BTCUSDT", "Hammer", "15m", now-60000,
+                     now-5000, 100, 101, now+28800000, "ACTIVE"))
+                db.commit()
+            self.assertFalse(paper._mark_live_tp("BTCUSDT", 100.9, now))
+            self.assertTrue(paper._mark_live_tp("BTCUSDT", 101.1, now))
+            with paper._db() as db:
+                row = db.execute("SELECT * FROM signals WHERE id='ws-test'").fetchone()
+                self.assertEqual(row["state"], "TP_HIT")
+                self.assertEqual(row["tp_ms"], now)
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM signals WHERE state='ACTIVE'").fetchone()[0], 0)
+            self.assertFalse(paper._mark_live_tp("BTCUSDT", 101.2, now+1000))
+
+    def test_ws_tp_rejects_prices_outside_original_window(self):
+        now = int(time.time() * 1000)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"DATA_DIR": directory}), \
+             patch.object(paper, "_notify"), patch.object(paper, "_sheet"):
+            with paper._db() as db:
+                db.execute("""INSERT INTO signals
+                    (id,symbol,pattern,tf,anchor_ms,entry_ms,entry,target,deadline_ms,state)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    ("ws-test2", "BTCUSDT", "Morning Star", "1h", now-60000,
+                     now, 100, 101, now+28800000, "ACTIVE"))
+                db.commit()
+            self.assertFalse(paper._mark_live_tp("BTCUSDT", 102, now-1000))
+            self.assertFalse(paper._mark_live_tp("BTCUSDT", 102, now+28800001))
+
     def test_duplicate_identity_ignores_price(self):
         now = 1_800_000_000_000
         row = {"symbol": "BTCUSDT", "exchange": "binance-futures", "tf": "15m",
