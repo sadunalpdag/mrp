@@ -59,7 +59,10 @@ class PreflightDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_request_timeout_logs_only_safe_metadata(self):
-        import requests
+        try:
+            import requests
+        except ImportError:
+            self.skipTest('requests is not installed in the repository-wide minimal test environment')
         output = io.StringIO()
         with patch("crash_rest_budget.BUDGET.reserve"), \
              patch("requests.request", side_effect=requests.Timeout("secret in signed URL")):
