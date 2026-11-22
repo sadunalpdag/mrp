@@ -200,6 +200,41 @@ class LiveLockTests(unittest.TestCase):
         self.assertEqual(self.ctrl.state["phase"], "WAIT_TARGET")
         self.assertEqual(self.ctrl.state["cashflow_total"], "100")
 
+    def test_income_history_every_ten_minutes_but_equity_still_checked(self):
+        seen = []
+        original = self.ex.broker.request
+
+        def recording_request(method, path, params=None, budget_priority=None):
+            seen.append(path)
+            return original(method, path, params, budget_priority)
+
+        self.ex.broker.request = recording_request
+        self.ctrl.step()
+        for _ in range(4):
+            self.advance()
+            self.ctrl.step()
+        self.assertEqual(seen.count("/fapi/v3/account"), 5)
+        self.assertEqual(seen.count("/fapi/v1/income"), 0)
+        self.advance()  # 650 seconds after initialization
+        self.ctrl.step()
+        self.assertEqual(seen.count("/fapi/v1/income"), 1)
+        self.advance()
+        self.ctrl.step()
+        self.assertEqual(seen.count("/fapi/v1/income"), 1)
+
+    def test_transfer_rechecked_before_trigger_during_ten_minute_gap(self):
+        self.ctrl.step()
+        self.advance()
+        self.ex.broker.balance = Decimal("900")
+        self.ex.broker.income = [{
+            "incomeType": "TRANSFER", "asset": "USDT",
+            "time": int(self.clock[0] * 1000), "income": "100", "tranId": 234
+        }]
+        self.ctrl.step()
+        self.assertEqual(self.ctrl.state["phase"], "WAIT_TARGET")
+        self.assertEqual(self.ctrl.state["cashflow_total"], "100")
+        self.assertFalse(any("Hedefe ulaşıldı" in msg for msg in self.ex.messages))
+
     def test_no_live_emission_without_explicit_opt_in(self):
         os.environ["CRASH_FIXED_PROFIT_LOCK_ENABLED"] = "0"
         self.assertFalse(LiveProfitLock(self.ex).active())
