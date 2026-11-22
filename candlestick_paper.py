@@ -206,33 +206,40 @@ def _sheet(db):
 
 
 def _archive(db, now):
-    # At/after Paris midnight, archive previous Paris calendar day exactly once;
-    # failed writes are retried on later cycles. No bulky candle arrays.
-    day = (datetime.fromtimestamp(now/1000, PARIS).date() - timedelta(days=1)).isoformat()
-    if db.execute("SELECT done FROM archive_days WHERE day=?", (day,)).fetchone():
-        if db.execute("SELECT done FROM archive_days WHERE day=?", (day,)).fetchone()[0]:
-            return
-    try:
-        from btc_hourly_direction import _r2_client
-        client, bucket = _r2_client()
-        if not client:
-            return
-        records = []
-        for x in db.execute("SELECT * FROM signals WHERE entry_ms>=? AND entry_ms<?",
-                            (int(datetime.fromisoformat(day).replace(tzinfo=PARIS).timestamp()*1000),
-                             int((datetime.fromisoformat(day).replace(tzinfo=PARIS) + timedelta(days=1)).timestamp()*1000))):
-            records.append({k: x[k] for k in ("id","symbol","pattern","tf","entry_ms","entry",
-                                             "target","deadline_ms","state","tp_ms","close_8h",
-                                             "ret_pct","up_pct","down_pct","bars")})
-        payload = json.dumps({"schema":"candlestick_paper_v1","day_paris":day,
-                              "records":records}, separators=(",",":"), allow_nan=False).encode()
-        key = f"candlestick-paper/daily/{day[:4]}/{day[5:7]}/{day}.json.gz"
-        client.put_object(Bucket=bucket, Key=key, Body=gzip.compress(payload),
-                          ContentType="application/json", ContentEncoding="gzip")
-        db.execute("INSERT OR REPLACE INTO archive_days(day,done) VALUES (?,1)", (day,))
-        db.commit()
-    except Exception as exc:
-        LOG.warning("Candlestick R2 archive failed: %s", type(exc).__name__)
+    # Archive yesterday and recent days at/after Paris midnight. An archive
+    # stays mutable until all cases from the date finish their full 8h review.
+    today = datetime.fromtimestamp(now/1000, PARIS).date()
+    for days_ago in (1, 2):
+        day = (today - timedelta(days=days_ago)).isoformat()
+        state = db.execute("SELECT done FROM archive_days WHERE day=?", (day,)).fetchone()
+        if state and state["done"]:
+            continue
+        start_day = datetime.fromisoformat(day).replace(tzinfo=PARIS)
+        begin = int(start_day.timestamp()*1000)
+        finish = int((start_day + timedelta(days=1)).timestamp()*1000)
+        rows = db.execute("SELECT * FROM signals WHERE entry_ms>=? AND entry_ms<?",
+                          (begin, finish)).fetchall()
+        if not rows and days_ago == 2:
+            continue
+        records = [{k: x[k] for k in (
+            "id","symbol","pattern","tf","entry_ms","entry","target",
+            "deadline_ms","state","tp_ms","close_8h","ret_pct",
+            "up_pct","down_pct","bars")} for x in rows]
+        try:
+            from btc_hourly_direction import _r2_client
+            client, bucket = _r2_client()
+            if not client:
+                return
+            payload = json.dumps({"schema":"candlestick_paper_v1","day_paris":day,
+                                  "records":records}, separators=(",",":"), allow_nan=False).encode()
+            key = f"candlestick-paper/daily/{day[:4]}/{day[5:7]}/{day}.json.gz"
+            client.put_object(Bucket=bucket, Key=key, Body=gzip.compress(payload),
+                              ContentType="application/json", ContentEncoding="gzip")
+            done = int(all(x["state"] == "DONE" for x in rows))
+            db.execute("INSERT OR REPLACE INTO archive_days(day,done) VALUES (?,?)", (day,done))
+            db.commit()
+        except Exception as exc:
+            LOG.warning("Candlestick R2 archive failed: %s", type(exc).__name__)
 
 
 def step():
