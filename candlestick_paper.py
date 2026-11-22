@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+import websocket
 
 LOG = logging.getLogger("candlestick_paper")
 API = "https://api.coinbeacon.io"
@@ -141,6 +142,75 @@ def _ts(ms):
     return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
 
 
+def _mark_live_tp(symbol, price, trade_ms):
+    """Mark exact Binance Futures trade-based paper TP and free a slot."""
+    if not symbol or not math.isfinite(price):
+        return False
+    with _db() as db:
+        rows = db.execute(
+            "SELECT * FROM signals WHERE symbol=? AND state='ACTIVE' "
+            "AND entry_ms<=? AND deadline_ms>=?",
+            (symbol, trade_ms, trade_ms)).fetchall()
+        hits = [r for r in rows if price >= r["target"]]
+        if not hits:
+            return False
+        for r in hits:
+            db.execute(
+                "UPDATE signals SET state='TP_HIT', tp_ms=?, sheet_dirty=1 "
+                "WHERE id=? AND state='ACTIVE'", (trade_ms, r["id"]))
+        db.commit()
+        for r in hits:
+            _notify(f"✅ CANDLESTICK SANAL TP %1\n{symbol} {r['pattern']} {r['tf']}\n"
+                    f"TP zamanı: {_ts(trade_ms)} | 8 saatlik analiz devam ediyor")
+        _sheet(db)
+        return True
+
+
+def _observe_trades():
+    """Single multiplexed Binance Futures WS connection for active paper positions."""
+    while True:
+        try:
+            with _db() as db:
+                symbols = sorted({r["symbol"].lower() for r in db.execute(
+                    "SELECT symbol FROM signals WHERE state='ACTIVE'")})
+            if not symbols:
+                time.sleep(5)
+                continue
+            streams = "/".join(f"{symbol}@aggTrade" for symbol in symbols)
+            ws = websocket.create_connection(
+                "wss://fstream.binance.com/stream?streams=" + streams, timeout=12)
+            try:
+                ws.settimeout(4)
+                last_check = 0.0
+                while True:
+                    if time.monotonic() - last_check >= 5:
+                        with _db() as db:
+                            current = sorted({r["symbol"].lower() for r in db.execute(
+                                "SELECT symbol FROM signals WHERE state='ACTIVE'")})
+                        if current != symbols:
+                            break
+                        last_check = time.monotonic()
+                    try:
+                        message = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if not message:
+                        break
+                    packet = json.loads(message)
+                    trade = packet.get("data", packet)
+                    if trade.get("e") != "aggTrade":
+                        continue
+                    price = _number(trade.get("p"))
+                    trade_ms = _ms(trade.get("T"))
+                    if price is not None and trade_ms is not None:
+                        _mark_live_tp(str(trade.get("s") or ""), price, trade_ms)
+            finally:
+                ws.close()
+        except Exception as exc:
+            LOG.warning("Candlestick WS reconnect: %s", type(exc).__name__)
+            time.sleep(5)
+
+
 def _result(db, rec, now):
     if now < rec["deadline_ms"] + BAR:
         return False
@@ -167,7 +237,8 @@ def _result(db, rec, now):
     expected = (end - start) // BAR
     if len(bars) != expected or any(b[0] != start + i * BAR for i, b in enumerate(bars)):
         raise ValueError("OHLCV_INCOMPLETE")
-    first_tp = next((b[0] + BAR - 1 for b in bars if b[1] >= rec["target"]), None)
+    historical_tp = next((b[0] + BAR - 1 for b in bars if b[1] >= rec["target"]), None)
+    first_tp = rec["tp_ms"] or historical_tp
     hi = max(b[1] for b in bars)
     lo = min(b[2] for b in bars)
     last = bars[-1][3]
@@ -267,7 +338,7 @@ def step():
     global _USAGE
     now = int(time.time()*1000)
     with _db() as db:
-        for rec in db.execute("SELECT * FROM signals WHERE state='ACTIVE' AND deadline_ms<=? ORDER BY deadline_ms", (now,)).fetchall():
+        for rec in db.execute("SELECT * FROM signals WHERE state IN ('ACTIVE','TP_HIT') AND deadline_ms<=? ORDER BY deadline_ms", (now,)).fetchall():
             try:
                 _result(db, rec, now)
             except Exception as exc:
@@ -338,5 +409,6 @@ def start():
             except Exception as exc:
                 LOG.warning("Candlestick observer cycle error: %s", type(exc).__name__)
             time.sleep(max(15, 900 - (time.time() % 900)))
+    threading.Thread(target=_observe_trades, daemon=True, name="candlestick-paper-ws").start()
     threading.Thread(target=loop, daemon=True, name="candlestick-paper").start()
     return True
