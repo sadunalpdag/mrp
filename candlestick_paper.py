@@ -264,6 +264,7 @@ def _archive(db, now):
 
 
 def step():
+    global _USAGE
     now = int(time.time()*1000)
     with _db() as db:
         for rec in db.execute("SELECT * FROM signals WHERE state='ACTIVE' AND deadline_ms<=? ORDER BY deadline_ms", (now,)).fetchall():
@@ -286,6 +287,8 @@ def step():
                     break
                 data = _api("/public/detectors/candlesticks",
                             {"exchange":"binance-futures","timeframe":tf,"quote":"USDT"})
+                if _USAGE is not None:
+                    _USAGE = (_USAGE[0] - 5, _USAGE[1] - 5)
                 if data.get("kind") != "candlesticks" or data.get("timeframe") != tf:
                     raise ValueError("DETECTOR_WRONG_BOARD")
                 board = data.get("items", [])
