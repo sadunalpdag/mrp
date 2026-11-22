@@ -85,7 +85,7 @@ def _pattern(row, tf, now):
     name = {"hammer": "Hammer", "morningstar": "Morning Star"}.get(raw)
     if not name or str(item.get("direction") or "bull").lower() not in ("bull", "bullish"):
         return None
-    if str(item.get("state") or "").lower() == "setup":
+    if str(item.get("state") or "").lower() not in ("complete", "confirmed"):
         return None
     symbol = str(row.get("symbol") or "")
     if not re.fullmatch(r"[A-Z0-9]{2,30}USDT", symbol):
