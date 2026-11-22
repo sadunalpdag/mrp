@@ -56,7 +56,7 @@ class LiveProfitLock:
         self._save(st)
         self.ex.alert("⚠️ SABİT KÂR HEDEFİ | " + msg)
 
-    def _sample(self):
+    def _sample(self, force_income=False):
         """Validated single-asset Binance equity, adjusted for cash transfers.
 
         Only the INITIAL reference is imported from the old paper monitor;
@@ -110,6 +110,14 @@ class LiveProfitLock:
         previous = int(st.get("cashflow_checked_ms") or 0)
         if previous < base or now_ms - previous > 6 * 24 * 3600 * 1000:
             raise ValueError("CASHFLOW_HISTORY_GAP")
+        # Check transfer/income history at most once per ten minutes during
+        # ordinary monitoring. A possible profit-target hit forces a fresh
+        # income reconciliation before any closing lock can be triggered.
+        if not force_income and now_ms - previous < 600_000:
+            adjusted = raw - D(str(st.get("cashflow_total", "0")))
+            if adjusted <= 0:
+                raise ValueError("INVALID_ADJUSTED_EQUITY")
+            return adjusted, pct, target, now
         # Re-read five minutes to absorb late-arriving income records.
         start = max(base + 1, previous - 300000)
         rows = self.ex.broker.request("GET", "/fapi/v1/income",
@@ -436,6 +444,10 @@ class LiveProfitLock:
                           cashflow_seen=[], cashflow_total="0")
                 self._save(st)
             if st["phase"] == "WAIT_TARGET":
+                # Verify cash transfers immediately before declaring a target
+                # hit, even when the regular ten-minute income poll is not due.
+                if equity >= D(str(st["target"])):
+                    equity, pct, _, instant = self._sample(force_income=True)
                 # One-off operator target, consumed durably before observation.
                 # Never change a triggered close cycle or reapply after restart.
                 override = os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip()
