@@ -23,6 +23,8 @@ BAR = 900_000
 HORIZON = 8 * 3_600_000
 CAP = 10
 _STARTED = False
+_USAGE_AT = 0.0
+_USAGE = None
 HEADERS = ["ID", "Coin", "Pattern", "TF", "Entry Paris", "Entry UTC",
            "Entry", "TP +1%", "8h deadline UTC", "Status", "TP reached",
            "TP time UTC", "8h close", "8h return %", "Max up %",
@@ -57,6 +59,25 @@ def _api(path, params=None):
         raise RuntimeError("COINBEACON_RATE_LIMIT")
     r.raise_for_status()
     return r.json()
+
+
+def _scan_quota_ok():
+    # Detector boards cost 5 credits. Preserve headroom for existing MRP services
+    # and the final 8h OHLCV requests, rather than exhausting the shared key.
+    global _USAGE_AT, _USAGE
+    if time.time() - _USAGE_AT > 300:
+        _USAGE_AT = time.time()
+        try:
+            d = _api("/public/usage")
+            _USAGE = (float((d.get("today") or {})["creditsLeft"]),
+                      float((d.get("thisMinute") or {})["creditsLeft"]))
+        except (ValueError, TypeError, KeyError, RuntimeError, requests.RequestException):
+            _USAGE = None
+    if _USAGE is None:
+        LOG.warning("Candlestick scan skipped: API quota status unavailable")
+        return False
+    daily, minute = _USAGE
+    return daily >= 155 and minute >= 10
 
 
 def _number(value):
@@ -261,6 +282,8 @@ def step():
             if len(active) >= CAP:
                 break
             try:
+                if not _scan_quota_ok():
+                    break
                 data = _api("/public/detectors/candlesticks",
                             {"exchange":"binance-futures","timeframe":tf,"quote":"USDT"})
                 if data.get("kind") != "candlesticks" or data.get("timeframe") != tf:
