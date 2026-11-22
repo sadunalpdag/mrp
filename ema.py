@@ -15976,6 +15976,13 @@ def main():
             log("[BULL FLAG PAPER] started=%s" % _bull_flag_paper_start())
         except Exception as exc:
             log("[BULL FLAG PAPER START ERR] " + type(exc).__name__)
+    # Hammer/Morning Star independent 8h paper observer; no broker imports.
+    if os.getenv("CANDLESTICK_PAPER_ENABLED", "0") == "1":
+        try:
+            from candlestick_paper import start as _candlestick_paper_start
+            log("[CANDLESTICK PAPER] started=%s" % _candlestick_paper_start())
+        except Exception as exc:
+            log("[CANDLESTICK PAPER START ERR] " + type(exc).__name__)
     # BTC hourly direction observer: read-only research, not part of trading decisions.
     # Feature is opt-in (BTC_DIRECTION_OBSERVER_ENABLED=1) and yields to live TP/entry.
     try:
