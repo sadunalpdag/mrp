@@ -441,8 +441,8 @@ class NightExecutor:
         self.broker.max_open_positions = self.max_open_positions
         self.broker.max_pending_entries = self.max_pending_entries
         self.position_usdt = D(str(settings.get('position_usdt', '500')))
-        # Daily dynamic budget uses the READ-ONLY paper account observer.
-        # A saved baseline and one daily amount survive every Render restart.
+        # Live new-order budget uses the fresh READ-ONLY paper account observer.
+        # The latest calculated amount survives restart, but stale samples block new BUYs.
         # Feature switch remains off unless explicitly enabled in Render.
         sizing = self.state.get('auto_position_sizing')
         if not isinstance(sizing, dict):
@@ -1560,11 +1560,11 @@ class NightExecutor:
             return
         configured_usdt = self.position_usdt
         target_usdt = configured_usdt * D(str(fraction))
-        # User requested whole-USDT budgets even for half-size/30% risk tiers.
+        # Whole-USDT budgets use ceiling, including half-size/30% risk tiers.
         # Existing trades and static-sized strategy remain unchanged.
         if self._auto_sizing_on():
             target_usdt = max(D('1'), target_usdt.quantize(
-                D('1'), rounding=ROUND_HALF_UP))
+                D('1'), rounding=ROUND_UP))
         flags = record['failure_shadow']['flags']
         risk_count = sum(flags.values())
         tp_pct = D('0.005') if risk_count in (2, 3) else D('0.01')
@@ -2164,7 +2164,7 @@ class NightExecutor:
         self.deliver_pending()
         # Never sleep inside the executor: maintain account WS, TP and
         # protective polls while waiting for a safe next-minute preflight.
-        # A still-pending midnight equity sample temporarily defers NEW BUYs
+        # A missing or stale equity sample temporarily defers NEW BUYs
         # only; existing TP protection and housekeeping above already ran.
         if self.auto_sizing_pending or self.profit_lock.entries_blocked():
             return
