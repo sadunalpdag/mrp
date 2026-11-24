@@ -1,4 +1,4 @@
-"""Daily equity-proportional trade NOTIONAL, based on the existing paper observer.
+"""Daily one-third trade NOTIONAL, based on the existing paper observer.
 
 This module NEVER calls Binance, never sends orders and never changes trading
 state itself. The executor alone commits one immutable size per Paris day.
@@ -68,3 +68,31 @@ def one_third_amount(equity):
     if not MIN_USDT <= value <= MAX_USDT:
         raise ValueError("EQUITY_THIRD_OUT_OF_BOUNDS")
     return value
+
+
+def previous_day_closing_equity(path, now):
+    """Use the last observed equity from the previous Paris date.
+
+    The hourly paper observer commonly records near 23:12. Only a sample
+    in the final two hours of yesterday is eligible for the midnight roll.
+    """
+    try:
+        with Path(path).open("r", encoding="utf8") as handle:
+            payload = json.load(handle)
+        if payload.get("mode") != "PAPER_ONLY":
+            return None
+        sampled = datetime.fromisoformat(payload["sampled_at"])
+        if sampled.tzinfo is None:
+            return None
+        at = sampled.timestamp()
+        today = datetime.fromtimestamp(now, PARIS).date()
+        at_day = datetime.fromtimestamp(at, PARIS).date()
+        from datetime import timedelta
+        if at_day != today - timedelta(days=1):
+            return None
+        midnight = datetime.combine(today, datetime.min.time(), PARIS).timestamp()
+        if not midnight - 7200 <= at < midnight or at > now:
+            return None
+        return decimal(payload["last_equity"]), at
+    except (OSError, ValueError, TypeError, KeyError, OverflowError):
+        return None
