@@ -1463,6 +1463,7 @@ class NightExecutor:
                  f'daily={self.daily_count()}/{self.max_daily}; '
                  f'halt={bool(self.state.get("halt"))}; outbox={len(self.state["outbox"])}')
         notices = {
+            'PROFIT_TARGET_LOCK': 'Sabit kâr hedefi kilidi aktif. Yeni alış emri gönderilmedi.',
             'AUTO_OFF': 'Otomatik alım kapalı.',
             'SIGNAL_BEFORE_ARM': 'Sinyal otomatik alım açılmadan önce oluşturuldu.',
             'DAILY_LIMIT': 'Günlük giriş sınırı doldu.',
