@@ -159,6 +159,8 @@ def _values(executor):
 def _apply(key, raw, approval, executor):
     """Return (success, result). Requires explicit confirmation per request."""
     text = str(approval).strip().upper()
+    if key in ("AMOUNT", "AUTO_SIZE"):
+        raise ValueError("Bu ayar sadece okunur; Render sermaye / 3 kuralini yonetir")
     if key in ("LIVE", "PAPER"):
         on = _mode(raw)
         expected = ("CANLI ONAY" if on else "UYGULA") if key == "LIVE" else "UYGULA"
