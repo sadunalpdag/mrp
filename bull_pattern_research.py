@@ -139,7 +139,7 @@ def followups(db, now):
                 bars, _ = legacy._bars(obj["symbol"], obj["first_ms"]+EIGHT+STEP_MS,40)
                 bars = [b for b in bars if obj["first_ms"] <= b[0] < obj["first_ms"]+EIGHT]
                 obj["payload"]["candles_8h"] = bars
-                obj["payload"]["complete_8h"] = len(bars) >= 31
+                obj["payload"]["complete_8h"] = len(bars) == 32 and all(\n                    b[0] - a[0] == STEP_MS for a, b in zip(bars, bars[1:]))
                 if len(bars) >= 31:
                     obj["outcome_8h"] = _outcome(bars,obj["entry"],obj["target"],obj["entry_ms"])
                     _store(db,obj)
@@ -151,7 +151,7 @@ def followups(db, now):
                 bars, complete = legacy._bars(obj["symbol"], obj["first_ms"]+DAY+STEP_MS,110)
                 bars = [b for b in bars if obj["first_ms"] <= b[0] < obj["first_ms"]+DAY]
                 obj["payload"]["candles_24h"] = bars
-                obj["payload"]["complete_24h"] = len(bars) >= 95 and all(
+                obj["payload"]["complete_24h"] = len(bars) == 96 and all(
                     b[0]-a[0] == STEP_MS for a,b in zip(bars,bars[1:]))
                 if obj["payload"]["complete_24h"]:
                     obj["outcome_24h"] = _outcome(bars,obj["entry"],obj["target"],obj["entry_ms"])
@@ -197,7 +197,7 @@ def _sheet(db):
                 latest.get("upper",""),r["target"] or "",r["entry"] or "",
                 r["outcome_8h"] or "",r["outcome_24h"] or "",
                 len(p.get("observations",[])),len(p.get("candles_24h",[]))])
-        sheet.update(range_name="A1",values=values)
+        sheet.update(range_name="A1",values=values)\n        LOG.info("Bull patterns Sheets updated rows=%d",len(values)-1)
     except Exception as exc:
         LOG.warning("Bull patterns sheet update failed: %s",type(exc).__name__)
 
