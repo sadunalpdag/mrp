@@ -388,9 +388,46 @@ class LiveProfitLock:
                 self.ex.enabled.set()
             self.ex.alert("✅ SABİT KÂR HEDEFİ | Eski döngü Binance üzerinde boş doğrulandı; kilit kaldırıldı.")
         else:
-            self._alert("Eski kapanış döngüsü salt okunur korumaya alındı. "
-                        "Yeni manuel emirler iptal edilmiyor; eski pozisyon ve "
-                        "LIMIT kapanışları için kontrol gerekli. Otomatik alış kilidi korunuyor.")
+            # Legacy cycles must never sweep new orders or add new positions.
+            # Release the BUY lock only if each still-live frozen position has
+            # an exchange-visible LIMIT close order from this very cycle.
+            st = self.state
+            snapshots = st.get("position_snapshot") or []
+            plan = st.get("exit_plan") or {}
+            positions = normalize_positions(self._positions())
+            normal, algo = self._orders()
+            open_ids = {str(o.get("clientOrderId") or o.get("clientAlgoId") or "")
+                        for o in normal + algo}
+            safe = bool(snapshots and plan and st.get("cycle_id"))
+            for snap in snapshots:
+                symbol, side = snap["symbol"], snap["position_side"]
+                qty = positions.get((symbol, side))
+                if qty is None:
+                    continue
+                original = D(str(snap["amount"]))
+                attempt = plan.get(symbol + "|" + side)
+                if (qty * original <= 0 or abs(qty) > abs(original) or
+                        not attempt or attempt.get("status") != "SENT" or
+                        str(attempt.get("id", "")) not in open_ids):
+                    safe = False
+                    break
+            if safe:
+                # WATCH_EXITS never places/cancels orders. Snapshot symbols
+                # remain reserved until their old exits actually clear.
+                st["one_shot_v2"] = True
+                st["phase"] = "WATCH_EXITS"
+                st["one_shot_released_at"] = self.ex.clock()
+                self._save(st)
+                if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                    self.ex.enabled.set()
+                self.ex.log("[PROFIT CYCLE LEGACY] Binance old LIMIT closes verified; entry lock released; reserved=%s" %
+                            ",".join(sorted(self.closing_symbols())))
+                self.ex.alert("✅ SABİT KÂR | Eski LIMIT kapanış emirleri Binance'de doğrulandı; "
+                              "diğer coinlerde otomatik alış serbest. Eski emirler izleniyor.")
+            else:
+                self._alert("Eski kapanış döngüsü salt okunur korumada. "
+                            "Bütün açık eski pozisyonların LIMIT kapanışları Binance'de "
+                            "doğrulanamadı; otomatik alış kilidi güvenlik için korunuyor.")
 
     def closing_symbols(self):
         """Symbols reserved by this exact snapshot; never attach new entries."""
