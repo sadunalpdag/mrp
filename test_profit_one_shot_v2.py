@@ -21,6 +21,7 @@ class OneShotTests(unittest.TestCase):
         self.addCleanup(self.extra.stop)
         self.clock = [datetime(2026, 11, 20, 15, tzinfo=timezone.utc).timestamp()]
         self.ex = FakeExecutor(self.clock)
+        self.ex.log = lambda message: None
         self.ctrl = LiveProfitLock(self.ex)
 
     def advance(self):
