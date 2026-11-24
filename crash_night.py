@@ -503,8 +503,7 @@ class NightExecutor:
         os.replace(self.path+'.tmp', self.path)
 
     def _auto_sizing_on(self):
-        return (os.getenv('CRASH_AUTO_POSITION_SIZING_ENABLED', '0') == '1'
-                and self.state.get('auto_position_sizing', {}).get('enabled') is True)
+        return os.getenv('CRASH_AUTO_POSITION_SIZING_ENABLED', '0') == '1'
 
     def _daily_size_update(self):
         """Size NEW orders from fresh observed equity, rounded UP to whole USDT.
