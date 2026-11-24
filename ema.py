@@ -6313,7 +6313,7 @@ def update_max_profit_tracking():
 CRASH_BOUNCE_STATE_FILE = os.path.join(DATA_DIR, "crash_bounce_state.json")
 CRASH_BOUNCE_SCAN_SECONDS = 180
 CRASH_DATA_FALLBACK_ENABLED = 1  # WS/cache -> REST -> Binance daily archive
-CRASH_BOUNCE_TOP_LOSERS = 20
+CRASH_BOUNCE_TOP_LOSERS = 25
 CRASH_BOUNCE_DROP_PCT = 12.0
 CRASH_BOUNCE_FILTER_VERSION = "five_day_entry_v2_only"
 CRASH_V2_SIGNAL_TTL_SECONDS = 280
@@ -8235,7 +8235,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     ranked.sort(key=lambda item: (item[0], item[1]))
     top = ranked[:CRASH_BOUNCE_TOP_LOSERS]
     # Keep entry candidates <24h and unresolved virtual OPEN trades through TP/timeout
-    # and after they leave the top 20 / recover above the -12% threshold.
+    # and after they leave the top 25 / recover above the -12% threshold.
     from crash_policy import is_active_candidate
     watching = {sym for sym, rec in state["symbols"].items()
                 if is_active_candidate(rec, now) and sym in market
@@ -8271,7 +8271,7 @@ def run_crash_bounce_alerts(state, market, now=None, tickers=None, candles_get=N
     _CRASH_WS_CACHE.reconcile([symbol for change,symbol,ticker in selected][:100],
                               trade_watching, research_symbols=research_symbols)
     _crash_append_data({"type":"scan", "observed_at":now,
-        "configuration":{"drop_pct":12,"top_losers":20,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":150,"tracking_model":"ws_aggtrade_upcross_v3",
+        "configuration":{"drop_pct":12,"top_losers":CRASH_BOUNCE_TOP_LOSERS,"scan_seconds":180,"tp_pct":1, "revision_min_drop_pct":2,"watch_hours":150,"tracking_model":"ws_aggtrade_upcross_v3",
                          "signal_filter_version":CRASH_BOUNCE_FILTER_VERSION,"rsi14_lt":25,"ema25_slope_lt":0,"indicators_block_signals":True,"condition_points":0,"v2_only":True,"v2_min_rsi":20,"v2_min_recovery_pct":1,"v2_history_candles":480,
                          "strength_score_version":"continuous_7factor_v1",
                          "strength_score_blocks_signals":False},
