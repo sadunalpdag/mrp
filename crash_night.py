@@ -1516,6 +1516,9 @@ class NightExecutor:
         if self.profit_lock.entries_blocked():
             self.entry_skip(symbol, 'PROFIT_TARGET_LOCK')
             return
+        if symbol in self.profit_lock.closing_symbols():
+            self.entry_skip(symbol, 'PROFIT_CLOSING_SYMBOL')
+            return
         if not self.enabled.is_set():
             self.entry_skip(symbol, 'AUTO_OFF')
             return
@@ -1539,6 +1542,7 @@ class NightExecutor:
         sid, symbol = record.get('signal_id'), record.get('symbol')
         reason = (
             'PROFIT_TARGET_LOCK' if self.profit_lock.entries_blocked() else
+            'PROFIT_CLOSING_SYMBOL' if symbol in self.profit_lock.closing_symbols() else
             'AUTO_OFF' if not self.enabled.is_set() else
             'SIGNAL_BEFORE_ARM' if observed_at < self.armed_at else
             'INVALID_SIGNAL' if not sid or not supported_symbol(symbol) else
@@ -1740,7 +1744,8 @@ class NightExecutor:
         An unconfirmed API result never closes a trade or cancels an order.
         """
         active = [o for o in self.state['orders'].values()
-                  if o.get('phase') in ('TP_UNKNOWN', 'PROTECTED')
+                  if o.get('symbol') not in self.profit_lock.closing_symbols()
+                  and o.get('phase') in ('TP_UNKNOWN', 'PROTECTED')
                   and o.get('symbol') and o.get('tp_id')]
         if not active or not callable(getattr(self.broker, 'positions', None)):
             return
@@ -1786,6 +1791,10 @@ class NightExecutor:
 
     def reconcile(self, order, check_expiry=True, ws_order=None):
         symbol = order['symbol']
+        # Frozen one-shot close owns this symbol until Binance verifies it flat.
+        # Do not resurrect an old TP or cancel a one-shot LIMIT exit.
+        if symbol in self.profit_lock.closing_symbols():
+            return
         try:
             if order['phase'] == 'ENTRY_UNKNOWN':
                 entry = ws_order if ws_order and ws_order['clientOrderId'] == order['entry_id'] else self.broker.order(symbol, order['entry_id'])
