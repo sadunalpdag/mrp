@@ -28,7 +28,7 @@ class LiveProfitLock:
         return self.ex.state.get("profit_lock_live")
 
     def locked(self):
-        return bool(self.state and self.state.get("phase") != "WAIT_TARGET")
+        return bool(self.state and self.state.get("phase") not in ("WAIT_TARGET", "WATCH_EXITS", "DONE_DAY"))
 
     def active(self):
         # A triggered lock is not dismissible by disabling the feature.
@@ -371,6 +371,143 @@ class LiveProfitLock:
                        and D(str(p["positionAmt"])) != 0)
             self._exit_one(item, row)
 
+    def closing_symbols(self):
+        """Symbols reserved by this exact snapshot; never attach new entries."""
+        st = self.state or {}
+        if not st.get("one_shot_v2") or st.get("phase") not in ("CLOSING", "WATCH_EXITS"):
+            return set()
+        return {p["symbol"] for p in st.get("position_snapshot", [])}
+
+    def _one_shot_close(self):
+        """Finish the frozen target-time exit plan, never sweep new manual orders."""
+        st = self.state
+        self._block()
+        positions = normalize_positions(self._positions())
+        normal, algo = self._orders()
+        initial_ids = set(st.get("initial_order_ids") or [])
+        # Only the orders present when the target fired may be cancelled.
+        for order in normal + algo:
+            cid = str(order.get("clientOrderId") or order.get("clientAlgoId") or "")
+            if cid not in initial_ids:
+                continue
+            symbol = order.get("symbol")
+            if not symbol:
+                raise ValueError("INITIAL_ORDER_SYMBOL_MISSING")
+            if "algoId" in order or "clientAlgoId" in order:
+                payload = {"symbol": symbol}
+                if order.get("algoId") is not None:
+                    payload["algoId"] = order["algoId"]
+                else:
+                    payload["clientAlgoId"] = cid
+                self.ex.broker.request("DELETE", "/fapi/v1/algoOrder", payload)
+            else:
+                payload = {"symbol": symbol}
+                if order.get("orderId") is not None:
+                    payload["orderId"] = order["orderId"]
+                else:
+                    payload["origClientOrderId"] = cid
+                self.ex.broker.request("DELETE", "/fapi/v1/order", payload)
+        normal, algo = self._orders()
+        if any(str(o.get("clientOrderId") or o.get("clientAlgoId") or "") in initial_ids
+               for o in normal + algo):
+            return
+        live = normalize_positions(self._positions())
+        planned = st.setdefault("exit_plan", {})
+        # Snapshot is immutable: later positions are NEVER added.
+        for snap in st.get("position_snapshot", []):
+            symbol, side = snap["symbol"], snap["position_side"]
+            key = (symbol, side)
+            qty = live.get(key)
+            if qty is None:
+                continue
+            original = D(str(snap["amount"]))
+            if qty * original <= 0 or abs(qty) > abs(original):
+                self._alert("Tek seferlik kapanışta " + symbol +
+                            " miktarı/yönü değişti. Emir yenilenmedi; kontrol gerekli.")
+                return
+            if symbol + "|" + side in planned:
+                continue
+            # New manual orders on a snapshot symbol are not silently removed.
+            unexpected = [o for o in normal + algo
+                          if o.get("symbol") == symbol and
+                          str(o.get("clientOrderId") or o.get("clientAlgoId") or "")
+                          not in {x.get("id") for x in planned.values()}]
+            if unexpected:
+                self._alert("Kapanış öncesinde " + symbol +
+                            " üzerinde yeni emir var. Müdahale edilmedi; kontrol gerekli.")
+                return
+            rows = self._positions()
+            match = next((p for p in rows if p.get("symbol") == symbol and
+                          p.get("positionSide", "BOTH") == side and
+                          D(str(p.get("positionAmt", "0"))) == qty), None)
+            if match is None:
+                return
+            self._exit_one(snap, match)
+        # Require confirmed live exchange acknowledgement for every still-open snapshot.
+        normal, algo = self._orders()
+        seen = {str(o.get("clientOrderId") or o.get("clientAlgoId") or "")
+                for o in normal + algo}
+        live = normalize_positions(self._positions())
+        for snap in st.get("position_snapshot", []):
+            key = snap["symbol"] + "|" + snap["position_side"]
+            if (snap["symbol"], snap["position_side"]) in live:
+                attempt = planned.get(key)
+                if not attempt or attempt.get("status") != "SENT" or attempt["id"] not in seen:
+                    self._alert("Kapanış LIMIT emri doğrulanamadı: " + snap["symbol"] +
+                                ". Kilit korunuyor; tekrar emir yok.")
+                    return
+        st["phase"] = "WATCH_EXITS"
+        st["one_shot_released_at"] = self.ex.clock()
+        self._save(st)
+        if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+            self.ex.enabled.set()
+        self.ex.log("[PROFIT CYCLE ONE SHOT] initial closing orders confirmed; "
+                    "new BUYs allowed on other symbols; frozen_symbols=%s" %
+                    ",".join(sorted(self.closing_symbols())))
+        self.ex.alert("✅ SABİT KÂR TEK SEFERLİK | İlk pozisyonların LIMIT "
+                      "kapanış emirleri doğrulandı. Yeni alışlar farklı coinlerde "
+                      "serbest; eski kapanışlar ayrıca takip ediliyor.")
+
+    def _watch_one_shot(self, equity, instant):
+        st = self.state
+        normal, algo = self._orders()
+        live = normalize_positions(self._positions())
+        seen = {str(o.get("clientOrderId") or o.get("clientAlgoId") or "")
+                for o in normal + algo}
+        all_done = True
+        for snap in st.get("position_snapshot", []):
+            symbol, side = snap["symbol"], snap["position_side"]
+            key = symbol + "|" + side
+            attempt = (st.get("exit_plan") or {}).get(key)
+            if (symbol, side) in live:
+                all_done = False
+                if not attempt or attempt["id"] not in seen:
+                    self._alert("Tek seferlik kapanış hâlâ açık: " + symbol +
+                                "; LIMIT emir doğrulanamadı. Otomatik tekrar yok.")
+            elif attempt and attempt["id"] in seen:
+                all_done = False
+            else:
+                # Never assume TP filled: only live-flat verification is known.
+                for order in self.ex.state["orders"].values():
+                    if (order.get("symbol") == symbol and
+                            order.get("phase") in ("PROTECTED", "TP_UNKNOWN")):
+                        order["phase"] = "CLOSED_EXTERNALLY"
+                        order["close_verification"] = "PROFIT_ONE_SHOT_LIVE_FLAT"
+                self.ex.save()
+        if all_done:
+            if st.get("phase") != "DONE_DAY":
+                st["phase"] = "DONE_DAY"
+                self._save(st)
+                self.ex.log("[PROFIT CYCLE ONE SHOT] tracked exits flat; no new "
+                            "target until next Paris day")
+            if instant.astimezone(PARIS).date().isoformat() != st.get("triggered_day"):
+                new = initial_state(equity, D("1"), instant)
+                for field in ("cashflow_from_ms", "cashflow_checked_ms",
+                              "cashflow_seen", "cashflow_total"):
+                    new[field] = st.get(field)
+                self._save(new)
+                self.ex.log("[PROFIT CYCLE ONE SHOT] new day target initialized")
+
     def _reconcile_restart(self):
         """Clear a stale lock at process startup only when Binance is fully flat.
 
@@ -382,7 +519,7 @@ class LiveProfitLock:
         self._startup_reconciled = True
         st = self.state or {}
         phase = st.get("phase")
-        if phase in (None, "WAIT_TARGET"):
+        if phase in (None, "WAIT_TARGET", "WATCH_EXITS", "DONE_DAY"):
             return
         if phase == "ERROR_LOCK" and not any(
                 st.get(k) for k in ("cycle_id", "position_snapshot", "exit_plan")):
@@ -469,6 +606,14 @@ class LiveProfitLock:
                     positions = self._positions()
                     new["position_snapshot"] = self._build_snapshot(positions)
                     new["exit_plan"] = {}
+                    if os.getenv("CRASH_PROFIT_ONE_SHOT_V2", "0") == "1":
+                        regular, algo = self._orders()
+                        ids = [o.get("clientOrderId") or o.get("clientAlgoId")
+                               for o in regular + algo]
+                        if any(not x for x in ids):
+                            raise ValueError("INITIAL_ORDER_ID_MISSING")
+                        new["initial_order_ids"] = ids
+                        new["one_shot_v2"] = True
                     new["cycle_id"] = str(int(self.ex.clock() * 1000))
                     self._save(new)
                     self._alert("Hedefe ulaşıldı; yalnız LIMIT kapanış başlatıldı. "
@@ -477,7 +622,12 @@ class LiveProfitLock:
                     self._save(new)
                 return
             if st["phase"] == "CLOSING":
-                self._closing_step()
+                if st.get("one_shot_v2"):
+                    self._one_shot_close()
+                else:
+                    self._closing_step()
+            elif st["phase"] in ("WATCH_EXITS", "DONE_DAY"):
+                self._watch_one_shot(equity, instant)
             elif st["phase"] in ("WAIT_REBASE", "WAIT_MIDNIGHT"):
                 self._block()
                 verify, _, _, _ = self._verify()
