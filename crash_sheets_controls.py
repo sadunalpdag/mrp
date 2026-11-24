@@ -14,7 +14,7 @@ ROWS = [
     ("PAPER", "Sanal gunluk kar takibi", "AÇIK/KAPALI. Emir olusturmaz; yalniz gozlem.", True),
     ("TARGET", "Gunluk kar hedefi (%)", "0,5-20. Yeni oran ertesi Paris gunu uygulanir. SANAL.", True),
     ("DAILY", "Gunluk yeni giris limiti", "1-50. Artirmak icin RISK ONAY; azaltmak icin UYGULA.", True),
-    ("AMOUNT", "Pozisyon USDT", "1-1000 USDT ISLEM TUTARI (teminat degil). Artis: RISK ONAY.", True),
+    ("AMOUNT", "Pozisyon USDT", "GUNLUK: dunun kapanis sermayesi / 3, yukari yuvarlama. Telegram gun ici degistirebilir; Sheets salt okunur.", False),
     ("SYMBOLS", "Eszamanli sembol limiti", "1-50. Acik + bekleyen kapasitesi. Artis: RISK ONAY.", True),
     ("OPEN", "Acik pozisyon limiti", "1-50. Yeni alislari sinirlar; mevcut isleme dokunmaz.", True),
     ("PENDING", "Bekleyen alis limiti", "1-50. Artis: RISK ONAY; dusus: UYGULA.", True),
@@ -23,7 +23,7 @@ ROWS = [
     ("LEVERAGE", "Kaldirac", "10x, kodda sabit. Bu panelden degismez.", False),
     ("REAL_PROFIT", "Gunluk karla GERCEK kapanis", "GELISTIRILMEDI: Yalniz sanal fotoğraf; GERCEK TP YOK.", False),
     ("AUTO_SIZE", "Sermayeye gore gunluk pozisyon tutari",
-     "AÇIK/KAPALI; Fransa 00:00 sonrasi ozsermaye degisimine gore tam USDT. Yalniz yeni alis.", True),
+     "Render uzerinden yonetilir; Paris gece yarisi dunun kapanis sermayesi / 3. Yalniz yeni alis.", False),
 ]
 COUNT = len(ROWS) + 1
 KINDS = {"DAILY": ("limit", "max_daily", 50),
@@ -159,6 +159,8 @@ def _values(executor):
 def _apply(key, raw, approval, executor):
     """Return (success, result). Requires explicit confirmation per request."""
     text = str(approval).strip().upper()
+    if key in ("AMOUNT", "AUTO_SIZE"):
+        raise ValueError("Bu ayar sadece okunur; Render sermaye / 3 kuralini yonetir")
     if key in ("LIVE", "PAPER"):
         on = _mode(raw)
         expected = ("CANLI ONAY" if on else "UYGULA") if key == "LIVE" else "UYGULA"

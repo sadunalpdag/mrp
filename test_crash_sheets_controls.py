@@ -138,14 +138,14 @@ class PanelTests(unittest.TestCase):
         self.assertNotIn("'Bot Status'!F4", cleared)
         self.assertNotIn("'Bot Status'!I4", cleared)
 
-    def test_raising_risk_requires_risk_onay(self):
+    def test_sheets_amount_is_read_only_even_with_approval(self):
         executor = FakeExecutor()
-        with self.assertRaisesRegex(ValueError, "RISK ONAY"):
-            ctrl._apply("AMOUNT", "1000", "UYGULA", executor)
+        self.assertFalse(next(editable for key, _, _, editable in ctrl.ROWS
+                              if key == 'AMOUNT'))
+        for approval in ('UYGULA', 'RISK ONAY'):
+            with self.assertRaisesRegex(ValueError, 'sadece okunur'):
+                ctrl._apply('AMOUNT', '900', approval, executor)
         self.assertEqual(executor.calls, [])
-        result = ctrl._apply("AMOUNT", "1000", "RISK ONAY", executor)
-        self.assertTrue(result[0])
-        self.assertEqual(executor.position_usdt, Decimal("1000"))
 
     def test_lowering_risk_only_needs_normal_confirmation(self):
         executor = FakeExecutor()
@@ -166,17 +166,14 @@ class PanelTests(unittest.TestCase):
         self.assertTrue(ctrl._apply("LIVE", "KAPALI", "UYGULA", executor)[0])
         self.assertEqual(executor.calls, ["on", "off"])
 
-    def test_auto_size_control_uses_executor_queue_and_render_gate(self):
+    def test_sheets_auto_size_cannot_be_changed(self):
         executor = FakeExecutor()
-        with patch.dict(os.environ, {"CRASH_AUTO_POSITION_SIZING_ENABLED":"0"}):
-            with self.assertRaisesRegex(ValueError, "Render"):
-                ctrl._apply("AUTO_SIZE", "AÇIK", "UYGULA", executor)
+        self.assertFalse(next(editable for key, _, _, editable in ctrl.ROWS
+                              if key == 'AUTO_SIZE'))
+        for value in ('AÇIK', 'KAPALI'):
+            with self.assertRaisesRegex(ValueError, 'sadece okunur'):
+                ctrl._apply('AUTO_SIZE', value, 'UYGULA', executor)
         self.assertEqual(executor.calls, [])
-        with patch.dict(os.environ, {"CRASH_AUTO_POSITION_SIZING_ENABLED":"1"}):
-            self.assertTrue(ctrl._apply("AUTO_SIZE", "AÇIK", "UYGULA", executor)[0])
-            self.assertTrue(executor._auto_sizing_on())
-            self.assertTrue(ctrl._apply("AUTO_SIZE", "KAPALI", "UYGULA", executor)[0])
-        self.assertEqual(executor.calls, ["auto_size_on", "auto_size_off"])
 
     def test_bad_numbers_and_uneditable_counter(self):
         executor = FakeExecutor()

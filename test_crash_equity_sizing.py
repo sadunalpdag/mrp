@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
-from crash_equity_sizing import proportional_amount, read_equity
+from crash_equity_sizing import proportional_amount, read_equity, one_third_amount, previous_day_closing_equity
 from crash_night import NightExecutor
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -57,93 +57,91 @@ class SizingMathTests(unittest.TestCase):
             self.assertIsNone(read_equity(path,now))
 
 
-class ExecutorDailySizingTests(unittest.TestCase):
+class ThirdEquitySizingTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.old=os.environ.copy()
-        self.addCleanup(lambda: (os.environ.clear(),os.environ.update(self.old)))
+        self.old = os.environ.copy()
+        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.old)))
         os.environ.update({'DATA_DIR': self.tmp.name,
-                           'CRASH_AUTO_POSITION_SIZING_ENABLED':'1'})
-        self.now=stamp('2026-11-12T23:30:00')
-        self.e=NightExecutor(self.tmp.name,DummyBroker(),Mock(),Mock(),
-                             clock=lambda:self.now,enabled=False)
+                           'CRASH_AUTO_POSITION_SIZING_ENABLED': '1'})
+        self.now = stamp('2026-11-24T23:30:00')
+        self.e = NightExecutor(self.tmp.name, DummyBroker(), Mock(), Mock(),
+                               clock=lambda: self.now, enabled=False)
         self.addCleanup(self.e.guard.close)
 
-    def sample(self,eq,at=None):
+    def sample(self, equity, at=None):
         at = self.now if at is None else at
-        path=Path(self.tmp.name)/'daily_profit_lock_paper.json'
-        path.write_text(json.dumps({
-            'mode':'PAPER_ONLY', 'sampled_at':datetime.fromtimestamp(
-                at,timezone.utc).isoformat(), 'last_equity':str(eq)}),
-                encoding='utf8')
+        (Path(self.tmp.name) / 'daily_profit_lock_paper.json').write_text(
+            json.dumps({'mode': 'PAPER_ONLY',
+                         'sampled_at': datetime.fromtimestamp(
+                             at, timezone.utc).isoformat(),
+                         'last_equity': str(equity)}), encoding='utf8')
 
-    def test_next_midnight_freezes_new_amount_and_restarts_same_day(self):
-        self.sample(1000)
+    def test_ceiling_examples(self):
+        for equity, expected in [('996', '332'), ('997', '333'),
+                                 ('998', '333'), ('1000', '334'), ('1005', '335')]:
+            self.assertEqual(one_third_amount(equity), Decimal(expected))
+        for invalid in ('0', '-3', 'NaN', '3001'):
+            with self.assertRaises(ValueError):
+                one_third_amount(invalid)
+
+    def test_roll_once_at_midnight_without_intraday_repricing(self):
+        self.sample(997)
         self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(500))
-        self.assertEqual(self.e.state['auto_position_sizing']['day'],'2026-11-12')
-        self.now=stamp('2026-11-13T00:00:05')
+        initial = self.e.position_usdt
+        self.assertEqual(self.e.state['auto_position_sizing']['day'], '2026-11-24')
+        self.assertEqual(self.e.position_usdt, initial)
+        self.now = stamp('2026-11-25T00:01:00')
         self.e._daily_size_update()
-        self.assertTrue(self.e.auto_sizing_pending)  # prior day's sample
-        self.now=stamp('2026-11-13T00:00:40')
-        self.sample(1030)
+        self.assertEqual(self.e.position_usdt, Decimal(333))
+        self.assertEqual(self.e.state['auto_position_sizing']['day'], '2026-11-25')
+        self.now = stamp('2026-11-25T12:00:00')
+        self.sample(1005)
         self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(515))
-        self.assertFalse(self.e.auto_sizing_pending)
-        self.assertEqual(self.e.state['trade_settings']['position_usdt'],'515')
-        self.now=stamp('2026-11-13T20:30:00')
-        self.sample(900)
-        self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(515))  # once per day
+        self.assertEqual(self.e.position_usdt, Decimal(333))
         self.e.guard.close()
-        self.e=NightExecutor(self.tmp.name,DummyBroker(),Mock(),Mock(),
-                             clock=lambda:self.now,enabled=False)
+        self.e = NightExecutor(self.tmp.name, DummyBroker(), Mock(), Mock(),
+                               clock=lambda: self.now, enabled=False)
         self.addCleanup(self.e.guard.close)
-        self.assertEqual(self.e.position_usdt,Decimal(515))
         self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(515))
-        self.now=stamp('2026-11-14T00:01:00')
-        self.sample(999.1)
-        self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(500))
+        self.assertEqual(self.e.position_usdt, Decimal(333))
 
-    def test_missing_midnight_equity_waits_then_carries_previous_day(self):
-        self.sample(1000)
+    def test_telegram_manual_amount_until_next_midnight(self):
+        self.sample(997)
         self.e._daily_size_update()
-        self.now=stamp('2026-11-13T00:02:00')
+        self.assertIn('kaydedildi', self.e.apply_control('amount:900'))
+        self.assertEqual(self.e.position_usdt, Decimal(900))
         self.e._daily_size_update()
-        self.assertTrue(self.e.auto_sizing_pending)
-        self.now=stamp('2026-11-13T00:10:01')
+        self.assertEqual(self.e.position_usdt, Decimal(900))
+        self.now = stamp('2026-11-25T00:01:00')
+        self.e._daily_size_update()
+        self.assertEqual(self.e.position_usdt, Decimal(333))
+        self.assertIn('Render', self.e.apply_control('auto_size_off'))
+        self.assertTrue(self.e._auto_sizing_on())
+
+    def test_no_valid_previous_close_keeps_amount_not_block_new_buys(self):
+        self.e._daily_size_update()
+        self.now = stamp('2026-11-25T00:01:00')
         self.e._daily_size_update()
         self.assertFalse(self.e.auto_sizing_pending)
-        self.assertEqual(self.e.position_usdt,Decimal(500))
-        self.assertEqual(self.e.state['auto_position_sizing']['day'],'2026-11-13')
-        self.now=stamp('2026-11-13T13:00:00')
-        self.sample(1030)
-        self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(500))
-
-    def test_settings_toggle_off_and_manual_override_reanchor(self):
-        self.sample(1000)
-        self.e._daily_size_update()
-        self.assertIn('KAPALI', self.e.apply_control('auto_size_off'))
-        self.assertFalse(self.e._auto_sizing_on())
-        self.now=stamp('2026-11-13T00:01:00')
-        self.sample(1030)
-        self.e._daily_size_update()
+        self.assertEqual(self.e.state['auto_position_sizing']['reason'],
+                         'WAIT_PREVIOUS_DAY_CLOSE')
         self.assertEqual(self.e.position_usdt, Decimal(500))
-        self.assertIn('AÇIK', self.e.apply_control('auto_size_on'))
+        self.sample(997, at=stamp('2026-11-24T23:12:00'))
         self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(500))
-        self.assertIn('Yeni giriş ayarı',self.e.apply_control('amount:400'))
-        self.assertEqual(self.e.state['auto_position_sizing']['day'],None)
+        self.now += 61
         self.e._daily_size_update()
-        self.assertEqual(self.e.state['auto_position_sizing']['day'],'2026-11-13')
-        self.now=stamp('2026-11-14T00:01:00')
-        self.sample(999.1)
+        self.assertEqual(self.e.position_usdt, Decimal(333))
+
+    def test_legacy_sheets_no_cannot_disable_render_daily_sizing(self):
+        self.e.state['auto_position_sizing']['enabled'] = False
         self.e._daily_size_update()
-        self.assertEqual(self.e.position_usdt,Decimal(388))
+        self.assertTrue(self.e._auto_sizing_on())
+        self.sample(997)
+        self.now = stamp('2026-11-25T00:01:00')
+        self.e._daily_size_update()
+        self.assertEqual(self.e.position_usdt, Decimal(333))
 
 
 if __name__ == "__main__":
