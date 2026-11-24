@@ -507,83 +507,50 @@ class NightExecutor:
                 and self.state.get('auto_position_sizing', {}).get('enabled') is True)
 
     def _daily_size_update(self):
-        """Apply at most one whole-USDT amount per Paris day, before new BUYs.
+        """Size NEW orders from fresh observed equity, rounded UP to whole USDT.
 
-        On first activation, anchor the currently configured amount to the
-        latest OBSERVED equity. On later days, use a fresh sample taken after
-        Paris midnight, multiplying yesterday's amount by equity ratio.
-        Never query Binance or modify pending/filled orders and TPs.
+        No Binance calls, no change to existing/pending orders or TP. If the
+        observer is stale or outside the supported order budget, defer BUYs.
         """
         self.auto_sizing_pending = False
         if not self._auto_sizing_on():
             return
-        now = self.clock()
-        today = day(now)
-        state = self.state['auto_position_sizing']
-        if state.get('day') == today:
-            return
-        # Rechecking the observer every 30 s avoids excessive disk IO.
-        if now < self.next_auto_sizing_check:
-            self.auto_sizing_pending = bool(state.get('day'))
-            return
-        self.next_auto_sizing_check = now + 30
-        from crash_equity_sizing import read_equity, proportional_amount
+        from crash_equity_sizing import read_equity, one_third_amount
         path = os.path.join(os.path.abspath(os.getenv('DATA_DIR', '/data')),
                             'daily_profit_lock_paper.json')
-        obs = read_equity(path, now)
-        if state.get('day') is None:
-            # First activation never changes the 500 USDT amount. Even if
-            # started late in the day, the baseline is explicit and persisted.
-            if obs is not None and obs[1] == today:
-                equity, _, sampled = obs
-                state.update(day=today, baseline_equity=str(equity),
-                             last_amount=str(self.position_usdt),
-                             baseline_at=sampled, reason='INITIAL_BASELINE')
-                self.save()
-                self.log(f'[CRASH AUTO SIZE] baseline day={today} '
-                         f'equity={equity} USDT; amount={self.position_usdt} USDT; '
-                         'NO ORDER CHANGED')
-            return
-        if obs is not None and obs[1] == today:
-            equity, _, sampled = obs
-            before = self.position_usdt
-            previous_equity = state.get('baseline_equity')
-            if previous_equity:
-                new_amount = proportional_amount(before, previous_equity, equity)
-            else:
-                new_amount = before
-            old_equity = previous_equity
-            settings = dict(self.state.get('trade_settings') or {})
-            settings['position_usdt'] = str(new_amount)
-            self.state['trade_settings'] = settings
-            state.update(day=today, baseline_equity=str(equity),
-                         previous_equity=old_equity,
-                         last_amount=str(new_amount),
-                         baseline_at=sampled,
-                         reason='EQUITY_RATIO_ROLLOVER')
-            self.save()
-            self.position_usdt = new_amount
-            self.log(f'[CRASH AUTO SIZE] day={today} equity_prev={old_equity} '
-                     f'equity_now={equity} | {before} -> {new_amount} USDT '
-                     '| rounded HALF_UP; new BUYs only; no order/TP changed')
-            return
-        # Midnight snapshot can take up to 180 seconds. Defer NEW buys for
-        # up to 10 minutes, keeping TP and order protection running.
-        from datetime import datetime
-        paris_now = datetime.fromtimestamp(now, ZONE)
-        elapsed = ((paris_now.hour * 60 + paris_now.minute) * 60
-                   + paris_now.second)
-        if elapsed < 600:
+        observation = read_equity(path, self.clock())
+        state = self.state['auto_position_sizing']
+        if observation is None:
             self.auto_sizing_pending = True
+            if state.get('reason') != 'WAIT_FRESH_EQUITY':
+                state['reason'] = 'WAIT_FRESH_EQUITY'
+                self.save()
+                self.log('[CRASH AUTO SIZE] fresh equity unavailable; NEW BUYs blocked; TP unchanged')
             return
-        # Fail open with yesterday's already-known amount if observer is
-        # unavailable. Do NOT invent an equity or resize during the day.
-        state.update(day=today, last_amount=str(self.position_usdt),
-                     reason='OBSERVER_MISSING_CARRY_PREVIOUS_AMOUNT')
-        self.save()
-        self.log(f'[CRASH AUTO SIZE] day={today} observer unavailable; '
-                 f'carried {self.position_usdt} USDT for full day; '
-                 'new BUYs continue with previous amount; TP unaffected')
+        equity, _, sampled = observation
+        try:
+            amount = one_third_amount(equity)
+        except ValueError:
+            self.auto_sizing_pending = True
+            if state.get('reason') != 'INVALID_EQUITY_THIRD':
+                state['reason'] = 'INVALID_EQUITY_THIRD'
+                self.save()
+                self.log('[CRASH AUTO SIZE] equity/3 outside supported 1-1000 USDT; NEW BUYs blocked')
+            return
+        changed = amount != self.position_usdt
+        if changed or state.get('reason') != 'EQUITY_THIRD_CEILING':
+            previous = self.position_usdt
+            settings = dict(self.state.get('trade_settings') or {})
+            settings['position_usdt'] = str(amount)
+            self.state['trade_settings'] = settings
+            state.update(day=day(self.clock()), baseline_equity=str(equity),
+                         last_amount=str(amount), baseline_at=sampled,
+                         reason='EQUITY_THIRD_CEILING')
+            self.position_usdt = amount
+            self.save()
+            self.log(f'[CRASH AUTO SIZE] equity={equity} USDT; '
+                     f'new order budget {previous} -> {amount} USDT; '
+                     'ceil(equity/3); existing orders and TP unchanged')
 
     def daily_count(self):
         today = day(self.clock())
@@ -617,6 +584,8 @@ class NightExecutor:
     def apply_control(self, action):
         if action in ('auto_size_on', 'auto_size_off'):
             on = action == 'auto_size_on'
+            if not on and os.getenv('CRASH_AUTO_POSITION_SIZING_ENABLED', '0') == '1':
+                return '⚠️ Sermayenin üçte biri kuralı Render üzerinden yönetilir.'
             if on and os.getenv('CRASH_AUTO_POSITION_SIZING_ENABLED', '0') != '1':
                 return '⚠️ Otomatik sermaye oranı Render ayarında henüz yetkili değil.'
             state = self.state.setdefault('auto_position_sizing', {})
@@ -637,6 +606,8 @@ class NightExecutor:
                     + ' Eski emirler ve TP değişmez.')
         if action.startswith(('limit:', 'amount:', 'symbols:', 'open_limit:', 'pending_limit:')):
             kind, raw = action.split(':', 1)
+            if kind == 'amount' and os.getenv('CRASH_AUTO_POSITION_SIZING_ENABLED', '0') == '1':
+                return '⚠️ İşlem tutarı otomatik: yukarı yuvarla(sermaye / 3). Manuel değiştirilemez.'
             try:
                 value = D(raw)
                 ceiling = {'amount':1000, 'symbols':MAX_CONFIGURABLE_ENTRIES_OR_SYMBOLS,
