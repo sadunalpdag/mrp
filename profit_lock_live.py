@@ -371,6 +371,27 @@ class LiveProfitLock:
                        and D(str(p["positionAmt"])) != 0)
             self._exit_one(item, row)
 
+    def _legacy_read_only_step(self):
+        """Quarantine old cycles: inspect only, never cancel or place orders.
+
+        A legacy snapshot is not an immutable target-time list. In particular,
+        new manual orders must not be swept while waiting for old exits.
+        """
+        self._block()
+        verified, _, _, _ = self._verify()
+        if verified["all_clear"]:
+            now = datetime.fromtimestamp(self.ex.clock(), timezone.utc)
+            completed = closing_verified(self.state, True, True, True, now)
+            equity, pct, _, _ = self._sample()
+            self._save(roll_after_midnight(completed, equity, pct, now, True, True, True))
+            if not self.ex.state.get("paused") and not self.ex.state.get("halt"):
+                self.ex.enabled.set()
+            self.ex.alert("✅ SABİT KÂR HEDEFİ | Eski döngü Binance üzerinde boş doğrulandı; kilit kaldırıldı.")
+        else:
+            self._alert("Eski kapanış döngüsü salt okunur korumaya alındı. "
+                        "Yeni manuel emirler iptal edilmiyor; eski pozisyon ve "
+                        "LIMIT kapanışları için kontrol gerekli. Otomatik alış kilidi korunuyor.")
+
     def closing_symbols(self):
         """Symbols reserved by this exact snapshot; never attach new entries."""
         st = self.state or {}
@@ -625,7 +646,10 @@ class LiveProfitLock:
                 if st.get("one_shot_v2"):
                     self._one_shot_close()
                 else:
-                    self._closing_step()
+                    # Legacy persisted cycles have no immutable initial-order IDs.
+                    # Never sweep account-wide orders or attach newer positions.
+                    # Keep the entry lock until the legacy book is fully settled.
+                    self._legacy_read_only_step()
             elif st["phase"] in ("WATCH_EXITS", "DONE_DAY"):
                 self._watch_one_shot(equity, instant)
             elif st["phase"] in ("WAIT_REBASE", "WAIT_MIDNIGHT"):
