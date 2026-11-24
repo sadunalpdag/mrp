@@ -256,7 +256,7 @@ def step():
                                         cur[3]<=lower*1.003 and close>prev[4] and close>lower)
                                 breakout=(status in ("broken","retest") and
                                           close>upper and prev[4]<=upper)
-                                if (bounce or breakout) and upper>close*1.012 if bounce else breakout:
+                                if (bounce and upper > close * 1.012) or breakout:
                                     obj["entry"]=close
                                     obj["entry_ms"]=cur[0]+STEP_MS
                                     obj["target"]=close*1.01
