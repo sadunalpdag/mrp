@@ -175,6 +175,7 @@ class ManualTPGuard:
                 record['absent'] = True
         self.e.save()
         excluded = {o['symbol'] for o in self.e.state['orders'].values() if o['phase'] not in ('DONE', 'NO_FILL', 'CLOSED_EXTERNALLY')}
+        excluded.update(self.e.profit_lock.closing_symbols())
         for p in positions:
             symbol = p.get('symbol')
             if symbols is not None and symbol not in symbols:
