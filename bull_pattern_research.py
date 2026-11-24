@@ -173,6 +173,7 @@ def _sheet(db):
         sid = (os.getenv("BULL_FLAG_SHEETS_ID") or os.getenv("CRASH_SHEETS_TARGET_ID")
                or DEFAULT_EMA_FILTER_ID).strip()
         if not raw or not sid:
+            print("[BULL PATTERN SHEETS] missing credentials or sheet ID",flush=True)
             LOG.warning("Bull patterns Sheets not configured")
             return
         try:
@@ -200,13 +201,16 @@ def _sheet(db):
                 r["outcome_8h"] or "",r["outcome_24h"] or "",
                 len(p.get("observations",[])),len(p.get("candles_24h",[]))])
         sheet.update(range_name="A1",values=values)
+        print("[BULL PATTERN SHEETS] updated rows=%d" % (len(values)-1),flush=True)
         LOG.info("Bull patterns Sheets updated rows=%d",len(values)-1)
     except Exception as exc:
+        print("[BULL PATTERN SHEETS ERROR] %s: %s" % (type(exc).__name__,str(exc)[:130]),flush=True)
         LOG.warning("Bull patterns sheet update failed: %s",type(exc).__name__)
 
 
 def step():
     now = int(time.time()*1000)
+    print("[BULL PATTERN SCAN] begin at_ms=%d" % now,flush=True)
     db=database()
     try:
         followups(db,now)
@@ -219,6 +223,7 @@ def step():
                 if data.get("kind")!="patterns" or data.get("timeframe")!=tf:
                     raise ValueError("INVALID_COINBEACON_BOARD")
                 items=data.get("items",[])
+                print("[BULL PATTERN API] tf=%s kind=%s total=%s returned=%s" % (tf,data.get("kind"),data.get("total"),len(items) if isinstance(items,list) else "invalid"),flush=True)
                 if not isinstance(items,list):
                     raise ValueError("INVALID_PATTERN_ITEMS")
                 if int(data.get("total",len(items)))>len(items):
@@ -266,7 +271,7 @@ def step():
                                     obj["payload"]["entry_reason"]="SUPPORT_REBOUND" if bounce else "BREAKOUT"
                         _store(db,obj)
                         continue
-                    bars,complete=legacy._bars(sym,_closed(now),480)
+                    bars,complete=[],False
                     payload={"schema":"bull_patterns_learning_v1","id":ident,
                              "symbol":sym,"tf":tf,"kind":kind,
                              "first_ms":now,"original_pattern":item,
@@ -277,12 +282,15 @@ def step():
                         " VALUES(?,?,?,?,?,?,?,?)",
                         (ident,sym,tf,kind,now,now,status,json.dumps(payload,separators=(",",":"))))
                     db.commit();fresh+=1
+                    print("[BULL PATTERN NEW] %s %s %s saved=%s" % (sym,tf,kind,ident),flush=True)
                     legacy._telegram("🚩 YENİ SANAL FORMASYON\n%s %s %s\n"
                         "Durum: %s | Konum: %s\nAlt: %s | Üst: %s" %
                         (sym,tf,kind,status,position,lower,upper))
             except Exception as exc:
+                print("[BULL PATTERN SCAN ERROR] tf=%s error=%s detail=%s" % (tf,type(exc).__name__,str(exc)[:160]),flush=True)
                 LOG.warning("Bull patterns scan %s failed: %s",tf,type(exc).__name__)
         _sheet(db)
+        print("[BULL PATTERN SCAN] cycle finished new=%s" % fresh,flush=True)
         LOG.info("Bull patterns cycle finished new=%s",fresh)
     finally:
         db.close()
