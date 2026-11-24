@@ -116,6 +116,13 @@ class ThirdEquitySizingTests(unittest.TestCase):
         self.e._daily_size_update()
         self.assertTrue(self.e.auto_sizing_pending)
 
+    def test_legacy_no_cannot_disable_render_authorized_third_rule(self):
+        self.e.state['auto_position_sizing']['enabled'] = False
+        self.sample(997)
+        self.assertTrue(self.e._auto_sizing_on())
+        self.e._daily_size_update()
+        self.assertEqual(self.e.position_usdt, Decimal(333))
+
     def test_manual_budget_rejected_and_other_controls_retained(self):
         self.sample(997)
         self.e._daily_size_update()
