@@ -5,7 +5,7 @@ state itself. The executor alone commits one immutable size per Paris day.
 """
 import json
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_CEILING
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -57,3 +57,14 @@ def proportional_amount(previous_amount, previous_equity, current_equity):
     value = decimal(previous_amount) * decimal(current_equity) / decimal(previous_equity)
     integer = value.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     return min(MAX_USDT, max(MIN_USDT, integer))
+
+
+def one_third_amount(equity):
+    """Entire new-order notional: ceil(fresh observed equity / 3) USDT.
+
+    Never silently clamp a higher equity value to an unrelated order size.
+    """
+    value = (decimal(equity) / Decimal("3")).to_integral_value(rounding=ROUND_CEILING)
+    if not MIN_USDT <= value <= MAX_USDT:
+        raise ValueError("EQUITY_THIRD_OUT_OF_BOUNDS")
+    return value
