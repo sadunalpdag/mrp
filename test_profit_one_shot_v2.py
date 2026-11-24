@@ -2,15 +2,29 @@
 import os
 from decimal import Decimal
 from unittest.mock import patch
-from test_profit_lock_live import LiveLockTests
+import tempfile
+import threading
+import unittest
+from datetime import datetime, timezone
+from test_profit_lock_live import FakeExecutor
+from profit_lock_live import LiveProfitLock
 
 
-class OneShotTests(LiveLockTests):
+class OneShotTests(unittest.TestCase):
     def setUp(self):
-        super().setUp()
-        self.extra = patch.dict(os.environ, {"CRASH_PROFIT_ONE_SHOT_V2": "1"})
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.extra = patch.dict(os.environ, {"DATA_DIR": self.temp.name,
+                       "CRASH_FIXED_PROFIT_LOCK_ENABLED": "1",
+                       "CRASH_PROFIT_ONE_SHOT_V2": "1"})
         self.extra.start()
         self.addCleanup(self.extra.stop)
+        self.clock = [datetime(2026, 11, 20, 15, tzinfo=timezone.utc).timestamp()]
+        self.ex = FakeExecutor(self.clock)
+        self.ctrl = LiveProfitLock(self.ex)
+
+    def advance(self):
+        self.clock[0] += 130
 
     def test_release_after_confirmed_limit_and_ignore_new_manual_order(self):
         broker = self.ex.broker
