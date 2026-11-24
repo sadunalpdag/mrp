@@ -360,6 +360,12 @@ def step():
 
 
 def start():
+    # Keep the existing ema.py entrypoint; use the combined research worker.
+    from bull_pattern_research import start as start_combined
+    return start_combined()
+
+
+def start_legacy():
     global _STARTED
     if _STARTED or os.getenv("BULL_FLAG_PAPER_ENABLED", "0") != "1":
         return False
