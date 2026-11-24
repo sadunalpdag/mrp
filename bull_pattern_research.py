@@ -139,8 +139,9 @@ def followups(db, now):
                 bars, _ = legacy._bars(obj["symbol"], obj["first_ms"]+EIGHT+STEP_MS,40)
                 bars = [b for b in bars if obj["first_ms"] <= b[0] < obj["first_ms"]+EIGHT]
                 obj["payload"]["candles_8h"] = bars
-                obj["payload"]["complete_8h"] = len(bars) == 32 and all(\n                    b[0] - a[0] == STEP_MS for a, b in zip(bars, bars[1:]))
-                if len(bars) >= 31:
+                obj["payload"]["complete_8h"] = len(bars) == 32 and all(
+                    b[0] - a[0] == STEP_MS for a, b in zip(bars, bars[1:]))
+                if obj["payload"]["complete_8h"]:
                     obj["outcome_8h"] = _outcome(bars,obj["entry"],obj["target"],obj["entry_ms"])
                     _store(db,obj)
             except Exception as exc:
@@ -172,6 +173,7 @@ def _sheet(db):
         sid = (os.getenv("BULL_FLAG_SHEETS_ID") or os.getenv("CRASH_SHEETS_TARGET_ID")
                or DEFAULT_EMA_FILTER_ID).strip()
         if not raw or not sid:
+            LOG.warning("Bull patterns Sheets not configured")
             return
         try:
             info = json.loads(raw)
@@ -197,7 +199,8 @@ def _sheet(db):
                 latest.get("upper",""),r["target"] or "",r["entry"] or "",
                 r["outcome_8h"] or "",r["outcome_24h"] or "",
                 len(p.get("observations",[])),len(p.get("candles_24h",[]))])
-        sheet.update(range_name="A1",values=values)\n        LOG.info("Bull patterns Sheets updated rows=%d",len(values)-1)
+        sheet.update(range_name="A1",values=values)
+        LOG.info("Bull patterns Sheets updated rows=%d",len(values)-1)
     except Exception as exc:
         LOG.warning("Bull patterns sheet update failed: %s",type(exc).__name__)
 
