@@ -361,7 +361,11 @@ def step():
 
 def start():
     # Keep the existing ema.py entrypoint; use the combined research worker.
-    from bull_pattern_research import start as start_combined
+    try:
+        from bull_pattern_research import start as start_combined
+    except SyntaxError as exc:
+        LOG.error("Bull pattern module syntax: file=%s line=%s message=%s", exc.filename, exc.lineno, exc.msg)
+        raise
     return start_combined()
 
 
