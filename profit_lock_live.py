@@ -618,7 +618,7 @@ class LiveProfitLock:
                 self.ex.enabled.set()
         if not self.active() or self.ex.clock() < self.next_poll:
             return
-        self.next_poll = self.ex.clock() + 120
+        self.next_poll = self.ex.clock() + 5 * 60
         if self.locked():
             self._block()
         try:
