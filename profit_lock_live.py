@@ -623,6 +623,11 @@ class LiveProfitLock:
                             " çakışan emir var; hiçbir yeni emir gönderilmedi.")
                 return
             status = job["status"]
+            if status == "VERIFIED":
+                if old or not new:
+                    self._alert("Yenileme: " + job["symbol"] +
+                                " doğrulanan LIMIT artık açık değil; kapanış kanıtı gerekli.")
+                    return
             if status == "READY_CANCEL":
                 if not old:
                     self._alert("Yenileme: " + job["symbol"] +
@@ -689,7 +694,9 @@ class LiveProfitLock:
                     return
                 if (new.get("symbol") != job["symbol"] or
                         new.get("side") != ("SELL" if qty > 0 else "BUY") or
-                        new.get("type") not in (None, "LIMIT")):
+                        new.get("type") != "LIMIT" or
+                        new.get("positionSide", "BOTH") != job["side"] or
+                        (job["side"] == "BOTH" and str(new.get("reduceOnly")).lower() not in ("true", "1"))):
                     self._alert("Yenileme: " + job["symbol"] +
                                 " yeni emir içeriği uyuşmuyor.")
                     return
