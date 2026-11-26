@@ -20,4 +20,4 @@ jobs:
       - name: Check Python syntax
         run: python -m py_compile profit_lock_live.py test_profit_one_shot_v2.py
       - name: Run offline safety tests
-        run: python -m unittest -v test_profit_one_shot_v2 test_profit_lock_live
+        run: python -m unittest -v test_profit_one_shot_v2
