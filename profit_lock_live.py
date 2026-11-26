@@ -646,8 +646,8 @@ class LiveProfitLock:
                 # One-off operator target, consumed durably before observation.
                 # Never change a triggered close cycle or reapply after restart.
                 override = os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip()
-                marker = "2026-11-24:1017"
-                if (override == marker and instant.astimezone(PARIS).date().isoformat() == "2026-11-24" and
+                marker = "2026-11-26:1017"
+                if (override == marker and instant.astimezone(PARIS).date().isoformat() == "2026-11-26" and
                         self.ex.state.get("profit_target_once_applied") != marker):
                     target = D("1017")
                     if not target.is_finite() or target <= 0:
@@ -656,7 +656,7 @@ class LiveProfitLock:
                     st["one_off_target"] = marker
                     self.ex.state["profit_target_once_applied"] = marker
                     self._save(st)
-                    self.ex.log("[PROFIT CYCLE] one-off target applied: 1017 USDT; 2026-11-24")
+                    self.ex.log("[PROFIT CYCLE] one-off target applied: 1017 USDT; 2026-11-26")
                 new, hit = observe(st, equity, instant)
                 if hit:
                     self._block()
