@@ -1,0 +1,23 @@
+name: Old EXIT reprice regression
+on:
+  push:
+    branches:
+      - fix/reprice-legacy-exits-target-1027-20261126
+  pull_request:
+    paths:
+      - 'profit_lock_live.py'
+      - 'test_profit_one_shot_v2.py'
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Dependencies
+        run: pip install -r requirements.txt
+      - name: Check Python syntax
+        run: python -m py_compile profit_lock_live.py test_profit_one_shot_v2.py
+      - name: Run offline safety tests
+        run: python -m unittest -v test_profit_one_shot_v2 test_profit_lock_live
