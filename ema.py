@@ -10116,6 +10116,7 @@ def reopen_positions_with_tp(closed_positions_info):
             
         except Exception as e:
             log(f"[REOPEN ERR] {sym} {e}")
+            tg_send(f"❌ REOPEN ERROR {sym} {direction}\n{e}")
     
     return reopened_count
 
@@ -11855,6 +11856,7 @@ def execute_real_trade(sig):
 
     except Exception as e:
         log(f"[OPEN ERR]{sym}{e}")
+        tg_send(f"❌ TRADE ERROR {sym} {direction}\n{e}")
         return False
 
 # ===================== TRENDLOCK TEMİZLİK =====================
