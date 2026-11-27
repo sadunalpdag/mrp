@@ -618,7 +618,12 @@ class LiveProfitLock:
                 self.ex.enabled.set()
         if not self.active() or self.ex.clock() < self.next_poll:
             return
-        self.next_poll = self.ex.clock() + 120
+        # Routine exchange observations after a fully completed cycle are
+        # five-minute checks.  Pending targets and active LIMIT-close cycles
+        # retain two-minute monitoring; new BUY/TP events are handled by the
+        # executor's separate immediate account-event path.
+        poll_seconds = 300 if (self.state or {}).get("phase") == "DONE_DAY" else 120
+        self.next_poll = self.ex.clock() + poll_seconds
         if self.locked():
             self._block()
         try:
@@ -663,6 +668,8 @@ class LiveProfitLock:
                     self.ex.state["profit_target_once_applied"] = rearm_marker
                     self._save(armed)
                     st = armed
+                    # Re-armed target monitoring must resume at two minutes.
+                    self.next_poll = self.ex.clock() + 120
                     self.ex.log("[PROFIT CYCLE] operator re-armed completed day once: 1084 USDT")
                 else:
                     self.ex.log("[PROFIT CYCLE] re-arm deferred: prior exits still active")
