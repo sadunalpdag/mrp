@@ -641,7 +641,7 @@ class LiveProfitLock:
             # Explicit operator re-arm for today's already completed one-shot cycle.
             # The marker is persisted before observing the new target, so a
             # restart cannot reopen the same completed cycle a second time.
-            rearm_marker = "2026-11-27:1068"
+            rearm_marker = "2026-11-27:1084"
             if (st.get("phase") == "DONE_DAY" and
                     os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip() == rearm_marker and
                     self.ex.state.get("profit_target_once_applied") != rearm_marker):
@@ -658,12 +658,12 @@ class LiveProfitLock:
                                   "cashflow_seen", "cashflow_total"):
                         if field in st:
                             armed[field] = st[field]
-                    armed["target"] = "1068"
+                    armed["target"] = "1084"
                     armed["one_off_target"] = rearm_marker
                     self.ex.state["profit_target_once_applied"] = rearm_marker
                     self._save(armed)
                     st = armed
-                    self.ex.log("[PROFIT CYCLE] operator re-armed completed day once: 1068 USDT")
+                    self.ex.log("[PROFIT CYCLE] operator re-armed completed day once: 1084 USDT")
                 else:
                     self.ex.log("[PROFIT CYCLE] re-arm deferred: prior exits still active")
             if st["phase"] == "WAIT_TARGET":
@@ -674,17 +674,17 @@ class LiveProfitLock:
                 # One-off operator target, consumed durably before observation.
                 # Never change a triggered close cycle or reapply after restart.
                 override = os.getenv("CRASH_FIXED_TARGET_ONCE", "").strip()
-                marker = "2026-11-27:1068"
+                marker = "2026-11-27:1084"
                 if (override == marker and
                         self.ex.state.get("profit_target_once_applied") != marker):
-                    target = D("1068")
+                    target = D("1084")
                     if not target.is_finite() or target <= 0:
                         raise ValueError("INVALID_ONE_OFF_TARGET")
                     st["target"] = str(target)
                     st["one_off_target"] = marker
                     self.ex.state["profit_target_once_applied"] = marker
                     self._save(st)
-                    self.ex.log("[PROFIT CYCLE] operator target held until close: 1068 USDT; 2026-11-27")
+                    self.ex.log("[PROFIT CYCLE] operator target held until close: 1084 USDT; 2026-11-27")
                 new, hit = observe(st, equity, instant)
                 if hit:
                     self._block()
